@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.coverage
+
+# IDE
+.idea/
+.vscode/
+
+# App data (never commit downloaded novels) — anchored to the repo root:
+# on case-insensitive filesystems an unanchored rule also matches src/noveltrans/
+/NovelTrans/
+*.db
+*.db-wal
+*.db-shm
+
+# OS
+.DS_Store
