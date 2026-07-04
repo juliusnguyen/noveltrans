@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "noveltrans"
+version = "0.1.0"
+description = "Scrape, translate (zh -> vi/en) and export Chinese web novels — PySide6 desktop app"
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6>=6.6",
+    "requests>=2.31",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.0",
+    "deep-translator>=1.11",
+    "anthropic>=0.40",
+    "python-docx>=1.1",
+    "ebooklib>=0.18",
+    "jieba>=0.42",
+    "opencc-python-reimplemented>=0.1.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "responses>=0.25",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+noveltrans = "noveltrans.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+noveltrans = ["translators/data/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "live: tests that hit real websites (excluded by default)",
+]
+addopts = "-m 'not live'"
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
