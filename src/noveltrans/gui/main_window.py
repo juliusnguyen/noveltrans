@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 
 from noveltrans.config import AppConfig
 from noveltrans.gui.settings_dialog import SettingsDialog
+from noveltrans.gui.tab_audio import AudioTab
 from noveltrans.gui.tab_export import ExportTab
 from noveltrans.gui.tab_scrape import ScrapeTab
 from noveltrans.gui.tab_translate import TranslateTab
@@ -44,9 +45,11 @@ class MainWindow(QMainWindow):
         self.scrape_tab = ScrapeTab(config)
         self.translate_tab = TranslateTab(config)
         self.export_tab = ExportTab(config)
+        self.audio_tab = AudioTab(config)
         self.tabs.addTab(self.scrape_tab, "1. Tải truyện")
         self.tabs.addTab(self.translate_tab, "2. Dịch")
         self.tabs.addTab(self.export_tab, "3. Xuất file")
+        self.tabs.addTab(self.audio_tab, "4. Nghe audio")
         self.setCentralWidget(self.tabs)
 
         # cross-session state: reopen the novel you were working on
@@ -54,11 +57,13 @@ class MainWindow(QMainWindow):
         self.scrape_tab.project_changed.connect(self._on_project_touched)
         self.translate_tab.picker.project_selected.connect(self.state.touch_project)
         self.export_tab.picker.project_selected.connect(self.state.touch_project)
+        self.audio_tab.picker.project_selected.connect(self.state.touch_project)
         last = self.state.valid_last_project()
         self.scrape_tab.refresh_recent(select_path=last)
         if last:
             self.translate_tab.refresh_projects(select_path=last)
             self.export_tab.refresh_projects(select_path=last)
+            self.audio_tab.refresh_projects(select_path=last)
 
         settings_action = QAction("&Cài đặt…", self)
         settings_action.setMenuRole(QAction.MenuRole.PreferencesRole)
@@ -80,6 +85,7 @@ class MainWindow(QMainWindow):
         self.state.touch_project(path)
         self.translate_tab.refresh_projects(path)
         self.export_tab.refresh_projects(path)
+        self.audio_tab.refresh_projects(path)
 
     def _open_settings(self) -> None:
         SettingsDialog(self.config, self).exec()

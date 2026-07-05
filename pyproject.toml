@@ -26,6 +26,9 @@ dev = [
     "responses>=0.25",
     "ruff>=0.4",
 ]
+tts = [
+    "vieneu>=3.0",  # VieNeu-TTS, torch-free ONNX runtime (~334 MB model on first run)
+]
 
 [project.scripts]
 noveltrans = "noveltrans.app:main"

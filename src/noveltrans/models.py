@@ -62,6 +62,11 @@ class Chapter:
     status: str = STATUS_PENDING
     error: str = ""
     updated_at: str = ""
+    # audio pipeline (parallel to download/translate status)
+    audio_path: str = ""  # path relative to the project folder ("" = not generated)
+    audio_voice: str = ""
+    audio_seconds: float = 0.0  # duration of the generated audio
+    audio_error: str = ""
 
     @property
     def is_downloaded(self) -> bool:
@@ -70,3 +75,7 @@ class Chapter:
     @property
     def is_translated(self) -> bool:
         return bool(self.translated)
+
+    @property
+    def has_audio(self) -> bool:
+        return bool(self.audio_path)

@@ -239,6 +239,119 @@ class LmStudioModelsWorker(QThread):
         self.models_listed.emit(self.base_url, list_models(self.base_url))
 
 
+class AudioWorker(QThread):
+    """Generate audio for translated chapters of a project, resumably."""
+
+    progress = Signal(int, int, str)  # done, total, chapter title / phase message
+    chapter_done = Signal(int)
+    chapter_error = Signal(int, str)
+    failed = Signal(str)  # engine could not be constructed/loaded
+    finished_ok = Signal(int, int)  # ok count, error count
+
+    def __init__(
+        self,
+        project_path: Path,
+        voice: str,
+        out_format: str = "wav",  # "wav" or "mp3" (mp3 needs ffmpeg)
+        indices: list[int] | None = None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.project_path = Path(project_path)
+        self.voice = voice
+        self.out_format = out_format
+        self.indices = indices  # None = all pending; else re-generate exactly these
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        from noveltrans.errors import TtsError
+        from noveltrans.storage.project import slugify
+        from noveltrans.tts import get_tts_engine
+
+        try:
+            engine = get_tts_engine("vieneu", voice=self.voice)
+            self.progress.emit(0, 0, "Đang tải model VieNeu (~330 MB lần đầu)…")
+            engine.load()
+        except TtsError as exc:
+            self.failed.emit(str(exc))
+            return
+        except Exception as exc:
+            self.failed.emit(f"Lỗi không mong đợi khi nạp TTS: {exc!r}")
+            return
+
+        project = NovelProject.open(self.project_path)
+        try:
+            if self.indices is not None:
+                chapters = (project.chapter(i) for i in self.indices)
+                pending = [c for c in chapters if c is not None and c.translated]
+            else:
+                pending = project.pending_audio(self.voice)
+            total = len(pending)
+            done = 0
+            errors = 0
+            project.audio_dir.mkdir(parents=True, exist_ok=True)
+
+            for chapter in pending:
+                if self._cancelled:
+                    break
+                title = chapter.translated_title or chapter.title
+                self.progress.emit(done, total, title)
+                # voice in the filename: re-voicing creates a NEW file, so audio
+                # players that cached/imported the old one can't play stale audio
+                name = f"{chapter.index + 1:04d}-{slugify(title)}-{slugify(self.voice)}.wav"
+                out_path = project.audio_dir / name
+                try:
+                    seconds = engine.synthesize_chapter(
+                        chapter.translated_title,
+                        chapter.translated,
+                        out_path,
+                        cancelled=lambda: self._cancelled,
+                    )
+                    if self.out_format == "mp3":
+                        from noveltrans.tts.convert import convert_to_mp3
+
+                        out_path = convert_to_mp3(out_path)
+                    rel_path = str(out_path.relative_to(project.path))
+                    if chapter.audio_path and chapter.audio_path != rel_path:
+                        # re-voiced with another format — drop the stale old file
+                        (project.path / chapter.audio_path).unlink(missing_ok=True)
+                    project.save_audio(chapter.index, rel_path, self.voice, seconds)
+                    self.chapter_done.emit(chapter.index)
+                except TtsError as exc:
+                    if self._cancelled:
+                        break  # mid-chapter cancel, not a real error
+                    errors += 1
+                    project.mark_audio_error(chapter.index, str(exc))
+                    self.chapter_error.emit(chapter.index, str(exc))
+                except Exception as exc:  # keep the batch going
+                    errors += 1
+                    project.mark_audio_error(chapter.index, repr(exc))
+                    self.chapter_error.emit(chapter.index, repr(exc))
+                done += 1
+            self.progress.emit(done, total, "")
+            self.finished_ok.emit(done - errors, errors)
+        finally:
+            project.close()
+
+
+class TtsVoicesWorker(QThread):
+    """List a TTS engine's voices without blocking the GUI."""
+
+    voices_listed = Signal(list)  # (label, voice_id) pairs
+
+    def run(self) -> None:
+        from noveltrans.tts import get_tts_engine
+
+        try:
+            voices = get_tts_engine("vieneu").list_voices()  # presets, no model load
+        except Exception:
+            voices = []
+        self.voices_listed.emit(list(voices))
+
+
 class ExportWorker(QThread):
     """Export a project to one output format."""
 

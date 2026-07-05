@@ -112,9 +112,7 @@ class ScrapeTab(QWidget):
         self.project = NovelProject.open(path)
         meta = self.project.meta
         self.url_edit.setText(meta.url)
-        self.title_label.setText(meta.title)
-        self.author_label.setText(meta.author or "—")
-        self.desc_label.setText(meta.description or "—")
+        self._show_meta(meta)
         self._reload_table()
         counts = self.project.counts()
         self.count_label.setText(str(counts["total"]))
@@ -141,14 +139,13 @@ class ScrapeTab(QWidget):
         self._scan_worker.finished.connect(lambda: self.scan_button.setEnabled(True))
         self._scan_worker.start()
 
-    def _on_scanned(self, path: str, meta, count: int) -> None:
+    def _on_scanned(self, path: str, _meta, count: int) -> None:
         if self.project is not None:
             self.project.close()
         self.project = NovelProject.open(path)
-        self.title_label.setText(meta.title)
-        self.author_label.setText(meta.author or "—")
+        # display the on-disk meta — it keeps translations from earlier runs
+        self._show_meta(self.project.meta)
         self.count_label.setText(str(count))
-        self.desc_label.setText(meta.description or "—")
         self._reload_table()
         self.download_button.setEnabled(True)
         counts = self.project.counts()
@@ -217,6 +214,29 @@ class ScrapeTab(QWidget):
             self.project_changed.emit(str(self.project.path))
 
     # ------------------------------------------------------------------ misc
+
+    def _show_meta(self, meta) -> None:
+        """Fill the metadata panel; translated info shows next to the original."""
+        if meta.translated_title:
+            self.title_label.setText(f"{meta.title}  —  {meta.translated_title}")
+        else:
+            self.title_label.setText(meta.title)
+        self.author_label.setText(meta.author or "—")
+        if meta.translated_description:
+            self.desc_label.setText(meta.translated_description)
+            self.desc_label.setToolTip(meta.description)  # original on hover
+        else:
+            self.desc_label.setText(meta.description or "—")
+            self.desc_label.setToolTip("")
+
+    def showEvent(self, event) -> None:  # a translation run may have filled the meta
+        busy = any(
+            w is not None and w.isRunning()
+            for w in (self._scan_worker, self._download_worker)
+        )
+        if self.project is not None and not busy:
+            self._show_meta(self.project.reload_meta())
+        super().showEvent(event)
 
     def _reload_table(self) -> None:
         if self.project is not None:

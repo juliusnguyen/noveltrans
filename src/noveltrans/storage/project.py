@@ -30,6 +30,7 @@ from noveltrans.models import (
 META_FILE = "meta.json"
 DB_FILE = "chapters.db"
 EXPORTS_DIR = "exports"
+AUDIO_DIR = "audio"  # inside exports/
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS chapters (
@@ -44,7 +45,11 @@ CREATE TABLE IF NOT EXISTS chapters (
   translate_seconds REAL NOT NULL DEFAULT 0,
   status           TEXT NOT NULL DEFAULT 'pending',
   error            TEXT NOT NULL DEFAULT '',
-  updated_at       TEXT NOT NULL DEFAULT ''
+  updated_at       TEXT NOT NULL DEFAULT '',
+  audio_path       TEXT NOT NULL DEFAULT '',
+  audio_voice      TEXT NOT NULL DEFAULT '',
+  audio_seconds    REAL NOT NULL DEFAULT 0,
+  audio_error      TEXT NOT NULL DEFAULT ''
 );
 """
 
@@ -55,6 +60,7 @@ def _now() -> str:
 
 def slugify(text: str, max_len: int = 40) -> str:
     """ASCII-safe folder slug; CJK titles fall back to 'novel'."""
+    text = text.replace("đ", "d").replace("Đ", "D")  # đ has no NFKD decomposition
     text = unicodedata.normalize("NFKD", text)
     text = text.encode("ascii", "ignore").decode("ascii")
     text = re.sub(r"[^a-zA-Z0-9]+", "-", text).strip("-").lower()
@@ -75,6 +81,10 @@ def _row_to_chapter(row: sqlite3.Row) -> Chapter:
         status=row["status"],
         error=row["error"],
         updated_at=row["updated_at"],
+        audio_path=row["audio_path"],
+        audio_voice=row["audio_voice"],
+        audio_seconds=row["audio_seconds"],
+        audio_error=row["audio_error"],
     )
 
 
@@ -96,6 +106,10 @@ class NovelProject:
         added = {
             "translator": "TEXT NOT NULL DEFAULT ''",
             "translate_seconds": "REAL NOT NULL DEFAULT 0",
+            "audio_path": "TEXT NOT NULL DEFAULT ''",
+            "audio_voice": "TEXT NOT NULL DEFAULT ''",
+            "audio_seconds": "REAL NOT NULL DEFAULT 0",
+            "audio_error": "TEXT NOT NULL DEFAULT ''",
         }
         with self._db:
             for name, ddl in added.items():
@@ -132,6 +146,12 @@ class NovelProject:
         data = json.loads((path / META_FILE).read_text(encoding="utf-8"))
         return cls(path, NovelMeta.from_dict(data))
 
+    def reload_meta(self) -> NovelMeta:
+        """Re-read meta.json — picks up translations written by another instance."""
+        data = json.loads((self.path / META_FILE).read_text(encoding="utf-8"))
+        self.meta = NovelMeta.from_dict(data)
+        return self.meta
+
     @staticmethod
     def is_project_dir(path: Path) -> bool:
         return (Path(path) / META_FILE).is_file() and (Path(path) / DB_FILE).is_file()
@@ -142,6 +162,10 @@ class NovelProject:
     @property
     def exports_dir(self) -> Path:
         return self.path / EXPORTS_DIR
+
+    @property
+    def audio_dir(self) -> Path:
+        return self.exports_dir / AUDIO_DIR
 
     # ---------------------------------------------------------------- TOC
 
@@ -197,6 +221,23 @@ class NovelProject:
         ).fetchall()
         return [_row_to_chapter(r) for r in rows]
 
+    def pending_audio(self, voice: str = "") -> list[Chapter]:
+        """Translated chapters that don't have audio in `voice` yet.
+
+        Like pending_translation with a language switch: audio generated with a
+        *different* voice counts as pending again (the old file gets replaced).
+        Empty `voice` only checks for missing audio.
+        """
+        rows = self._db.execute(
+            """
+            SELECT * FROM chapters
+            WHERE translated != '' AND (audio_path = '' OR (? != '' AND audio_voice != ?))
+            ORDER BY idx
+            """,
+            (voice, voice),
+        ).fetchall()
+        return [_row_to_chapter(r) for r in rows]
+
     def errored(self) -> list[Chapter]:
         rows = self._db.execute(
             "SELECT * FROM chapters WHERE status = ? ORDER BY idx", (STATUS_ERROR,)
@@ -214,11 +255,15 @@ class NovelProject:
         errors = self._db.execute(
             "SELECT COUNT(*) FROM chapters WHERE status = ?", (STATUS_ERROR,)
         ).fetchone()[0]
+        audio = self._db.execute(
+            "SELECT COUNT(*) FROM chapters WHERE audio_path != ''"
+        ).fetchone()[0]
         return {
             "total": total,
             "downloaded": downloaded,
             "translated": translated,
             "errors": errors,
+            "audio": audio,
         }
 
     # ---------------------------------------------------------------- writes
@@ -248,11 +293,61 @@ class NovelProject:
                 (text, title, lang, translator, seconds, STATUS_TRANSLATED, _now(), idx),
             )
 
+    def edit_translation(
+        self, idx: int, title: str | None = None, text: str | None = None
+    ) -> None:
+        """Manual edit of a chapter's translated title/text.
+
+        Only the given fields change — engine, language, timing and status
+        stay as the original translation run left them.
+        """
+        sets, params = [], []
+        if title is not None:
+            sets.append("translated_title = ?")
+            params.append(title)
+        if text is not None:
+            sets.append("translated = ?")
+            params.append(text)
+        if not sets:
+            return
+        with self._db:
+            self._db.execute(
+                f"UPDATE chapters SET {', '.join(sets)}, updated_at = ? WHERE idx = ?",
+                (*params, _now(), idx),
+            )
+
     def mark_error(self, idx: int, message: str) -> None:
         with self._db:
             self._db.execute(
                 "UPDATE chapters SET status = ?, error = ?, updated_at = ? WHERE idx = ?",
                 (STATUS_ERROR, message, _now(), idx),
+            )
+
+    def save_audio(self, idx: int, rel_path: str, voice: str, seconds: float) -> None:
+        with self._db:
+            self._db.execute(
+                "UPDATE chapters SET audio_path = ?, audio_voice = ?, audio_seconds = ?,"
+                " audio_error = '', updated_at = ? WHERE idx = ?",
+                (rel_path, voice, seconds, _now(), idx),
+            )
+
+    def mark_audio_error(self, idx: int, message: str) -> None:
+        with self._db:
+            self._db.execute(
+                "UPDATE chapters SET audio_error = ?, updated_at = ? WHERE idx = ?",
+                (message, _now(), idx),
+            )
+
+    def clear_audio(self) -> None:
+        """Reset all audio state so the novel can be re-voiced from scratch.
+
+        Does not delete the audio files — the worker overwrites them.
+        """
+        with self._db:
+            self._db.execute(
+                "UPDATE chapters SET audio_path = '', audio_voice = '',"
+                " audio_seconds = 0, audio_error = '', updated_at = ?",
+                (_now(),),
             )
 
     def save_meta_translation(self, title: str, description: str, lang: str) -> None:

@@ -20,6 +20,8 @@ DEFAULT_CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 DEFAULT_CLI_COMMAND = "agy -p"
 DEFAULT_CLAUDE_CLI_COMMAND = "claude -p"
 DEFAULT_LMSTUDIO_URL = "http://127.0.0.1:1234"
+DEFAULT_TTS_VOICE = "Ngọc Lan"
+DEFAULT_TTS_FORMAT = "mp3"  # falls back to wav when ffmpeg is missing
 
 TARGET_LANGS = {"vi": "Tiếng Việt", "en": "English"}
 TRANSLATORS = {
@@ -126,6 +128,22 @@ class AppConfig:
     @lmstudio_url.setter
     def lmstudio_url(self, value: str) -> None:
         self._s.setValue("lmstudio_url", value.strip() or DEFAULT_LMSTUDIO_URL)
+
+    @property
+    def tts_voice(self) -> str:
+        return str(self._s.value("tts_voice", DEFAULT_TTS_VOICE))
+
+    @tts_voice.setter
+    def tts_voice(self, value: str) -> None:
+        self._s.setValue("tts_voice", value.strip() or DEFAULT_TTS_VOICE)
+
+    @property
+    def tts_format(self) -> str:
+        return str(self._s.value("tts_format", DEFAULT_TTS_FORMAT))
+
+    @tts_format.setter
+    def tts_format(self, value: str) -> None:
+        self._s.setValue("tts_format", value)
 
     def cli_model_for(self, engine: str) -> str:
         """Model override for a CLI-based engine ("" = the CLI's own default)."""

@@ -31,5 +31,17 @@ def library_dir(tmp_path: Path) -> Path:
     return tmp_path / "library"
 
 
+@pytest.fixture(scope="session")
+def qapp():
+    """Offscreen QApplication for model/widget tests."""
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    yield app
+
+
 def load_fixture(site: str, name: str) -> str:
     return (FIXTURES_DIR / site / name).read_text(encoding="utf-8")
