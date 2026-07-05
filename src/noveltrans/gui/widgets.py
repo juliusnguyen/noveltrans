@@ -85,17 +85,24 @@ class ProjectPicker(QComboBox):
         self.project_selected.emit(self.selected_path())
 
 
-class RetranslateButtonDelegate(QStyledItemDelegate):
-    """Paints a per-row 'Dịch lại' push button without creating row widgets."""
+class RowButtonDelegate(QStyledItemDelegate):
+    """Paints a per-row push button without creating row widgets.
 
-    retranslate_clicked = Signal(int)  # table row
+    The button shows only when the cell's UserRole data is truthy.
+    """
+
+    clicked = Signal(int)  # table row
+
+    def __init__(self, text: str, parent=None):
+        super().__init__(parent)
+        self.text = text
 
     def paint(self, painter, option, index) -> None:
         if not index.data(Qt.ItemDataRole.UserRole):
-            return  # chapter has no content yet — nothing to translate
+            return  # row not eligible for this action
         button = QStyleOptionButton()
         button.rect = option.rect.adjusted(4, 3, -4, -3)
-        button.text = "↻ Dịch lại"
+        button.text = self.text
         button.state = QStyle.StateFlag.State_Enabled
         if option.state & QStyle.StateFlag.State_MouseOver:
             button.state |= QStyle.StateFlag.State_MouseOver
@@ -109,13 +116,102 @@ class RetranslateButtonDelegate(QStyledItemDelegate):
             and index.data(Qt.ItemDataRole.UserRole)
             and option.rect.contains(event.position().toPoint())
         ):
-            self.retranslate_clicked.emit(index.row())
+            self.clicked.emit(index.row())
             return True
         return False
 
 
+class RetranslateButtonDelegate(RowButtonDelegate):
+    def __init__(self, parent=None):
+        super().__init__("↻ Dịch lại", parent)
+
+
+class AudioChapterTableModel(QAbstractTableModel):
+    """Read-only table over Chapter rows, audio-pipeline view."""
+
+    COLUMNS = ("#", "Tên chương (dịch)", "Âm thanh", "Thời lượng", "Giọng", "Lỗi", "")
+    TITLE_COLUMN = 1
+    STATUS_COLUMN = 2
+    DURATION_COLUMN = 3
+    VOICE_COLUMN = 4
+    ERROR_COLUMN = 5
+    REGENERATE_COLUMN = 6
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._chapters: list[Chapter] = []
+
+    def set_chapters(self, chapters: list[Chapter]) -> None:
+        self.beginResetModel()
+        self._chapters = list(chapters)
+        self.endResetModel()
+
+    def update_chapter(self, chapter: Chapter) -> None:
+        for row, existing in enumerate(self._chapters):
+            if existing.index == chapter.index:
+                self._chapters[row] = chapter
+                self.dataChanged.emit(
+                    self.index(row, 0), self.index(row, self.columnCount() - 1)
+                )
+                return
+
+    def chapter_at(self, row: int) -> Chapter | None:
+        return self._chapters[row] if 0 <= row < len(self._chapters) else None
+
+    def _audio_status(self, chapter: Chapter) -> tuple[str, QColor]:
+        if not chapter.translated:
+            return "Chưa dịch", STATUS_COLORS[STATUS_PENDING]
+        if chapter.audio_error:
+            return "Lỗi", STATUS_COLORS[STATUS_ERROR]
+        if chapter.has_audio:
+            return "Đã tạo", STATUS_COLORS[STATUS_TRANSLATED]
+        return "Chưa tạo", STATUS_COLORS[STATUS_DOWNLOADED]
+
+    def rowCount(self, parent=QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._chapters)
+
+    def columnCount(self, parent=QModelIndex()) -> int:
+        return len(self.COLUMNS)
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
+            return self.COLUMNS[section]
+        return None
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+        chapter = self._chapters[index.row()]
+        column = index.column()
+        if role == Qt.ItemDataRole.DisplayRole:
+            if column == 0:
+                return chapter.index + 1
+            if column == self.TITLE_COLUMN:
+                return chapter.translated_title or chapter.title
+            if column == self.STATUS_COLUMN:
+                return self._audio_status(chapter)[0]
+            if column == self.DURATION_COLUMN:
+                return format_duration(chapter.audio_seconds)
+            if column == self.VOICE_COLUMN:
+                return chapter.audio_voice
+            if column == self.ERROR_COLUMN:
+                return chapter.audio_error
+        if role == Qt.ItemDataRole.ForegroundRole and column == self.STATUS_COLUMN:
+            return self._audio_status(chapter)[1]
+        if role == Qt.ItemDataRole.TextAlignmentRole and column == self.DURATION_COLUMN:
+            return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        if column == self.REGENERATE_COLUMN:
+            if role == Qt.ItemDataRole.UserRole:
+                return bool(chapter.translated)
+            if role == Qt.ItemDataRole.ToolTipRole and chapter.translated:
+                return "Tạo (lại) audio riêng chương này"
+        return None
+
+
 class ChapterTableModel(QAbstractTableModel):
-    """Read-only table over a list of Chapter rows."""
+    """Table over a list of Chapter rows; 'Tên dịch' is editable in place."""
+
+    translated_title_edited = Signal(int, str)  # chapter.index, new title
 
     COLUMNS = ("#", "Tên chương", "Tên dịch", "Trạng thái", "Dịch bằng", "Thời gian", "Lỗi", "")
     TITLE_COLUMN = 1
@@ -183,6 +279,14 @@ class ChapterTableModel(QAbstractTableModel):
                 return format_duration(chapter.translate_seconds)
             if column == self.ERROR_COLUMN:
                 return chapter.error
+        if role == Qt.ItemDataRole.EditRole and column == self.TRANSLATED_TITLE_COLUMN:
+            return chapter.translated_title
+        if (
+            role == Qt.ItemDataRole.ToolTipRole
+            and column == self.TRANSLATED_TITLE_COLUMN
+            and chapter.is_translated
+        ):
+            return "Nháy đúp để sửa tên dịch"
         if role == Qt.ItemDataRole.ForegroundRole and column == self.STATUS_COLUMN:
             return STATUS_COLORS.get(chapter.status)
         if role == Qt.ItemDataRole.TextAlignmentRole and column == self.DURATION_COLUMN:
@@ -193,3 +297,29 @@ class ChapterTableModel(QAbstractTableModel):
             if role == Qt.ItemDataRole.ToolTipRole and chapter.content:
                 return "Dịch lại riêng chương này"
         return None
+
+    def flags(self, index):
+        flags = super().flags(index)
+        if (
+            index.isValid()
+            and index.column() == self.TRANSLATED_TITLE_COLUMN
+            and self._chapters[index.row()].is_translated
+        ):
+            flags |= Qt.ItemFlag.ItemIsEditable
+        return flags
+
+    def setData(self, index, value, role=Qt.ItemDataRole.EditRole) -> bool:
+        if (
+            not index.isValid()
+            or role != Qt.ItemDataRole.EditRole
+            or index.column() != self.TRANSLATED_TITLE_COLUMN
+        ):
+            return False
+        chapter = self._chapters[index.row()]
+        title = str(value).strip()
+        if not title or title == chapter.translated_title:
+            return False
+        chapter.translated_title = title
+        self.dataChanged.emit(index, index)
+        self.translated_title_edited.emit(chapter.index, title)
+        return True

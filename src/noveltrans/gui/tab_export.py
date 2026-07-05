@@ -24,8 +24,15 @@ from noveltrans.config import AppConfig
 from noveltrans.exporters import EXPORTER_NAMES, get_exporter
 from noveltrans.gui.widgets import ProjectPicker
 from noveltrans.gui.workers import ExportWorker
+from noveltrans.models import NovelMeta
 from noveltrans.storage import NovelProject
 from noveltrans.storage.project import slugify
+
+
+def default_export_name(meta: NovelMeta, use_translation: bool, extension: str) -> str:
+    """Default save-dialog filename — the translated title slugs far better than CJK."""
+    title = meta.translated_title if use_translation and meta.translated_title else meta.title
+    return slugify(title) + extension
 
 
 class ExportTab(QWidget):
@@ -137,7 +144,10 @@ class ExportTab(QWidget):
                 return
 
         exporter = get_exporter(self.format_combo.currentData())
-        default_name = slugify(self.project.meta.title) + exporter.extension
+        self.project.reload_meta()  # pick up a title translated after this tab opened
+        default_name = default_export_name(
+            self.project.meta, use_translation, exporter.extension
+        )
         out_path, _selected = QFileDialog.getSaveFileName(
             self,
             "Lưu file",

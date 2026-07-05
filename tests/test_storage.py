@@ -21,6 +21,10 @@ class TestSlugify:
     def test_mixed(self):
         assert slugify("测试 Test Novel 123") == "test-novel-123"
 
+    def test_vietnamese_diacritics(self):
+        assert slugify("Đấu Phá Thương Khung") == "dau-pha-thuong-khung"
+        assert slugify("Truyện Thử") == "truyen-thu"
+
 
 class TestProjectLifecycle:
     def test_create_seeds_chapters(self, library_dir, sample_meta, sample_refs):
@@ -99,6 +103,39 @@ class TestResumeQueries:
         project.save_translation(0, "t", "dịch 2", "vi", translator="Google Translate")
         assert project.chapter(0).translator == "Google Translate"
 
+    def test_edit_translation_keeps_engine_metadata(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_content(0, "原文")
+        project.save_translation(0, "Chương 1", "bản dịch", "vi", translator="CLI (agy)", seconds=3.0)
+
+        project.edit_translation(0, title="Chương Một")
+        chapter = project.chapter(0)
+        assert chapter.translated_title == "Chương Một"
+        assert chapter.translated == "bản dịch"  # text untouched
+
+        project.edit_translation(0, text="bản dịch sửa tay")
+        chapter = project.chapter(0)
+        assert chapter.translated == "bản dịch sửa tay"
+        assert chapter.translated_title == "Chương Một"  # title untouched
+        # engine metadata and status survive manual edits
+        assert chapter.translator == "CLI (agy)"
+        assert chapter.translate_seconds == 3.0
+        assert chapter.status == STATUS_TRANSLATED
+        assert chapter.target_lang == "vi"
+
+    def test_edit_translation_without_fields_is_noop(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_content(0, "原文")
+        project.save_translation(0, "t", "dịch", "vi")
+        before = project.chapter(0)
+        project.edit_translation(0)
+        after = project.chapter(0)
+        assert after == before
+
     def test_clear_translations_resets_translator(self, library_dir, sample_meta, sample_refs):
         project = NovelProject.create(library_dir, sample_meta, sample_refs)
         project.save_content(0, "原文")
@@ -118,6 +155,7 @@ class TestResumeQueries:
             "downloaded": 2,
             "translated": 1,
             "errors": 1,
+            "audio": 0,
         }
 
 
@@ -132,17 +170,75 @@ class TestMigration:
 
         # simulate a chapters.db created before the newer columns existed
         db = sqlite3.connect(path / "chapters.db")
-        db.execute("ALTER TABLE chapters DROP COLUMN translator")
-        db.execute("ALTER TABLE chapters DROP COLUMN translate_seconds")
+        for column in (
+            "translator",
+            "translate_seconds",
+            "audio_path",
+            "audio_voice",
+            "audio_seconds",
+            "audio_error",
+        ):
+            db.execute(f"ALTER TABLE chapters DROP COLUMN {column}")
         db.commit()
         db.close()
 
         reopened = NovelProject.open(path)
         assert reopened.chapter(0).translator == ""
         assert reopened.chapter(0).translate_seconds == 0
+        assert reopened.chapter(0).audio_path == ""
         reopened.save_translation(0, "t", "dịch", "vi", translator="CLI (agy)", seconds=3.0)
         assert reopened.chapter(0).translator == "CLI (agy)"
         assert reopened.chapter(0).translate_seconds == 3.0
+
+
+class TestAudioState:
+    def _translated_project(self, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_content(0, "原文")
+        project.save_translation(0, "Chương 1", "bản dịch", "vi")
+        return project
+
+    def test_pending_audio_requires_translation(self, library_dir, sample_meta, sample_refs):
+        project = self._translated_project(library_dir, sample_meta, sample_refs)
+        assert [c.index for c in project.pending_audio()] == [0]
+        project.save_audio(0, "exports/audio/0001-chuong-1.wav", "Ngọc Lan", 123.4)
+        assert project.pending_audio() == []
+
+    def test_pending_audio_voice_change_repends(self, library_dir, sample_meta, sample_refs):
+        project = self._translated_project(library_dir, sample_meta, sample_refs)
+        project.save_audio(0, "exports/audio/0001-chuong-1.wav", "Ngọc Lan", 123.4)
+        assert project.pending_audio("Ngọc Lan") == []
+        # switching voice re-pends the chapter (old audio gets replaced)
+        assert [c.index for c in project.pending_audio("Gia Bảo")] == [0]
+        # no voice given -> only missing audio counts
+        assert project.pending_audio() == []
+
+    def test_save_audio_roundtrip(self, library_dir, sample_meta, sample_refs):
+        project = self._translated_project(library_dir, sample_meta, sample_refs)
+        project.mark_audio_error(0, "boom")
+        assert project.chapter(0).audio_error == "boom"
+        project.save_audio(0, "exports/audio/0001-chuong-1.wav", "Ngọc Lan", 123.4)
+        chapter = project.chapter(0)
+        assert chapter.audio_path == "exports/audio/0001-chuong-1.wav"
+        assert chapter.audio_voice == "Ngọc Lan"
+        assert chapter.audio_seconds == 123.4
+        assert chapter.audio_error == ""  # save clears a previous error
+        assert chapter.has_audio
+        assert project.counts()["audio"] == 1
+
+    def test_clear_audio(self, library_dir, sample_meta, sample_refs):
+        project = self._translated_project(library_dir, sample_meta, sample_refs)
+        project.save_audio(0, "exports/audio/0001-chuong-1.wav", "Ngọc Lan", 9.0)
+        project.clear_audio()
+        chapter = project.chapter(0)
+        assert not chapter.has_audio
+        assert chapter.audio_voice == "" and chapter.audio_seconds == 0
+        # translation state untouched
+        assert chapter.translated == "bản dịch"
+
+    def test_audio_dir(self, library_dir, sample_meta, sample_refs):
+        project = self._translated_project(library_dir, sample_meta, sample_refs)
+        assert project.audio_dir == project.exports_dir / "audio"
 
 
 class TestMetaTranslation:
@@ -158,6 +254,21 @@ class TestMetaTranslation:
         assert reopened.meta.translated_lang == "vi"
         # original fields untouched
         assert reopened.meta.title == sample_meta.title
+
+
+class TestReloadMeta:
+    def test_picks_up_translation_from_another_instance(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        other = NovelProject.open(project.path)  # e.g. the translate tab's handle
+        other.save_meta_translation("Truyện Thử", "Mô tả tiếng Việt.", "vi")
+        other.close()
+
+        assert project.meta.translated_title == ""  # stale in-memory copy
+        reloaded = project.reload_meta()
+        assert reloaded.translated_title == "Truyện Thử"
+        assert project.meta.translated_description == "Mô tả tiếng Việt."
 
 
 class TestErrorHandling:

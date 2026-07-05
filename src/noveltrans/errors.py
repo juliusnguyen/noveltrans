@@ -27,3 +27,7 @@ class TranslateError(NovelTransError):
 
 class ExportError(NovelTransError):
     """Export to an output format failed."""
+
+
+class TtsError(NovelTransError):
+    """Text-to-speech synthesis failed or the engine is unavailable."""

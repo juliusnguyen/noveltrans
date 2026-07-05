@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, Qt
 from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
@@ -26,6 +26,7 @@ from noveltrans.gui.widgets import (
     RetranslateButtonDelegate,
 )
 from noveltrans.gui.workers import CliModelsWorker, LmStudioModelsWorker, TranslateWorker
+from noveltrans.models import Chapter
 from noveltrans.storage import NovelProject
 
 
@@ -34,6 +35,7 @@ class TranslateTab(QWidget):
         super().__init__(parent)
         self.config = config
         self.project: NovelProject | None = None
+        self._preview_idx: int | None = None  # chapter shown in the preview panes
         self._worker: TranslateWorker | None = None
         self._models_worker: CliModelsWorker | LmStudioModelsWorker | None = None
         self._model_suggestions: dict[str, list[str]] = {}  # binary/url -> model labels
@@ -92,8 +94,9 @@ class TranslateTab(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
         self.table.setMouseTracking(True)  # hover state for the row buttons
+        self.model.translated_title_edited.connect(self._on_translated_title_edited)
         self._row_button_delegate = RetranslateButtonDelegate(self.table)
-        self._row_button_delegate.retranslate_clicked.connect(self._retranslate_row)
+        self._row_button_delegate.clicked.connect(self._retranslate_row)
         self.table.setItemDelegateForColumn(
             ChapterTableModel.RETRANSLATE_COLUMN, self._row_button_delegate
         )
@@ -103,8 +106,12 @@ class TranslateTab(QWidget):
         self.original_view.setReadOnly(True)
         self.original_view.setPlaceholderText("Bản gốc (tiếng Trung)")
         self.translated_view = QPlainTextEdit()
-        self.translated_view.setReadOnly(True)
-        self.translated_view.setPlaceholderText("Bản dịch")
+        self.translated_view.setReadOnly(True)  # editable once a translated chapter loads
+        self.translated_view.setPlaceholderText("Bản dịch (bấm vào để sửa, tự lưu khi rời ô)")
+        self.translated_view.setToolTip(
+            "Sửa trực tiếp bản dịch — dòng đầu là tên chương, phần sau là nội dung."
+        )
+        self.translated_view.installEventFilter(self)  # save edits on focus-out
         preview = QSplitter(Qt.Orientation.Horizontal)
         preview.addWidget(self.original_view)
         preview.addWidget(self.translated_view)
@@ -237,6 +244,7 @@ class TranslateTab(QWidget):
         super().showEvent(event)
 
     def _on_project_selected(self, path: str) -> None:
+        self._save_preview_edits()
         if self.project is not None:
             self.project.close()
             self.project = None
@@ -253,24 +261,67 @@ class TranslateTab(QWidget):
             self.status_label.setText("")
         self.original_view.clear()
         self.translated_view.clear()
+        self.translated_view.setReadOnly(True)
+        self._preview_idx = None
 
     # --------------------------------------------------------------- preview
 
     def _on_row_selected(self, current, _previous) -> None:
+        self._save_preview_edits()
         chapter = self.model.chapter_at(current.row()) if current.isValid() else None
         if chapter is None or self.project is None:
             return
-        fresh = self.project.chapter(chapter.index)
+        self._load_preview(self.project.chapter(chapter.index))
+
+    def _load_preview(self, fresh: Chapter | None) -> None:
         if fresh is None:
             return
+        self._preview_idx = fresh.index
         self.original_view.setPlainText(f"{fresh.title}\n\n{fresh.content}")
-        self.translated_view.setPlainText(
-            f"{fresh.translated_title}\n\n{fresh.translated}" if fresh.translated else ""
-        )
+        if fresh.translated:
+            self.translated_view.setPlainText(f"{fresh.translated_title}\n\n{fresh.translated}")
+            self.translated_view.setReadOnly(False)
+        else:
+            self.translated_view.clear()
+            self.translated_view.setReadOnly(True)
+        self.translated_view.document().setModified(False)
+
+    def _save_preview_edits(self) -> None:
+        """Persist manual edits typed into the translated preview pane."""
+        if (
+            self.project is None
+            or self._preview_idx is None
+            or not self.translated_view.document().isModified()
+        ):
+            return
+        raw = self.translated_view.toPlainText()
+        if not raw.strip():  # an emptied pane is treated as an accidental clear
+            return
+        title, sep, body = raw.partition("\n\n")
+        if not sep:  # blank line removed — fall back to first line = title
+            title, _, body = raw.partition("\n")
+        self.project.edit_translation(self._preview_idx, title=title.strip(), text=body.strip())
+        self.translated_view.document().setModified(False)
+        chapter = self.project.chapter(self._preview_idx)
+        if chapter is not None:
+            self.model.update_chapter(chapter)
+
+    def _on_translated_title_edited(self, idx: int, title: str) -> None:
+        if self.project is None:
+            return
+        self.project.edit_translation(idx, title=title)
+        if idx == self._preview_idx:
+            self._load_preview(self.project.chapter(idx))
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self.translated_view and event.type() == QEvent.Type.FocusOut:
+            self._save_preview_edits()
+        return super().eventFilter(obj, event)
 
     # ------------------------------------------------------------- translate
 
     def _start_translate(self, indices: list[int] | None = None) -> None:
+        self._save_preview_edits()
         if self.project is None:
             QMessageBox.information(self, "Chưa chọn truyện", "Hãy tải một truyện ở Tab 1 trước.")
             return
@@ -368,6 +419,8 @@ class TranslateTab(QWidget):
         chapter = self.project.chapter(idx)
         if chapter is not None:
             self.model.update_chapter(chapter)
+            if idx == self._preview_idx:  # fresh translation replaces the stale pane
+                self._load_preview(chapter)
 
     def _on_failed(self, message: str) -> None:
         self._reset_buttons()
@@ -387,6 +440,7 @@ class TranslateTab(QWidget):
         self.picker.setEnabled(True)
 
     def shutdown(self) -> None:
+        self._save_preview_edits()
         if self._worker is not None and self._worker.isRunning():
             self._worker.cancel()
             self._worker.wait(60_000)
