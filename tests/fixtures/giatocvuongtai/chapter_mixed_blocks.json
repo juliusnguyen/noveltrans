@@ -1,0 +1,64 @@
+{
+ "data": {
+  "id": "mixed-0001",
+  "story_id": "s1",
+  "title": "Mixed blocks",
+  "order_number": 9,
+  "content": {
+   "blocks": [
+    {
+     "id": "b1",
+     "type": "heading",
+     "inline": [
+      {
+       "text": "Phần Một",
+       "marks": []
+      }
+     ]
+    },
+    {
+     "id": "b2",
+     "type": "paragraph",
+     "inline": [
+      {
+       "text": "Câu văn thứ nhất.",
+       "marks": []
+      }
+     ]
+    },
+    {
+     "id": "b3",
+     "type": "divider"
+    },
+    {
+     "id": "b4",
+     "type": "image",
+     "src": "https://x/y.png"
+    },
+    {
+     "id": "b5",
+     "type": "paragraph",
+     "inline": [
+      {
+       "text": "Câu ",
+       "marks": []
+      },
+      {
+       "text": "thứ hai.",
+       "marks": [
+        "bold"
+       ]
+      }
+     ]
+    },
+    {
+     "id": "b6",
+     "type": "paragraph",
+     "inline": []
+    }
+   ]
+  },
+  "is_published": true
+ },
+ "error": null
+}
