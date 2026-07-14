@@ -1,0 +1,18 @@
+{
+ "data": {
+  "id": "f8d51ca8-d1bd-44f1-8811-0027b23d67ce",
+  "story_id": "22924d69-8c31-45f9-95ae-79f337e3bac8",
+  "title": "TRƯỜNG TRUNG HỌC ĐỨC TÀI",
+  "order_number": 1,
+  "content": "{\"blocks\": [{\"id\": \"blk_mpdd9kj0_1qwjje\", \"type\": \"paragraph\", \"inline\": [{\"text\": \"“Rầm!”\", \"marks\": []}]}, {\"id\": \"blk_mpdd9kj1_mp05cw\", \"type\": \"paragraph\", \"inline\": [{\"text\": \"Một tiếng động lớn vang lên, ánh sáng cực mạnh của đèn flash bỗng vụt sáng. Vầng sáng chói lọi như ban ngày xua tan bóng tối, phút chốc mọi thứ đều hiển hiện rõ ràng.\", \"marks\": []}]}, {\"id\": \"blk_mpdd9kj1_ffbuz0\", \"type\": \"paragraph\", \"inline\": [{\"text\": \"Ôn Giản Ngôn vô thức co người lại, nâng tay chắn thứ ánh sáng bất thình lình kia.\", \"marks\": []}]}, {\"id\": \"blk_mpdd9kj1_5zg1zf\", \"type\": \"paragraph\", \"inline\": [{\"text\": \"[Chương trình livestream sẽ bắt đầu sau năm phút nữa.]\", \"marks\": []}]}, {\"id\": \"blk_mpdd9kj1_2kem8t\", \"type\": \"paragraph\", \"inline\": [{\"text\": \"Giọng nữ không cảm xúc vang lên, âm thanh chói tai vang dội giữa không gian nhỏ hẹp.\", \"marks\": []}]}], \"version\": \"1.0\"}",
+  "created_at": "2026-05-15T08:28:05.130Z",
+  "updated_at": "2026-05-19T18:11:51.000Z",
+  "is_published": true,
+  "view_count": 5281,
+  "favorite_count": 200,
+  "comment_count": 413,
+  "word_count": 3196,
+  "is_password_protected": false
+ },
+ "error": null
+}
