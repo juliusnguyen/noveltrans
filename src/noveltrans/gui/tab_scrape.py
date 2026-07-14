@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
@@ -41,6 +43,9 @@ class ScrapeTab(QWidget):
         super().__init__(parent)
         self.config = config
         self.project: NovelProject | None = None
+        # Host veto: returns False if this project is already open in another workspace,
+        # so we never open the same SQLite project in two tabs. None = always allowed.
+        self.can_open_project: Callable[[str], bool] | None = None
         self._scan_worker: ScanWorker | None = None
         self._download_worker: DownloadWorker | None = None
         self._unlock_worker: UnlockWorker | None = None
@@ -131,13 +136,24 @@ class ScrapeTab(QWidget):
         """Re-list library projects in the picker; optionally select one."""
         self.picker.refresh(self.config.library_dir, select_path)
 
+    def _select_in_picker(self, path: str) -> None:
+        """Set the recent picker to `path` (or blank) without re-triggering a load."""
+        self.picker.blockSignals(True)
+        self.picker.setCurrentIndex(self.picker.findData(path) if path else -1)
+        self.picker.blockSignals(False)
+
     def _load_project(self, path: str) -> None:
         """Open an existing project (no network) so work can just continue."""
         if not path:
             return
+        if self.project is not None and str(self.project.path) == path:
+            return
+        # Refuse if another workspace already owns this project — revert the picker to
+        # the current project (or blank) so nothing gets opened twice.
+        if self.can_open_project is not None and not self.can_open_project(path):
+            self._select_in_picker(str(self.project.path) if self.project else "")
+            return
         if self.project is not None:
-            if str(self.project.path) == path:
-                return
             self.project.close()
         self.project = NovelProject.open(path)
         meta = self.project.meta
@@ -397,6 +413,16 @@ class ScrapeTab(QWidget):
     def _reload_table(self) -> None:
         if self.project is not None:
             self.model.set_chapters(self.project.chapters())
+
+    def current_title(self) -> str:
+        """The loaded novel's title (for the workspace tab label), or ""."""
+        return self.project.meta.title if self.project is not None else ""
+
+    def has_running_workers(self) -> bool:
+        return any(
+            w is not None and w.isRunning()
+            for w in (self._scan_worker, self._download_worker, self._unlock_worker)
+        )
 
     def shutdown(self) -> None:
         """Cancel running workers and wait for them (called on window close)."""

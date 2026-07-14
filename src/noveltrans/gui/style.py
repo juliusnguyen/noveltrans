@@ -54,6 +54,64 @@ QTabBar::tab {{
 QTabBar::tab:selected {{ background-color: {ACCENT}; color: #ffffff; }}
 QTabBar::tab:hover:!selected {{ background-color: {SURFACE_HI}; color: {TEXT}; }}
 
+/* ---- outer workspace tabs: browser-style, distinct from the inner step-tabs ---- */
+QTabWidget#workspaceTabs::pane {{
+    border: 1px solid {BORDER};
+    border-radius: 10px;
+    top: -1px;
+    background-color: {SURFACE};
+}}
+QTabWidget#workspaceTabs > QTabBar {{ qproperty-drawBase: 0; }}
+QTabWidget#workspaceTabs > QTabBar::tab {{
+    background: {BG};
+    color: {MUTED};
+    padding: 7px 8px 7px 14px;
+    margin-right: 3px;
+    border: 1px solid {BORDER};
+    border-bottom: none;
+    border-top-left-radius: 9px;
+    border-top-right-radius: 9px;
+    min-width: 92px;
+    max-width: 190px;
+}}
+QTabWidget#workspaceTabs > QTabBar::tab:selected {{
+    background: {SURFACE};
+    color: {TEXT};
+    border-color: {BORDER_HI};
+}}
+QTabWidget#workspaceTabs > QTabBar::tab:hover:!selected {{
+    background: {SURFACE_HI};
+    color: {TEXT};
+}}
+/* our own per-tab close button (Qt's default icon is invisible on dark) */
+QToolButton#tabCloseButton {{
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    color: {MUTED};
+    font-size: 12px;
+    padding: 0;
+    margin-left: 2px;
+    min-width: 16px;
+    max-width: 16px;
+    min-height: 16px;
+    max-height: 16px;
+}}
+QToolButton#tabCloseButton:hover {{ background: #c0433f; color: #ffffff; }}
+
+/* flat icon buttons in the outer tab-bar corners (＋ new, ⚙ settings) */
+QPushButton#cornerButton {{
+    background: transparent;
+    border: none;
+    border-radius: 8px;
+    padding: 4px 11px;
+    margin: 2px 4px;
+    color: {MUTED};
+    font-size: 17px;
+}}
+QPushButton#cornerButton:hover {{ background: {SURFACE_HI}; color: {TEXT}; }}
+QPushButton#cornerButton:pressed {{ background: {BORDER}; }}
+
 /* ---- buttons ---- */
 QPushButton {{
     background-color: {SURFACE_HI};
@@ -201,7 +259,11 @@ def apply_theme(app: QApplication) -> None:
     pal.setColor(QPalette.ColorRole.PlaceholderText, QColor(MUTED))
     pal.setColor(QPalette.ColorRole.Link, QColor(ACCENT_HI))
     disabled = QColor("#616a78")
-    for role in (QPalette.ColorRole.Text, QPalette.ColorRole.WindowText, QPalette.ColorRole.ButtonText):
+    for role in (
+        QPalette.ColorRole.Text,
+        QPalette.ColorRole.WindowText,
+        QPalette.ColorRole.ButtonText,
+    ):
         pal.setColor(QPalette.ColorGroup.Disabled, role, disabled)
     app.setPalette(pal)
 
