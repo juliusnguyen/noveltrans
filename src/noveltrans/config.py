@@ -103,6 +103,24 @@ class AppConfig:
         self._s.setValue("medoctruyen_cookies", value)
 
     @property
+    def discord_autounlock_enabled(self) -> bool:
+        return self._s.value("discord_autounlock_enabled", False, type=bool)
+
+    @discord_autounlock_enabled.setter
+    def discord_autounlock_enabled(self, value: bool) -> None:
+        self._s.setValue("discord_autounlock_enabled", bool(value))
+
+    @property
+    def discord_channel_url(self) -> str:
+        """The #mở-khoá channel link (https://discord.com/channels/<guild>/<chan>)
+        the throwaway account uses to run /mochuong. Empty until the user sets it."""
+        return str(self._s.value("discord_channel_url", ""))
+
+    @discord_channel_url.setter
+    def discord_channel_url(self, value: str) -> None:
+        self._s.setValue("discord_channel_url", value.strip())
+
+    @property
     def claude_model(self) -> str:
         return str(self._s.value("claude_model", DEFAULT_CLAUDE_MODEL))
 

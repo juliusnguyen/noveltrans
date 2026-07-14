@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
@@ -19,10 +20,18 @@ from PySide6.QtWidgets import (
 )
 
 from noveltrans.config import AppConfig
+from noveltrans.discord_unlock import valid_channel_url
 from noveltrans.gui.notify import clear_dock_badge, request_attention, set_dock_badge
 from noveltrans.gui.widgets import ChapterTableModel, ProjectPicker, enable_cell_copy
-from noveltrans.gui.workers import DownloadWorker, ScanWorker
+from noveltrans.gui.workers import DownloadWorker, ScanWorker, UnlockWorker
 from noveltrans.storage import NovelProject
+
+_MAX_AUTO_UNLOCKS = 3  # consecutive auto-unlocks with no progress before giving up
+# Grace period after the /mochuong command is sent before resuming the download.
+# "Command sent" isn't "cap lifted": the bot needs a moment to process the code, and
+# resuming too soon just re-hits the limit page (burning a fresh single-use code) and
+# triggers a redundant second unlock.
+_UNLOCK_SETTLE_MS = 6_000
 
 
 class ScrapeTab(QWidget):
@@ -34,6 +43,18 @@ class ScrapeTab(QWidget):
         self.project: NovelProject | None = None
         self._scan_worker: ScanWorker | None = None
         self._download_worker: DownloadWorker | None = None
+        self._unlock_worker: UnlockWorker | None = None
+        self._auto_unlocking = False  # suppress the "download finished" chrome mid-unlock
+        self._unlock_attempts = 0  # consecutive auto-unlocks with no chapter progress
+        # last daily-limit hit, kept so the manual fallback can still offer the code
+        # even when auto-unlock is what failed
+        self._last_limit_message = ""
+        self._last_limit_code = ""
+        # Delays the post-unlock resume so the bot has time to lift the cap; owned by
+        # self so shutdown() can stop it before the widget is torn down.
+        self._resume_timer = QTimer(self)
+        self._resume_timer.setSingleShot(True)
+        self._resume_timer.timeout.connect(self._start_download)
 
         # --- recent projects row: continue a novel without pasting its URL
         self.picker = ProjectPicker()
@@ -44,7 +65,9 @@ class ScrapeTab(QWidget):
 
         # --- URL row
         self.url_edit = QLineEdit()
-        self.url_edit.setPlaceholderText("Dán URL trang tiểu thuyết, ví dụ: https://medoctruyen.vn/tu-bao-tien-bon")
+        self.url_edit.setPlaceholderText(
+            "Dán URL trang tiểu thuyết, ví dụ: https://medoctruyen.vn/tu-bao-tien-bon"
+        )
         self.scan_button = QPushButton("Quét")
         self.scan_button.setProperty("primary", True)
         self.scan_button.clicked.connect(self._start_scan)
@@ -174,6 +197,10 @@ class ScrapeTab(QWidget):
     # -------------------------------------------------------------- download
 
     def _start_download(self) -> None:
+        # The unlock's resume lands here; we're downloading again, so the "unlock in
+        # flight" state is over. If this resumed batch immediately re-hits the cap,
+        # _on_daily_limit re-sets the flag before _on_download_finished reads it.
+        self._auto_unlocking = False
         if self.project is None:
             return
         pending = len(self.project.pending_download())
@@ -194,10 +221,8 @@ class ScrapeTab(QWidget):
             cookies=self.config.medoctruyen_cookies,
         )
         self._download_worker.progress.connect(self._on_progress)
-        self._download_worker.chapter_done.connect(self._on_chapter_updated)
-        self._download_worker.chapter_error.connect(
-            lambda idx, _msg: self._on_chapter_updated(idx)
-        )
+        self._download_worker.chapter_done.connect(self._on_chapter_done)
+        self._download_worker.chapter_error.connect(lambda idx, _msg: self._on_chapter_updated(idx))
         self._download_worker.daily_limit_hit.connect(self._on_daily_limit)
         self._download_worker.finished_ok.connect(self._on_download_finished)
         self._download_worker.start()
@@ -213,6 +238,12 @@ class ScrapeTab(QWidget):
         if title:
             self.status_label.setText(f"Đang tải: {title}")
 
+    def _on_chapter_done(self, idx: int) -> None:
+        # A real download landed → the last unlock actually worked; reset the
+        # runaway-loop guard so a genuinely long novel keeps unlocking as needed.
+        self._unlock_attempts = 0
+        self._on_chapter_updated(idx)
+
     def _on_chapter_updated(self, idx: int) -> None:
         if self.project is None:
             return
@@ -220,18 +251,117 @@ class ScrapeTab(QWidget):
         if chapter is not None:
             self.model.update_chapter(chapter)
 
-    def _on_daily_limit(self, message: str) -> None:
-        # The batch stopped on the site's per-day cap: flag the Dock so the user
-        # notices even when the app is in the background, and show the unlock steps.
-        self.status_label.setText(f"🔒 {message}")
+    def _on_daily_limit(self, message: str, code: str) -> None:
+        # The batch stopped on the site's per-day cap. If auto-unlock is configured,
+        # run the site's Discord /mochuong <code> unlock and resume automatically;
+        # otherwise flag the Dock and show the manual steps.
+        self._last_limit_message = message
+        self._last_limit_code = code
+        if (
+            self.config.discord_autounlock_enabled
+            and code
+            and valid_channel_url(self.config.discord_channel_url)
+        ):
+            self._start_auto_unlock(code)
+            return
         set_dock_badge(1)
         request_attention(self.window())
-        QMessageBox.warning(self, "Đã đạt giới hạn đọc trong ngày", message)
+        self._show_manual_unlock(message, code)
+
+    # -------------------------------------------------------- auto-unlock (Discord)
+
+    def _start_auto_unlock(self, code: str) -> None:
+        # If several unlocks in a row buy no new chapters, the unlock isn't really
+        # working (wrong channel, bot didn't act, still capped) — stop auto-looping
+        # and hand off to the manual flow instead of hammering Discord.
+        if self._unlock_attempts >= _MAX_AUTO_UNLOCKS:
+            self._unlock_attempts = 0
+            set_dock_badge(1)
+            request_attention(self.window())
+            QMessageBox.warning(
+                self,
+                "Tự mở khoá không hiệu quả",
+                f"Đã thử tự mở khoá {_MAX_AUTO_UNLOCKS} lần nhưng vẫn bị giới hạn. "
+                "Kiểm tra lại link kênh #mở-khoá và tài khoản Discord phụ, hoặc mở "
+                "khoá thủ công.",
+            )
+            self._show_manual_unlock(self._last_limit_message, code)
+            return
+        self._unlock_attempts += 1
+        self._auto_unlocking = True
+        self.download_button.setEnabled(False)
+        self.status_label.setText("🔓 Đang tự mở khoá qua Discord (/mochuong)… giữ cửa sổ mở.")
+        self._unlock_worker = UnlockWorker(self.config.discord_channel_url, code)
+        self._unlock_worker.unlocked.connect(self._on_unlocked)
+        self._unlock_worker.needs_login.connect(self._on_unlock_needs_login)
+        self._unlock_worker.failed.connect(self._on_unlock_failed)
+        self._unlock_worker.start()
+
+    def _on_unlocked(self) -> None:
+        # Keep _auto_unlocking True through the settle wait: the resume can immediately
+        # re-hit the cap, and _on_download_finished must still stay quiet if so.
+        clear_dock_badge()
+        self.status_label.setText("✅ Đã gửi lệnh mở khoá — chờ bot xử lý rồi tải tiếp…")
+        # Wait before resuming: the bot lifts the cap a moment after the command lands;
+        # resuming instantly re-hits the limit and wastes a fresh code (see constant).
+        self._resume_timer.start(_UNLOCK_SETTLE_MS)
+
+    def _on_unlock_needs_login(self, message: str) -> None:
+        self._auto_unlocking = False
+        self.download_button.setEnabled(True)
+        set_dock_badge(1)
+        request_attention(self.window())
+        QMessageBox.warning(
+            self,
+            "Cần đăng nhập Discord",
+            f"{message}\n\nVào Cài đặt → “Đăng nhập Discord” để đăng nhập tài khoản "
+            "phụ một lần, rồi bấm “Tải các chương” lại.",
+        )
+
+    def _on_unlock_failed(self, message: str) -> None:
+        # Auto-unlock failed — fall back to the manual flow so the user isn't stuck.
+        self._auto_unlocking = False
+        self.download_button.setEnabled(True)
+        set_dock_badge(1)
+        request_attention(self.window())
+        QMessageBox.warning(
+            self,
+            "Tự mở khoá không thành công",
+            f"Không tự chạy được /mochuong: {message}\n\n"
+            "Bạn có thể mở khoá thủ công theo hướng dẫn tiếp theo.",
+        )
+        # Hand over the code the batch actually stopped on — this is exactly when the
+        # user has to type /mochuong themselves.
+        self._show_manual_unlock(self._last_limit_message, self._last_limit_code)
+
+    def _show_manual_unlock(self, message: str, code: str) -> None:
+        """Fallback: show the unlock steps and pre-copy the command to the clipboard."""
+        self.status_label.setText(f"🔒 {message}")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Đã đạt giới hạn đọc trong ngày")
+        box.setText(message)
+        open_channel = None
+        if code:
+            QGuiApplication.clipboard().setText(f"/mochuong {code}")
+            box.setInformativeText(
+                f"Đã copy lệnh “/mochuong {code}” vào clipboard — dán vào kênh #mở-khoá rồi Enter."
+            )
+            if valid_channel_url(self.config.discord_channel_url):
+                open_channel = box.addButton("Mở kênh #mở-khoá", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Ok)
+        box.exec()
+        if open_channel is not None and box.clickedButton() is open_channel:
+            QDesktopServices.openUrl(QUrl(self.config.discord_channel_url))
 
     def _on_download_finished(self, ok: int, errors: int) -> None:
-        self.download_button.setEnabled(True)
         self.scan_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
+        if self._auto_unlocking:
+            # An auto-unlock is in flight (this "finished" is just the batch stopping
+            # on the cap); leave the download button disabled and the status as-is.
+            return
+        self.download_button.setEnabled(True)
         message = f"Tải xong: {ok} chương thành công"
         if errors:
             message += f", {errors} lỗi (bấm 'Tải các chương' để thử lại)"
@@ -258,7 +388,7 @@ class ScrapeTab(QWidget):
     def showEvent(self, event) -> None:  # a translation run may have filled the meta
         busy = any(
             w is not None and w.isRunning()
-            for w in (self._scan_worker, self._download_worker)
+            for w in (self._scan_worker, self._download_worker, self._unlock_worker)
         )
         if self.project is not None and not busy:
             self._show_meta(self.project.reload_meta())
@@ -270,7 +400,8 @@ class ScrapeTab(QWidget):
 
     def shutdown(self) -> None:
         """Cancel running workers and wait for them (called on window close)."""
-        for worker in (self._scan_worker, self._download_worker):
+        self._resume_timer.stop()  # don't let a pending resume fire post-teardown
+        for worker in (self._scan_worker, self._download_worker, self._unlock_worker):
             if worker is not None and worker.isRunning():
                 if hasattr(worker, "cancel"):
                     worker.cancel()

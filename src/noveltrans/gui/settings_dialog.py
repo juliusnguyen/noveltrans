@@ -5,6 +5,7 @@ from __future__ import annotations
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -20,6 +21,8 @@ from PySide6.QtWidgets import (
 )
 
 from noveltrans.config import TARGET_LANGS, AppConfig, translator_labels
+from noveltrans.discord_unlock import valid_channel_url
+from noveltrans.gui.workers import DiscordLoginWorker
 
 _MEDOCTRUYEN_LOGIN_URL = "https://medoctruyen.vn/auth/login"
 
@@ -145,6 +148,37 @@ class SettingsDialog(QDialog):
         cookie_hint.setWordWrap(True)
         form.addRow("", cookie_hint)
 
+        # Auto-unlock: run medoctruyen's Discord /mochuong unlock automatically when
+        # the 50-chapters/day cap is hit, so a download batch resumes unattended.
+        self.discord_enable = QCheckBox(
+            "Tự mở khoá qua Discord khi đạt giới hạn 50 chương/ngày"
+        )
+        self.discord_enable.setChecked(config.discord_autounlock_enabled)
+        form.addRow("Tự mở khoá:", self.discord_enable)
+
+        self.discord_channel_edit = QLineEdit(config.discord_channel_url)
+        self.discord_channel_edit.setPlaceholderText(
+            "https://discord.com/channels/…/…  (chuột phải kênh #mở-khoá → Copy Link)"
+        )
+        discord_login = QPushButton("Đăng nhập Discord")
+        discord_login.setToolTip(
+            "Mở cửa sổ Chrome riêng để đăng nhập tài khoản Discord phụ một lần."
+        )
+        discord_login.clicked.connect(self._discord_login)
+        discord_row = QHBoxLayout()
+        discord_row.addWidget(self.discord_channel_edit, stretch=1)
+        discord_row.addWidget(discord_login)
+        form.addRow("Kênh #mở-khoá:", discord_row)
+
+        discord_hint = QLabel(
+            "Dùng một tài khoản Discord PHỤ (không dùng tài khoản chính): tự động hoá "
+            "tài khoản Discord là vi phạm điều khoản của Discord. Cần cài Playwright: "
+            "pip install 'noveltrans[discord]' rồi playwright install chromium."
+        )
+        discord_hint.setProperty("muted", True)
+        discord_hint.setWordWrap(True)
+        form.addRow("", discord_hint)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -168,6 +202,28 @@ class SettingsDialog(QDialog):
         if box.clickedButton() is open_login:
             QDesktopServices.openUrl(QUrl(_MEDOCTRUYEN_LOGIN_URL))
 
+    def _discord_login(self) -> None:
+        """Open the one-time Discord login window for the throwaway account."""
+        self._login_worker = DiscordLoginWorker(self)
+        self._login_worker.done.connect(
+            lambda: QMessageBox.information(
+                self,
+                "Đăng nhập Discord",
+                "Đã đăng nhập xong. Từ giờ ứng dụng có thể tự chạy /mochuong khi bị "
+                "giới hạn.",
+            )
+        )
+        self._login_worker.failed.connect(
+            lambda msg: QMessageBox.warning(self, "Đăng nhập Discord", msg)
+        )
+        self._login_worker.start()
+        QMessageBox.information(
+            self,
+            "Đăng nhập Discord",
+            "Một cửa sổ trình duyệt riêng sẽ mở ra. Đăng nhập tài khoản Discord phụ "
+            "và mở tới server có kênh #mở-khoá, rồi đóng lại.",
+        )
+
     def _browse_library(self) -> None:
         path = QFileDialog.getExistingDirectory(
             self, "Chọn thư mục thư viện", self.library_edit.text()
@@ -185,5 +241,20 @@ class SettingsDialog(QDialog):
         self.config.cli_command = self.cli_edit.text().strip()
         self.config.claude_cli_command = self.claude_cli_edit.text().strip()
         self.config.medoctruyen_cookies = self.medoctruyen_cookie_edit.text().strip()
+        channel_url = self.discord_channel_edit.text().strip()
+        if (
+            self.discord_enable.isChecked()
+            and channel_url
+            and not valid_channel_url(channel_url)
+        ):
+            QMessageBox.warning(
+                self,
+                "Link kênh Discord không hợp lệ",
+                "Link kênh #mở-khoá phải có dạng https://discord.com/channels/…/… "
+                "(chuột phải kênh → Copy Link). Tự mở khoá sẽ không chạy tới khi link "
+                "đúng.",
+            )
+        self.config.discord_autounlock_enabled = self.discord_enable.isChecked()
+        self.config.discord_channel_url = channel_url
         self.config.sync()
         super().accept()
