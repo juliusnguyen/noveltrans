@@ -34,8 +34,22 @@ _LOGGED_OUT_URL_RE = re.compile(r"/(login|register)\b")
 _LOGGED_IN_URL_RE = re.compile(r"/channels/")
 _CHANNEL_URL_RE = re.compile(r"^https://discord\.com/channels/(\d+|@me)/(\d+)/?$")
 
+_COMMAND = "mochuong"  # the site's unlock slash command, without the leading "/"
+
+# Real Chrome first, Playwright's bundled Chromium (channel=None) as the fallback.
+_BROWSER_CHANNELS = ("chrome", None)
+_LAUNCH_ARGS = [
+    "--no-first-run",
+    "--no-default-browser-check",
+    # Discord's login gates react badly to navigator.webdriver; this and dropping
+    # --enable-automation keep the window looking like an ordinary Chrome.
+    "--disable-blink-features=AutomationControlled",
+]
+
 _PICKER_WAIT_MS = 5_000  # how long to wait for the slash-command popup to render
 _TYPE_DELAY_MS = 40  # per-keystroke delay so Discord's editor keeps up
+_SEND_WAIT_MS = 8_000  # how long to wait for the composer to clear after Enter
+_SEND_POLL_MS = 250
 
 
 class DiscordUnlockError(Exception):
@@ -78,15 +92,80 @@ def _require_playwright():
 
 
 def _launch_context(sync_playwright, *, headless: bool):
-    """Open the persistent, dedicated-profile Chromium context."""
+    """Open the dedicated profile in the user's real Chrome (bundled Chromium if not).
+
+    Discord's login flow (captcha, new-device checks) routinely refuses Playwright's
+    bundled Chromium — it's a different build with a headless-ish fingerprint — so we
+    drive the *installed* Chrome instead. Same dedicated profile either way: this is
+    still a throwaway account in its own user-data-dir, never the user's own browser
+    session. Falls back to bundled Chromium where Chrome isn't installed.
+    """
     profile_dir().mkdir(parents=True, exist_ok=True)
     playwright = sync_playwright().start()
-    context = playwright.chromium.launch_persistent_context(
-        str(profile_dir()),
-        headless=headless,
-        args=["--no-first-run", "--no-default-browser-check"],
+    last_exc: Exception | None = None
+    for channel in _BROWSER_CHANNELS:
+        try:
+            context = playwright.chromium.launch_persistent_context(
+                str(profile_dir()),
+                headless=headless,
+                channel=channel,
+                args=_LAUNCH_ARGS,
+                ignore_default_args=["--enable-automation"],
+            )
+        except Exception as exc:  # channel not installed on this machine
+            last_exc = exc
+            continue
+        return playwright, context
+
+    playwright.stop()
+    raise DiscordUnlockError(
+        "Không mở được trình duyệt cho tính năng tự mở khoá. Cài Google Chrome, hoặc "
+        "chạy:  playwright install chromium"
+    ) from last_exc
+
+
+def _command_offered(page) -> bool:
+    """True if Discord's slash-command picker is actually offering `/mochuong`.
+
+    Guards the send: with no picker match, Enter posts the typed text as an ordinary
+    message instead of running the command.
+    """
+    return any(
+        _COMMAND in text.lower() for text in page.locator(_PICKER_OPTION_SEL).all_inner_texts()
     )
-    return playwright, context
+
+
+def _wait_until_sent(page, code: str) -> bool:
+    """Poll the composer until the command leaves it — Discord clears it on send.
+
+    False means the command is still sitting in the composer after `_SEND_WAIT_MS`,
+    i.e. it never went out (checking for a bot reply instead would be brittle across
+    server configs, but "the composer emptied" is the same signal a human reads).
+    """
+    needles = (_COMMAND, code.lower())
+    waited = 0
+    while True:
+        text = page.locator(_COMPOSER_SEL).last.inner_text().lower()
+        if not any(needle in text for needle in needles):
+            return True
+        if waited >= _SEND_WAIT_MS:
+            return False
+        page.wait_for_timeout(_SEND_POLL_MS)
+        waited += _SEND_POLL_MS
+
+
+def _clear_composer(page) -> None:
+    """Best-effort wipe of a half-typed command.
+
+    Discord persists per-channel drafts, so leaving `/mochuong` behind would corrupt
+    the next run's typing. Never raises — it runs on paths that are already failing.
+    """
+    try:
+        page.locator(_COMPOSER_SEL).last.click()
+        page.keyboard.press("ControlOrMeta+A")
+        page.keyboard.press("Backspace")
+    except Exception:
+        pass
 
 
 def open_login(timeout_ms: int = 300_000) -> None:
@@ -112,13 +191,22 @@ def run_unlock(
     channel_url: str,
     code: str,
     *,
-    headless: bool = True,
+    headless: bool = False,
     timeout_ms: int = 30_000,
 ) -> None:
     """Run `/mochuong <code>` in the given Discord channel. Blocks; raise on failure.
 
+    Returning normally means the command was really submitted: the picker offered it
+    and the composer emptied. Anything less raises, so callers never resume a download
+    on the strength of a command that silently went nowhere.
+
     Raises DiscordUnlockError(needs_login=True) if the dedicated profile isn't
     logged in, so the caller can prompt the one-time login instead of retrying.
+
+    Runs headed by default: Discord's login gate challenges this profile hard, and a
+    headless session (HeadlessChrome UA, different fingerprint) invites a mid-run
+    re-challenge that would read as a failure. The window is brief and the UI already
+    tells the user to keep it open.
     """
     channel_url = (channel_url or "").strip()
     code = (code or "").strip()
@@ -161,20 +249,38 @@ def run_unlock(
             ) from exc
         composer.click()
 
-        # Slash command: type the name, let the picker render, Enter to insert the
-        # command pill (focus moves to its argument), type the code, Enter to send.
-        page.keyboard.type("/mochuong", delay=_TYPE_DELAY_MS)
         try:
-            page.wait_for_selector(_PICKER_OPTION_SEL, timeout=_PICKER_WAIT_MS)
-        except PlaywrightTimeoutError:
-            pass  # some builds auto-highlight; Enter still selects the match
-        page.keyboard.press("Enter")
-        page.keyboard.type(code, delay=_TYPE_DELAY_MS)
-        page.keyboard.press("Enter")
+            # Type the name and make sure Discord really offers the command before
+            # committing: if the picker never matches (bot gone from the server, wrong
+            # channel, no permission), Enter would post "/mochuong" and then the bare
+            # code as two plain messages. Bail out first — the channel stays clean.
+            page.keyboard.type(f"/{_COMMAND}", delay=_TYPE_DELAY_MS)
+            try:
+                page.wait_for_selector(_PICKER_OPTION_SEL, timeout=_PICKER_WAIT_MS)
+                offered = _command_offered(page)
+            except PlaywrightTimeoutError:
+                offered = False
+            if not offered:
+                raise DiscordUnlockError(
+                    "Discord không gợi ý lệnh /mochuong trong kênh này (chưa gửi gì "
+                    "cả). Kiểm tra link kênh #mở-khoá và xem tài khoản phụ đã vào "
+                    "server, thấy được bot chưa."
+                )
 
-        # A sent interaction empties the composer; that's our success signal (waiting
-        # on a specific bot reply text is brittle across server configs).
-        page.wait_for_timeout(1_500)
+            # Enter inserts the command pill (focus moves to its argument), type the
+            # code, Enter submits the interaction.
+            page.keyboard.press("Enter")
+            page.keyboard.type(code, delay=_TYPE_DELAY_MS)
+            page.keyboard.press("Enter")
+
+            if not _wait_until_sent(page, code):
+                raise DiscordUnlockError(
+                    "Đã gõ /mochuong nhưng Discord không gửi lệnh đi (lệnh vẫn nằm "
+                    "trong ô nhập). Thử mở khoá thủ công."
+                )
+        except DiscordUnlockError:
+            _clear_composer(page)  # don't leave a draft to poison the next run
+            raise
     finally:
         _close(context, playwright)
 
