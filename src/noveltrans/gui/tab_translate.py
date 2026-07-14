@@ -24,6 +24,7 @@ from noveltrans.gui.widgets import (
     ChapterTableModel,
     ProjectPicker,
     RetranslateButtonDelegate,
+    enable_cell_copy,
 )
 from noveltrans.gui.workers import CliModelsWorker, LmStudioModelsWorker, TranslateWorker
 from noveltrans.models import Chapter
@@ -93,6 +94,9 @@ class TranslateTab(QWidget):
             )
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
+        enable_cell_copy(self.table)  # Ctrl+C / right-click to copy a cell (e.g. errors)
         self.table.setMouseTracking(True)  # hover state for the row buttons
         self.model.translated_title_edited.connect(self._on_translated_title_edited)
         self._row_button_delegate = RetranslateButtonDelegate(self.table)
@@ -104,7 +108,7 @@ class TranslateTab(QWidget):
 
         self.original_view = QPlainTextEdit()
         self.original_view.setReadOnly(True)
-        self.original_view.setPlaceholderText("Bản gốc (tiếng Trung)")
+        self.original_view.setPlaceholderText("Bản gốc")
         self.translated_view = QPlainTextEdit()
         self.translated_view.setReadOnly(True)  # editable once a translated chapter loads
         self.translated_view.setPlaceholderText("Bản dịch (bấm vào để sửa, tự lưu khi rời ô)")
@@ -124,6 +128,7 @@ class TranslateTab(QWidget):
 
         # --- bottom row
         self.translate_button = QPushButton("Dịch tất cả")
+        self.translate_button.setProperty("primary", True)
         self.translate_button.clicked.connect(lambda: self._start_translate())
         self.retranslate_button = QPushButton("Dịch lại từ đầu")
         self.retranslate_button.setToolTip(

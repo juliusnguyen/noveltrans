@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import QEvent, Qt, QUrl
 from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
+    QPushButton,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from noveltrans.config import AppConfig
+from noveltrans.gui.notify import clear_dock_badge
 from noveltrans.gui.settings_dialog import SettingsDialog
 from noveltrans.gui.tab_audio import AudioTab
 from noveltrans.gui.tab_export import ExportTab
@@ -50,6 +52,14 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.translate_tab, "2. Dịch")
         self.tabs.addTab(self.export_tab, "3. Xuất file")
         self.tabs.addTab(self.audio_tab, "4. Nghe audio")
+
+        # always-visible Settings button in the tab-bar corner (macOS hides the
+        # Preferences menu item up in the app menu, which is easy to miss)
+        self.settings_button = QPushButton("⚙ Cài đặt")
+        self.settings_button.setToolTip("Mở cài đặt (thư viện, engine dịch, cookie medoctruyen.vn…)")
+        self.settings_button.clicked.connect(self._open_settings)
+        self.tabs.setCornerWidget(self.settings_button, Qt.Corner.TopRightCorner)
+
         self.setCentralWidget(self.tabs)
 
         # cross-session state: reopen the novel you were working on
@@ -80,6 +90,12 @@ class MainWindow(QMainWindow):
         geometry = self.config.window_geometry
         if geometry is not None:
             self.restoreGeometry(geometry)
+
+    def changeEvent(self, event) -> None:
+        # user brought the app to the front → they've seen any pending alert
+        if event.type() == QEvent.Type.ActivationChange and self.isActiveWindow():
+            clear_dock_badge()
+        super().changeEvent(event)
 
     def _on_project_touched(self, path: str) -> None:
         self.state.touch_project(path)

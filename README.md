@@ -15,6 +15,7 @@
 |---|---|
 | 半夏小說 (xbanxia.cc) | `https://www.xbanxia.cc/books/331303.html` |
 | 爱下电子书 (ixdzs8.com) | `https://ixdzs8.com/read/620438/` |
+| Mê Đọc Truyện (medoctruyen.vn) | `https://medoctruyen.vn/tu-bao-tien-bon` (nội dung tiếng Việt; cần dán cookie đăng nhập trong Cài đặt để tải chương) |
 
 Thêm site mới = thêm 1 file adapter trong `src/noveltrans/scrapers/` (kế thừa `SiteAdapter`, đăng ký bằng `@register`).
 
@@ -35,6 +36,21 @@ python3.12 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 noveltrans
 ```
+
+## Đóng gói thành app macOS
+
+Tạo `NovelTrans.app` (và file `.dmg` để kéo vào Applications) bằng PyInstaller:
+
+```bash
+uv pip install -e ".[tts]"   # để gói kèm engine đọc audio
+make dmg                      # → dist/NovelTrans.app + dist/NovelTrans.dmg
+# hoặc chỉ tạo .app:  make app
+```
+
+App **chưa được ký (unsigned)**, nên lần đầu mở macOS sẽ cảnh báo. Cách mở:
+chuột phải vào app → **Open** → **Open**, hoặc chạy `xattr -cr /Applications/NovelTrans.app`.
+Model TTS (~334 MB) tải về lần đầu khi dùng tab "Nghe audio" (cần mạng).
+Đổi icon: sửa `packaging/make_icon.py` rồi `make icon`.
 
 ## Cấu hình
 

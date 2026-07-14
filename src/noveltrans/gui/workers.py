@@ -12,11 +12,21 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
-from noveltrans.errors import NovelTransError, UnsupportedSiteError
+from noveltrans.errors import (
+    DailyLimitError,
+    NovelTransError,
+    RateLimitedError,
+    UnsupportedSiteError,
+)
 from noveltrans.models import ChapterRef
 from noveltrans.scrapers import adapter_for_url
 from noveltrans.scrapers.base import HttpClient
 from noveltrans.storage import Library, NovelProject
+
+# Some sites (e.g. medoctruyen.vn) throttle after a few chapters read quickly.
+# On a rate-limit signal the download waits, then retries the same chapter.
+_RATE_LIMIT_WAIT_SECONDS = 60
+_RATE_LIMIT_MAX_RETRIES = 8
 
 
 class ScanWorker(QThread):
@@ -25,11 +35,14 @@ class ScanWorker(QThread):
     scanned = Signal(str, object, int)  # project path, NovelMeta, chapter count
     failed = Signal(str)
 
-    def __init__(self, url: str, library_dir: Path, delay: float, parent=None):
+    def __init__(
+        self, url: str, library_dir: Path, delay: float, cookies: str = "", parent=None
+    ):
         super().__init__(parent)
         self.url = url
         self.library_dir = library_dir
         self.delay = delay
+        self.cookies = cookies
 
     def run(self) -> None:
         try:
@@ -39,6 +52,8 @@ class ScanWorker(QThread):
                 raise UnsupportedSiteError(
                     f"Chưa hỗ trợ trang web này: {self.url}"
                 )
+            if adapter.name == "medoctruyen":
+                client.set_cookies(self.cookies)
             meta = adapter.fetch_metadata(self.url)
             refs = adapter.fetch_chapter_list(self.url)
 
@@ -108,22 +123,35 @@ class TranslateWorker(QThread):
         binary = parts[0] if parts else self.engine_name
         return f"CLI ({binary}, {self.model})" if self.model else f"CLI ({binary})"
 
-    def run(self) -> None:
-        from noveltrans.translators import get_translator
-        from noveltrans.translators.names import apply_glossary, build_glossary
-
-        try:
-            translator = get_translator(
-                self.engine_name,
-                api_key=self.api_key,
-                model=self.model,
-                request_delay=self.request_delay,
-                cli_command=self.cli_command,
-                base_url=self.base_url,
+    def _run_identity(self, project: NovelProject, pending: list) -> None:
+        """Passthrough 'translation' when source_lang == target_lang: copy the
+        original text into `translated` so downstream steps have data to work with.
+        """
+        total = len(pending)
+        done = 0
+        if project.meta.translated_lang != self.target_lang:
+            project.save_meta_translation(
+                project.meta.title, project.meta.description, self.target_lang
             )
-        except NovelTransError as exc:
-            self.failed.emit(str(exc))
-            return
+        for chapter in pending:
+            if self._cancelled:
+                break
+            self.progress.emit(done, total, chapter.title)
+            project.save_translation(
+                chapter.index,
+                chapter.title,
+                chapter.content,
+                self.target_lang,
+                "(nguyên bản)",
+                seconds=0.0,
+            )
+            self.chapter_done.emit(chapter.index)
+            done += 1
+        self.progress.emit(done, total, "")
+        self.finished_ok.emit(done, 0)
+
+    def run(self) -> None:
+        from noveltrans.translators.names import apply_glossary, build_glossary
 
         project = NovelProject.open(self.project_path)
         try:
@@ -132,6 +160,29 @@ class TranslateWorker(QThread):
                 pending = [c for c in chapters if c is not None and c.content]
             else:
                 pending = project.pending_translation(self.target_lang)
+
+            # A source already in the target language (e.g. Vietnamese novels from
+            # medoctruyen.vn with target "vi") needs no engine: copy the original
+            # into `translated` so TTS/export work with the same DB shape.
+            if project.meta.source_lang == self.target_lang:
+                self._run_identity(project, pending)
+                return
+
+            from noveltrans.translators import get_translator
+
+            try:
+                translator = get_translator(
+                    self.engine_name,
+                    api_key=self.api_key,
+                    model=self.model,
+                    request_delay=self.request_delay,
+                    cli_command=self.cli_command,
+                    base_url=self.base_url,
+                )
+            except NovelTransError as exc:
+                self.failed.emit(str(exc))
+                return
+
             total = len(pending)
             done = 0
             errors = 0
@@ -399,16 +450,41 @@ class DownloadWorker(QThread):
     progress = Signal(int, int, str)  # done, total, chapter title
     chapter_done = Signal(int)  # chapter index (GUI refreshes that row)
     chapter_error = Signal(int, str)
+    daily_limit_hit = Signal(str)  # per-day cap stopped the batch; message for the user
     finished_ok = Signal(int, int)  # downloaded count, error count
 
-    def __init__(self, project_path: Path, delay: float, parent=None):
+    def __init__(
+        self, project_path: Path, delay: float, cookies: str = "", parent=None
+    ):
         super().__init__(parent)
         self.project_path = Path(project_path)
         self.delay = delay
+        self.cookies = cookies
         self._cancelled = False
 
     def cancel(self) -> None:
         self._cancelled = True
+
+    def _fetch_with_backoff(self, adapter, chapter, done: int, total: int) -> str:
+        """Fetch a chapter, waiting and retrying when the site throttles reads."""
+        ref = ChapterRef(index=chapter.index, title=chapter.title, url=chapter.url)
+        for attempt in range(_RATE_LIMIT_MAX_RETRIES + 1):
+            try:
+                return adapter.fetch_chapter(ref)
+            except RateLimitedError:
+                if attempt >= _RATE_LIMIT_MAX_RETRIES or self._cancelled:
+                    raise
+                for remaining in range(_RATE_LIMIT_WAIT_SECONDS, 0, -1):
+                    if self._cancelled:
+                        raise
+                    self.progress.emit(
+                        done,
+                        total,
+                        f"⏳ Site giới hạn tốc độ đọc — chờ {remaining}s rồi thử lại: "
+                        f"{chapter.title}",
+                    )
+                    time.sleep(1)
+        raise RateLimitedError("Vẫn bị giới hạn sau nhiều lần thử", chapter.url)
 
     def run(self) -> None:
         project = NovelProject.open(self.project_path)
@@ -418,6 +494,8 @@ class DownloadWorker(QThread):
             if adapter is None:
                 self.finished_ok.emit(0, 0)
                 return
+            if adapter.name == "medoctruyen":
+                client.set_cookies(self.cookies)
 
             pending = project.pending_download()
             total = len(pending)
@@ -429,11 +507,18 @@ class DownloadWorker(QThread):
                 ref_title = chapter.title
                 self.progress.emit(done, total, ref_title)
                 try:
-                    text = adapter.fetch_chapter(
-                        ChapterRef(index=chapter.index, title=chapter.title, url=chapter.url)
-                    )
+                    text = self._fetch_with_backoff(adapter, chapter, done, total)
                     project.save_content(chapter.index, text)
                     self.chapter_done.emit(chapter.index)
+                except DailyLimitError as exc:
+                    # A per-day cap blocks every remaining chapter — stop the batch
+                    # and surface the unlock instructions instead of failing each row.
+                    errors += 1
+                    project.mark_error(chapter.index, str(exc))
+                    self.chapter_error.emit(chapter.index, str(exc))
+                    self.progress.emit(done, total, f"🔒 {exc}")
+                    self.daily_limit_hit.emit(str(exc))
+                    break
                 except NovelTransError as exc:
                     errors += 1
                     project.mark_error(chapter.index, str(exc))

@@ -4,16 +4,19 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractTableModel, QEvent, QModelIndex, Qt, Signal
+from PySide6.QtCore import QAbstractTableModel, QEvent, QModelIndex, QPoint, Qt, Signal
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QComboBox,
+    QMenu,
     QStyle,
     QStyledItemDelegate,
     QStyleOptionButton,
+    QTableView,
 )
 
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QKeySequence, QShortcut
 
 from noveltrans.models import (
     STATUS_DOWNLOADED,
@@ -196,6 +199,12 @@ class AudioChapterTableModel(QAbstractTableModel):
                 return chapter.audio_voice
             if column == self.ERROR_COLUMN:
                 return chapter.audio_error
+        if (
+            role == Qt.ItemDataRole.ToolTipRole
+            and column == self.ERROR_COLUMN
+            and chapter.audio_error
+        ):
+            return chapter.audio_error  # full text on hover (cell is truncated)
         if role == Qt.ItemDataRole.ForegroundRole and column == self.STATUS_COLUMN:
             return self._audio_status(chapter)[1]
         if role == Qt.ItemDataRole.TextAlignmentRole and column == self.DURATION_COLUMN:
@@ -279,6 +288,12 @@ class ChapterTableModel(QAbstractTableModel):
                 return format_duration(chapter.translate_seconds)
             if column == self.ERROR_COLUMN:
                 return chapter.error
+        if (
+            role == Qt.ItemDataRole.ToolTipRole
+            and column == self.ERROR_COLUMN
+            and chapter.error
+        ):
+            return chapter.error  # full text on hover (cell is truncated)
         if role == Qt.ItemDataRole.EditRole and column == self.TRANSLATED_TITLE_COLUMN:
             return chapter.translated_title
         if (
@@ -323,3 +338,37 @@ class ChapterTableModel(QAbstractTableModel):
         self.dataChanged.emit(index, index)
         self.translated_title_edited.emit(chapter.index, title)
         return True
+
+
+def _copy_index_text(index) -> None:
+    """Put a cell's text on the clipboard (its tooltip if longer than the display)."""
+    if not index.isValid():
+        return
+    display = index.data(Qt.ItemDataRole.DisplayRole)
+    tooltip = index.data(Qt.ItemDataRole.ToolTipRole)
+    text = tooltip if tooltip else display
+    if text:
+        QApplication.clipboard().setText(str(text))
+
+
+def enable_cell_copy(table: QTableView) -> None:
+    """Let the user copy a table cell (e.g. a long error message) via Ctrl+C or a
+    right-click "Sao chép" menu, so it's easy to paste elsewhere."""
+    table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+    table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+
+    def copy_current() -> None:
+        _copy_index_text(table.currentIndex())
+
+    def show_menu(pos: QPoint) -> None:
+        index = table.indexAt(pos)
+        if not index.isValid():
+            return
+        table.setCurrentIndex(index)
+        menu = QMenu(table)
+        menu.addAction("Sao chép", lambda: _copy_index_text(index))
+        menu.exec(table.viewport().mapToGlobal(pos))
+
+    shortcut = QShortcut(QKeySequence.StandardKey.Copy, table)
+    shortcut.activated.connect(copy_current)
+    table.customContextMenuRequested.connect(show_menu)

@@ -29,6 +29,9 @@ dev = [
 tts = [
     "vieneu>=3.0",  # VieNeu-TTS, torch-free ONNX runtime (~334 MB model on first run)
 ]
+build = [
+    "pyinstaller>=6.0",  # package the macOS .app (see `make app` / `make dmg`)
+]
 
 [project.scripts]
 noveltrans = "noveltrans.app:main"
