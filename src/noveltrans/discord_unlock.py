@@ -50,6 +50,9 @@ _PICKER_WAIT_MS = 5_000  # how long to wait for the slash-command popup to rende
 _TYPE_DELAY_MS = 40  # per-keystroke delay so Discord's editor keeps up
 _SEND_WAIT_MS = 8_000  # how long to wait for the composer to clear after Enter
 _SEND_POLL_MS = 250
+# After the command is confirmed sent, keep the window open this long so the bot can
+# receive and process the interaction before we tear the browser down.
+_POST_SEND_WAIT_MS = 12_000
 
 
 class DiscordUnlockError(Exception):
@@ -248,6 +251,9 @@ def run_unlock(
                 "quyền của tài khoản phụ trong server."
             ) from exc
         composer.click()
+        # Discord persists a per-channel draft: wipe anything left from a prior run so
+        # the new command can't be prepended to stale text (which would send both).
+        _clear_composer(page)
 
         try:
             # Type the name and make sure Discord really offers the command before
@@ -278,6 +284,10 @@ def run_unlock(
                     "Đã gõ /mochuong nhưng Discord không gửi lệnh đi (lệnh vẫn nằm "
                     "trong ô nhập). Thử mở khoá thủ công."
                 )
+
+            # Command is out — hold the window open so the bot can process it before
+            # we close the browser (closing instantly can drop the interaction).
+            page.wait_for_timeout(_POST_SEND_WAIT_MS)
         except DiscordUnlockError:
             _clear_composer(page)  # don't leave a draft to poison the next run
             raise
