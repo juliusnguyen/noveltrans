@@ -34,6 +34,7 @@ STATUS_LABELS = {
     STATUS_ERROR: "Lỗi",
 }
 
+
 def format_duration(seconds: float) -> str:
     """Compact duration for the chapter table: 42s / 3m05s / 1h02m ("" if unset)."""
     seconds = int(round(seconds))
@@ -66,8 +67,15 @@ class ProjectPicker(QComboBox):
         self._library_dir: Path | None = None
         self.currentIndexChanged.connect(self._on_index_changed)
 
-    def refresh(self, library_dir: Path, select_path: str = "") -> None:
-        """Re-list projects; keep (or set) the selection when possible."""
+    def refresh(
+        self, library_dir: Path, select_path: str = "", default_to_first: bool = True
+    ) -> None:
+        """Re-list projects; keep (or set) the selection when possible.
+
+        `default_to_first=False` leaves the picker with no selection when nothing
+        matches — used to populate a fresh workspace's list without auto-opening a
+        novel it never asked for.
+        """
         self._library_dir = Path(library_dir)
         current = select_path or (self.currentData() or "")
         library = Library(self._library_dir)
@@ -77,7 +85,9 @@ class ProjectPicker(QComboBox):
             meta = library.project_meta(path)
             self.addItem(meta.title, str(path))
         index = self.findData(current)
-        self.setCurrentIndex(index if index >= 0 else (0 if self.count() else -1))
+        if index < 0 and default_to_first and self.count():
+            index = 0
+        self.setCurrentIndex(index)
         self.blockSignals(False)
         self._on_index_changed(self.currentIndex())
 
@@ -109,9 +119,7 @@ class RowButtonDelegate(QStyledItemDelegate):
         button.state = QStyle.StateFlag.State_Enabled
         if option.state & QStyle.StateFlag.State_MouseOver:
             button.state |= QStyle.StateFlag.State_MouseOver
-        QApplication.style().drawControl(
-            QStyle.ControlElement.CE_PushButton, button, painter
-        )
+        QApplication.style().drawControl(QStyle.ControlElement.CE_PushButton, button, painter)
 
     def editorEvent(self, event, model, option, index) -> bool:
         if (
@@ -153,9 +161,7 @@ class AudioChapterTableModel(QAbstractTableModel):
         for row, existing in enumerate(self._chapters):
             if existing.index == chapter.index:
                 self._chapters[row] = chapter
-                self.dataChanged.emit(
-                    self.index(row, 0), self.index(row, self.columnCount() - 1)
-                )
+                self.dataChanged.emit(self.index(row, 0), self.index(row, self.columnCount() - 1))
                 return
 
     def chapter_at(self, row: int) -> Chapter | None:
@@ -247,9 +253,7 @@ class ChapterTableModel(QAbstractTableModel):
         for row, existing in enumerate(self._chapters):
             if existing.index == chapter.index:
                 self._chapters[row] = chapter
-                self.dataChanged.emit(
-                    self.index(row, 0), self.index(row, self.columnCount() - 1)
-                )
+                self.dataChanged.emit(self.index(row, 0), self.index(row, self.columnCount() - 1))
                 return
 
     def chapter_at(self, row: int) -> Chapter | None:
@@ -288,11 +292,7 @@ class ChapterTableModel(QAbstractTableModel):
                 return format_duration(chapter.translate_seconds)
             if column == self.ERROR_COLUMN:
                 return chapter.error
-        if (
-            role == Qt.ItemDataRole.ToolTipRole
-            and column == self.ERROR_COLUMN
-            and chapter.error
-        ):
+        if role == Qt.ItemDataRole.ToolTipRole and column == self.ERROR_COLUMN and chapter.error:
             return chapter.error  # full text on hover (cell is truncated)
         if role == Qt.ItemDataRole.EditRole and column == self.TRANSLATED_TITLE_COLUMN:
             return chapter.translated_title

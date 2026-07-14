@@ -444,6 +444,11 @@ class TranslateTab(QWidget):
         self.cancel_button.setEnabled(False)
         self.picker.setEnabled(True)
 
+    def has_running_workers(self) -> bool:
+        # Only the translation run is user-meaningful work worth a close-confirm; the
+        # models-list fetch is a short background metadata call (shutdown still joins it).
+        return self._worker is not None and self._worker.isRunning()
+
     def shutdown(self) -> None:
         self._save_preview_edits()
         if self._worker is not None and self._worker.isRunning():

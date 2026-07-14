@@ -280,6 +280,11 @@ class AudioTab(QWidget):
         self.cancel_button.setEnabled(False)
         self.picker.setEnabled(True)
 
+    def has_running_workers(self) -> bool:
+        # Only TTS generation is user-meaningful work worth a close-confirm; the
+        # voices-list fetch is a short background metadata call (shutdown still joins it).
+        return self._worker is not None and self._worker.isRunning()
+
     def shutdown(self) -> None:
         if self._worker is not None and self._worker.isRunning():
             self._worker.cancel()

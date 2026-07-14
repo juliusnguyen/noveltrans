@@ -132,7 +132,11 @@ class ExportTab(QWidget):
                 self,
                 "Chưa có nội dung",
                 "Chưa có chương nào "
-                + ("đã dịch (hãy dịch ở Tab 2)." if use_translation else "đã tải (hãy tải ở Tab 1)."),
+                + (
+                    "đã dịch (hãy dịch ở Tab 2)."
+                    if use_translation
+                    else "đã tải (hãy tải ở Tab 1)."
+                ),
             )
             return
         if available < counts["total"]:
@@ -146,9 +150,7 @@ class ExportTab(QWidget):
 
         exporter = get_exporter(self.format_combo.currentData())
         self.project.reload_meta()  # pick up a title translated after this tab opened
-        default_name = default_export_name(
-            self.project.meta, use_translation, exporter.extension
-        )
+        default_name = default_export_name(self.project.meta, use_translation, exporter.extension)
         out_path, _selected = QFileDialog.getSaveFileName(
             self,
             "Lưu file",
@@ -181,6 +183,9 @@ class ExportTab(QWidget):
     def _open_folder(self) -> None:
         if self._last_export:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(self._last_export).parent)))
+
+    def has_running_workers(self) -> bool:
+        return self._worker is not None and self._worker.isRunning()
 
     def shutdown(self) -> None:
         if self._worker is not None and self._worker.isRunning():
