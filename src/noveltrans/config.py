@@ -1,7 +1,8 @@
 """AppConfig — typed wrapper around QSettings.
 
-Note: the Claude API key is stored unencrypted in the native QSettings
-location (plist on macOS, registry on Windows, ini on Linux).
+Note: the Claude API key and the medoctruyen.vn session cookie are stored
+unencrypted in the native QSettings location (plist on macOS, registry on
+Windows, ini on Linux).
 """
 
 from __future__ import annotations
@@ -92,6 +93,14 @@ class AppConfig:
     @claude_api_key.setter
     def claude_api_key(self, value: str) -> None:
         self._s.setValue("claude_api_key", value)
+
+    @property
+    def medoctruyen_cookies(self) -> str:
+        return str(self._s.value("medoctruyen_cookies", ""))
+
+    @medoctruyen_cookies.setter
+    def medoctruyen_cookies(self, value: str) -> None:
+        self._s.setValue("medoctruyen_cookies", value)
 
     @property
     def claude_model(self) -> str:

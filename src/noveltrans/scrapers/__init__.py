@@ -22,7 +22,7 @@ def adapter_for_url(url: str, client: HttpClient) -> SiteAdapter | None:
 
 def _import_adapters() -> None:
     """Import all adapter modules so their @register decorators run."""
-    from noveltrans.scrapers import ixdzs, xbanxia  # noqa: F401
+    from noveltrans.scrapers import ixdzs, medoctruyen, xbanxia  # noqa: F401
 
 
 _import_adapters()

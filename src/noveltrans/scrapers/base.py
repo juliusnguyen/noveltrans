@@ -20,13 +20,30 @@ USER_AGENT = (
 class HttpClient:
     """requests.Session wrapper: polite delay, retries with backoff, encoding fix."""
 
-    def __init__(self, delay_seconds: float = 1.5, max_retries: int = 3, timeout: float = 20.0):
+    def __init__(
+        self,
+        delay_seconds: float = 1.5,
+        max_retries: int = 3,
+        timeout: float = 20.0,
+        cookies: str = "",
+    ):
         self.delay_seconds = delay_seconds
         self.max_retries = max_retries
         self.timeout = timeout
         self._session = requests.Session()
         self._session.headers["User-Agent"] = USER_AGENT
         self._last_request_at = 0.0
+        if cookies:
+            self.set_cookies(cookies)
+
+    def set_cookies(self, cookie_string: str) -> None:
+        """Attach a raw browser Cookie header for sites that gate content on login.
+
+        Sent with every request from this client, so scope one client to one site.
+        """
+        cookie_string = cookie_string.strip()
+        if cookie_string:
+            self._session.headers["Cookie"] = cookie_string
 
     def _throttle(self) -> None:
         elapsed = time.monotonic() - self._last_request_at

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
@@ -19,7 +19,8 @@ from PySide6.QtWidgets import (
 )
 
 from noveltrans.config import AppConfig
-from noveltrans.gui.widgets import ChapterTableModel, ProjectPicker
+from noveltrans.gui.notify import clear_dock_badge, request_attention, set_dock_badge
+from noveltrans.gui.widgets import ChapterTableModel, ProjectPicker, enable_cell_copy
 from noveltrans.gui.workers import DownloadWorker, ScanWorker
 from noveltrans.storage import NovelProject
 
@@ -43,8 +44,9 @@ class ScrapeTab(QWidget):
 
         # --- URL row
         self.url_edit = QLineEdit()
-        self.url_edit.setPlaceholderText("Dán URL trang tiểu thuyết, ví dụ: https://www.xbanxia.cc/books/331303.html")
+        self.url_edit.setPlaceholderText("Dán URL trang tiểu thuyết, ví dụ: https://medoctruyen.vn/tu-bao-tien-bon")
         self.scan_button = QPushButton("Quét")
+        self.scan_button.setProperty("primary", True)
         self.scan_button.clicked.connect(self._start_scan)
         self.url_edit.returnPressed.connect(self._start_scan)
         url_row = QHBoxLayout()
@@ -71,9 +73,13 @@ class ScrapeTab(QWidget):
         self.table.setModel(self.model)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.verticalHeader().setVisible(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
+        enable_cell_copy(self.table)  # Ctrl+C / right-click to copy a cell (e.g. errors)
 
         # --- download row
         self.download_button = QPushButton("Tải các chương")
+        self.download_button.setProperty("primary", True)
         self.download_button.setEnabled(False)
         self.download_button.clicked.connect(self._start_download)
         self.cancel_button = QPushButton("Dừng")
@@ -82,6 +88,7 @@ class ScrapeTab(QWidget):
         self.progress = QProgressBar()
         self.progress.setFormat("%v / %m chương")
         self.status_label = QLabel("")
+        self.status_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         download_row = QHBoxLayout()
         download_row.addWidget(self.download_button)
         download_row.addWidget(self.cancel_button)
@@ -133,7 +140,12 @@ class ScrapeTab(QWidget):
         self.download_button.setEnabled(False)
         self.status_label.setText("Đang quét metadata và mục lục…")
 
-        self._scan_worker = ScanWorker(url, self.config.library_dir, self.config.request_delay)
+        self._scan_worker = ScanWorker(
+            url,
+            self.config.library_dir,
+            self.config.request_delay,
+            cookies=self.config.medoctruyen_cookies,
+        )
         self._scan_worker.scanned.connect(self._on_scanned)
         self._scan_worker.failed.connect(self._on_scan_failed)
         self._scan_worker.finished.connect(lambda: self.scan_button.setEnabled(True))
@@ -174,13 +186,19 @@ class ScrapeTab(QWidget):
         self.cancel_button.setEnabled(True)
         self.progress.setMaximum(pending)
         self.progress.setValue(0)
+        clear_dock_badge()  # starting fresh — drop any leftover limit badge
 
-        self._download_worker = DownloadWorker(self.project.path, self.config.request_delay)
+        self._download_worker = DownloadWorker(
+            self.project.path,
+            self.config.request_delay,
+            cookies=self.config.medoctruyen_cookies,
+        )
         self._download_worker.progress.connect(self._on_progress)
         self._download_worker.chapter_done.connect(self._on_chapter_updated)
         self._download_worker.chapter_error.connect(
             lambda idx, _msg: self._on_chapter_updated(idx)
         )
+        self._download_worker.daily_limit_hit.connect(self._on_daily_limit)
         self._download_worker.finished_ok.connect(self._on_download_finished)
         self._download_worker.start()
 
@@ -201,6 +219,14 @@ class ScrapeTab(QWidget):
         chapter = self.project.chapter(idx)
         if chapter is not None:
             self.model.update_chapter(chapter)
+
+    def _on_daily_limit(self, message: str) -> None:
+        # The batch stopped on the site's per-day cap: flag the Dock so the user
+        # notices even when the app is in the background, and show the unlock steps.
+        self.status_label.setText(f"🔒 {message}")
+        set_dock_badge(1)
+        request_attention(self.window())
+        QMessageBox.warning(self, "Đã đạt giới hạn đọc trong ngày", message)
 
     def _on_download_finished(self, ok: int, errors: int) -> None:
         self.download_button.setEnabled(True)

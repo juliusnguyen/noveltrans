@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from PySide6.QtCore import QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -10,12 +12,47 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QVBoxLayout,
 )
 
 from noveltrans.config import TARGET_LANGS, AppConfig, translator_labels
+
+_MEDOCTRUYEN_LOGIN_URL = "https://medoctruyen.vn/auth/login"
+
+_COOKIE_HELP = """\
+medoctruyen.vn yêu cầu đăng nhập mới đọc được nội dung đầy đủ của chương. \
+Hãy lấy cookie phiên đăng nhập của bạn từ trình duyệt:
+
+1. Mở trình duyệt (Chrome / Edge / Cốc Cốc) và ĐĂNG NHẬP vào medoctruyen.vn.
+
+2. Mở một trang chương bất kỳ, ví dụ:
+   https://medoctruyen.vn/tu-bao-tien-bon/chuong-1
+
+3. Mở Developer Tools:
+   • macOS:  ⌥ + ⌘ + I
+   • Windows / Linux:  F12  (hoặc Ctrl + Shift + I)
+
+4. Chọn tab “Network” (Mạng), rồi tải lại trang (⌘R hoặc F5).
+
+5. Bấm vào request đầu tiên trong danh sách (thường trùng tên trang, ví dụ “chuong-1”).
+
+6. Kéo xuống mục “Request Headers”, tìm dòng bắt đầu bằng “cookie:”.
+
+7. Sao chép TOÀN BỘ giá trị phía sau chữ “cookie:” (gồm nhiều cặp tên=giá_trị, \
+ngăn cách bằng “; ”).
+
+8. Dán vào ô “Cookie medoctruyen.vn” trong cửa sổ Cài đặt rồi bấm OK.
+
+Lưu ý:
+• Phải đang ĐĂNG NHẬP khi sao chép — cookie khi đăng xuất sẽ không mở được nội dung.
+• Sao chép ĐẦY ĐỦ dòng cookie, không chỉ một cặp.
+• Cookie sẽ hết hạn sau một thời gian; nếu tải chương báo lỗi “cần đăng nhập”, \
+hãy lấy lại cookie mới và dán lại.\
+"""
 
 
 class SettingsDialog(QDialog):
@@ -84,15 +121,52 @@ class SettingsDialog(QDialog):
         )
         form.addRow("Lệnh Claude CLI:", self.claude_cli_edit)
 
+        # medoctruyen.vn session cookie — needed to read full chapter bodies
+        self.medoctruyen_cookie_edit = QLineEdit(config.medoctruyen_cookies)
+        self.medoctruyen_cookie_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.medoctruyen_cookie_edit.setPlaceholderText("__Secure-…=…; session=…")
+        self.medoctruyen_cookie_edit.setToolTip(
+            "Đăng nhập medoctruyen.vn trên trình duyệt, sao chép header 'Cookie' của "
+            "request rồi dán vào đây. Cần thiết để tải nội dung đầy đủ của chương."
+        )
+        cookie_help = QPushButton("Hướng dẫn")
+        cookie_help.setToolTip("Xem các bước lấy cookie medoctruyen.vn")
+        cookie_help.clicked.connect(self._show_cookie_help)
+        cookie_row = QHBoxLayout()
+        cookie_row.addWidget(self.medoctruyen_cookie_edit, stretch=1)
+        cookie_row.addWidget(cookie_help)
+        form.addRow("Cookie medoctruyen.vn:", cookie_row)
+
+        cookie_hint = QLabel(
+            'Cần đăng nhập medoctruyen.vn để tải nội dung đầy đủ — bấm “Hướng dẫn” để '
+            "xem cách lấy cookie."
+        )
+        cookie_hint.setProperty("muted", True)
+        cookie_hint.setWordWrap(True)
+        form.addRow("", cookie_hint)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setProperty("primary", True)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
         layout = QVBoxLayout(self)
         layout.addLayout(form)
         layout.addWidget(buttons)
+
+    def _show_cookie_help(self) -> None:
+        box = QMessageBox(self)
+        box.setWindowTitle("Cách lấy cookie medoctruyen.vn")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText("Hướng dẫn lấy cookie đăng nhập")
+        box.setInformativeText(_COOKIE_HELP)
+        open_login = box.addButton("Mở trang đăng nhập", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Ok)
+        box.exec()
+        if box.clickedButton() is open_login:
+            QDesktopServices.openUrl(QUrl(_MEDOCTRUYEN_LOGIN_URL))
 
     def _browse_library(self) -> None:
         path = QFileDialog.getExistingDirectory(
@@ -110,5 +184,6 @@ class SettingsDialog(QDialog):
         self.config.claude_model = self.model_edit.text().strip()
         self.config.cli_command = self.cli_edit.text().strip()
         self.config.claude_cli_command = self.claude_cli_edit.text().strip()
+        self.config.medoctruyen_cookies = self.medoctruyen_cookie_edit.text().strip()
         self.config.sync()
         super().accept()

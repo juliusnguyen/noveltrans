@@ -57,7 +57,7 @@ class ExportTab(QWidget):
 
         self.translated_radio = QRadioButton("Bản dịch")
         self.translated_radio.setChecked(True)
-        self.original_radio = QRadioButton("Bản gốc (tiếng Trung)")
+        self.original_radio = QRadioButton("Bản gốc")
         lang_row = QHBoxLayout()
         lang_row.addWidget(self.translated_radio)
         lang_row.addWidget(self.original_radio)
@@ -73,6 +73,7 @@ class ExportTab(QWidget):
         self.summary_label.setWordWrap(True)
 
         self.export_button = QPushButton("Xuất file…")
+        self.export_button.setProperty("primary", True)
         self.export_button.clicked.connect(self._start_export)
         self.open_button = QPushButton("Mở thư mục")
         self.open_button.setEnabled(False)

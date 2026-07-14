@@ -17,6 +17,23 @@ class ObfuscatedContentError(ScrapeError):
     """Chapter content was fetched but could not be decoded (site obfuscation)."""
 
 
+class AuthRequiredError(ScrapeError):
+    """Full chapter body needs an authenticated session (missing/expired cookie),
+    or the chapter is paywalled for this account."""
+
+
+class RateLimitedError(ScrapeError):
+    """The site is throttling reads ("reading too fast"); retry after a wait."""
+
+
+class DailyLimitError(ScrapeError):
+    """A hard per-day read quota was hit; waiting won't help within the batch.
+
+    The user must lift it themselves (the site's own unlock flow) or wait for the
+    daily reset, so the download should stop and surface the instructions.
+    """
+
+
 class UnsupportedSiteError(NovelTransError):
     """No SiteAdapter matches the given URL."""
 

@@ -18,7 +18,12 @@ from PySide6.QtWidgets import (
 )
 
 from noveltrans.config import AppConfig
-from noveltrans.gui.widgets import AudioChapterTableModel, ProjectPicker, RowButtonDelegate
+from noveltrans.gui.widgets import (
+    AudioChapterTableModel,
+    ProjectPicker,
+    RowButtonDelegate,
+    enable_cell_copy,
+)
 from noveltrans.gui.workers import AudioWorker, TtsVoicesWorker
 from noveltrans.storage import NovelProject
 
@@ -71,6 +76,9 @@ class AudioTab(QWidget):
         )
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
+        enable_cell_copy(self.table)  # Ctrl+C / right-click to copy a cell (e.g. errors)
         self.table.setMouseTracking(True)
         self._row_button_delegate = RowButtonDelegate("🔊 Tạo lại", self.table)
         self._row_button_delegate.clicked.connect(self._regenerate_row)
@@ -82,6 +90,7 @@ class AudioTab(QWidget):
 
         # --- bottom row
         self.generate_button = QPushButton("Tạo audio tất cả")
+        self.generate_button.setProperty("primary", True)
         self.generate_button.clicked.connect(lambda: self._start_generate())
         self.regenerate_button = QPushButton("Tạo lại từ đầu")
         self.regenerate_button.setToolTip(
