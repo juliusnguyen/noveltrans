@@ -29,6 +29,11 @@ dev = [
 tts = [
     "vieneu>=3.0",  # VieNeu-TTS, torch-free ONNX runtime (~334 MB model on first run)
 ]
+discord = [
+    # Auto-unlock medoctruyen's 50/day cap by driving its Discord /mochuong command.
+    # After installing, run `playwright install chromium` once to fetch the browser.
+    "playwright>=1.40",
+]
 build = [
     "pyinstaller>=6.0",  # package the macOS .app (see `make app` / `make dmg`)
 ]

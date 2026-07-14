@@ -450,7 +450,7 @@ class DownloadWorker(QThread):
     progress = Signal(int, int, str)  # done, total, chapter title
     chapter_done = Signal(int)  # chapter index (GUI refreshes that row)
     chapter_error = Signal(int, str)
-    daily_limit_hit = Signal(str)  # per-day cap stopped the batch; message for the user
+    daily_limit_hit = Signal(str, str)  # per-day cap stopped the batch: (message, unlock code)
     finished_ok = Signal(int, int)  # downloaded count, error count
 
     def __init__(
@@ -517,7 +517,7 @@ class DownloadWorker(QThread):
                     project.mark_error(chapter.index, str(exc))
                     self.chapter_error.emit(chapter.index, str(exc))
                     self.progress.emit(done, total, f"🔒 {exc}")
-                    self.daily_limit_hit.emit(str(exc))
+                    self.daily_limit_hit.emit(str(exc), exc.code)
                     break
                 except NovelTransError as exc:
                     errors += 1
@@ -532,3 +532,57 @@ class DownloadWorker(QThread):
             self.finished_ok.emit(done - errors, errors)
         finally:
             project.close()
+
+
+class UnlockWorker(QThread):
+    """Run medoctruyen's Discord `/mochuong <code>` unlock off the GUI thread.
+
+    Playwright's sync API blocks, so it can't run on the Qt event-loop thread. On
+    success the scrape tab auto-resumes the download; `needs_login` tells it to
+    prompt the one-time throwaway-account login instead of just failing.
+    """
+
+    unlocked = Signal()
+    needs_login = Signal(str)  # message: profile has no valid Discord session yet
+    failed = Signal(str)
+
+    def __init__(self, channel_url: str, code: str, parent=None):
+        super().__init__(parent)
+        self.channel_url = channel_url
+        self.code = code
+
+    def run(self) -> None:
+        # Imported here so a missing Playwright (optional dep) only bites when the
+        # user actually turns auto-unlock on, not at app import time.
+        from noveltrans.discord_unlock import DiscordUnlockError, run_unlock
+
+        try:
+            run_unlock(self.channel_url, self.code)
+        except DiscordUnlockError as exc:
+            if exc.needs_login:
+                self.needs_login.emit(str(exc))
+            else:
+                self.failed.emit(str(exc))
+        except Exception as exc:  # keep unexpected automation errors on-screen
+            self.failed.emit(repr(exc))
+        else:
+            self.unlocked.emit()
+
+
+class DiscordLoginWorker(QThread):
+    """Open the one-time Discord login window for the throwaway account off-thread."""
+
+    done = Signal()
+    failed = Signal(str)
+
+    def run(self) -> None:
+        from noveltrans.discord_unlock import DiscordUnlockError, open_login
+
+        try:
+            open_login()
+        except DiscordUnlockError as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:
+            self.failed.emit(repr(exc))
+        else:
+            self.done.emit()

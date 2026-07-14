@@ -154,24 +154,30 @@ class MedoctruyenAdapter(SiteAdapter):
         ]
 
     @staticmethod
-    def _daily_limit_message(soup: BeautifulSoup, html: str) -> str:
-        """Turn the daily-limit page into actionable instructions for the user,
-        surfacing the site's own unlock code / Discord link so they can lift it."""
+    def _daily_limit_details(soup: BeautifulSoup, html: str) -> tuple[str, str, str]:
+        """Parse the daily-limit page into (message, code, discord_url).
+
+        The message is actionable instructions for the user; the code and Discord
+        invite are also returned raw so the app can run the `/mochuong <code>`
+        unlock itself (auto-unlock) instead of only showing the text.
+        """
         text = soup.get_text(" ", strip=True)
-        code = re.search(r"/mochuong\s+([A-Z0-9]{5,16})", text)
-        discord = re.search(r"https://discord\.gg/[^\s\"'<]+", html)
+        code_match = re.search(r"/mochuong\s+([A-Z0-9]{5,16})", text)
+        discord_match = re.search(r"https://discord\.gg/[^\s\"'<]+", html)
         reset = re.search(r"đặt lại vào\s*([\d:]+)\s*[·.]?\s*([\d/]+)", text)
+        code = code_match.group(1) if code_match else ""
+        discord_url = discord_match.group(0) if discord_match else ""
 
         parts = ["Đã đạt giới hạn 50 chương/ngày của medoctruyen.vn."]
-        if code and discord:
+        if code and discord_url:
             parts.append(
-                f"Mở khoá 50 chương tiếp: vào Discord {discord.group(0)} , kênh "
-                f"#mở-khoá, gõ lệnh:  /mochuong {code.group(1)}  rồi bấm “Tải các "
+                f"Mở khoá 50 chương tiếp: vào Discord {discord_url} , kênh "
+                f"#mở-khoá, gõ lệnh:  /mochuong {code}  rồi bấm “Tải các "
                 "chương” lại."
             )
         if reset:
             parts.append(f"Hoặc chờ giới hạn tự đặt lại lúc {reset.group(1)} ngày {reset.group(2)}.")
-        return " ".join(parts)
+        return " ".join(parts), code, discord_url
 
     def fetch_chapter(self, ref: ChapterRef) -> str:
         html = self.client.get_html(ref.url)
@@ -208,7 +214,10 @@ class MedoctruyenAdapter(SiteAdapter):
             # Hard per-day quota (50 chapters/day): waiting won't help — the user
             # must run the site's own Discord unlock or wait for the daily reset.
             if _DAILY_LIMIT_NOTICE in html:
-                raise DailyLimitError(self._daily_limit_message(soup, html), ref.url)
+                message, code, discord_url = self._daily_limit_details(soup, html)
+                raise DailyLimitError(
+                    message, ref.url, code=code, discord_url=discord_url
+                )
             # "reading too fast" throttle: the page renders without the body.
             # Retryable after a short wait — the download worker backs off.
             if '"isRateLimited":true' in html or _RATE_LIMIT_NOTICE in html:

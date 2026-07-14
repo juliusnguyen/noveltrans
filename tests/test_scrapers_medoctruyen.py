@@ -120,6 +120,9 @@ class TestRateLimit:
         assert "50 chương/ngày" in msg
         assert "/mochuong URFME4PA" in msg  # site's own unlock code surfaced
         assert "discord.gg/QDP8zjCa38" in msg
+        # structured fields let the app run the /mochuong auto-unlock, not just show text
+        assert exc.value.code == "URFME4PA"
+        assert exc.value.discord_url == "https://discord.gg/QDP8zjCa38"
         # a daily cap is NOT the short "reading too fast" throttle
         assert not isinstance(exc.value, RateLimitedError)
 

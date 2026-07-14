@@ -31,7 +31,18 @@ class DailyLimitError(ScrapeError):
 
     The user must lift it themselves (the site's own unlock flow) or wait for the
     daily reset, so the download should stop and surface the instructions.
+
+    `code` and `discord_url` are the site's own single-use unlock code and Discord
+    invite parsed off the limit page (when present), so the app can drive — or
+    hand the user — the `/mochuong <code>` unlock instead of only showing text.
     """
+
+    def __init__(
+        self, message: str, url: str = "", *, code: str = "", discord_url: str = ""
+    ):
+        super().__init__(message, url)
+        self.code = code
+        self.discord_url = discord_url
 
 
 class UnsupportedSiteError(NovelTransError):
