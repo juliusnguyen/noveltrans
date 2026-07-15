@@ -291,7 +291,7 @@ class LmStudioModelsWorker(QThread):
 
 
 class AudioWorker(QThread):
-    """Generate audio for translated chapters of a project, resumably."""
+    """Generate audio for a project's translated (or original) chapters, resumably."""
 
     progress = Signal(int, int, str)  # done, total, chapter title / phase message
     chapter_done = Signal(int)
@@ -305,6 +305,7 @@ class AudioWorker(QThread):
         voice: str,
         out_format: str = "wav",  # "wav" or "mp3" (mp3 needs ffmpeg)
         indices: list[int] | None = None,
+        use_translation: bool = True,  # False = voice the original `content`
         parent=None,
     ):
         super().__init__(parent)
@@ -312,6 +313,7 @@ class AudioWorker(QThread):
         self.voice = voice
         self.out_format = out_format
         self.indices = indices  # None = all pending; else re-generate exactly these
+        self.use_translation = use_translation
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -335,11 +337,16 @@ class AudioWorker(QThread):
 
         project = NovelProject.open(self.project_path)
         try:
+            source = "translated" if self.use_translation else "original"
             if self.indices is not None:
                 chapters = (project.chapter(i) for i in self.indices)
-                pending = [c for c in chapters if c is not None and c.translated]
+                pending = [
+                    c
+                    for c in chapters
+                    if c is not None and (c.translated if self.use_translation else c.content)
+                ]
             else:
-                pending = project.pending_audio(self.voice)
+                pending = project.pending_audio(self.voice, self.use_translation)
             total = len(pending)
             done = 0
             errors = 0
@@ -348,7 +355,10 @@ class AudioWorker(QThread):
             for chapter in pending:
                 if self._cancelled:
                     break
-                title = chapter.translated_title or chapter.title
+                if self.use_translation:
+                    title, text = chapter.translated_title or chapter.title, chapter.translated
+                else:
+                    title, text = chapter.title, chapter.content
                 self.progress.emit(done, total, title)
                 # voice in the filename: re-voicing creates a NEW file, so audio
                 # players that cached/imported the old one can't play stale audio
@@ -356,8 +366,8 @@ class AudioWorker(QThread):
                 out_path = project.audio_dir / name
                 try:
                     seconds = engine.synthesize_chapter(
-                        chapter.translated_title,
-                        chapter.translated,
+                        title,
+                        text,
                         out_path,
                         cancelled=lambda: self._cancelled,
                     )
@@ -369,7 +379,7 @@ class AudioWorker(QThread):
                     if chapter.audio_path and chapter.audio_path != rel_path:
                         # re-voiced with another format — drop the stale old file
                         (project.path / chapter.audio_path).unlink(missing_ok=True)
-                    project.save_audio(chapter.index, rel_path, self.voice, seconds)
+                    project.save_audio(chapter.index, rel_path, self.voice, seconds, source)
                     self.chapter_done.emit(chapter.index)
                 except TtsError as exc:
                     if self._cancelled:

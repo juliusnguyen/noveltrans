@@ -65,6 +65,7 @@ class Chapter:
     # audio pipeline (parallel to download/translate status)
     audio_path: str = ""  # path relative to the project folder ("" = not generated)
     audio_voice: str = ""
+    audio_source: str = "translated"  # which text the audio was voiced from
     audio_seconds: float = 0.0  # duration of the generated audio
     audio_error: str = ""
 

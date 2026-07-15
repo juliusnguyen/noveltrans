@@ -172,6 +172,15 @@ class AppConfig:
     def tts_format(self, value: str) -> None:
         self._s.setValue("tts_format", value)
 
+    @property
+    def tts_use_translation(self) -> bool:
+        """Voice the translation (True) or the original text (False)."""
+        return self._s.value("tts_use_translation", True, type=bool)
+
+    @tts_use_translation.setter
+    def tts_use_translation(self, value: bool) -> None:
+        self._s.setValue("tts_use_translation", bool(value))
+
     def cli_model_for(self, engine: str) -> str:
         """Model override for a CLI-based engine ("" = the CLI's own default)."""
         return str(self._s.value(f"{engine}_model", ""))

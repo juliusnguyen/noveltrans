@@ -38,6 +38,22 @@ class TestAudioChapterTableModel:
         assert m.data(m.index(0, m.REGENERATE_COLUMN), Qt.ItemDataRole.UserRole) is False
         assert m.data(m.index(1, m.REGENERATE_COLUMN), Qt.ItemDataRole.UserRole) is True
 
+    def test_original_source_status_and_title(self, qapp):
+        from PySide6.QtCore import Qt
+
+        m = self._model(qapp)
+        m.set_source(use_translation=False)  # Bản gốc
+        col = m.STATUS_COLUMN
+        # row 0 has no content → "Chưa tải" (not "Chưa dịch"); rows 1-2 have content
+        assert m.data(m.index(0, col)) == "Chưa tải"
+        assert m.data(m.index(1, col)) == "Chưa tạo"
+        assert m.data(m.index(2, col)) == "Đã tạo"
+        # title column shows the original title, not the translated one
+        assert m.data(m.index(2, m.TITLE_COLUMN)) == "第3章"
+        # regenerate button follows content availability now
+        assert m.data(m.index(0, m.REGENERATE_COLUMN), Qt.ItemDataRole.UserRole) is False
+        assert m.data(m.index(1, m.REGENERATE_COLUMN), Qt.ItemDataRole.UserRole) is True
+
 
 class TestChapterTableModelEditing:
     def _model(self, qapp):
