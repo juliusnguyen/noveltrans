@@ -7,6 +7,7 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QButtonGroup,
     QComboBox,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -14,6 +15,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
+    QSpinBox,
     QTableView,
     QVBoxLayout,
     QWidget,
@@ -26,7 +28,7 @@ from noveltrans.gui.widgets import (
     RowButtonDelegate,
     enable_cell_copy,
 )
-from noveltrans.gui.workers import AudioWorker, TtsVoicesWorker
+from noveltrans.gui.workers import AudioWorker, MergeWorker, TtsVoicesWorker
 from noveltrans.storage import NovelProject
 
 
@@ -37,6 +39,7 @@ class AudioTab(QWidget):
         self.project: NovelProject | None = None
         self._worker: AudioWorker | None = None
         self._voices_worker: TtsVoicesWorker | None = None
+        self._merge_worker: MergeWorker | None = None
 
         # --- top row: novel + voice
         self.picker = ProjectPicker()
@@ -135,11 +138,76 @@ class AudioTab(QWidget):
         bottom_row.addWidget(self.open_dir_button)
         bottom_row.addWidget(self.progress, stretch=1)
 
+        merge_box = self._build_merge_box()
+
         layout = QVBoxLayout(self)
         layout.addLayout(top_row)
         layout.addWidget(self.table, stretch=1)
         layout.addLayout(bottom_row)
+        layout.addWidget(merge_box)
         layout.addWidget(self.status_label)
+
+    def _build_merge_box(self) -> QGroupBox:
+        """The 'Ghép audio' controls: mode (all/range/batch), format, and the button."""
+        from noveltrans.tts.convert import ffmpeg_available, ffmpeg_has_encoder
+
+        self.merge_mode = QComboBox()
+        self.merge_mode.addItem("Toàn bộ", "all")
+        self.merge_mode.addItem("Từ chương … đến …", "range")
+        self.merge_mode.addItem("Theo lô", "batch")
+        self.merge_mode.currentIndexChanged.connect(self._on_merge_mode_changed)
+
+        self.range_from = QSpinBox()
+        self.range_from.setMinimum(1)
+        self.range_from.setMaximum(999999)
+        self.range_to = QSpinBox()
+        self.range_to.setMinimum(1)
+        self.range_to.setMaximum(999999)
+        self.range_label = QLabel("→")
+        self.batch_size = QSpinBox()
+        self.batch_size.setMinimum(1)
+        self.batch_size.setMaximum(999999)
+        self.batch_size.setValue(10)
+        self.batch_label = QLabel("chương/lô")
+
+        self.merge_format = QComboBox()
+        has_aac = ffmpeg_has_encoder("aac")
+        if has_aac:
+            self.merge_format.addItem("M4B (có mục lục chương)", "m4b")
+        self.merge_format.addItem("MP3 (gộp phẳng)", "mp3")
+
+        self.merge_button = QPushButton("Ghép audio")
+        self.merge_button.clicked.connect(self._start_merge)
+        if not ffmpeg_available():
+            self.merge_button.setEnabled(False)
+            self.merge_button.setToolTip("Cần ffmpeg để ghép audio (brew install ffmpeg).")
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Chế độ:"))
+        row.addWidget(self.merge_mode)
+        row.addWidget(self.range_from)
+        row.addWidget(self.range_label)
+        row.addWidget(self.range_to)
+        row.addWidget(self.batch_size)
+        row.addWidget(self.batch_label)
+        row.addWidget(QLabel("Định dạng:"))
+        row.addWidget(self.merge_format)
+        row.addWidget(self.merge_button)
+        row.addStretch()
+
+        box = QGroupBox("Ghép thành 1 file")
+        box.setLayout(row)
+        self._on_merge_mode_changed()  # set initial visibility
+        return box
+
+    def _on_merge_mode_changed(self) -> None:
+        mode = self.merge_mode.currentData()
+        is_range = mode == "range"
+        is_batch = mode == "batch"
+        for w in (self.range_from, self.range_label, self.range_to):
+            w.setVisible(is_range)
+        for w in (self.batch_size, self.batch_label):
+            w.setVisible(is_batch)
 
     # -------------------------------------------------------------- projects
 
@@ -158,6 +226,9 @@ class AudioTab(QWidget):
         if path:
             self.project = NovelProject.open(path)
             self.model.set_chapters(self.project.chapters())
+            total = self.project.counts()["total"]
+            self.range_to.setValue(max(total, 1))  # default merge range = whole novel
+            self.range_from.setValue(1)
             self._update_status_line()
         else:
             self.model.set_chapters([])
@@ -294,9 +365,12 @@ class AudioTab(QWidget):
         self._start_generate()
 
     def _cancel(self) -> None:
-        if self._worker is not None:
+        if self._worker is not None and self._worker.isRunning():
             self._worker.cancel()
             self.status_label.setText("Đang dừng…")
+        if self._merge_worker is not None and self._merge_worker.isRunning():
+            self._merge_worker.cancel()
+            self.status_label.setText("Đang dừng ghép…")
 
     # --------------------------------------------------------------- helpers
 
@@ -343,14 +417,104 @@ class AudioTab(QWidget):
         self.cancel_button.setEnabled(False)
         self.picker.setEnabled(True)
 
+    # ------------------------------------------------------------------ merge
+
+    def _start_merge(self) -> None:
+        from noveltrans.tts.merge import plan_merge_windows
+
+        if self.project is None:
+            QMessageBox.information(self, "Chưa chọn truyện", "Hãy chọn một truyện trước.")
+            return
+        if self._merge_worker is not None and self._merge_worker.isRunning():
+            return
+        voice = self.voice_combo.currentData() or self.voice_combo.currentText().strip()
+        mode = self.merge_mode.currentData()
+        start = self.range_from.value() if mode == "range" else None
+        end = self.range_to.value() if mode == "range" else None
+        batch = self.batch_size.value() if mode == "batch" else None
+        if mode == "range" and start > end:
+            QMessageBox.warning(self, "Phạm vi sai", "Chương bắt đầu phải ≤ chương kết thúc.")
+            return
+
+        # cheap preview (no ffmpeg) so we can show the file/chapter count before a long run
+        windows = plan_merge_windows(
+            self.project.chapters(), voice, mode, start=start, end=end, batch=batch
+        )
+        if not windows:
+            QMessageBox.information(
+                self,
+                "Chưa có audio",
+                f"Không có chương nào có audio giọng {voice} trong phạm vi đã chọn.",
+            )
+            return
+        n_chapters = sum(len(w.chapters) for w in windows)
+        answer = QMessageBox.question(
+            self,
+            "Ghép audio",
+            f"Sẽ tạo {len(windows)} file từ {n_chapters} chương (giọng {voice}). Tiếp tục?",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        self.merge_button.setEnabled(False)
+        self.generate_button.setEnabled(False)
+        self.cancel_button.setEnabled(True)  # let the user stop a long merge
+        self.progress.setMaximum(len(windows))
+        self.progress.setValue(0)
+        self.status_label.setText(f"🔗 Đang ghép audio… ({len(windows)} file, có thể mất vài phút)")
+        self._merge_worker = MergeWorker(
+            self.project.path,
+            voice=voice,
+            fmt=self.merge_format.currentData(),
+            mode=mode,
+            start=start,
+            end=end,
+            batch=batch,
+        )
+        self._merge_worker.progress.connect(self._on_merge_progress)
+        self._merge_worker.file_done.connect(self._on_merge_file_done)
+        self._merge_worker.finished_ok.connect(self._on_merge_finished)
+        self._merge_worker.failed.connect(self._on_merge_failed)
+        self._merge_worker.start()
+
+    def _on_merge_progress(self, done: int, total: int, name: str) -> None:
+        self.progress.setValue(done)
+        if name:
+            self.status_label.setText(f"🔗 Đang ghép ({done + 1}/{total}): {name}")
+
+    def _on_merge_file_done(self, path: str) -> None:
+        self.progress.setValue(self.progress.value() + 1)
+
+    def _reset_merge_ui(self) -> None:
+        self.merge_button.setEnabled(True)
+        self.generate_button.setEnabled(True)
+        self.cancel_button.setEnabled(False)
+
+    def _on_merge_finished(self, count: int) -> None:
+        self._reset_merge_ui()
+        if count:
+            self.status_label.setText(f"✅ Đã ghép xong {count} file — bấm “Mở thư mục audio”.")
+        else:
+            self.status_label.setText("Đã dừng ghép audio.")
+
+    def _on_merge_failed(self, message: str) -> None:
+        self._reset_merge_ui()
+        self.status_label.setText("")
+        QMessageBox.warning(self, "Ghép audio thất bại", message)
+
     def has_running_workers(self) -> bool:
-        # Only TTS generation is user-meaningful work worth a close-confirm; the
+        # Only TTS generation / merge are user-meaningful work worth a close-confirm; the
         # voices-list fetch is a short background metadata call (shutdown still joins it).
-        return self._worker is not None and self._worker.isRunning()
+        return (self._worker is not None and self._worker.isRunning()) or (
+            self._merge_worker is not None and self._merge_worker.isRunning()
+        )
 
     def shutdown(self) -> None:
         if self._worker is not None and self._worker.isRunning():
             self._worker.cancel()
             self._worker.wait(120_000)  # a mid-chapter chunk may take a while
+        if self._merge_worker is not None and self._merge_worker.isRunning():
+            self._merge_worker.cancel()  # stops before the next window; current ffmpeg finishes
+            self._merge_worker.wait(120_000)
         if self._voices_worker is not None and self._voices_worker.isRunning():
             self._voices_worker.wait(5_000)

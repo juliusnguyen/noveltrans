@@ -398,6 +398,107 @@ class AudioWorker(QThread):
             project.close()
 
 
+class MergeWorker(QThread):
+    """Merge per-chapter audio into one or more files (all / range / batch), off-thread."""
+
+    progress = Signal(int, int, str)  # windows done, total windows, label
+    file_done = Signal(str)  # each output file path as it finishes
+    finished_ok = Signal(int)  # number of files written
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        project_path: Path,
+        voice: str,
+        fmt: str,  # "m4b" | "mp3"
+        mode: str,  # "all" | "range" | "batch"
+        start: int | None = None,
+        end: int | None = None,
+        batch: int | None = None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.project_path = Path(project_path)
+        self.voice = voice
+        self.fmt = fmt
+        self.mode = mode
+        # NOTE: not `self.start` — that would shadow QThread.start() and the thread
+        # would never launch. Same care for end/batch for symmetry.
+        self.start_num = start
+        self.end_num = end
+        self.batch_size = batch
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        from noveltrans.errors import TtsError
+        from noveltrans.storage.project import slugify
+        from noveltrans.tts.merge import (
+            MergeCancelled,
+            MergeSegment,
+            chapter_marker_title,
+            merge_chapters,
+            plan_merge_windows,
+        )
+
+        project = NovelProject.open(self.project_path)
+        try:
+            windows = plan_merge_windows(
+                project.chapters(),
+                self.voice,
+                self.mode,
+                start=self.start_num,
+                end=self.end_num,
+                batch=self.batch_size,
+            )
+            if not windows:
+                self.failed.emit("Không có chương nào có audio giọng này trong phạm vi đã chọn.")
+                return
+            project.audio_dir.mkdir(parents=True, exist_ok=True)
+            slug = slugify(project.meta.translated_title or project.meta.title)
+            ext = "m4b" if self.fmt == "m4b" else "mp3"
+            total = len(windows)
+            written = 0
+            for i, window in enumerate(windows):
+                if self._cancelled:
+                    break
+                # resolve to on-disk segments, skipping any file that went missing
+                segments = [
+                    MergeSegment(
+                        path=self.project_path / c.audio_path,
+                        seconds=c.audio_seconds,
+                        title=chapter_marker_title(c),
+                    )
+                    for c in window.chapters
+                    if (self.project_path / c.audio_path).is_file()
+                ]
+                if not segments:
+                    continue
+                if total == 1 and self.mode == "all":
+                    name = f"{slug}.{ext}"
+                else:
+                    name = f"{slug}-{window.first_num:04d}-{window.last_num:04d}.{ext}"
+                out_path = project.audio_dir / name  # alongside the per-chapter files
+                self.progress.emit(i, total, name)
+                try:
+                    merge_chapters(segments, out_path, self.fmt, cancelled=lambda: self._cancelled)
+                    written += 1
+                    self.file_done.emit(str(out_path))
+                except MergeCancelled:
+                    break  # user stopped — partial files kept, not an error
+                except TtsError as exc:
+                    self.failed.emit(str(exc))
+                    return
+            self.progress.emit(total, total, "")
+            self.finished_ok.emit(written)
+        except Exception as exc:  # keep unexpected errors on-screen
+            self.failed.emit(f"Lỗi khi ghép audio: {exc!r}")
+        finally:
+            project.close()
+
+
 class TtsVoicesWorker(QThread):
     """List a TTS engine's voices without blocking the GUI."""
 

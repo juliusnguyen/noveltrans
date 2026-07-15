@@ -13,6 +13,22 @@ def ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
+def ffmpeg_has_encoder(name: str) -> bool:
+    """True if this ffmpeg build ships the given audio encoder (e.g. 'aac' for M4B)."""
+    if not ffmpeg_available():
+        return False
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return any(line.split()[1:2] == [name] for line in result.stdout.splitlines())
+
+
 def convert_to_mp3(wav_path: Path, bitrate: str = "96k") -> Path:
     """Convert a WAV to MP3 next to it, delete the WAV, return the MP3 path."""
     mp3_path = wav_path.with_suffix(".mp3")
