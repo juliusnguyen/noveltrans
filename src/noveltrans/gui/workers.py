@@ -415,6 +415,7 @@ class ExportWorker(QThread):
         exporter_name: str,
         out_path: Path,
         use_translation: bool,
+        number_chapters: bool = False,
         parent=None,
     ):
         super().__init__(parent)
@@ -422,6 +423,7 @@ class ExportWorker(QThread):
         self.exporter_name = exporter_name
         self.out_path = Path(out_path)
         self.use_translation = use_translation
+        self.number_chapters = number_chapters
 
     def run(self) -> None:
         from noveltrans.exporters import get_exporter
@@ -434,6 +436,7 @@ class ExportWorker(QThread):
                 project.chapters(),
                 self.out_path,
                 use_translation=self.use_translation,
+                number_chapters=self.number_chapters,
             )
             self.finished_ok.emit(str(written))
         except NovelTransError as exc:

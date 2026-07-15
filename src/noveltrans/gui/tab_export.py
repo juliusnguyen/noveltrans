@@ -7,6 +7,7 @@ from pathlib import Path
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -63,10 +64,17 @@ class ExportTab(QWidget):
         lang_row.addWidget(self.original_radio)
         lang_row.addStretch()
 
+        self.number_checkbox = QCheckBox("Thêm số chương vào tiêu đề")
+        self.number_checkbox.setToolTip(
+            "Đặt tiêu đề mỗi chương thành “Chương 1: <tên chương>”, “Chương 2: …” — "
+            "thêm số thứ tự vào trước tên chương đã tải."
+        )
+
         options_box = QGroupBox("Tùy chọn xuất")
         form = QFormLayout(options_box)
         form.addRow("Định dạng:", self.format_combo)
         form.addRow("Nội dung:", lang_row)
+        form.addRow("Tiêu đề chương:", self.number_checkbox)
 
         # --- summary + actions
         self.summary_label = QLabel("—")
@@ -163,7 +171,11 @@ class ExportTab(QWidget):
         self.export_button.setEnabled(False)
         self.status_label.setText("Đang xuất…")
         self._worker = ExportWorker(
-            self.project.path, exporter.name, Path(out_path), use_translation
+            self.project.path,
+            exporter.name,
+            Path(out_path),
+            use_translation,
+            number_chapters=self.number_checkbox.isChecked(),
         )
         self._worker.finished_ok.connect(self._on_finished)
         self._worker.failed.connect(self._on_failed)

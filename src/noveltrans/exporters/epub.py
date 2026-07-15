@@ -25,8 +25,9 @@ class EpubExporter(Exporter):
         chapters: list[Chapter],
         out_path: Path,
         use_translation: bool = True,
+        number_chapters: bool = False,
     ) -> Path:
-        included, skipped = self.split_available(chapters, use_translation)
+        included, skipped = self.split_available(chapters, use_translation, number_chapters)
         if not included:
             raise ExportError("Không có chương nào để xuất (chưa tải/dịch chương nào).")
 
