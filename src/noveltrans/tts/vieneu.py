@@ -6,24 +6,33 @@ model auto-downloads from HuggingFace on first load.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from noveltrans.errors import TtsError
 from noveltrans.tts.base import TtsEngine
 
-# (label, voice_id) pairs, shown before the model is loaded — verified against
-# vieneu 3.0.11's list_preset_voices(); the model may add more after load()
+logger = logging.getLogger(__name__)
+
+# (label, voice_id) pairs, shown before the model is loaded. These mirror the
+# v3turbo build's list_preset_voices() output (label = "{name} — {description}").
+# It's a best-effort snapshot: load() reconciles self.voice against the real list
+# the model reports, so a drift here can no longer crash synthesis.
 PRESET_VOICES = [
-    ("Ngọc Lan — nữ, giọng dịu dàng", "Ngọc Lan"),
-    ("Mỹ Duyên — nữ, giọng mượt mà", "Mỹ Duyên"),
-    ("Trúc Ly — nữ, giọng trẻ trung", "Trúc Ly"),
-    ("Ngọc Linh — nữ, giọng tươi sáng", "Ngọc Linh"),
-    ("Gia Bảo — nam, giọng mượt mà", "Gia Bảo"),
-    ("Thái Sơn — nam, giọng chắc khỏe", "Thái Sơn"),
-    ("Đức Trí — nam, giọng rõ ràng", "Đức Trí"),
-    ("Xuân Vĩnh — nam, giọng vui tươi", "Xuân Vĩnh"),
-    ("Trọng Hữu — nam, giọng uyên bác", "Trọng Hữu"),
-    ("Bình An — nam, giọng điềm đạm", "Bình An"),
+    ("Minh Đức — Nam · Bắc · Phong cách tin tức", "Minh Đức"),
+    ("Phạm Tuyên — Nam · Bắc · Phong cách tự nhiên", "Phạm Tuyên"),
+    ("Thái Sơn — Nam · Nam · Phong cách kể chuyện", "Thái Sơn"),
+    ("Xuân Vĩnh — Nam · Nam · Phong cách tự nhiên", "Xuân Vĩnh"),
+    ("Thanh Bình — Nam · Bắc · Phong cách kể chuyện", "Thanh Bình"),
+    ("Trúc Ly — Nữ · Bắc · Phong cách tự nhiên", "Trúc Ly"),
+    ("Ngọc Linh — Nữ · Bắc · Phong cách kể chuyện", "Ngọc Linh"),
+    ("Đoan Trang — Nữ · Bắc · Phong cách tự nhiên", "Đoan Trang"),
+    ("Mai Anh — Nữ · Bắc · Phong cách tin tức", "Mai Anh"),
+    ("Thục Đoan — Nữ · Nam · Phong cách kể chuyện", "Thục Đoan"),
+    ("Minh Triết — Nam · Nam · Phong cách tin tức", "Minh Triết"),
+    ("Thùy Dung — Nữ · Nam · Phong cách tin tức", "Thùy Dung"),
+    ("Quang Sơn — Nam · Trung · Phong cách tự nhiên", "Quang Sơn"),
+    ("Ngọc Trân — Nữ · Trung · Phong cách tự nhiên", "Ngọc Trân"),
 ]
 
 INSTALL_HINT = (
@@ -39,6 +48,9 @@ class VieneuEngine(TtsEngine):
 
     def __init__(self, voice: str = ""):
         self.voice = (voice or "").strip()
+        # Set by load() when the requested voice was substituted; a human-readable
+        # notice the caller can surface (empty means the voice was used as-is).
+        self.voice_notice = ""
         self._tts = None
 
     def load(self) -> None:
@@ -50,6 +62,32 @@ class VieneuEngine(TtsEngine):
             self._tts = Vieneu()
         except Exception as exc:
             raise TtsError(f"Không khởi tạo được VieNeu-TTS: {exc}") from exc
+        self._resolve_voice()
+
+    def _resolve_voice(self) -> None:
+        """Pin self.voice to a voice the loaded model actually offers.
+
+        Voice names drift between vieneu builds; passing a stale name to infer()
+        raises. Resolve once here (not per-chunk) so synthesize() can never fail
+        on an unknown voice: fall back to the model's default, else the first
+        available voice, else "" (which lets the model pick its own default).
+        """
+        if not self.voice:
+            return
+        try:
+            available = [vid for _, vid in self.list_voices()]
+        except Exception:
+            return  # can't determine — leave self.voice untouched, degrade safely
+        if not available or self.voice in available:
+            return
+        fallback = getattr(self._tts, "_default_voice", None)
+        if fallback not in available:
+            fallback = available[0]
+        self.voice_notice = (
+            f"Giọng '{self.voice}' không còn khả dụng — dùng '{fallback}' thay thế."
+        )
+        logger.warning(self.voice_notice)
+        self.voice = fallback
 
     def _require_loaded(self):
         if self._tts is None:

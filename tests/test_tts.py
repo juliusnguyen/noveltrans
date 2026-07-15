@@ -100,9 +100,9 @@ class TestRegistry:
 
     def test_vieneu_engine_constructed_without_package(self):
         # constructing is lazy; only load() needs the vieneu package
-        engine = get_tts_engine("vieneu", voice="Ngọc Lan")
+        engine = get_tts_engine("vieneu", voice="Xuân Vĩnh")
         assert engine.name == "vieneu"
-        assert engine.voice == "Ngọc Lan"
+        assert engine.voice == "Xuân Vĩnh"
 
     def test_missing_package_raises_install_hint(self):
         engine = get_tts_engine("vieneu")
@@ -112,8 +112,12 @@ class TestRegistry:
 
 
 class TestVieneuEngine:
-    def _engine_with_mock(self, voice=""):
+    def _engine_with_mock(self, voice="", presets=None, default_voice=None):
         mock_tts = MagicMock()
+        if presets is not None:
+            mock_tts.list_preset_voices.return_value = presets
+        if default_voice is not None:
+            mock_tts._default_voice = default_voice
         mock_module = MagicMock()
         mock_module.Vieneu.return_value = mock_tts
         engine = get_tts_engine("vieneu", voice=voice)
@@ -135,7 +139,7 @@ class TestVieneuEngine:
 
     def test_voices_before_load_are_presets(self):
         engine = get_tts_engine("vieneu")
-        assert ("Ngọc Lan — nữ, giọng dịu dàng", "Ngọc Lan") in engine.list_voices()
+        assert ("Ngọc Linh — Nữ · Bắc · Phong cách kể chuyện", "Ngọc Linh") in engine.list_voices()
 
     def test_voices_from_loaded_model(self):
         engine, mock_tts = self._engine_with_mock()
@@ -147,6 +151,53 @@ class TestVieneuEngine:
         mock_tts.infer.side_effect = RuntimeError("onnx boom")
         with pytest.raises(TtsError, match="onnx boom"):
             engine.synthesize("xin chào")
+
+    def test_load_resolves_unknown_voice_to_default(self):
+        presets = [(f"{n} — mô tả", n) for n in ("Minh Đức", "Phạm Tuyên", "Ngọc Linh")]
+        engine, mock_tts = self._engine_with_mock(
+            voice="Ngọc Lan", presets=presets, default_voice="Phạm Tuyên"
+        )
+        assert engine.voice == "Phạm Tuyên"  # model default, not the stale name
+        assert engine.voice_notice  # non-empty substitution notice
+        mock_tts.infer.return_value = np.zeros(10)
+        engine.synthesize("xin chào")  # must not raise on the (resolved) voice
+        mock_tts.infer.assert_called_once_with("xin chào", voice="Phạm Tuyên")
+
+    def test_load_resolves_unknown_voice_to_first_when_no_default(self):
+        presets = [(f"{n} — mô tả", n) for n in ("Minh Đức", "Phạm Tuyên")]
+        engine, _ = self._engine_with_mock(
+            voice="Ngọc Lan", presets=presets, default_voice="Không Tồn Tại"
+        )
+        assert engine.voice == "Minh Đức"  # first available, since default is invalid too
+        assert engine.voice_notice
+
+    def test_load_keeps_valid_voice(self):
+        presets = [(f"{n} — mô tả", n) for n in ("Minh Đức", "Ngọc Linh")]
+        engine, _ = self._engine_with_mock(
+            voice="Ngọc Linh", presets=presets, default_voice="Minh Đức"
+        )
+        assert engine.voice == "Ngọc Linh"
+        assert engine.voice_notice == ""
+
+    def test_load_survives_model_voice_list_error(self):
+        # If the model's voice list errors, list_voices() falls back to PRESET_VOICES,
+        # so load() must not raise and self.voice must end up a real preset id.
+        from noveltrans.tts.vieneu import PRESET_VOICES
+
+        mock_tts = MagicMock()
+        mock_tts.list_preset_voices.side_effect = RuntimeError("boom")
+        mock_module = MagicMock()
+        mock_module.Vieneu.return_value = mock_tts
+        engine = get_tts_engine("vieneu", voice="Ngọc Lan")
+        with patch.dict(sys.modules, {"vieneu": mock_module}):
+            engine.load()  # must not raise
+        assert engine.voice in {vid for _, vid in PRESET_VOICES}
+
+    def test_default_voice_constant_is_a_preset(self):
+        from noveltrans.config import DEFAULT_TTS_VOICE
+        from noveltrans.tts.vieneu import PRESET_VOICES
+
+        assert DEFAULT_TTS_VOICE in {vid for _, vid in PRESET_VOICES}
 
 
 class TestAudioWorker:
