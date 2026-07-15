@@ -138,6 +138,90 @@ class TestEpub:
         assert book.get_metadata("DC", "language")[0][0] == "zh"
 
 
+class TestChapterNumbering:
+    """number_chapters prepends 'Chương N: ' to the title (N = index + 1), unless the
+    title already opens with its own chapter marker (no doubled number)."""
+
+    def _num(self, chapter, use_translation=True):
+        from noveltrans.exporters.base import chapter_text
+
+        return chapter_text(chapter, use_translation, number_chapters=True).title
+
+    def test_prepends_number_to_plain_title(self):
+        ch = Chapter(
+            index=4,
+            title="第五章 真名",
+            url="u",
+            content="原文",
+            translated="Thân thể.",
+            translated_title="On Jianyong gặp nạn",  # no leading number
+            status="translated",
+        )
+        from noveltrans.exporters.base import chapter_text
+
+        text = chapter_text(ch, use_translation=True, number_chapters=True)
+        assert text.title == "Chương 5: On Jianyong gặp nạn"  # number + parsed title
+        assert text.body == "Thân thể."  # body untouched
+
+    def test_guard_skips_vietnamese_marker(self):
+        ch = Chapter(index=0, title="t", url="u", content="c", translated="b",
+                     translated_title="Chương 1: Trường học", status="translated")
+        assert self._num(ch) == "Chương 1: Trường học"  # not "Chương 1: Chương 1: …"
+
+    def test_guard_skips_chinese_marker(self):
+        ch = Chapter(index=2, title="第三章 真名", url="u", content="原文", status="downloaded")
+        assert self._num(ch, use_translation=False) == "第三章 真名"  # left as-is
+
+    def test_guard_skips_english_marker(self):
+        ch = Chapter(index=1, title="t", url="u", content="c", translated="b",
+                     translated_title="Chapter 2 - The Fight", status="translated")
+        assert self._num(ch) == "Chapter 2 - The Fight"
+
+    def test_markdown_headings_are_numbered(self, tmp_path, meta):
+        chs = [
+            Chapter(index=0, title="第一章", url="u0", content="a", translated="Đoạn một",
+                    translated_title="Mở đầu", target_lang="vi", status="translated"),
+        ]
+        out = get_exporter("markdown").export(
+            meta, chs, tmp_path / "book.md", number_chapters=True
+        )
+        text = out.read_text(encoding="utf-8")
+        assert "## Chương 1: Mở đầu" in text
+        assert "Đoạn một" in text  # body preserved
+
+    def test_numbering_is_gap_preserving(self, tmp_path, meta):
+        # index 1 has no content → skipped; the surrounding chapters keep 1 and 3
+        gapped = [
+            Chapter(index=0, title="Mở đầu", url="u0", content="A", status="downloaded"),
+            Chapter(index=1, title="Trống", url="u1", content="", status="pending"),
+            Chapter(index=2, title="Kết", url="u2", content="C", status="downloaded"),
+        ]
+        out = get_exporter("markdown").export(
+            meta, gapped, tmp_path / "book.md", use_translation=False, number_chapters=True
+        )
+        text = out.read_text(encoding="utf-8")
+        assert "## Chương 1: Mở đầu" in text and "## Chương 3: Kết" in text
+        assert "Chương 2" not in text  # skipped chapter is not renumbered away
+
+    def test_epub_toc_is_numbered(self, tmp_path, meta):
+        chs = [
+            Chapter(index=0, title="第一章", url="u0", content="a", translated="Đoạn một",
+                    translated_title="Mở đầu", target_lang="vi", status="translated"),
+        ]
+        out = get_exporter("epub").export(meta, chs, tmp_path / "book.epub", number_chapters=True)
+        book = epub.read_epub(str(out))
+        assert [item.title for item in book.toc] == ["Chương 1: Mở đầu"]
+
+    def test_default_keeps_parsed_title(self, tmp_path, meta, chapters):
+        # regression: without the flag, an original-language export keeps the real title
+        out = get_exporter("markdown").export(
+            meta, chapters, tmp_path / "book.md", use_translation=False
+        )
+        text = out.read_text(encoding="utf-8")
+        assert "## 第一章" in text  # parsed title preserved
+        assert "Chương 1:" not in text  # no numbering applied
+
+
 class TestRegistry:
     def test_unknown(self):
         with pytest.raises(ExportError):
