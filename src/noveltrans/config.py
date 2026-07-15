@@ -21,7 +21,7 @@ DEFAULT_CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 DEFAULT_CLI_COMMAND = "agy -p"
 DEFAULT_CLAUDE_CLI_COMMAND = "claude -p"
 DEFAULT_LMSTUDIO_URL = "http://127.0.0.1:1234"
-DEFAULT_TTS_VOICE = "Ngọc Lan"
+DEFAULT_TTS_VOICE = "Ngọc Linh"
 DEFAULT_TTS_FORMAT = "mp3"  # falls back to wav when ffmpeg is missing
 
 TARGET_LANGS = {"vi": "Tiếng Việt", "en": "English"}

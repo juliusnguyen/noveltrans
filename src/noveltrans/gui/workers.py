@@ -335,6 +335,14 @@ class AudioWorker(QThread):
             self.failed.emit(f"Lỗi không mong đợi khi nạp TTS: {exc!r}")
             return
 
+        # The engine may have substituted a stale/unknown voice for a real one at
+        # load(); adopt the resolved voice so the filename, pending_audio dedup, and
+        # stored audio_voice all reflect the voice actually spoken.
+        self.voice = getattr(engine, "voice", self.voice)
+        notice = getattr(engine, "voice_notice", "")
+        if notice:
+            self.progress.emit(0, 0, notice)
+
         project = NovelProject.open(self.project_path)
         try:
             source = "translated" if self.use_translation else "original"
