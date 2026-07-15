@@ -1,10 +1,11 @@
-"""Tab 4 — Audio: read translated chapters aloud with a local TTS engine."""
+"""Tab 4 — Audio: read chapters aloud (translation or original) with a local TTS engine."""
 
 from __future__ import annotations
 
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QComboBox,
     QHBoxLayout,
     QHeaderView,
@@ -12,6 +13,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QTableView,
     QVBoxLayout,
     QWidget,
@@ -59,9 +61,27 @@ class AudioTab(QWidget):
             saved = self.format_combo.findData(config.tts_format)
             self.format_combo.setCurrentIndex(saved if saved >= 0 else 0)
 
+        # --- source: read the translation (default) or the original text
+        self.translated_radio = QRadioButton("Bản dịch")
+        self.original_radio = QRadioButton("Bản gốc")
+        self._source_group = QButtonGroup(self)
+        self._source_group.addButton(self.translated_radio)
+        self._source_group.addButton(self.original_radio)
+        (self.translated_radio if config.tts_use_translation else self.original_radio).setChecked(
+            True
+        )
+        self.original_radio.setToolTip(
+            "Đọc thẳng nội dung gốc (chưa dịch). Hợp với nguồn tiếng Việt như "
+            "medoctruyen.vn / giatocvuongtai.com — giọng VieNeu là tiếng Việt."
+        )
+        self._warned_original_lang = False  # toggled connected after the model exists
+
         top_row = QHBoxLayout()
         top_row.addWidget(QLabel("Truyện:"))
         top_row.addWidget(self.picker, stretch=1)
+        top_row.addWidget(QLabel("Nguồn:"))
+        top_row.addWidget(self.translated_radio)
+        top_row.addWidget(self.original_radio)
         top_row.addWidget(QLabel("Giọng đọc:"))
         top_row.addWidget(self.voice_combo)
         top_row.addWidget(QLabel("Định dạng:"))
@@ -69,6 +89,9 @@ class AudioTab(QWidget):
 
         # --- chapter table
         self.model = AudioChapterTableModel(self)
+        self.model.set_source(config.tts_use_translation)
+        # connect now that the model exists (setChecked above ran before this)
+        self.translated_radio.toggled.connect(self._on_source_changed)
         self.table = QTableView()
         self.table.setModel(self.model)
         self.table.horizontalHeader().setSectionResizeMode(
@@ -135,14 +158,43 @@ class AudioTab(QWidget):
         if path:
             self.project = NovelProject.open(path)
             self.model.set_chapters(self.project.chapters())
-            counts = self.project.counts()
-            self.status_label.setText(
-                f"{counts['translated']}/{counts['total']} chương đã dịch, "
-                f"{counts['audio']} đã có audio."
-            )
+            self._update_status_line()
         else:
             self.model.set_chapters([])
             self.status_label.setText("")
+
+    def _use_translation(self) -> bool:
+        return self.translated_radio.isChecked()
+
+    def _update_status_line(self) -> None:
+        if self.project is None:
+            return
+        counts = self.project.counts()
+        if self._use_translation():
+            ready = f"{counts['translated']}/{counts['total']} chương đã dịch"
+        else:
+            ready = f"{counts['downloaded']}/{counts['total']} chương đã tải"
+        self.status_label.setText(f"{ready}, {counts['audio']} đã có audio.")
+
+    def _on_source_changed(self) -> None:
+        use_translation = self._use_translation()
+        self.config.tts_use_translation = use_translation
+        self.model.set_source(use_translation)
+        self._update_status_line()
+        # VieNeu is a Vietnamese TTS: warn once if voicing a non-Vietnamese original
+        if (
+            not use_translation
+            and not self._warned_original_lang
+            and self.project is not None
+            and (self.project.meta.source_lang or "") != "vi"
+        ):
+            self._warned_original_lang = True
+            QMessageBox.warning(
+                self,
+                "Bản gốc không phải tiếng Việt",
+                "Giọng đọc VieNeu là tiếng Việt, nhưng bản gốc của truyện này không "
+                "phải tiếng Việt — audio tạo ra có thể không đúng. Nên dùng “Bản dịch”.",
+            )
 
     # ---------------------------------------------------------------- voices
 
@@ -167,18 +219,23 @@ class AudioTab(QWidget):
         if self.project is None:
             QMessageBox.information(self, "Chưa chọn truyện", "Hãy tải một truyện ở Tab 1 trước.")
             return
+        use_translation = self._use_translation()
         counts = self.project.counts()
-        if counts["translated"] == 0:
+        if use_translation and counts["translated"] == 0:
             QMessageBox.information(self, "Chưa có bản dịch", "Hãy dịch truyện ở Tab 2 trước.")
+            return
+        if not use_translation and counts["downloaded"] == 0:
+            QMessageBox.information(self, "Chưa tải", "Hãy tải truyện ở Tab 1 trước.")
             return
         voice = self.voice_combo.currentData() or self.voice_combo.currentText().strip()
         out_format = self.format_combo.currentData()
         if indices is None:
-            # a voice change re-pends chapters voiced differently (like a language switch)
-            total = len(self.project.pending_audio(voice))
+            # a voice or source change re-pends chapters voiced differently
+            total = len(self.project.pending_audio(voice, use_translation))
             if total == 0:
+                nguon = "bản dịch" if use_translation else "bản gốc"
                 QMessageBox.information(
-                    self, "Đã đủ", f"Mọi chương đã dịch đều có audio giọng {voice}."
+                    self, "Đã đủ", f"Mọi chương ({nguon}) đều có audio giọng {voice}."
                 )
                 return
         else:
@@ -195,7 +252,11 @@ class AudioTab(QWidget):
         self.progress.setValue(0)
 
         self._worker = AudioWorker(
-            self.project.path, voice=voice, out_format=out_format, indices=indices
+            self.project.path,
+            voice=voice,
+            out_format=out_format,
+            indices=indices,
+            use_translation=use_translation,
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.chapter_done.connect(self._on_chapter_updated)
@@ -206,7 +267,9 @@ class AudioTab(QWidget):
 
     def _regenerate_row(self, row: int) -> None:
         chapter = self.model.chapter_at(row)
-        if chapter is None or self.project is None or not chapter.translated:
+        if chapter is None or self.project is None:
+            return
+        if not (chapter.translated if self._use_translation() else chapter.content):
             return
         if self._worker is not None and self._worker.isRunning():
             self.status_label.setText("Đang có phiên tạo audio chạy — chờ xong rồi thử lại.")

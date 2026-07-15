@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS chapters (
   updated_at       TEXT NOT NULL DEFAULT '',
   audio_path       TEXT NOT NULL DEFAULT '',
   audio_voice      TEXT NOT NULL DEFAULT '',
+  audio_source     TEXT NOT NULL DEFAULT 'translated',
   audio_seconds    REAL NOT NULL DEFAULT 0,
   audio_error      TEXT NOT NULL DEFAULT ''
 );
@@ -83,6 +84,7 @@ def _row_to_chapter(row: sqlite3.Row) -> Chapter:
         updated_at=row["updated_at"],
         audio_path=row["audio_path"],
         audio_voice=row["audio_voice"],
+        audio_source=row["audio_source"],
         audio_seconds=row["audio_seconds"],
         audio_error=row["audio_error"],
     )
@@ -108,6 +110,8 @@ class NovelProject:
             "translate_seconds": "REAL NOT NULL DEFAULT 0",
             "audio_path": "TEXT NOT NULL DEFAULT ''",
             "audio_voice": "TEXT NOT NULL DEFAULT ''",
+            # existing audio predates the original/translation choice → it's translated
+            "audio_source": "TEXT NOT NULL DEFAULT 'translated'",
             "audio_seconds": "REAL NOT NULL DEFAULT 0",
             "audio_error": "TEXT NOT NULL DEFAULT ''",
         }
@@ -221,20 +225,24 @@ class NovelProject:
         ).fetchall()
         return [_row_to_chapter(r) for r in rows]
 
-    def pending_audio(self, voice: str = "") -> list[Chapter]:
-        """Translated chapters that don't have audio in `voice` yet.
+    def pending_audio(self, voice: str = "", use_translation: bool = True) -> list[Chapter]:
+        """Chapters that need audio in `voice` from the requested source.
 
-        Like pending_translation with a language switch: audio generated with a
-        *different* voice counts as pending again (the old file gets replaced).
-        Empty `voice` only checks for missing audio.
+        `use_translation` chooses which text gates availability — the translation
+        (default) or the original `content`. A chapter is pending if it has that source
+        text AND (has no audio yet, OR its audio used a *different* voice, OR its audio
+        was made from the *other* source). Empty `voice` skips the voice-mismatch check.
         """
+        src_col = "translated" if use_translation else "content"
+        source = "translated" if use_translation else "original"
         rows = self._db.execute(
-            """
+            f"""
             SELECT * FROM chapters
-            WHERE translated != '' AND (audio_path = '' OR (? != '' AND audio_voice != ?))
+            WHERE {src_col} != ''
+              AND (audio_path = '' OR (? != '' AND audio_voice != ?) OR audio_source != ?)
             ORDER BY idx
             """,
-            (voice, voice),
+            (voice, voice, source),
         ).fetchall()
         return [_row_to_chapter(r) for r in rows]
 
@@ -323,12 +331,19 @@ class NovelProject:
                 (STATUS_ERROR, message, _now(), idx),
             )
 
-    def save_audio(self, idx: int, rel_path: str, voice: str, seconds: float) -> None:
+    def save_audio(
+        self,
+        idx: int,
+        rel_path: str,
+        voice: str,
+        seconds: float,
+        source: str = "translated",
+    ) -> None:
         with self._db:
             self._db.execute(
-                "UPDATE chapters SET audio_path = ?, audio_voice = ?, audio_seconds = ?,"
-                " audio_error = '', updated_at = ? WHERE idx = ?",
-                (rel_path, voice, seconds, _now(), idx),
+                "UPDATE chapters SET audio_path = ?, audio_voice = ?, audio_source = ?,"
+                " audio_seconds = ?, audio_error = '', updated_at = ? WHERE idx = ?",
+                (rel_path, voice, source, seconds, _now(), idx),
             )
 
     def mark_audio_error(self, idx: int, message: str) -> None:

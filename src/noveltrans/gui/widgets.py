@@ -151,10 +151,19 @@ class AudioChapterTableModel(QAbstractTableModel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._chapters: list[Chapter] = []
+        self._use_translation = True  # which text the audio is voiced from
 
     def set_chapters(self, chapters: list[Chapter]) -> None:
         self.beginResetModel()
         self._chapters = list(chapters)
+        self.endResetModel()
+
+    def set_source(self, use_translation: bool) -> None:
+        """Switch the source-text the status column reflects (Bản dịch / Bản gốc)."""
+        if use_translation == self._use_translation:
+            return
+        self.beginResetModel()
+        self._use_translation = use_translation
         self.endResetModel()
 
     def update_chapter(self, chapter: Chapter) -> None:
@@ -168,8 +177,10 @@ class AudioChapterTableModel(QAbstractTableModel):
         return self._chapters[row] if 0 <= row < len(self._chapters) else None
 
     def _audio_status(self, chapter: Chapter) -> tuple[str, QColor]:
-        if not chapter.translated:
+        if self._use_translation and not chapter.translated:
             return "Chưa dịch", STATUS_COLORS[STATUS_PENDING]
+        if not self._use_translation and not chapter.content:
+            return "Chưa tải", STATUS_COLORS[STATUS_PENDING]
         if chapter.audio_error:
             return "Lỗi", STATUS_COLORS[STATUS_ERROR]
         if chapter.has_audio:
@@ -196,7 +207,9 @@ class AudioChapterTableModel(QAbstractTableModel):
             if column == 0:
                 return chapter.index + 1
             if column == self.TITLE_COLUMN:
-                return chapter.translated_title or chapter.title
+                if self._use_translation:
+                    return chapter.translated_title or chapter.title
+                return chapter.title
             if column == self.STATUS_COLUMN:
                 return self._audio_status(chapter)[0]
             if column == self.DURATION_COLUMN:
@@ -216,9 +229,10 @@ class AudioChapterTableModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.TextAlignmentRole and column == self.DURATION_COLUMN:
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         if column == self.REGENERATE_COLUMN:
+            has_source = bool(chapter.translated if self._use_translation else chapter.content)
             if role == Qt.ItemDataRole.UserRole:
-                return bool(chapter.translated)
-            if role == Qt.ItemDataRole.ToolTipRole and chapter.translated:
+                return has_source
+            if role == Qt.ItemDataRole.ToolTipRole and has_source:
                 return "Tạo (lại) audio riêng chương này"
         return None
 

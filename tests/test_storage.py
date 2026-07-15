@@ -240,6 +240,34 @@ class TestAudioState:
         project = self._translated_project(library_dir, sample_meta, sample_refs)
         assert project.audio_dir == project.exports_dir / "audio"
 
+    def test_pending_audio_original_uses_content(self, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_content(0, "nội dung gốc")  # downloaded, NOT translated
+        # translation source sees nothing pending; original source sees the chapter
+        assert project.pending_audio(use_translation=True) == []
+        assert [c.index for c in project.pending_audio(use_translation=False)] == [0]
+
+    def test_save_audio_records_source(self, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_content(0, "nội dung gốc")
+        project.save_audio(0, "exports/audio/0001.wav", "Ngọc Lan", 5.0, source="original")
+        assert project.chapter(0).audio_source == "original"
+
+    def test_switching_source_repends(self, library_dir, sample_meta, sample_refs):
+        project = self._translated_project(library_dir, sample_meta, sample_refs)  # has both
+        project.save_audio(0, "exports/audio/0001.wav", "Ngọc Lan", 5.0, source="translated")
+        # same source+voice → not pending; the other source re-pends the chapter
+        assert project.pending_audio("Ngọc Lan", use_translation=True) == []
+        assert [c.index for c in project.pending_audio("Ngọc Lan", use_translation=False)] == [0]
+
+    def test_legacy_audio_defaults_to_translated(self, library_dir, sample_meta, sample_refs):
+        # audio saved before the source column existed back-fills to 'translated', so
+        # the translation query does NOT needlessly re-pend it
+        project = self._translated_project(library_dir, sample_meta, sample_refs)
+        project.save_audio(0, "exports/audio/0001.wav", "Ngọc Lan", 5.0)  # no source arg
+        assert project.chapter(0).audio_source == "translated"
+        assert project.pending_audio("Ngọc Lan", use_translation=True) == []
+
 
 class TestMetaTranslation:
     def test_save_and_reload(self, library_dir, sample_meta, sample_refs):
