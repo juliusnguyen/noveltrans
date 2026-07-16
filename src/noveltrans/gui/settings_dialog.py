@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
 )
 
@@ -185,6 +186,18 @@ class SettingsDialog(QDialog):
         self.keep_awake_check.setChecked(config.keep_awake_enabled)
         form.addRow("Chống ngủ:", self.keep_awake_check)
 
+        # Parallel TTS workers — each loads its own ~334MB model, so more workers
+        # means proportionally more RAM and CPU. Default 1 = current behavior.
+        self.tts_workers_spin = QSpinBox()
+        self.tts_workers_spin.setRange(1, 6)
+        self.tts_workers_spin.setValue(config.tts_workers)
+        self.tts_workers_spin.setToolTip(
+            "Số luồng tạo audio song song. Mỗi luồng nạp một model VieNeu riêng "
+            "(~334 MB RAM/luồng) và dùng thêm CPU. 1 = tuần tự (mặc định). "
+            "Chỉ tăng nếu máy nhiều RAM/nhân."
+        )
+        form.addRow("Luồng tạo audio song song:", self.tts_workers_spin)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -264,5 +277,6 @@ class SettingsDialog(QDialog):
         self.config.discord_channel_url = channel_url
         self.config.keep_awake_enabled = self.keep_awake_check.isChecked()
         keep_awake.set_enabled(self.keep_awake_check.isChecked())  # apply live
+        self.config.tts_workers = self.tts_workers_spin.value()
         self.config.sync()
         super().accept()

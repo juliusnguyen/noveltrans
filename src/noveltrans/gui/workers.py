@@ -7,7 +7,11 @@ NovelProject inside run(). The GUI keeps its own read connection.
 
 from __future__ import annotations
 
+import queue
+import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
@@ -290,8 +294,29 @@ class LmStudioModelsWorker(QThread):
         self.models_listed.emit(self.base_url, list_models(self.base_url))
 
 
+@dataclass
+class _AudioResult:
+    """One chapter's synthesis outcome, passed from a pool thread back to the
+    orchestrator (which owns the sqlite connection and does all DB writes)."""
+
+    index: int
+    title: str
+    status: str  # "ok" | "error" | "cancelled"
+    rel_path: str = ""
+    seconds: float = 0.0
+    prev_audio_path: str = ""  # chapter.audio_path, for stale-file cleanup
+    error: str = ""
+
+
 class AudioWorker(QThread):
-    """Generate audio for a project's translated (or original) chapters, resumably."""
+    """Generate audio for a project's translated (or original) chapters, resumably.
+
+    A single orchestrator QThread: it loads one "probe" engine up front (fail-fast
+    + voice resolution), owns the one NovelProject sqlite connection, and performs
+    all DB writes. With workers == 1 it runs a plain sequential loop; with
+    workers > 1 it drives a thread pool whose threads each reuse their own engine
+    and only synthesize files, handing results back here to commit.
+    """
 
     progress = Signal(int, int, str)  # done, total, chapter title / phase message
     chapter_done = Signal(int)
@@ -306,6 +331,7 @@ class AudioWorker(QThread):
         out_format: str = "wav",  # "wav" or "mp3" (mp3 needs ffmpeg)
         indices: list[int] | None = None,
         use_translation: bool = True,  # False = voice the original `content`
+        workers: int = 1,  # >1 synthesizes chapters in parallel (N engines in RAM)
         parent=None,
     ):
         super().__init__(parent)
@@ -314,6 +340,7 @@ class AudioWorker(QThread):
         self.out_format = out_format
         self.indices = indices  # None = all pending; else re-generate exactly these
         self.use_translation = use_translation
+        self.workers = max(1, int(workers))
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -321,13 +348,15 @@ class AudioWorker(QThread):
 
     def run(self) -> None:
         from noveltrans.errors import TtsError
-        from noveltrans.storage.project import slugify
         from noveltrans.tts import get_tts_engine
 
         try:
-            engine = get_tts_engine("vieneu", voice=self.voice)
+            # The "probe" engine: fail fast on load errors and resolve the voice
+            # once. With parallel workers it becomes the first pool thread's engine
+            # (seeded below), so its ~334 MB load is never wasted.
+            probe = get_tts_engine("vieneu", voice=self.voice)
             self.progress.emit(0, 0, "Đang tải model VieNeu (~330 MB lần đầu)…")
-            engine.load()
+            probe.load()
         except TtsError as exc:
             self.failed.emit(str(exc))
             return
@@ -338,8 +367,8 @@ class AudioWorker(QThread):
         # The engine may have substituted a stale/unknown voice for a real one at
         # load(); adopt the resolved voice so the filename, pending_audio dedup, and
         # stored audio_voice all reflect the voice actually spoken.
-        self.voice = getattr(engine, "voice", self.voice)
-        notice = getattr(engine, "voice_notice", "")
+        self.voice = getattr(probe, "voice", self.voice)
+        notice = getattr(probe, "voice_notice", "")
         if notice:
             self.progress.emit(0, 0, notice)
 
@@ -355,55 +384,181 @@ class AudioWorker(QThread):
                 ]
             else:
                 pending = project.pending_audio(self.voice, self.use_translation)
-            total = len(pending)
-            done = 0
-            errors = 0
             project.audio_dir.mkdir(parents=True, exist_ok=True)
 
-            for chapter in pending:
-                if self._cancelled:
-                    break
-                if self.use_translation:
-                    title, text = chapter.translated_title or chapter.title, chapter.translated
-                else:
-                    title, text = chapter.title, chapter.content
-                self.progress.emit(done, total, title)
-                # voice in the filename: re-voicing creates a NEW file, so audio
-                # players that cached/imported the old one can't play stale audio
-                name = f"{chapter.index + 1:04d}-{slugify(title)}-{slugify(self.voice)}.wav"
-                out_path = project.audio_dir / name
-                try:
-                    seconds = engine.synthesize_chapter(
-                        title,
-                        text,
-                        out_path,
-                        cancelled=lambda: self._cancelled,
-                    )
-                    if self.out_format == "mp3":
-                        from noveltrans.tts.convert import convert_to_mp3
-
-                        out_path = convert_to_mp3(out_path)
-                    rel_path = str(out_path.relative_to(project.path))
-                    if chapter.audio_path and chapter.audio_path != rel_path:
-                        # re-voiced with another format — drop the stale old file
-                        (project.path / chapter.audio_path).unlink(missing_ok=True)
-                    project.save_audio(chapter.index, rel_path, self.voice, seconds, source)
-                    self.chapter_done.emit(chapter.index)
-                except TtsError as exc:
-                    if self._cancelled:
-                        break  # mid-chapter cancel, not a real error
-                    errors += 1
-                    project.mark_audio_error(chapter.index, str(exc))
-                    self.chapter_error.emit(chapter.index, str(exc))
-                except Exception as exc:  # keep the batch going
-                    errors += 1
-                    project.mark_audio_error(chapter.index, repr(exc))
-                    self.chapter_error.emit(chapter.index, repr(exc))
-                done += 1
-            self.progress.emit(done, total, "")
-            self.finished_ok.emit(done - errors, errors)
+            if self.workers == 1:
+                self._run_sequential(project, probe, pending, source)
+            else:
+                self._run_parallel(project, probe, pending, source)
         finally:
             project.close()
+
+    def _title_text_for(self, chapter) -> tuple[str, str]:
+        if self.use_translation:
+            return chapter.translated_title or chapter.title, chapter.translated
+        return chapter.title, chapter.content
+
+    def _run_sequential(self, project, engine, pending: list, source: str) -> None:
+        """The original single-engine loop — used whenever workers == 1."""
+        from noveltrans.errors import TtsError
+        from noveltrans.storage.project import slugify
+
+        total = len(pending)
+        done = 0
+        errors = 0
+        for chapter in pending:
+            if self._cancelled:
+                break
+            title, text = self._title_text_for(chapter)
+            self.progress.emit(done, total, title)
+            # voice in the filename: re-voicing creates a NEW file, so audio
+            # players that cached/imported the old one can't play stale audio
+            name = f"{chapter.index + 1:04d}-{slugify(title)}-{slugify(self.voice)}.wav"
+            out_path = project.audio_dir / name
+            try:
+                seconds = engine.synthesize_chapter(
+                    title,
+                    text,
+                    out_path,
+                    cancelled=lambda: self._cancelled,
+                )
+                if self.out_format == "mp3":
+                    from noveltrans.tts.convert import convert_to_mp3
+
+                    out_path = convert_to_mp3(out_path)
+                rel_path = str(out_path.relative_to(project.path))
+                if chapter.audio_path and chapter.audio_path != rel_path:
+                    # re-voiced with another format — drop the stale old file
+                    (project.path / chapter.audio_path).unlink(missing_ok=True)
+                project.save_audio(chapter.index, rel_path, self.voice, seconds, source)
+                self.chapter_done.emit(chapter.index)
+            except TtsError as exc:
+                if self._cancelled:
+                    break  # mid-chapter cancel, not a real error
+                errors += 1
+                project.mark_audio_error(chapter.index, str(exc))
+                self.chapter_error.emit(chapter.index, str(exc))
+            except Exception as exc:  # keep the batch going
+                errors += 1
+                project.mark_audio_error(chapter.index, repr(exc))
+                self.chapter_error.emit(chapter.index, repr(exc))
+            done += 1
+        self.progress.emit(done, total, "")
+        self.finished_ok.emit(done - errors, errors)
+
+    def _engine_for_thread(self, tl: threading.local, seed: "queue.Queue"):
+        """One TTS engine per pool thread, loaded once and reused across chapters.
+
+        The first thread reuses the already-loaded probe from `seed`; later threads
+        build+load their own. Only min(workers, #chapters) engines ever load, since
+        this runs lazily as pool threads actually start pulling work.
+        """
+        engine = getattr(tl, "engine", None)
+        if engine is None:
+            try:
+                engine = seed.get_nowait()  # reuse the loaded probe on the first thread
+            except queue.Empty:
+                from noveltrans.tts import get_tts_engine
+
+                engine = get_tts_engine("vieneu", voice=self.voice)  # voice already resolved
+                engine.load()  # lazy: only when a new thread actually starts
+            tl.engine = engine
+        return engine
+
+    def _synth_one(self, chapter, source: str, project_path, audio_dir, tl, seed) -> _AudioResult:
+        """Synthesize one chapter to disk on a pool thread. No sqlite access — the
+        orchestrator commits the returned result on the connection-owning thread."""
+        from noveltrans.errors import TtsError
+        from noveltrans.storage.project import slugify
+
+        if self._cancelled:
+            return _AudioResult(chapter.index, "", "cancelled")
+        engine = self._engine_for_thread(tl, seed)
+        title, text = self._title_text_for(chapter)
+        name = f"{chapter.index + 1:04d}-{slugify(title)}-{slugify(self.voice)}.wav"
+        out_path = audio_dir / name
+        try:
+            seconds = engine.synthesize_chapter(
+                title, text, out_path, cancelled=lambda: self._cancelled
+            )
+            if self.out_format == "mp3":
+                from noveltrans.tts.convert import convert_to_mp3
+
+                out_path = convert_to_mp3(out_path)
+            rel_path = str(out_path.relative_to(project_path))
+            return _AudioResult(
+                chapter.index, title, "ok", rel_path, seconds, chapter.audio_path or ""
+            )
+        except TtsError as exc:
+            if self._cancelled:
+                return _AudioResult(chapter.index, title, "cancelled")  # mid-chapter cancel
+            return _AudioResult(chapter.index, title, "error", error=str(exc))
+        except Exception as exc:  # keep the batch going
+            return _AudioResult(chapter.index, title, "error", error=repr(exc))
+
+    def _run_parallel(self, project, probe, pending: list, source: str) -> None:
+        """Synthesize chapters across a thread pool; commit results here, in order
+        of completion, on the sqlite-owning orchestrator thread."""
+        total = len(pending)
+        done = 0
+        errors = 0
+        if total == 0:
+            self.progress.emit(0, 0, "")
+            self.finished_ok.emit(0, 0)
+            return
+
+        tl = threading.local()
+        seed: queue.Queue = queue.Queue()
+        seed.put(probe)  # first pool thread reuses the already-loaded probe
+        pending_iter = iter(pending)
+        inflight: set = set()
+        n_workers = min(self.workers, total)
+        pool = ThreadPoolExecutor(max_workers=n_workers)
+
+        def submit_next() -> bool:
+            if self._cancelled:
+                return False
+            try:
+                chapter = next(pending_iter)
+            except StopIteration:
+                return False
+            inflight.add(
+                pool.submit(
+                    self._synth_one, chapter, source, project.path, project.audio_dir, tl, seed
+                )
+            )
+            return True
+
+        try:
+            for _ in range(n_workers):
+                if not submit_next():
+                    break
+            while inflight:
+                finished, still = wait(inflight, return_when=FIRST_COMPLETED)
+                inflight = set(still)
+                for fut in finished:
+                    result = fut.result()
+                    if result.status == "cancelled":
+                        continue  # not counted, no write (matches sequential break)
+                    if result.status == "ok":
+                        if result.prev_audio_path and result.prev_audio_path != result.rel_path:
+                            # re-voiced with another format — drop the stale old file
+                            (project.path / result.prev_audio_path).unlink(missing_ok=True)
+                        project.save_audio(
+                            result.index, result.rel_path, self.voice, result.seconds, source
+                        )
+                        self.chapter_done.emit(result.index)
+                    else:  # "error"
+                        errors += 1
+                        project.mark_audio_error(result.index, result.error)
+                        self.chapter_error.emit(result.index, result.error)
+                    done += 1
+                    self.progress.emit(done, total, result.title)
+                    submit_next()  # backfill; a no-op once cancelled or exhausted
+        finally:
+            pool.shutdown(wait=True)  # let in-flight chapters finish/cancel cleanly
+        self.progress.emit(done, total, "")
+        self.finished_ok.emit(done - errors, errors)
 
 
 class MergeWorker(QThread):
