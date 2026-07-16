@@ -100,6 +100,15 @@ class SiteAdapter(ABC):
     def matches(cls, url: str) -> bool:
         return any(re.search(p, url) for p in cls.url_patterns)
 
+    def close(self) -> None:
+        """Release anything held for the batch. Default: nothing.
+
+        Most adapters fetch over the shared HttpClient and hold nothing of their own.
+        One (69shuba) drives a browser for the life of a scan/download, and a leaked
+        Chromium is a window the user has to force-quit — so workers call this in a
+        `finally`. Must be idempotent and must never raise.
+        """
+
     @abstractmethod
     def fetch_metadata(self, url: str) -> NovelMeta:
         """Scrape title/author/description from the novel's landing page."""

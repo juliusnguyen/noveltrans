@@ -49,6 +49,7 @@ class ScanWorker(QThread):
         self.cookies = cookies
 
     def run(self) -> None:
+        adapter = None
         try:
             client = HttpClient(delay_seconds=self.delay)
             adapter = adapter_for_url(self.url, client)
@@ -75,6 +76,9 @@ class ScanWorker(QThread):
             self.failed.emit(str(exc))
         except Exception as exc:  # unexpected — still must not crash the app
             self.failed.emit(f"Lỗi không mong đợi: {exc!r}")
+        finally:
+            if adapter is not None:
+                adapter.close()  # 69shuba holds a browser; don't leak it
 
 
 class TranslateWorker(QThread):
@@ -765,6 +769,7 @@ class DownloadWorker(QThread):
 
     def run(self) -> None:
         project = NovelProject.open(self.project_path)
+        adapter = None
         try:
             client = HttpClient(delay_seconds=self.delay)
             adapter = adapter_for_url(project.meta.url, client)
@@ -808,6 +813,8 @@ class DownloadWorker(QThread):
             self.progress.emit(done, total, "")
             self.finished_ok.emit(done - errors, errors)
         finally:
+            if adapter is not None:
+                adapter.close()  # 69shuba holds a browser for the whole batch
             project.close()
 
 
