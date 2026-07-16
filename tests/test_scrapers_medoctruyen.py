@@ -69,12 +69,18 @@ class TestChapterList:
 
         assert len(refs) == 6  # chapters 1–6, chrome/duplicate links deduped
         assert [r.index for r in refs] == [0, 1, 2, 3, 4, 5]
-        assert refs[0].title == "Chương 1: Khởi đầu"  # not "Đọc từ đầu"
+        # status badges dropped: title span used (ch.1 "Đã đọc" badge span), and the
+        # plain-text fallback strips several trailing badges (ch.3 "Miễn phí Đã đọc")
+        assert refs[0].title == "Chương 1: Khởi đầu"  # not "… Đã đọc", not "Đọc từ đầu"
+        assert refs[1].title == "Chương 2: Gặp gỡ"
+        assert refs[2].title == "Chương 3: Ngã rẽ"
         assert refs[0].url == f"{TOC_URL}/chuong-1"
         assert refs[-1].title == "Chương 6: Chương mới nhất"
         assert refs[-1].url == f"{TOC_URL}/chuong-6"
-        # trailing "Miễn phí" free-tag stripped from titles
-        assert all("Miễn phí" not in r.title for r in refs)
+        # no badge text leaks into any title
+        assert all(
+            badge not in r.title for r in refs for badge in ("Miễn phí", "Đã đọc", "VIP")
+        )
 
 
 class TestChapterContentFull:

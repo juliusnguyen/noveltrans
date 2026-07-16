@@ -35,7 +35,9 @@ _ORIGIN = "https://medoctruyen.vn"
 _SLUG_RE = re.compile(r"medoctruyen\.vn/([a-z0-9-]+)")
 _CH_NUM_RE = re.compile(r"/chuong-(\d+)")
 _CH_PAGE_RE = re.compile(r"[?&]ch=(\d+)")
-_FREE_TAG = "Miễn phí"  # trailing tag appended to free-chapter link text
+# Per-chapter status badges the TOC appends next to the title; stripped from the plain
+# fallback path (structured links carry them in their own <span>, ignored entirely).
+_BADGE_TAGS = ("Đã đọc", "Miễn phí", "VIP", "Trả phí", "Mới")
 _MAX_TOC_PAGES = 500  # sanity cap in case pager markup drifts
 _RATE_LIMIT_NOTICE = "Bạn đọc quá nhanh"  # shown when the site throttles reads
 _DAILY_LIMIT_NOTICE = "GIỚI HẠN ĐỌC TRONG NGÀY"  # hard 50-chapters/day cap page
@@ -139,8 +141,7 @@ class MedoctruyenAdapter(SiteAdapter):
                 number = int(num_match.group(1))
                 found += 1
                 if number not in by_number:
-                    title = text.removesuffix(_FREE_TAG).strip()
-                    by_number[number] = title
+                    by_number[number] = self._chapter_title(a)
             # A page that yields no chapter links means we've run past the end.
             if found == 0 and page > 1:
                 break
@@ -152,6 +153,30 @@ class MedoctruyenAdapter(SiteAdapter):
             ChapterRef(index=i, title=by_number[num], url=f"{base}/chuong-{num}")
             for i, num in enumerate(sorted(by_number))
         ]
+
+    @staticmethod
+    def _chapter_title(a) -> str:
+        """The chapter title from a TOC link, without status badges.
+
+        The full TOC renders the title and each status badge ("Đã đọc", "Miễn phí", …)
+        in separate <span>s, so we take the title span (the one starting with "Chương")
+        and ignore the rest — robust to any badge. The compact "latest chapter" links
+        have no inner span; there we fall back to the link text and strip known trailing
+        badges.
+        """
+        for span in a.find_all("span"):
+            span_text = span.get_text(" ", strip=True)
+            if span_text.startswith("Chương"):
+                return span_text
+        title = a.get_text(" ", strip=True)
+        changed = True
+        while changed:  # a link may carry several badges (e.g. "… Miễn phí Đã đọc")
+            changed = False
+            for tag in _BADGE_TAGS:
+                if title.endswith(tag):
+                    title = title[: -len(tag)].strip()
+                    changed = True
+        return title
 
     @staticmethod
     def _daily_limit_details(soup: BeautifulSoup, html: str) -> tuple[str, str, str]:

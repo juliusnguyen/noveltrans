@@ -11,9 +11,11 @@
     <a href="/truyen-thu/chuong-1">Đọc từ đầu</a>
   </div>
   <ul class="book-list">
-    <li><a href="/truyen-thu/chuong-1">Chương 1: Khởi đầu Miễn phí</a></li>
-    <li><a href="/truyen-thu/chuong-2">Chương 2: Gặp gỡ Miễn phí</a></li>
-    <li><a href="/truyen-thu/chuong-3">Chương 3: Ngã rẽ Miễn phí</a></li>
+    <!-- real markup: title + status badges in separate spans -->
+    <li><a href="/truyen-thu/chuong-1"><span class="flex-1 truncate">Chương 1: Khởi đầu</span><span class="text-text-muted">Đã đọc</span></a></li>
+    <li><a href="/truyen-thu/chuong-2"><span class="flex-1 truncate">Chương 2: Gặp gỡ</span><span class="badge">Miễn phí</span></a></li>
+    <!-- plainer variant: badges as trailing text (fallback stripping) -->
+    <li><a href="/truyen-thu/chuong-3">Chương 3: Ngã rẽ Miễn phí Đã đọc</a></li>
   </ul>
 </body>
 </html>
