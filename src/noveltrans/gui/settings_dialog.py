@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 
 from noveltrans.config import TARGET_LANGS, AppConfig, translator_labels
 from noveltrans.discord_unlock import valid_channel_url
+from noveltrans.gui import keep_awake
 from noveltrans.gui.workers import DiscordLoginWorker
 
 _MEDOCTRUYEN_LOGIN_URL = "https://medoctruyen.vn/auth/login"
@@ -179,6 +180,11 @@ class SettingsDialog(QDialog):
         discord_hint.setWordWrap(True)
         form.addRow("", discord_hint)
 
+        # Keep the Mac awake while a job runs so it doesn't idle-sleep mid-download.
+        self.keep_awake_check = QCheckBox("Giữ máy thức khi đang chạy (tải/dịch/tạo audio)")
+        self.keep_awake_check.setChecked(config.keep_awake_enabled)
+        form.addRow("Chống ngủ:", self.keep_awake_check)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -256,5 +262,7 @@ class SettingsDialog(QDialog):
             )
         self.config.discord_autounlock_enabled = self.discord_enable.isChecked()
         self.config.discord_channel_url = channel_url
+        self.config.keep_awake_enabled = self.keep_awake_check.isChecked()
+        keep_awake.set_enabled(self.keep_awake_check.isChecked())  # apply live
         self.config.sync()
         super().accept()

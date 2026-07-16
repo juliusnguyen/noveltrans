@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 
 from noveltrans.config import AppConfig
 from noveltrans.discord_unlock import valid_channel_url
+from noveltrans.gui.keep_awake import track_worker
 from noveltrans.gui.notify import clear_dock_badge, request_attention, set_dock_badge
 from noveltrans.gui.widgets import ChapterTableModel, ProjectPicker, enable_cell_copy
 from noveltrans.gui.workers import DownloadWorker, ScanWorker, UnlockWorker
@@ -241,6 +242,7 @@ class ScrapeTab(QWidget):
         self._download_worker.chapter_error.connect(lambda idx, _msg: self._on_chapter_updated(idx))
         self._download_worker.daily_limit_hit.connect(self._on_daily_limit)
         self._download_worker.finished_ok.connect(self._on_download_finished)
+        track_worker(self._download_worker)  # keep the Mac awake for the batch
         self._download_worker.start()
 
     def _cancel_download(self) -> None:

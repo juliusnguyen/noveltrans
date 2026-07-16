@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from noveltrans.config import TARGET_LANGS, AppConfig, translator_labels
+from noveltrans.gui.keep_awake import track_worker
 from noveltrans.gui.widgets import (
     ChapterTableModel,
     ProjectPicker,
@@ -378,6 +379,7 @@ class TranslateTab(QWidget):
         self._worker.chapter_error.connect(lambda idx, _msg: self._on_chapter_updated(idx))
         self._worker.failed.connect(self._on_failed)
         self._worker.finished_ok.connect(self._on_finished)
+        track_worker(self._worker)  # keep the Mac awake while translating
         self._worker.start()
 
     def _retranslate_row(self, row: int) -> None:

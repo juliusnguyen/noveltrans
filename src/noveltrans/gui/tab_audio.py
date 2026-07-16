@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from noveltrans.config import AppConfig
+from noveltrans.gui.keep_awake import track_worker
 from noveltrans.gui.widgets import (
     AudioChapterTableModel,
     ProjectPicker,
@@ -334,6 +335,7 @@ class AudioTab(QWidget):
         self._worker.chapter_error.connect(lambda idx, _msg: self._on_chapter_updated(idx))
         self._worker.failed.connect(self._on_failed)
         self._worker.finished_ok.connect(self._on_finished)
+        track_worker(self._worker)  # keep the Mac awake while generating audio
         self._worker.start()
 
     def _regenerate_row(self, row: int) -> None:
@@ -475,6 +477,7 @@ class AudioTab(QWidget):
         self._merge_worker.file_done.connect(self._on_merge_file_done)
         self._merge_worker.finished_ok.connect(self._on_merge_finished)
         self._merge_worker.failed.connect(self._on_merge_failed)
+        track_worker(self._merge_worker)  # keep the Mac awake while merging
         self._merge_worker.start()
 
     def _on_merge_progress(self, done: int, total: int, name: str) -> None:

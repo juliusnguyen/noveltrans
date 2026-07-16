@@ -181,6 +181,15 @@ class AppConfig:
     def tts_use_translation(self, value: bool) -> None:
         self._s.setValue("tts_use_translation", bool(value))
 
+    @property
+    def keep_awake_enabled(self) -> bool:
+        """Keep the Mac awake while a download/translate/TTS/merge job is running."""
+        return self._s.value("keep_awake_enabled", True, type=bool)
+
+    @keep_awake_enabled.setter
+    def keep_awake_enabled(self, value: bool) -> None:
+        self._s.setValue("keep_awake_enabled", bool(value))
+
     def cli_model_for(self, engine: str) -> str:
         """Model override for a CLI-based engine ("" = the CLI's own default)."""
         return str(self._s.value(f"{engine}_model", ""))
