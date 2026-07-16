@@ -12,6 +12,10 @@ Design choices (see changes/004-DISCORD-AUTOUNLOCK):
     command picker, press Enter to insert the command, type the code argument, then
     Enter to submit — mirroring a human typing in the official web client.
 
+The browser launch itself lives in `noveltrans.browser`, shared with the Cloudflare
+solver (see changes/015-69SHUBA-SOURCE); this module keeps the Discord-specific DOM
+handling and its own Vietnamese error strings.
+
 Playwright is an optional dependency (`pip install 'noveltrans[discord]'` then
 `playwright install chromium`); it is imported lazily so the core app runs without it.
 
@@ -24,6 +28,9 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from noveltrans.browser import BrowserUnavailableError
+from noveltrans.browser import close as _close
+from noveltrans.browser import launch_persistent_context, require_playwright
 from noveltrans.storage.library import DEFAULT_LIBRARY_DIR
 
 # The composer, the command picker option, and the "still logged out" markers. Kept
@@ -35,16 +42,6 @@ _LOGGED_IN_URL_RE = re.compile(r"/channels/")
 _CHANNEL_URL_RE = re.compile(r"^https://discord\.com/channels/(\d+|@me)/(\d+)/?$")
 
 _COMMAND = "mochuong"  # the site's unlock slash command, without the leading "/"
-
-# Real Chrome first, Playwright's bundled Chromium (channel=None) as the fallback.
-_BROWSER_CHANNELS = ("chrome", None)
-_LAUNCH_ARGS = [
-    "--no-first-run",
-    "--no-default-browser-check",
-    # Discord's login gates react badly to navigator.webdriver; this and dropping
-    # --enable-automation keep the window looking like an ordinary Chrome.
-    "--disable-blink-features=AutomationControlled",
-]
 
 _PICKER_WAIT_MS = 5_000  # how long to wait for the slash-command popup to render
 _TYPE_DELAY_MS = 40  # per-keystroke delay so Discord's editor keeps up
@@ -84,14 +81,13 @@ def valid_channel_url(url: str) -> bool:
 def _require_playwright():
     """Import Playwright's sync API, or raise a message that says how to install it."""
     try:
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:  # optional dependency not installed
+        return require_playwright()
+    except BrowserUnavailableError as exc:
         raise DiscordUnlockError(
             "Chưa cài Playwright cho tính năng tự mở khoá. Chạy:\n"
             "  pip install 'noveltrans[discord]'\n"
             "  playwright install chromium"
         ) from exc
-    return sync_playwright
 
 
 def _launch_context(sync_playwright, *, headless: bool):
@@ -103,28 +99,13 @@ def _launch_context(sync_playwright, *, headless: bool):
     still a throwaway account in its own user-data-dir, never the user's own browser
     session. Falls back to bundled Chromium where Chrome isn't installed.
     """
-    profile_dir().mkdir(parents=True, exist_ok=True)
-    playwright = sync_playwright().start()
-    last_exc: Exception | None = None
-    for channel in _BROWSER_CHANNELS:
-        try:
-            context = playwright.chromium.launch_persistent_context(
-                str(profile_dir()),
-                headless=headless,
-                channel=channel,
-                args=_LAUNCH_ARGS,
-                ignore_default_args=["--enable-automation"],
-            )
-        except Exception as exc:  # channel not installed on this machine
-            last_exc = exc
-            continue
-        return playwright, context
-
-    playwright.stop()
-    raise DiscordUnlockError(
-        "Không mở được trình duyệt cho tính năng tự mở khoá. Cài Google Chrome, hoặc "
-        "chạy:  playwright install chromium"
-    ) from last_exc
+    try:
+        return launch_persistent_context(sync_playwright, profile_dir(), headless=headless)
+    except BrowserUnavailableError as exc:
+        raise DiscordUnlockError(
+            "Không mở được trình duyệt cho tính năng tự mở khoá. Cài Google Chrome, hoặc "
+            "chạy:  playwright install chromium"
+        ) from exc
 
 
 def _command_offered(page) -> bool:
@@ -293,11 +274,3 @@ def run_unlock(
             raise
     finally:
         _close(context, playwright)
-
-
-def _close(context, playwright) -> None:
-    for close in (context.close, playwright.stop):
-        try:
-            close()
-        except Exception:
-            pass
