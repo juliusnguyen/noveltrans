@@ -25,8 +25,12 @@ from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
+from noveltrans.browser import BrowserUnavailableError
+from noveltrans.cf_browser import BrowserSession, BrowserSessionError
 from noveltrans.errors import ScrapeError
 from noveltrans.models import ChapterRef, NovelMeta
+from noveltrans.scrapers import register
+from noveltrans.scrapers.base import SiteAdapter
 
 SEL_TOC_LINKS = "#catalog ul li a[href]"
 SEL_CONTENT = ".txtnav"
@@ -151,3 +155,70 @@ def parse_chapter(markup: str, title: str, url: str) -> str:
     if not lines:
         raise ScrapeError("Chapter content is empty", url)
     return "\n\n".join(lines)
+
+
+@register
+class Shuba69Adapter(SiteAdapter):
+    """69书吧. Fetches through a browser; everything above this line does the parsing.
+
+    Module is `shuba69`, not `69shuba` — the latter isn't a valid Python identifier and
+    couldn't be imported. `name` is the plain string, so it's unaffected.
+    """
+
+    name = "69shuba"
+    display_name = "69书吧 (69shuba.com)"
+    # Matches both /book/59024.htm and /book/59024/ — `matches()` uses re.search.
+    # Only www.69shuba.com has actually been read past the challenge; .cx is the same
+    # operator's known mirror (worst case there is a clean ScrapeError).
+    url_patterns = [r"69shuba\.(?:com|cx)/book/\d+"]
+
+    def __init__(self, client, *, headless: bool = False):
+        super().__init__(client)
+        # Headless is fingerprinted by Cloudflare and does not clear the challenge
+        # (measured — see cf_browser). The flag exists in case that ever changes.
+        self._headless = headless
+        self._session: BrowserSession | None = None
+
+    # -- fetching: the only part that touches a browser ---------------------------
+
+    def _get_html(self, url: str) -> str:
+        """The single seam between this adapter and the browser."""
+        if self._session is None:
+            self._session = BrowserSession(
+                headless=self._headless,
+                # Honour the app's configured politeness delay: HttpClient's own
+                # throttle is bypassed on this path, so this is the only one left.
+                delay_seconds=self.client.delay_seconds,
+            )
+        try:
+            return self._session.get_html(url)
+        except BrowserUnavailableError as exc:
+            raise ScrapeError(
+                "Cần trình duyệt để đọc 69shuba (trang này có kiểm tra Cloudflare). "
+                "Cài Google Chrome, hoặc chạy:  pip install 'noveltrans[browser]' "
+                "&& playwright install chromium",
+                url,
+            ) from exc
+        except BrowserSessionError as exc:
+            raise ScrapeError(
+                "Không đọc được trang 69shuba — trình duyệt bị đóng hoặc không vượt "
+                f"được kiểm tra Cloudflare. Thử tải lại. ({exc})",
+                url,
+            ) from exc
+
+    def close(self) -> None:
+        """Release the browser. Idempotent; never raises."""
+        if self._session is not None:
+            self._session.close()
+            self._session = None
+
+    # -- SiteAdapter ---------------------------------------------------------------
+
+    def fetch_metadata(self, url: str) -> NovelMeta:
+        return parse_metadata(self._get_html(info_url(url)), url, self.name)
+
+    def fetch_chapter_list(self, url: str) -> list[ChapterRef]:
+        return parse_chapter_list(self._get_html(toc_url(url)), url)
+
+    def fetch_chapter(self, ref: ChapterRef) -> str:
+        return parse_chapter(self._get_html(ref.url), ref.title, ref.url)

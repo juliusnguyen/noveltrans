@@ -11,7 +11,11 @@ from __future__ import annotations
 import pytest
 
 from noveltrans.errors import ScrapeError
+from noveltrans.models import ChapterRef
+from noveltrans.scrapers import adapter_for_url
+from noveltrans.scrapers.base import HttpClient
 from noveltrans.scrapers.shuba69 import (
+    Shuba69Adapter,
     _clean_title,
     book_id,
     info_url,
@@ -177,3 +181,125 @@ class TestChapterContent:
         markup = "<html><body><div class='txtnav'><h1 class='hide720'>t</h1></div></body></html>"
         with pytest.raises(ScrapeError, match="empty"):
             parse_chapter(markup, CHAPTER_TITLE, CHAPTER_URL)
+
+
+class TestRegistry:
+    @pytest.mark.parametrize("url", [BOOK_URL, INFO_URL, "https://www.69shuba.cx/book/1/"])
+    def test_matches_both_url_forms(self, url):
+        assert Shuba69Adapter.matches(url)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://example.com/book/59024/",
+            "https://www.69shuba.com/novels/hot",  # not a book page
+            "https://ixdzs8.com/read/12345",  # another adapter's site
+        ],
+    )
+    def test_rejects_other_urls(self, url):
+        assert not Shuba69Adapter.matches(url)
+
+    def test_adapter_for_url_resolves_to_this_adapter(self):
+        adapter = adapter_for_url(BOOK_URL, HttpClient(delay_seconds=0))
+        assert isinstance(adapter, Shuba69Adapter)
+
+    def test_registration_does_not_shadow_other_adapters(self):
+        # url_patterns must not be so loose that it captures another site's URLs.
+        from noveltrans.scrapers.ixdzs import IxdzsAdapter
+
+        adapter = adapter_for_url("https://ixdzs8.com/read/12345", HttpClient(delay_seconds=0))
+        assert isinstance(adapter, IxdzsAdapter)
+
+
+class _FakeSession:
+    """Stands in for BrowserSession: serves fixtures by URL, records what was asked."""
+
+    def __init__(self, pages: dict[str, str]):
+        self.pages = pages
+        self.requested: list[str] = []
+        self.closed = False
+
+    def get_html(self, url: str) -> str:
+        self.requested.append(url)
+        if url not in self.pages:
+            raise AssertionError(f"adapter fetched an unexpected URL: {url}")
+        return self.pages[url]
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def make_adapter() -> tuple[Shuba69Adapter, _FakeSession]:
+    adapter = Shuba69Adapter(HttpClient(delay_seconds=0))
+    session = _FakeSession(
+        {
+            INFO_URL: load_fixture("69shuba", "novel.html"),
+            BOOK_URL: load_fixture("69shuba", "toc.html"),
+            CHAPTER_URL: load_fixture("69shuba", "chapter.html"),
+        }
+    )
+    adapter._session = session  # never launches a browser
+    return adapter, session
+
+
+class TestAdapterWiring:
+    def test_fetch_metadata_hits_the_info_page_not_the_toc(self):
+        # The correction the initial plan got wrong: metadata and the chapter list are
+        # different URLs, so this deserves its own test.
+        adapter, session = make_adapter()
+        meta = adapter.fetch_metadata(BOOK_URL)
+        assert session.requested == [INFO_URL]
+        assert meta.title == "穿书反派跟班，开局被女主盯上"
+        assert meta.url == BOOK_URL  # echoed, not rewritten to the .htm page
+
+    def test_fetch_chapter_list_hits_the_toc_page(self):
+        adapter, session = make_adapter()
+        refs = adapter.fetch_chapter_list(BOOK_URL)
+        assert session.requested == [BOOK_URL]
+        assert len(refs) == 199
+
+    def test_fetch_metadata_works_from_the_info_url_too(self):
+        # Whichever form the user pastes, both targets resolve the same.
+        adapter, session = make_adapter()
+        adapter.fetch_metadata(INFO_URL)
+        assert session.requested == [INFO_URL]
+
+    def test_fetch_chapter(self):
+        adapter, _session = make_adapter()
+        ref = ChapterRef(index=0, title=CHAPTER_TITLE, url=CHAPTER_URL)
+        text = adapter.fetch_chapter(ref)
+        assert len(text) > 1500
+        assert not text.startswith(CHAPTER_TITLE)  # dup heading stripped
+
+    def test_one_session_is_reused_across_fetches(self):
+        adapter, session = make_adapter()
+        adapter.fetch_metadata(BOOK_URL)
+        adapter.fetch_chapter_list(BOOK_URL)
+        assert adapter._session is session  # not rebuilt per call
+
+    def test_close_releases_the_session_and_is_idempotent(self):
+        adapter, session = make_adapter()
+        adapter.close()
+        adapter.close()
+        assert session.closed and adapter._session is None
+
+    def test_close_is_safe_before_any_fetch(self):
+        Shuba69Adapter(HttpClient(delay_seconds=0)).close()  # must not raise or launch
+
+    def test_constructing_never_launches_a_browser(self):
+        adapter = Shuba69Adapter(HttpClient(delay_seconds=0))
+        assert adapter._session is None
+
+    def test_politeness_delay_is_taken_from_the_client(self, monkeypatch):
+        # HttpClient's throttle is bypassed on this path, so the session must inherit
+        # the configured delay or a batch would hammer the site.
+        built = {}
+        monkeypatch.setattr(
+            "noveltrans.scrapers.shuba69.BrowserSession",
+            lambda **kw: built.update(kw) or _FakeSession({INFO_URL: "<html></html>"}),
+        )
+        adapter = Shuba69Adapter(HttpClient(delay_seconds=2.5))
+        with pytest.raises(ScrapeError):  # empty markup fails to parse; we only want the kwargs
+            adapter.fetch_metadata(BOOK_URL)
+        assert built["delay_seconds"] == 2.5
+        assert built["headless"] is False  # headless is fingerprinted; headed default
