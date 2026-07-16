@@ -6,7 +6,10 @@ binaries = []
 hiddenimports = []
 
 # Packages that ship data files / dynamic submodules PyInstaller can miss.
-for pkg in ("vieneu", "onnxruntime", "jieba", "opencc", "ebooklib"):
+# sea_g2p: VieNeu's Vietnamese phonemizer loads sea_g2p.bin from os.path.dirname(
+# __file__) at synthesis time — without collecting it, TTS fails with
+# "No such file or directory (os error 2)" in the frozen app.
+for pkg in ("vieneu", "sea_g2p", "onnxruntime", "jieba", "opencc", "ebooklib"):
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b
