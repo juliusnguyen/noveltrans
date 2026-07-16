@@ -23,6 +23,7 @@ DEFAULT_CLAUDE_CLI_COMMAND = "claude -p"
 DEFAULT_LMSTUDIO_URL = "http://127.0.0.1:1234"
 DEFAULT_TTS_VOICE = "Ngọc Linh"
 DEFAULT_TTS_FORMAT = "mp3"  # falls back to wav when ffmpeg is missing
+DEFAULT_TTS_WORKERS = 1  # sequential; >1 loads one ~334MB engine per worker
 
 TARGET_LANGS = {"vi": "Tiếng Việt", "en": "English"}
 TRANSLATORS = {
@@ -180,6 +181,16 @@ class AppConfig:
     @tts_use_translation.setter
     def tts_use_translation(self, value: bool) -> None:
         self._s.setValue("tts_use_translation", bool(value))
+
+    @property
+    def tts_workers(self) -> int:
+        """Parallel TTS synthesis workers. Each worker loads its own ~334MB
+        VieNeu engine, so N workers ≈ N×334MB RAM. 1 = sequential (default)."""
+        return max(1, self._s.value("tts_workers", DEFAULT_TTS_WORKERS, type=int))
+
+    @tts_workers.setter
+    def tts_workers(self, value: int) -> None:
+        self._s.setValue("tts_workers", max(1, int(value)))
 
     @property
     def keep_awake_enabled(self) -> bool:

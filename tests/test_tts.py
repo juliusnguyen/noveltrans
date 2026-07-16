@@ -302,6 +302,122 @@ class TestAudioWorker:
         assert finished == [(1, 0)]
         assert not project.chapter(1).has_audio
 
+    def test_workers_one_loads_engine_once(self, library_dir, sample_meta, sample_refs):
+        # workers=1 (default) must take the sequential path: only the probe engine
+        # is built — no wasted second ~334 MB load.
+        project = self._project(library_dir, sample_meta, sample_refs)
+        factory = MagicMock(side_effect=lambda *a, **k: FakeTtsEngine())
+        from noveltrans.gui.workers import AudioWorker
+
+        worker = AudioWorker(project.path, voice="Ngọc Lan")
+        with patch("noveltrans.tts.get_tts_engine", factory):
+            worker.run()
+        assert factory.call_count == 1
+
+
+class TestAudioWorkerParallel:
+    """workers > 1: a fresh FakeTtsEngine per pool thread (via a factory), so each
+    thread mutates only its own chunk/save lists — assert on final DB state."""
+
+    def _project(self, library_dir, sample_meta, sample_refs, translated=(0, 1, 2, 3)):
+        from noveltrans.storage import NovelProject
+
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        for idx in translated:
+            project.save_content(idx, "原文")
+            project.save_translation(idx, f"Chương {idx + 1}", "bản dịch dài.", "vi")
+        return project
+
+    def _run(self, project, factory, *, workers=3, **kwargs):
+        from noveltrans.gui.workers import AudioWorker
+
+        results = {"done": [], "errors": [], "failed": [], "finished": None}
+        worker = AudioWorker(project.path, voice="Ngọc Lan", workers=workers, **kwargs)
+        worker.chapter_done.connect(results["done"].append)
+        worker.chapter_error.connect(lambda i, m: results["errors"].append((i, m)))
+        worker.failed.connect(results["failed"].append)
+        worker.finished_ok.connect(lambda ok, err: results.__setitem__("finished", (ok, err)))
+        with patch("noveltrans.tts.get_tts_engine", factory):
+            worker.run()
+        return results
+
+    def test_generates_all_pending(self, library_dir, sample_meta, sample_refs):
+        project = self._project(library_dir, sample_meta, sample_refs)
+        factory = MagicMock(side_effect=lambda *a, **k: FakeTtsEngine())
+        results = self._run(project, factory, workers=3)
+        assert results["finished"] == (4, 0)
+        assert sorted(results["done"]) == [0, 1, 2, 3]
+        for idx in range(4):
+            chapter = project.chapter(idx)
+            assert chapter.has_audio
+            assert chapter.audio_voice == "Ngọc Lan"
+            assert chapter.audio_path.endswith("-ngoc-lan.wav")
+            assert (project.path / chapter.audio_path).exists()
+
+    def test_continues_on_error(self, library_dir, sample_meta, sample_refs):
+        project = self._project(library_dir, sample_meta, sample_refs)
+
+        def make(*a, **k):
+            engine = FakeTtsEngine()
+            original = engine.synthesize
+            engine.synthesize = lambda text: (_ for _ in ()).throw(TtsError("hỏng")) \
+                if "Chương 1" in text else original(text)
+            return engine
+
+        results = self._run(project, MagicMock(side_effect=make), workers=3)
+        assert results["finished"] == (3, 1)
+        assert project.chapter(0).audio_error == "hỏng"
+        for idx in (1, 2, 3):
+            assert project.chapter(idx).has_audio
+
+    def test_stale_file_cleanup(self, library_dir, sample_meta, sample_refs):
+        project = self._project(library_dir, sample_meta, sample_refs, translated=(0, 1))
+        stale = project.path / "exports/audio/0001-old-format.mp3"
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_bytes(b"ID3")
+        project.save_audio(0, "exports/audio/0001-old-format.mp3", "Giọng Cũ", 1.0)
+        project.save_audio(1, "exports/audio/0002-x.wav", "Giọng Cũ", 1.0)
+        factory = MagicMock(side_effect=lambda *a, **k: FakeTtsEngine())
+        results = self._run(project, factory, workers=2)
+        assert results["finished"] == (2, 0)
+        assert project.chapter(0).audio_path.endswith("-ngoc-lan.wav")
+        assert not stale.exists()  # old differently-named file cleaned up
+
+    def test_engine_count_capped_by_chapters(self, library_dir, sample_meta, sample_refs):
+        # workers=5 but only 2 chapters → never more than 2 engines load
+        # (probe + at most one extra), i.e. min(workers, #chapters).
+        project = self._project(library_dir, sample_meta, sample_refs, translated=(0, 1))
+        factory = MagicMock(side_effect=lambda *a, **k: FakeTtsEngine())
+        results = self._run(project, factory, workers=5)
+        assert results["finished"] == (2, 0)
+        assert factory.call_count <= 2
+
+
+class TestConfigWorkers:
+    def _config(self, tmp_path):
+        from PySide6.QtCore import QSettings
+
+        from noveltrans.config import AppConfig
+
+        config = AppConfig()
+        config._s = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+        return config
+
+    def test_default_is_one(self, tmp_path):
+        assert self._config(tmp_path).tts_workers == 1
+
+    def test_clamps_below_one(self, tmp_path):
+        config = self._config(tmp_path)
+        config.tts_workers = 0
+        assert config.tts_workers == 1
+        config.tts_workers = -3
+        assert config.tts_workers == 1
+
+    def test_roundtrips_valid_value(self, tmp_path):
+        config = self._config(tmp_path)
+        config.tts_workers = 4
+        assert config.tts_workers == 4
+
 
 class TestConvert:
     def test_convert_replaces_wav_with_mp3(self, tmp_path):

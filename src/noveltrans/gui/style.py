@@ -6,8 +6,11 @@ the accent colour by setting the dynamic property `primary` to True.
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QPalette
+import tempfile
+from pathlib import Path
+
+from PySide6.QtCore import QPointF, Qt
+from PySide6.QtGui import QColor, QPainter, QPalette, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import QApplication
 
 # palette tokens (kept in sync with the QSS below)
@@ -157,6 +160,33 @@ QComboBox QAbstractItemView {{
     padding: 4px;
 }}
 
+/* ---- spin box up/down buttons (default Fusion arrows are near-invisible here) ---- */
+QAbstractSpinBox {{ padding-right: 26px; }}  /* reserve room for the two buttons */
+QAbstractSpinBox::up-button {{
+    subcontrol-origin: border;
+    subcontrol-position: top right;
+    width: 24px;
+    background-color: {SURFACE_HI};
+    border-left: 1px solid {BORDER};
+    border-bottom: 1px solid {BORDER};
+    border-top-right-radius: 8px;
+}}
+QAbstractSpinBox::down-button {{
+    subcontrol-origin: border;
+    subcontrol-position: bottom right;
+    width: 24px;
+    background-color: {SURFACE_HI};
+    border-left: 1px solid {BORDER};
+    border-bottom-right-radius: 8px;
+}}
+QAbstractSpinBox::up-button:hover, QAbstractSpinBox::down-button:hover {{
+    background-color: {ACCENT};
+}}
+QAbstractSpinBox::up-button:pressed, QAbstractSpinBox::down-button:pressed {{
+    background-color: {ACCENT_LO};
+}}
+/* arrow glyphs (image: url) are injected by apply_theme — see _icon_qss */
+
 /* ---- tables ---- */
 QTableView {{
     background-color: #1f232a;
@@ -210,7 +240,28 @@ QProgressBar {{
 QProgressBar::chunk {{ background-color: {ACCENT}; border-radius: 7px; }}
 
 /* ---- radio / check ---- */
-QRadioButton, QCheckBox {{ spacing: 7px; background: transparent; }}
+QRadioButton, QCheckBox {{ spacing: 8px; background: transparent; }}
+QCheckBox::indicator, QRadioButton::indicator {{
+    width: 17px;
+    height: 17px;
+    background-color: {SURFACE};
+    border: 1px solid {BORDER_HI};
+}}
+QCheckBox::indicator {{ border-radius: 5px; }}
+QRadioButton::indicator {{ border-radius: 9px; }}
+QCheckBox::indicator:hover, QRadioButton::indicator:hover {{ border-color: {ACCENT_HI}; }}
+QCheckBox::indicator:checked, QRadioButton::indicator:checked {{
+    background-color: {ACCENT};
+    border-color: {ACCENT};
+}}
+QCheckBox::indicator:checked:hover, QRadioButton::indicator:checked:hover {{
+    background-color: {ACCENT_HI};
+    border-color: {ACCENT_HI};
+}}
+QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {{
+    background-color: #202329;
+    border-color: {BORDER};
+}}
 
 /* ---- scrollbars ---- */
 QScrollBar:vertical {{ background: transparent; width: 12px; margin: 2px; }}
@@ -241,6 +292,114 @@ QToolTip {{
 """
 
 
+_ICON_DIR = Path(tempfile.gettempdir()) / "noveltrans-theme-icons"
+
+
+def _pixmap(size: int = 16) -> QPixmap:
+    pix = QPixmap(size, size)
+    pix.fill(Qt.GlobalColor.transparent)
+    return pix
+
+
+def _save(pix: QPixmap, name: str) -> str:
+    """Write a themed glyph to disk; return a QSS-safe (forward-slash) path."""
+    _ICON_DIR.mkdir(parents=True, exist_ok=True)
+    path = _ICON_DIR / name
+    pix.save(str(path))
+    return path.as_posix()
+
+
+def _make_icons() -> dict[str, str]:
+    """Render the spinbox arrows / check / radio-dot glyphs the QSS references.
+
+    Generated at runtime (needs a live QApplication) so no image assets have to
+    ship with the frozen app, and so the colours track the palette tokens above.
+    Qt's stylesheet url() has no data-URI support, hence real files.
+    """
+    icons: dict[str, str] = {}
+    for name, up in (("arrow_up", True), ("arrow_down", False)):
+        pix = _pixmap()
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(TEXT))
+        cx, cy, half_w, half_h = 8.0, 8.0, 4.5, 2.6
+        if up:
+            tri = [
+                QPointF(cx - half_w, cy + half_h),
+                QPointF(cx + half_w, cy + half_h),
+                QPointF(cx, cy - half_h),
+            ]
+        else:
+            tri = [
+                QPointF(cx - half_w, cy - half_h),
+                QPointF(cx + half_w, cy - half_h),
+                QPointF(cx, cy + half_h),
+            ]
+        p.drawPolygon(QPolygonF(tri))
+        p.end()
+        icons[name] = _save(pix, f"{name}.png")
+
+    # white checkmark for a ticked QCheckBox (drawn on the accent fill)
+    pix = _pixmap()
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    pen = QPen(QColor("#ffffff"))
+    pen.setWidth(2)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+    p.drawPolyline(QPolygonF([QPointF(3.5, 8.4), QPointF(6.6, 11.5), QPointF(12.5, 4.8)]))
+    p.end()
+    icons["check"] = _save(pix, "check.png")
+
+    # white dot for a selected QRadioButton
+    pix = _pixmap()
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor("#ffffff"))
+    p.drawEllipse(QPointF(8.0, 8.0), 3.1, 3.1)
+    p.end()
+    icons["radio_dot"] = _save(pix, "radio_dot.png")
+    return icons
+
+
+def _icon_qss(icons: dict[str, str]) -> str:
+    """QSS fragment (appended after _QSS) that points the sub-controls at the
+    generated glyphs. Later rules override, so this fills in image: url(...)."""
+    return f"""
+QAbstractSpinBox::up-arrow {{
+    image: url({icons["arrow_up"]});
+    width: 12px; height: 12px;
+}}
+QAbstractSpinBox::down-arrow {{
+    image: url({icons["arrow_down"]});
+    width: 12px; height: 12px;
+}}
+QAbstractSpinBox::up-arrow:off {{ image: none; }}
+QAbstractSpinBox::down-arrow:off {{ image: none; }}
+QCheckBox::indicator:checked {{
+    background-color: {ACCENT};
+    border-color: {ACCENT};
+    image: url({icons["check"]});
+}}
+QCheckBox::indicator:checked:hover {{
+    background-color: {ACCENT_HI};
+    border-color: {ACCENT_HI};
+}}
+QRadioButton::indicator:checked {{
+    background-color: {ACCENT};
+    border-color: {ACCENT};
+    image: url({icons["radio_dot"]});
+}}
+QRadioButton::indicator:checked:hover {{
+    background-color: {ACCENT_HI};
+    border-color: {ACCENT_HI};
+}}
+"""
+
+
 def apply_theme(app: QApplication) -> None:
     app.setStyle("Fusion")
 
@@ -267,7 +426,7 @@ def apply_theme(app: QApplication) -> None:
         pal.setColor(QPalette.ColorGroup.Disabled, role, disabled)
     app.setPalette(pal)
 
-    app.setStyleSheet(_QSS)
+    app.setStyleSheet(_QSS + _icon_qss(_make_icons()))
 
 
 def mark_primary(*buttons) -> None:

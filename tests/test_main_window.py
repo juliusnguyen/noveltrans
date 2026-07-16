@@ -114,3 +114,22 @@ class TestSameProjectGuard:
         main._claim_project(ws2, "/lib/novel-c")
         main._close_workspace(main.workspaces.indexOf(ws2))
         assert "/lib/novel-c" not in main._open_paths
+
+
+class TestSettingsDialog:
+    def _config(self, tmp_path):
+        from PySide6.QtCore import QSettings
+
+        config = AppConfig()
+        config._s = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+        return config
+
+    def test_tts_workers_persists(self, qapp, tmp_path):
+        from noveltrans.gui.settings_dialog import SettingsDialog
+
+        config = self._config(tmp_path)
+        dialog = SettingsDialog(config)
+        assert dialog.tts_workers_spin.value() == 1  # default reflected
+        dialog.tts_workers_spin.setValue(3)
+        dialog.accept()
+        assert config.tts_workers == 3
