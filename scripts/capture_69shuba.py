@@ -20,10 +20,14 @@ It does two jobs:
 
 Everything it prints is answering the "MUST verify" checklist in plan §6.
 
-Run:  .venv/bin/python scripts/capture_69shuba.py [book_url]
+Run:  .venv/bin/python scripts/capture_69shuba.py [book_url] [--headless]
 
-Opens a visible Chrome window; click the Cloudflare checkbox if prompted. Requests are
-made from your IP — the polite delay stays on, keep this low-frequency.
+`--headless` runs sub-step 3a of plan 015.02: does Cloudflare fingerprint headless
+Chrome? The answer decides whether the app must keep a Chrome window visible for a
+whole 199-chapter download, so it's worth settling by experiment rather than analogy.
+
+Opens a visible Chrome window by default; click the Cloudflare checkbox if prompted.
+Requests are made from your IP — the polite delay stays on, keep this low-frequency.
 """
 
 from __future__ import annotations
@@ -36,9 +40,12 @@ from urllib.parse import urljoin
 import requests
 
 from noveltrans.browser import close, launch_persistent_context, require_playwright
+from noveltrans.scrapers.base import USER_AGENT
 from noveltrans.storage.library import DEFAULT_LIBRARY_DIR
 
-BOOK_URL = sys.argv[1] if len(sys.argv) > 1 else "https://www.69shuba.com/book/59024/"
+_ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
+HEADLESS = "--headless" in sys.argv
+BOOK_URL = _ARGS[0] if _ARGS else "https://www.69shuba.com/book/59024/"
 
 FIXTURES_DIR = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "69shuba"
 PROFILE_DIR = DEFAULT_LIBRARY_DIR / ".cf-profile"
@@ -211,22 +218,56 @@ def capture_via_browser(context, page, toc_markup: str) -> None:
     print(f"\n  (chapter URL shape: {chapter_url})")
 
 
+def capture_challenge_fixture() -> None:
+    """Sub-step 3b: save the raw interstitial for tests to assert against.
+
+    Gives tests a real challenge page rather than a hand-written mock of markup nobody
+    has read. `ixdzs/challenge.html` is the precedent.
+
+    Must send a browser-ish User-Agent: with an obvious bot UA ("python-requests") the
+    site returns a bare 404 instead of the Cloudflare interstitial, which would save a
+    14-byte fixture that silently proves nothing.
+    """
+    response = requests.get(BOOK_URL, headers={"User-Agent": USER_AGENT}, timeout=30)
+    print("\n--- challenge fixture (via bare requests)")
+    print(f"  status: {response.status_code}  cf-mitigated: "
+          f"{response.headers.get('cf-mitigated', '(absent)')}  bytes: {len(response.content)}")
+    if not looks_like_interstitial(response.text):
+        print(f"  ! Not an interstitial ({response.status_code}) — NOT saved.")
+        return
+    save_text("challenge.html", response.text)
+
+
 def main() -> None:
     print(f"book url    : {BOOK_URL}")
     print(f"profile dir : {PROFILE_DIR}")
-    print("\nLaunching a visible browser — click the Cloudflare checkbox if it asks.\n")
+    print(f"headless    : {HEADLESS}")
+    if HEADLESS:
+        print("\n=== SUB-STEP 3a: does Cloudflare fingerprint headless Chrome? ===")
+    else:
+        print("\nLaunching a visible browser — click the Cloudflare checkbox if it asks.")
+    print()
+
+    capture_challenge_fixture()
 
     sync_playwright = require_playwright()
-    playwright, context = launch_persistent_context(sync_playwright, PROFILE_DIR, headless=False)
+    playwright, context = launch_persistent_context(
+        sync_playwright, PROFILE_DIR, headless=HEADLESS
+    )
     try:
         page = context.pages[0] if context.pages else context.new_page()
         page.goto(BOOK_URL, wait_until="domcontentloaded")
 
         if not wait_for_clearance(context, page):
             print("\n=> TIMED OUT on the Cloudflare challenge. Nothing captured.")
+            if HEADLESS:
+                print("   3a VERDICT: headless is FINGERPRINTED — the app must run")
+                print("   headed. Keep headless=False as the default.")
             return
 
         print("=> Challenge cleared in the browser.")
+        if HEADLESS:
+            print("   3a VERDICT: headless PASSES the challenge.")
         print(f"   page title: {page.title()!r}")
 
         user_agent = page.evaluate("() => navigator.userAgent")
