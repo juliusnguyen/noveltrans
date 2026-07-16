@@ -36,6 +36,7 @@ _RATE_LIMIT_MAX_RETRIES = 8
 class ScanWorker(QThread):
     """Fetch metadata + TOC for a URL and create/refresh the project."""
 
+    progress = Signal(str)  # human-readable status (e.g. "opening a browser…")
     scanned = Signal(str, object, int)  # project path, NovelMeta, chapter count
     failed = Signal(str)
 
@@ -59,6 +60,7 @@ class ScanWorker(QThread):
                 )
             if adapter.name == "medoctruyen":
                 client.set_cookies(self.cookies)
+            adapter.on_status = self.progress.emit
             meta = adapter.fetch_metadata(self.url)
             refs = adapter.fetch_chapter_list(self.url)
 
@@ -783,6 +785,9 @@ class DownloadWorker(QThread):
             total = len(pending)
             done = 0
             errors = 0
+            # Reads `done`/`total` at call time (closure over run()'s locals), so a
+            # mid-batch browser relaunch reports the real position, not 0.
+            adapter.on_status = lambda msg: self.progress.emit(done, total, msg)
             for chapter in pending:
                 if self._cancelled:
                     break

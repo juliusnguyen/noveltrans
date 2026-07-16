@@ -184,6 +184,12 @@ class Shuba69Adapter(SiteAdapter):
     def _get_html(self, url: str) -> str:
         """The single seam between this adapter and the browser."""
         if self._session is None:
+            # A Chrome window is about to appear on the user's screen — say why before
+            # it does, or it reads as the app misbehaving.
+            self._status(
+                "🌐 Đang mở trình duyệt để vượt kiểm tra Cloudflare của 69shuba — "
+                "giữ cửa sổ mở…"
+            )
             self._session = BrowserSession(
                 headless=self._headless,
                 # Honour the app's configured politeness delay: HttpClient's own

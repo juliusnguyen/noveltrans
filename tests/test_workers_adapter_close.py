@@ -34,6 +34,7 @@ class _FakeAdapter(SiteAdapter):
         self.fail = fail
 
     def fetch_metadata(self, url: str) -> NovelMeta:
+        self._status("đang mở trình duyệt…")
         if self.fail:
             raise ScrapeError("boom", url)
         return NovelMeta(url=url, site=self.name, title="Tựa đề")
@@ -42,6 +43,7 @@ class _FakeAdapter(SiteAdapter):
         return [ChapterRef(index=0, title="C1", url="https://fake.test/txt/1/1")]
 
     def fetch_chapter(self, ref: ChapterRef) -> str:
+        self._status("đang mở trình duyệt…")
         if self.fail:
             raise ScrapeError("boom", ref.url)
         return "nội dung"
@@ -127,3 +129,33 @@ class TestDownloadWorker:
         worker.cancel()  # breaks out of the loop before any chapter
         worker.run()
         assert adapter.closed == 1
+
+
+class TestStatusPlumbing:
+    def test_adapter_status_is_a_noop_without_a_listener(self):
+        # Adapters run outside the GUI too (scripts, tests) — _status must not care.
+        _FakeAdapter().fetch_metadata(URL)  # on_status is None; must not raise
+
+    def test_scan_worker_forwards_adapter_status(self, qapp, library_dir, fake_adapter):
+        # A Chrome window appearing during a scan needs explaining; ScanWorker had no
+        # progress signal at all before this.
+        adapter = fake_adapter()
+        messages: list[str] = []
+        worker = ScanWorker(URL, library_dir, delay=0)
+        worker.progress.connect(messages.append)
+        worker.run()
+        assert adapter.on_status is not None
+        assert "đang mở trình duyệt…" in messages
+
+    def test_download_worker_forwards_adapter_status_with_position(
+        self, qapp, library_dir, fake_adapter
+    ):
+        fake_adapter()
+        seen: list[tuple[int, int, str]] = []
+        worker = DownloadWorker(_project(library_dir), delay=0)
+        worker.progress.connect(lambda d, t, m: seen.append((d, t, m)))
+        worker.run()
+        status = [row for row in seen if row[2] == "đang mở trình duyệt…"]
+        assert status, "adapter status never reached the progress signal"
+        # Carries the real batch position, not a placeholder.
+        assert status[0][0] == 0 and status[0][1] == 1

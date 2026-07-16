@@ -186,6 +186,7 @@ class ScrapeTab(QWidget):
             self.config.request_delay,
             cookies=self.config.medoctruyen_cookies,
         )
+        self._scan_worker.progress.connect(self.status_label.setText)
         self._scan_worker.scanned.connect(self._on_scanned)
         self._scan_worker.failed.connect(self._on_scan_failed)
         self._scan_worker.finished.connect(lambda: self.scan_button.setEnabled(True))
