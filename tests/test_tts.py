@@ -62,8 +62,9 @@ class FakeTtsEngine(TtsEngine):
         return np.ones(len(text), dtype=np.float32)
 
     def save_wav(self, samples, out_path: Path) -> None:
-        out_path.write_bytes(b"RIFF" + bytes(int(s) for s in samples[:4]))
+        out_path.write_bytes(b"RIFF" + bytes(int(abs(s)) for s in samples[:4]))
         self.saved.append(out_path)
+        self.last_samples = np.asarray(samples)  # captured so gain/gap are assertable
 
 
 class TestSynthesizeChapter:
@@ -113,6 +114,44 @@ class TestSynthesizeChapter:
         with pytest.raises(TtsError, match="không có nội dung"):
             engine.synthesize_chapter("", "★☆※ 😀 【】", tmp_path / "x.wav")
         assert engine.saved == []
+
+
+class TestGapAndVolume:
+    # FakeTtsEngine is 1000 Hz, 1 sample/char, so duration math is exact and gain is
+    # visible in the captured samples — no model needed.
+    def _text(self):
+        # Two sentences each over max_chunk_chars (30) so they land in separate chunks
+        # → exactly one gap between them.
+        return "a" * 25 + ". " + "b" * 25 + "."
+
+    def test_gap_seconds_overrides_the_default_and_moves_duration(self, tmp_path):
+        engine = FakeTtsEngine()
+        # two chunks → one gap between them. default gap 0.1s = 100 samples.
+        default = engine.synthesize_chapter("", self._text(), tmp_path / "d.wav")
+        wide = engine.synthesize_chapter("", self._text(), tmp_path / "w.wav", gap_seconds=0.3)
+        # 0.3s gap = 300 samples vs 100 → +200 samples = +0.2s
+        assert wide == pytest.approx(default + 0.2)
+
+    def test_zero_gap_inserts_no_silence(self, tmp_path):
+        engine = FakeTtsEngine()
+        default = engine.synthesize_chapter("", self._text(), tmp_path / "d.wav")
+        none = engine.synthesize_chapter("", self._text(), tmp_path / "z.wav", gap_seconds=0.0)
+        # gap_seconds=0 drops the 100-sample (0.1s) default pad between the two chunks
+        assert none == pytest.approx(default - 0.1)
+
+    def test_volume_scales_and_default_is_untouched(self, tmp_path):
+        engine = FakeTtsEngine()
+        engine.synthesize_chapter("", "aaaa.", tmp_path / "half.wav", volume=0.5)
+        assert engine.last_samples.max() == pytest.approx(0.5)  # ones → 0.5
+
+        engine.synthesize_chapter("", "aaaa.", tmp_path / "one.wav")  # default 1.0
+        assert engine.last_samples.max() == pytest.approx(1.0)
+
+    def test_volume_above_one_is_hard_clipped(self, tmp_path):
+        engine = FakeTtsEngine()
+        engine.synthesize_chapter("", "aaaa.", tmp_path / "loud.wav", volume=2.0)
+        # ones × 2 = 2.0, clipped back to 1.0 — no wraparound distortion
+        assert engine.last_samples.max() == pytest.approx(1.0)
 
 
 class TestRegistry:
@@ -439,6 +478,43 @@ class TestConfigWorkers:
         config = self._config(tmp_path)
         config.tts_workers = 4
         assert config.tts_workers == 4
+
+
+class TestConfigTtsAdjust:
+    def _config(self, tmp_path):
+        from PySide6.QtCore import QSettings
+
+        from noveltrans.config import AppConfig
+
+        config = AppConfig()
+        config._s = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+        return config
+
+    def test_defaults_reproduce_current_behaviour(self, tmp_path):
+        c = self._config(tmp_path)
+        assert (c.tts_gap_seconds, c.tts_speed, c.tts_volume, c.tts_temperature) == (
+            0.4, 1.0, 1.0, 0.0
+        )
+
+    def test_each_knob_clamps_at_both_bounds(self, tmp_path):
+        c = self._config(tmp_path)
+        for name, lo, hi in [
+            ("tts_gap_seconds", 0.0, 2.0),
+            ("tts_speed", 0.5, 2.0),
+            ("tts_volume", 0.1, 3.0),
+            ("tts_temperature", 0.0, 1.5),
+        ]:
+            setattr(c, name, 999)
+            assert getattr(c, name) == hi, name
+            setattr(c, name, -999)
+            assert getattr(c, name) == lo, name
+
+    def test_roundtrips_valid_values(self, tmp_path):
+        c = self._config(tmp_path)
+        c.tts_gap_seconds, c.tts_speed, c.tts_volume, c.tts_temperature = 0.6, 1.25, 1.5, 0.7
+        assert (c.tts_gap_seconds, c.tts_speed, c.tts_volume, c.tts_temperature) == (
+            0.6, 1.25, 1.5, 0.7
+        )
 
 
 class TestConvert:

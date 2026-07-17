@@ -25,8 +25,19 @@ DEFAULT_TTS_VOICE = "Ngọc Linh"
 DEFAULT_TTS_FORMAT = "mp3"  # falls back to wav when ffmpeg is missing
 DEFAULT_TTS_WORKERS = 1  # sequential; >1 loads one ~334MB engine per worker
 DEFAULT_TTS_CLEAN_TEXT = True  # strip special chars before TTS for smoother audio
+# Adjustable TTS output. Defaults reproduce the pre-018 behaviour exactly:
+DEFAULT_TTS_GAP = 0.4  # seconds of silence between chunks
+DEFAULT_TTS_SPEED = 1.0  # playback tempo (ffmpeg atempo); 1.0 = unchanged
+DEFAULT_TTS_VOLUME = 1.0  # linear gain; 1.0 = unchanged
+DEFAULT_TTS_TEMPERATURE = 0.0  # 0.0 = unset (pass nothing → the model's own default)
 
 TARGET_LANGS = {"vi": "Tiếng Việt", "en": "English"}
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
 TRANSLATORS = {
     "google": "Google Translate (miễn phí)",
     "claude": "Claude API",
@@ -214,6 +225,43 @@ class AppConfig:
     @tts_workers.setter
     def tts_workers(self, value: int) -> None:
         self._s.setValue("tts_workers", max(1, int(value)))
+
+    @property
+    def tts_gap_seconds(self) -> float:
+        """Silence between chunks/paragraphs in the audio (seconds). Default 0.4."""
+        return _clamp(self._s.value("tts_gap_seconds", DEFAULT_TTS_GAP, type=float), 0.0, 2.0)
+
+    @tts_gap_seconds.setter
+    def tts_gap_seconds(self, value: float) -> None:
+        self._s.setValue("tts_gap_seconds", _clamp(float(value), 0.0, 2.0))
+
+    @property
+    def tts_speed(self) -> float:
+        """Playback tempo, applied via ffmpeg atempo (pitch-preserving). 1.0 = normal."""
+        return _clamp(self._s.value("tts_speed", DEFAULT_TTS_SPEED, type=float), 0.5, 2.0)
+
+    @tts_speed.setter
+    def tts_speed(self, value: float) -> None:
+        self._s.setValue("tts_speed", _clamp(float(value), 0.5, 2.0))
+
+    @property
+    def tts_volume(self) -> float:
+        """Linear gain on the rendered audio. 1.0 = unchanged; >1.0 may clip."""
+        return _clamp(self._s.value("tts_volume", DEFAULT_TTS_VOLUME, type=float), 0.1, 3.0)
+
+    @tts_volume.setter
+    def tts_volume(self, value: float) -> None:
+        self._s.setValue("tts_volume", _clamp(float(value), 0.1, 3.0))
+
+    @property
+    def tts_temperature(self) -> float:
+        """VieNeu expressiveness. 0.0 = unset (pass nothing → the model's own default);
+        higher = more varied delivery, lower = steadier."""
+        return _clamp(self._s.value("tts_temperature", DEFAULT_TTS_TEMPERATURE, type=float), 0.0, 1.5)
+
+    @tts_temperature.setter
+    def tts_temperature(self, value: float) -> None:
+        self._s.setValue("tts_temperature", _clamp(float(value), 0.0, 1.5))
 
     @property
     def keep_awake_enabled(self) -> bool:
