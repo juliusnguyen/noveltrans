@@ -9,15 +9,16 @@ TTS_ENGINE_NAMES = {"vieneu": "VieNeu-TTS (local)"}
 
 
 def get_tts_engine(
-    name: str, *, voice: str = "", temperature: float | None = None
+    name: str, *, voice: str = "", temperature: float | None = None, precision: str = "int8"
 ) -> TtsEngine:
     """Build a TTS engine by name. Imports lazily — the heavy TTS dependency
     is optional and only needed when audio generation is actually used.
 
-    `temperature` (None = the model's own default) sets VieNeu's expressiveness.
+    `temperature` (None = the model's own default) sets VieNeu's expressiveness;
+    `precision` ("int8" = fast, "fp32" = higher quality) selects its ONNX/CPU graph.
     """
     if name == "vieneu":
         from noveltrans.tts.vieneu import VieneuEngine
 
-        return VieneuEngine(voice=voice, temperature=temperature)
+        return VieneuEngine(voice=voice, temperature=temperature, precision=precision)
     raise TtsError(f"Unknown TTS engine: {name!r}")

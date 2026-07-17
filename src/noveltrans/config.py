@@ -30,6 +30,8 @@ DEFAULT_TTS_GAP = 0.4  # seconds of silence between chunks
 DEFAULT_TTS_SPEED = 1.0  # playback tempo (ffmpeg atempo); 1.0 = unchanged
 DEFAULT_TTS_VOLUME = 1.0  # linear gain; 1.0 = unchanged
 DEFAULT_TTS_TEMPERATURE = 0.0  # 0.0 = unset (pass nothing → the model's own default)
+DEFAULT_TTS_PRECISION = "int8"  # VieNeu ONNX/CPU graph: "int8" (fast) or "fp32" (accurate)
+TTS_PRECISIONS = ("int8", "fp32")
 
 TARGET_LANGS = {"vi": "Tiếng Việt", "en": "English"}
 
@@ -262,6 +264,19 @@ class AppConfig:
     @tts_temperature.setter
     def tts_temperature(self, value: float) -> None:
         self._s.setValue("tts_temperature", _clamp(float(value), 0.0, 1.5))
+
+    @property
+    def tts_precision(self) -> str:
+        """VieNeu model precision on the CPU/ONNX path. "int8" = fast default,
+        "fp32" = higher quality (slower, larger download). Unknown values → int8."""
+        value = str(self._s.value("tts_precision", DEFAULT_TTS_PRECISION))
+        return value if value in TTS_PRECISIONS else DEFAULT_TTS_PRECISION
+
+    @tts_precision.setter
+    def tts_precision(self, value: str) -> None:
+        self._s.setValue(
+            "tts_precision", value if value in TTS_PRECISIONS else DEFAULT_TTS_PRECISION
+        )
 
     @property
     def keep_awake_enabled(self) -> bool:

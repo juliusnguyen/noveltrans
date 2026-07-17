@@ -88,3 +88,15 @@ def test_speed_control_disabled_without_ffmpeg(qapp, tmp_path, monkeypatch):
     dialog = SettingsDialog(_isolated_config(tmp_path))
     assert dialog.tts_speed_spin.isEnabled() is False
     assert "ffmpeg" in dialog.tts_speed_spin.toolTip()
+
+
+def test_precision_dropdown_loads_and_saves(qapp, tmp_path):
+    config = _isolated_config(tmp_path)
+    config.tts_precision = "fp32"
+    dialog = SettingsDialog(config)
+    assert dialog.tts_precision_combo.currentData() == "fp32"
+
+    dialog.tts_precision_combo.setCurrentIndex(dialog.tts_precision_combo.findData("int8"))
+    dialog.accept()
+    assert config.tts_precision == "int8"
+    assert SettingsDialog(config).tts_precision_combo.currentData() == "int8"

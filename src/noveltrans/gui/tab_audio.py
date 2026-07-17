@@ -346,6 +346,7 @@ class AudioTab(QWidget):
             speed=self.config.tts_speed,
             volume=self.config.tts_volume,
             temperature=self.config.tts_temperature,
+            precision=self.config.tts_precision,
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.chapter_done.connect(self._on_chapter_updated)

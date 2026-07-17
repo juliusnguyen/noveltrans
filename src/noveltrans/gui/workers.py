@@ -344,6 +344,7 @@ class AudioWorker(QThread):
         speed: float = 1.0,  # playback tempo via ffmpeg atempo (1.0 = unchanged)
         volume: float = 1.0,  # linear gain (1.0 = unchanged)
         temperature: float = 0.0,  # VieNeu expressiveness (0.0 = model default)
+        precision: str = "int8",  # VieNeu ONNX graph: "int8" (fast) or "fp32" (accurate)
         parent=None,
     ):
         super().__init__(parent)
@@ -359,6 +360,7 @@ class AudioWorker(QThread):
         self.speed = speed
         self.volume = volume
         self.temperature = temperature
+        self.precision = precision
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -390,7 +392,10 @@ class AudioWorker(QThread):
             # once. With parallel workers it becomes the first pool thread's engine
             # (seeded below), so its ~334 MB load is never wasted.
             probe = get_tts_engine(
-                "vieneu", voice=self.voice, temperature=self._effective_temperature()
+                "vieneu",
+                voice=self.voice,
+                temperature=self._effective_temperature(),
+                precision=self.precision,
             )
             self.progress.emit(0, 0, "Đang tải model VieNeu (~330 MB lần đầu)…")
             probe.load()
@@ -503,7 +508,10 @@ class AudioWorker(QThread):
                 from noveltrans.tts import get_tts_engine
 
                 engine = get_tts_engine(  # voice already resolved
-                    "vieneu", voice=self.voice, temperature=self._effective_temperature()
+                    "vieneu",
+                    voice=self.voice,
+                    temperature=self._effective_temperature(),
+                    precision=self.precision,
                 )
                 engine.load()  # lazy: only when a new thread actually starts
             tl.engine = engine

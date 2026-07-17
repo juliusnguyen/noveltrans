@@ -46,11 +46,16 @@ class VieneuEngine(TtsEngine):
     display_name = "VieNeu-TTS (local)"
     sample_rate = 48000
 
-    def __init__(self, voice: str = "", temperature: float | None = None):
+    def __init__(
+        self, voice: str = "", temperature: float | None = None, precision: str = "int8"
+    ):
         self.voice = (voice or "").strip()
         # None = pass nothing to infer() → the model's own default. Keeps byte-for-byte
         # parity with pre-018 behaviour, which never passed a temperature.
         self.temperature = temperature
+        # ONNX/CPU graph: "int8" (fast, default) or "fp32" (higher quality, slower and a
+        # larger one-time download). Set at model construction, not per-chunk.
+        self.precision = precision
         # Set by load() when the requested voice was substituted; a human-readable
         # notice the caller can surface (empty means the voice was used as-is).
         self.voice_notice = ""
@@ -62,7 +67,7 @@ class VieneuEngine(TtsEngine):
         except ImportError as exc:
             raise TtsError(INSTALL_HINT) from exc
         try:
-            self._tts = Vieneu()
+            self._tts = Vieneu(precision=self.precision)
         except Exception as exc:
             raise TtsError(f"Không khởi tạo được VieNeu-TTS: {exc}") from exc
         self._resolve_voice()

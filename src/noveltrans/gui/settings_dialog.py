@@ -265,6 +265,19 @@ class SettingsDialog(QDialog):
         )
         form.addRow("Độ biểu cảm:", self.tts_temperature_spin)
 
+        # Model precision (ONNX/CPU graph). fp32 is higher quality but slower and pulls
+        # a larger one-time model download; int8 is the fast default.
+        self.tts_precision_combo = QComboBox()
+        self.tts_precision_combo.addItem("Nhanh (int8 — mặc định)", "int8")
+        self.tts_precision_combo.addItem("Chất lượng cao (fp32 — chậm hơn)", "fp32")
+        idx = self.tts_precision_combo.findData(config.tts_precision)
+        self.tts_precision_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.tts_precision_combo.setToolTip(
+            "fp32 cho chất lượng cao hơn nhưng đọc chậm hơn và tải thêm model (~1 lần). "
+            "Đổi lựa chọn này sẽ tải graph mới ở lần tạo audio kế tiếp."
+        )
+        form.addRow("Chất lượng giọng:", self.tts_precision_combo)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -351,5 +364,6 @@ class SettingsDialog(QDialog):
         self.config.tts_speed = self.tts_speed_spin.value()
         self.config.tts_volume = self.tts_volume_spin.value()
         self.config.tts_temperature = self.tts_temperature_spin.value()
+        self.config.tts_precision = self.tts_precision_combo.currentData()
         self.config.sync()
         super().accept()
