@@ -32,6 +32,11 @@ DB_FILE = "chapters.db"
 EXPORTS_DIR = "exports"
 AUDIO_DIR = "audio"  # inside exports/
 
+# Columns a find-and-replace may write. Whitelisted because apply_replacements
+# interpolates column names into SQL; `title` is included (the user opted in) even
+# though replace_toc reverts it on a TOC re-scan — the GUI warns about that.
+EDITABLE_COLUMNS = frozenset({"title", "content", "translated", "translated_title"})
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS chapters (
   idx              INTEGER PRIMARY KEY,
@@ -323,6 +328,40 @@ class NovelProject:
                 f"UPDATE chapters SET {', '.join(sets)}, updated_at = ? WHERE idx = ?",
                 (*params, _now(), idx),
             )
+
+    def edit_content(self, idx: int, text: str) -> None:
+        """Manual edit of a chapter's original text.
+
+        Unlike save_content, this does NOT touch status/error: a text correction is
+        not a re-download, and flipping a translated chapter back to "downloaded" would
+        wrongly re-queue it in pending_translation.
+        """
+        with self._db:
+            self._db.execute(
+                "UPDATE chapters SET content = ?, updated_at = ? WHERE idx = ?",
+                (text, _now(), idx),
+            )
+
+    def apply_replacements(self, changes: dict[int, dict[str, str]]) -> None:
+        """Write find-and-replace results: {idx: {column: new_value}}.
+
+        One transaction for the whole batch (atomic — no half-applied replace across a
+        199-chapter novel). Bumps updated_at, never changes status/error. Column names
+        are whitelisted because they are interpolated into the SQL; values stay bound.
+        """
+        with self._db:
+            now = _now()
+            for idx, cols in changes.items():
+                if not cols:
+                    continue
+                bad = set(cols) - EDITABLE_COLUMNS
+                if bad:
+                    raise ValueError(f"non-editable column(s): {sorted(bad)}")
+                assignments = ", ".join(f"{col} = ?" for col in cols)
+                self._db.execute(
+                    f"UPDATE chapters SET {assignments}, updated_at = ? WHERE idx = ?",
+                    (*cols.values(), now, idx),
+                )
 
     def mark_error(self, idx: int, message: str) -> None:
         with self._db:
