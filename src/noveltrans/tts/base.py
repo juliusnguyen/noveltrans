@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Callable
 
 from noveltrans.errors import TtsError
+from noveltrans.tts.clean import clean_for_tts
 
 # sentence enders (incl. Vietnamese usage of …), keeping the delimiter attached
 _SENTENCE_RE = re.compile(r"[^.!?…]*[.!?…]+[\"'”’)]*\s*|[^.!?…]+$")
@@ -71,14 +72,21 @@ class TtsEngine(ABC):
         body: str,
         out_path: Path,
         cancelled: Callable[[], bool] | None = None,
+        clean: bool = True,
     ) -> float:
         """Synthesize title + body into one WAV. Returns audio duration (s).
+
+        With `clean` (the default), special characters are stripped from the text
+        before synthesis so the audio reads smoothly (see tts/clean.py). Only the copy
+        fed to the engine is cleaned — nothing stored is touched.
 
         Raises TtsError("đã dừng") if `cancelled()` turns true between chunks.
         """
         import numpy as np
 
         text = f"{title}\n\n{body}" if title else body
+        if clean:
+            text = clean_for_tts(text)
         chunks = split_sentences(text, self.max_chunk_chars)
         if not chunks:
             raise TtsError("Chương không có nội dung để đọc.")

@@ -92,6 +92,28 @@ class TestSynthesizeChapter:
             )
         assert engine.saved == []
 
+    def test_clean_strips_specials_before_synthesis(self, tmp_path):
+        # clean=True (default): the engine never sees the emoji/CJK.
+        engine = FakeTtsEngine()
+        engine.synthesize_chapter("★ Tiêu đề ★", "Nội dung 😀 中文 ở đây.", tmp_path / "x.wav")
+        seen = " ".join(engine.chunks)
+        assert "★" not in seen and "😀" not in seen and "中" not in seen
+        assert "Tiêu đề" in seen and "Nội dung" in seen  # Vietnamese survived
+
+    def test_clean_false_passes_text_through_untouched(self, tmp_path):
+        # The escape hatch: nothing is stripped when cleaning is off.
+        engine = FakeTtsEngine()
+        engine.synthesize_chapter("", "Nội dung ★ 😀 nguyên vẹn.", tmp_path / "x.wav", clean=False)
+        assert "★" in " ".join(engine.chunks)
+
+    def test_chapter_that_cleans_to_empty_raises_gracefully(self, tmp_path):
+        # A chapter of only symbols cleans to "" — must hit the existing empty-content
+        # TtsError, not crash on an empty concatenate.
+        engine = FakeTtsEngine()
+        with pytest.raises(TtsError, match="không có nội dung"):
+            engine.synthesize_chapter("", "★☆※ 😀 【】", tmp_path / "x.wav")
+        assert engine.saved == []
+
 
 class TestRegistry:
     def test_unknown_engine(self):
