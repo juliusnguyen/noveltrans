@@ -46,8 +46,11 @@ class VieneuEngine(TtsEngine):
     display_name = "VieNeu-TTS (local)"
     sample_rate = 48000
 
-    def __init__(self, voice: str = ""):
+    def __init__(self, voice: str = "", temperature: float | None = None):
         self.voice = (voice or "").strip()
+        # None = pass nothing to infer() → the model's own default. Keeps byte-for-byte
+        # parity with pre-018 behaviour, which never passed a temperature.
+        self.temperature = temperature
         # Set by load() when the requested voice was substituted; a human-readable
         # notice the caller can surface (empty means the voice was used as-is).
         self.voice_notice = ""
@@ -108,10 +111,15 @@ class VieneuEngine(TtsEngine):
 
     def synthesize(self, text: str):
         tts = self._require_loaded()
+        # Only include kwargs that are set, so an unset temperature passes nothing and
+        # the model uses its own default (exact pre-018 behaviour).
+        kwargs = {}
+        if self.voice:
+            kwargs["voice"] = self.voice
+        if self.temperature is not None:
+            kwargs["temperature"] = self.temperature
         try:
-            if self.voice:
-                return tts.infer(text, voice=self.voice)
-            return tts.infer(text)
+            return tts.infer(text, **kwargs)
         except Exception as exc:
             raise TtsError(f"VieNeu-TTS lỗi khi đọc đoạn văn: {exc}") from exc
 

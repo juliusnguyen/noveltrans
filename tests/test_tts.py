@@ -173,7 +173,7 @@ class TestRegistry:
 
 
 class TestVieneuEngine:
-    def _engine_with_mock(self, voice="", presets=None, default_voice=None):
+    def _engine_with_mock(self, voice="", presets=None, default_voice=None, temperature=None):
         mock_tts = MagicMock()
         if presets is not None:
             mock_tts.list_preset_voices.return_value = presets
@@ -181,7 +181,7 @@ class TestVieneuEngine:
             mock_tts._default_voice = default_voice
         mock_module = MagicMock()
         mock_module.Vieneu.return_value = mock_tts
-        engine = get_tts_engine("vieneu", voice=voice)
+        engine = get_tts_engine("vieneu", voice=voice, temperature=temperature)
         with patch.dict(sys.modules, {"vieneu": mock_module}):
             engine.load()
         return engine, mock_tts
@@ -194,6 +194,19 @@ class TestVieneuEngine:
 
     def test_synthesize_default_voice(self):
         engine, mock_tts = self._engine_with_mock()
+        mock_tts.infer.return_value = np.zeros(10)
+        engine.synthesize("xin chào")
+        mock_tts.infer.assert_called_once_with("xin chào")
+
+    def test_synthesize_passes_temperature_when_set(self):
+        engine, mock_tts = self._engine_with_mock(voice="Xuân Vĩnh", temperature=0.7)
+        mock_tts.infer.return_value = np.zeros(10)
+        engine.synthesize("xin chào")
+        mock_tts.infer.assert_called_once_with("xin chào", voice="Xuân Vĩnh", temperature=0.7)
+
+    def test_synthesize_omits_temperature_when_unset(self):
+        # Parity: an unset temperature must add NO kwarg, so infer uses the model default.
+        engine, mock_tts = self._engine_with_mock(temperature=None)
         mock_tts.infer.return_value = np.zeros(10)
         engine.synthesize("xin chào")
         mock_tts.infer.assert_called_once_with("xin chào")
