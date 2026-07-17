@@ -32,6 +32,14 @@ DEFAULT_TTS_VOLUME = 1.0  # linear gain; 1.0 = unchanged
 DEFAULT_TTS_TEMPERATURE = 0.0  # 0.0 = unset (pass nothing → the model's own default)
 DEFAULT_TTS_PRECISION = "int8"  # VieNeu ONNX/CPU graph: "int8" (fast) or "fp32" (accurate)
 TTS_PRECISIONS = ("int8", "fp32")
+# Reading style, independent of voice. Default "tu_nhien" reproduces today's output
+# (the engine's own default). Ordered (id, label) for the audio-tab dropdown.
+DEFAULT_TTS_STYLE = "tu_nhien"
+TTS_STYLES = (
+    ("tu_nhien", "Tự nhiên"),
+    ("doc_truyen", "Kể chuyện"),
+    ("tin_tuc", "Tin tức"),
+)
 
 TARGET_LANGS = {"vi": "Tiếng Việt", "en": "English"}
 
@@ -277,6 +285,19 @@ class AppConfig:
         self._s.setValue(
             "tts_precision", value if value in TTS_PRECISIONS else DEFAULT_TTS_PRECISION
         )
+
+    @property
+    def tts_style(self) -> str:
+        """Reading style, independent of voice: tu_nhien / doc_truyen / tin_tuc.
+        Unknown values fall back to the default (tu_nhien)."""
+        value = str(self._s.value("tts_style", DEFAULT_TTS_STYLE))
+        valid = {sid for sid, _ in TTS_STYLES}
+        return value if value in valid else DEFAULT_TTS_STYLE
+
+    @tts_style.setter
+    def tts_style(self, value: str) -> None:
+        valid = {sid for sid, _ in TTS_STYLES}
+        self._s.setValue("tts_style", value if value in valid else DEFAULT_TTS_STYLE)
 
     @property
     def keep_awake_enabled(self) -> bool:

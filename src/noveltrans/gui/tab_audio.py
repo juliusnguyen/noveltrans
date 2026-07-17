@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
@@ -24,7 +26,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from noveltrans.config import AppConfig
+from noveltrans.config import TTS_STYLES, AppConfig
 from noveltrans.gui.keep_awake import track_worker
 from noveltrans.gui.widgets import (
     AudioChapterTableModel,
@@ -50,9 +52,17 @@ class AudioTab(QWidget):
         self.picker.project_selected.connect(self._on_project_selected)
 
         self.voice_combo = QComboBox()
-        self.voice_combo.setMinimumWidth(240)
-        self.voice_combo.setToolTip("Giọng đọc VieNeu-TTS.")
+        self.voice_combo.setMinimumWidth(200)
+        self.voice_combo.setToolTip("Giọng đọc (người đọc) VieNeu-TTS.")
         self._load_voices()
+
+        # Style is a separate axis from voice — any voice can read in any style.
+        self.style_combo = QComboBox()
+        self.style_combo.setToolTip("Phong cách đọc, độc lập với giọng.")
+        for style_id, label in TTS_STYLES:
+            self.style_combo.addItem(label, style_id)
+        idx = self.style_combo.findData(config.tts_style)
+        self.style_combo.setCurrentIndex(idx if idx >= 0 else 0)
 
         from noveltrans.tts.convert import ffmpeg_available
 
@@ -91,6 +101,8 @@ class AudioTab(QWidget):
         top_row.addWidget(self.original_radio)
         top_row.addWidget(QLabel("Giọng đọc:"))
         top_row.addWidget(self.voice_combo)
+        top_row.addWidget(QLabel("Phong cách:"))
+        top_row.addWidget(self.style_combo)
         top_row.addWidget(QLabel("Định dạng:"))
         top_row.addWidget(self.format_combo)
 
@@ -290,6 +302,9 @@ class AudioTab(QWidget):
         self.voice_combo.blockSignals(True)
         self.voice_combo.clear()
         for label, voice_id in voices:
+            # Drop the "· Phong cách X" suffix — style is its own dropdown now, and the
+            # old suffix was never actually applied to synthesis anyway.
+            label = re.sub(r"\s*·\s*Phong cách.*$", "", label)
             self.voice_combo.addItem(label, voice_id)
         index = self.voice_combo.findData(saved)
         self.voice_combo.setCurrentIndex(index if index >= 0 else 0)
@@ -324,6 +339,7 @@ class AudioTab(QWidget):
             total = len(indices)
 
         self.config.tts_voice = voice
+        self.config.tts_style = self.style_combo.currentData()
         self.config.tts_format = out_format
 
         self.generate_button.setEnabled(False)
@@ -347,6 +363,7 @@ class AudioTab(QWidget):
             volume=self.config.tts_volume,
             temperature=self.config.tts_temperature,
             precision=self.config.tts_precision,
+            style=self.config.tts_style,
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.chapter_done.connect(self._on_chapter_updated)

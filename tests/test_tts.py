@@ -223,6 +223,20 @@ class TestVieneuEngine:
     def test_precision_defaults_to_int8(self):
         assert get_tts_engine("vieneu").precision == "int8"
 
+    def test_synthesize_passes_style_when_set(self):
+        engine, mock_tts = self._engine_with_mock(voice="V")
+        engine.style = "tin_tuc"
+        mock_tts.infer.return_value = np.zeros(10)
+        engine.synthesize("xin chào")
+        mock_tts.infer.assert_called_once_with("xin chào", voice="V", style="tin_tuc")
+
+    def test_synthesize_omits_style_when_empty(self):
+        # Parity: no style → model's own default (tu_nhien), same as today.
+        engine, mock_tts = self._engine_with_mock(voice="V")  # style "" by default
+        mock_tts.infer.return_value = np.zeros(10)
+        engine.synthesize("xin chào")
+        mock_tts.infer.assert_called_once_with("xin chào", voice="V")
+
     def test_voices_before_load_are_presets(self):
         engine = get_tts_engine("vieneu")
         assert ("Ngọc Linh — Nữ · Bắc · Phong cách kể chuyện", "Ngọc Linh") in engine.list_voices()
@@ -549,6 +563,14 @@ class TestConfigTtsAdjust:
         c.tts_precision = "int4"  # not a real option → falls back
         assert c.tts_precision == "int8"
 
+    def test_style_default_and_validation(self, tmp_path):
+        c = self._config(tmp_path)
+        assert c.tts_style == "tu_nhien"  # reproduces today's output
+        c.tts_style = "doc_truyen"
+        assert c.tts_style == "doc_truyen"
+        c.tts_style = "khong_ton_tai"  # not one of the three → falls back
+        assert c.tts_style == "tu_nhien"
+
 
 class TestConvert:
     def test_convert_replaces_wav_with_mp3(self, tmp_path):
@@ -758,9 +780,10 @@ class TestConvert:
 
         real_engine.synthesize_chapter = spy
 
-        def fake_get(name, *, voice="", temperature=None, precision="int8"):
+        def fake_get(name, *, voice="", temperature=None, precision="int8", style=""):
             captured["temperature"] = temperature
             captured["precision"] = precision
+            captured["style"] = style
             return real_engine
 
         with (
@@ -770,6 +793,7 @@ class TestConvert:
             AudioWorker(project.path, voice="V").run()
         assert captured["temperature"] is None  # unset → model default
         assert captured["precision"] == "int8"  # fast default
+        assert captured["style"] == ""  # unset → model default (tu_nhien)
         assert captured["gap_seconds"] is None and captured["volume"] == 1.0
         run.assert_not_called()  # speed 1.0 → ffmpeg never invoked
 

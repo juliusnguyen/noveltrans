@@ -65,3 +65,20 @@ def test_preview_applies_extra_remove_from_settings(qapp, tmp_path):
     _title, text, _cleaned = tab._engine_text_for(chapter)
     assert "(" not in text and ")" not in text  # user-listed parens gone
     assert "một" in text and text.rstrip().endswith("!")  # rest intact, ！ normalised
+
+
+def test_style_combo_lists_three_styles_and_loads_config(qapp, tmp_path):
+    config = _config(tmp_path, use_translation=True, clean=True)
+    config.tts_style = "tin_tuc"
+    tab = AudioTab(config)
+    styles = [tab.style_combo.itemData(i) for i in range(tab.style_combo.count())]
+    assert styles == ["tu_nhien", "doc_truyen", "tin_tuc"]
+    assert tab.style_combo.currentData() == "tin_tuc"  # loaded from config
+
+
+def test_voice_labels_drop_the_style_suffix(qapp, tmp_path):
+    # Style is its own dropdown now — the voice label shouldn't repeat it.
+    tab = AudioTab(_config(tmp_path, use_translation=True, clean=True))
+    tab._on_voices_listed([("Ngọc Linh — Nữ · Bắc · Phong cách kể chuyện", "Ngọc Linh")])
+    assert tab.voice_combo.itemText(0) == "Ngọc Linh — Nữ · Bắc"
+    assert tab.voice_combo.itemData(0) == "Ngọc Linh"  # voice id unchanged

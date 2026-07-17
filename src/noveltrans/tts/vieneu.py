@@ -47,7 +47,11 @@ class VieneuEngine(TtsEngine):
     sample_rate = 48000
 
     def __init__(
-        self, voice: str = "", temperature: float | None = None, precision: str = "int8"
+        self,
+        voice: str = "",
+        temperature: float | None = None,
+        precision: str = "int8",
+        style: str = "",
     ):
         self.voice = (voice or "").strip()
         # None = pass nothing to infer() → the model's own default. Keeps byte-for-byte
@@ -56,6 +60,9 @@ class VieneuEngine(TtsEngine):
         # ONNX/CPU graph: "int8" (fast, default) or "fp32" (higher quality, slower and a
         # larger one-time download). Set at model construction, not per-chunk.
         self.precision = precision
+        # Reading style (tu_nhien / doc_truyen / tin_tuc), independent of voice. Empty =
+        # pass nothing → the model's own default (tu_nhien), i.e. today's behaviour.
+        self.style = (style or "").strip()
         # Set by load() when the requested voice was substituted; a human-readable
         # notice the caller can surface (empty means the voice was used as-is).
         self.voice_notice = ""
@@ -123,6 +130,8 @@ class VieneuEngine(TtsEngine):
             kwargs["voice"] = self.voice
         if self.temperature is not None:
             kwargs["temperature"] = self.temperature
+        if self.style:
+            kwargs["style"] = self.style
         try:
             return tts.infer(text, **kwargs)
         except Exception as exc:

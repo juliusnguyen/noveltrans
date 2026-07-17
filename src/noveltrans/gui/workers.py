@@ -345,6 +345,7 @@ class AudioWorker(QThread):
         volume: float = 1.0,  # linear gain (1.0 = unchanged)
         temperature: float = 0.0,  # VieNeu expressiveness (0.0 = model default)
         precision: str = "int8",  # VieNeu ONNX graph: "int8" (fast) or "fp32" (accurate)
+        style: str = "",  # reading style ("" = model default), independent of voice
         parent=None,
     ):
         super().__init__(parent)
@@ -361,6 +362,7 @@ class AudioWorker(QThread):
         self.volume = volume
         self.temperature = temperature
         self.precision = precision
+        self.style = style
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -396,6 +398,7 @@ class AudioWorker(QThread):
                 voice=self.voice,
                 temperature=self._effective_temperature(),
                 precision=self.precision,
+                style=self.style,
             )
             self.progress.emit(0, 0, "Đang tải model VieNeu (~330 MB lần đầu)…")
             probe.load()
@@ -512,6 +515,7 @@ class AudioWorker(QThread):
                     voice=self.voice,
                     temperature=self._effective_temperature(),
                     precision=self.precision,
+                    style=self.style,
                 )
                 engine.load()  # lazy: only when a new thread actually starts
             tl.engine = engine
