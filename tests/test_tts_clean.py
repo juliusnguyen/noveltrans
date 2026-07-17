@@ -58,6 +58,26 @@ class TestDashes:
         assert clean_for_tts("A – B — C") == "A - B - C"
 
 
+class TestFullwidthPunctuation:
+    # Chinese-sourced text leaks fullwidth punctuation through translation; it must be
+    # normalised to ASCII (which carries the pause), not stripped (which loses it).
+    def test_sentence_and_clause_marks_normalised(self):
+        assert clean_for_tts("Thật sao？ Đúng！ Rồi，đi。") == "Thật sao? Đúng! Rồi,đi."
+
+    def test_colon_semicolon_and_ideographic_comma(self):
+        assert clean_for_tts("A：b；c、d") == 'A:b;c,d'
+
+    def test_corner_and_fullwidth_brackets_become_quotes_and_parens(self):
+        assert clean_for_tts("「trích」（chú）") == '"trích"(chú)'
+
+    def test_a_fullwidth_ender_is_a_real_sentence_boundary(self):
+        # The whole point: a leftover ！ becomes an ASCII ender the chunker splits on,
+        # not a gap. split_sentences packs greedily, so force a split with a small limit.
+        cleaned = clean_for_tts("Câu một！Câu hai。")
+        assert cleaned == "Câu một!Câu hai."  # both enders normalised, nothing dropped
+        assert len(split_sentences(cleaned, max_chars=10)) == 2  # a usable boundary
+
+
 class TestWhitespace:
     def test_paragraph_breaks_preserved(self):
         # \n\n must survive — split_sentences relies on it.

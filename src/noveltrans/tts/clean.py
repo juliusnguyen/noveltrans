@@ -33,6 +33,17 @@ _KEEP_PUNCT = frozenset('.!?…,;:"\'“”‘’«»()')
 # as a simple pause-worthy mark rather than being dropped.
 _DASHES = frozenset("—–‒―−-")
 
+# Fullwidth / CJK punctuation → ASCII. The source novels are Chinese, so these leak
+# through translation; without this they'd be stripped and their sentence/clause pauses
+# lost — the opposite of what the cleaner is for. Mapped to the ASCII forms that are
+# already in the keep-set so prosody survives.
+_PUNCT_MAP = {
+    "！": "!", "？": "?", "，": ",", "、": ",", "。": ".", "．": ".",
+    "：": ":", "；": ";", "（": "(", "）": ")",
+    "「": '"', "」": '"', "『": '"', "』": '"', "《": '"', "》": '"',
+    "…": "…",  # (already kept; listed for clarity — the Chinese ellipsis …… is two of these)
+}
+
 _MULTISPACE_RE = re.compile(r"[^\S\n]+")  # runs of non-newline whitespace
 _SPACE_AROUND_NL_RE = re.compile(r" *\n *")
 _BLANK_RUN_RE = re.compile(r"\n{3,}")
@@ -68,6 +79,8 @@ def clean_for_tts(text: str) -> str:
             out.append("\n")
         elif ch in _DASHES:
             out.append("-")
+        elif ch in _PUNCT_MAP:
+            out.append(_PUNCT_MAP[ch])
         elif ch.isspace():
             out.append(" ")
         elif _keep(ch):
