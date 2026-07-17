@@ -38,3 +38,22 @@ def test_unticking_and_accepting_persists_off(qapp, tmp_path):
     assert config.tts_clean_text is False
     # a freshly opened dialog reflects the saved value
     assert SettingsDialog(config).tts_clean_check.isChecked() is False
+
+
+def test_extra_remove_field_round_trips(qapp, tmp_path):
+    config = _isolated_config(tmp_path)
+    dialog = SettingsDialog(config)
+    dialog.tts_extra_remove_edit.setText("()“”")
+    dialog.accept()
+    assert config.tts_clean_extra_remove == "()“”"
+    assert SettingsDialog(config).tts_extra_remove_edit.text() == "()“”"
+
+
+def test_extra_remove_field_disabled_when_cleaning_is_off(qapp, tmp_path):
+    config = _isolated_config(tmp_path)
+    config.tts_clean_text = False
+    dialog = SettingsDialog(config)
+    assert dialog.tts_extra_remove_edit.isEnabled() is False
+    # re-enables live when the checkbox is ticked
+    dialog.tts_clean_check.setChecked(True)
+    assert dialog.tts_extra_remove_edit.isEnabled() is True

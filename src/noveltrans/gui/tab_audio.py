@@ -341,6 +341,7 @@ class AudioTab(QWidget):
             use_translation=use_translation,
             workers=self.config.tts_workers,
             clean_text=self.config.tts_clean_text,
+            clean_extra_remove=self.config.tts_clean_extra_remove,
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.chapter_done.connect(self._on_chapter_updated)
@@ -411,7 +412,7 @@ class AudioTab(QWidget):
         text = f"{title}\n\n{body}" if title else body
         cleaned = self.config.tts_clean_text
         if cleaned:
-            text = clean_for_tts(text)
+            text = clean_for_tts(text, self.config.tts_clean_extra_remove)
         return title, text, cleaned
 
     def _preview_text(self) -> None:

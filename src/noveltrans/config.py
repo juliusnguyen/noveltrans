@@ -195,6 +195,17 @@ class AppConfig:
         self._s.setValue("tts_clean_text", bool(value))
 
     @property
+    def tts_clean_extra_remove(self) -> str:
+        """Extra characters to strip before TTS, on top of the automatic cleaning.
+        Only affects characters that would otherwise be kept (e.g. "()" so parentheses
+        aren't voiced) — anything already stripped is unaffected."""
+        return str(self._s.value("tts_clean_extra_remove", ""))
+
+    @tts_clean_extra_remove.setter
+    def tts_clean_extra_remove(self, value: str) -> None:
+        self._s.setValue("tts_clean_extra_remove", value)
+
+    @property
     def tts_workers(self) -> int:
         """Parallel TTS synthesis workers. Each worker loads its own ~334MB
         VieNeu engine, so N workers ≈ N×334MB RAM. 1 = sequential (default)."""

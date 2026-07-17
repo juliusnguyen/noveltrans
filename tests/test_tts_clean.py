@@ -78,6 +78,35 @@ class TestFullwidthPunctuation:
         assert len(split_sentences(cleaned, max_chars=10)) == 2  # a usable boundary
 
 
+class TestExtraRemove:
+    def test_strips_kept_punctuation_the_user_lists(self):
+        # The point of the setting: remove things the whitelist normally keeps.
+        assert clean_for_tts("Câu (một) hai.", extra_remove="()") == "Câu một hai."
+
+    def test_removes_each_listed_character(self):
+        # Removed chars become a space (like any dropped symbol), so words don't merge.
+        out = clean_for_tts("nói “xin chào” nhé", extra_remove="“”")
+        assert "“" not in out and "”" not in out
+        assert out == "nói xin chào nhé"
+
+    def test_no_op_for_already_stripped_characters(self):
+        # ★ is gone with or without listing it — listing it changes nothing.
+        assert clean_for_tts("x ★ y", extra_remove="★") == clean_for_tts("x ★ y")
+
+    def test_empty_extra_remove_is_the_default_behaviour(self):
+        assert clean_for_tts("Bình thường (rồi).", extra_remove="") == clean_for_tts(
+            "Bình thường (rồi)."
+        )
+
+    def test_whitespace_in_the_list_is_ignored(self):
+        # A stray space in the setting must not delete every space in the text.
+        assert clean_for_tts("A B C", extra_remove="   ") == "A B C"
+
+    def test_matches_the_cleaned_form_not_the_raw_form(self):
+        # Fullwidth ！ is normalised to ! first, so listing "!" removes it.
+        assert clean_for_tts("Đi nào！", extra_remove="!") == "Đi nào"
+
+
 class TestWhitespace:
     def test_paragraph_breaks_preserved(self):
         # \n\n must survive — split_sentences relies on it.

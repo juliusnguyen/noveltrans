@@ -13,11 +13,12 @@ from noveltrans.gui.tab_audio import AudioTab
 from noveltrans.models import Chapter
 
 
-def _config(tmp_path, *, use_translation: bool, clean: bool) -> AppConfig:
+def _config(tmp_path, *, use_translation: bool, clean: bool, extra_remove: str = "") -> AppConfig:
     config = AppConfig()
     config._s = QSettings(str(tmp_path / "s.ini"), QSettings.Format.IniFormat)
     config.tts_use_translation = use_translation
     config.tts_clean_text = clean
+    config.tts_clean_extra_remove = extra_remove
     return config
 
 
@@ -55,3 +56,12 @@ def test_preview_shows_raw_text_when_cleaning_off(qapp, tmp_path):
     _title, text, cleaned = tab._engine_text_for(_chapter())
     assert cleaned is False
     assert "😀" in text and "！" in text  # nothing stripped — this is the escape hatch
+
+
+def test_preview_applies_extra_remove_from_settings(qapp, tmp_path):
+    # The user's "bỏ thêm ký tự" list reaches the preview (and thus the engine).
+    chapter = Chapter(index=0, title="", url="u", translated="Câu (một) hai！")
+    tab = AudioTab(_config(tmp_path, use_translation=True, clean=True, extra_remove="()"))
+    _title, text, _cleaned = tab._engine_text_for(chapter)
+    assert "(" not in text and ")" not in text  # user-listed parens gone
+    assert "một" in text and text.rstrip().endswith("!")  # rest intact, ！ normalised

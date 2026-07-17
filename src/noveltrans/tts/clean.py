@@ -66,12 +66,19 @@ def _keep(ch: str) -> bool:
     return False
 
 
-def clean_for_tts(text: str) -> str:
+def clean_for_tts(text: str, extra_remove: str = "") -> str:
     """Return `text` with TTS-hostile characters removed, prosody preserved.
 
     Keeps Vietnamese/Latin letters, digits, newlines and prosody punctuation; drops
     everything else. Paragraph breaks (\\n\\n) are preserved so downstream sentence
     chunking still works; runs of spaces left by removed symbols are tidied.
+
+    `extra_remove` is a user-supplied string of characters to strip in ADDITION to the
+    automatic cleaning — its only visible effect is on characters the whitelist would
+    otherwise keep (e.g. removing "()" so parentheses aren't voiced). It's applied to
+    the already-cleaned output, so the characters match what the preview shows (a
+    fullwidth "！" has already become "!" by then). Whitespace in it is ignored so a
+    stray space in the setting can't nuke every space.
     """
     out: list[str] = []
     for ch in text:
@@ -95,6 +102,12 @@ def clean_for_tts(text: str) -> str:
             out.append(" ")
 
     cleaned = "".join(out)
+
+    drop = {ch for ch in extra_remove if not ch.isspace()}
+    if drop:
+        # Match visible-symbol removal above: → space, then let the tidy collapse it.
+        cleaned = "".join(" " if ch in drop else ch for ch in cleaned)
+
     cleaned = _MULTISPACE_RE.sub(" ", cleaned)
     cleaned = _SPACE_AROUND_NL_RE.sub("\n", cleaned)  # trim spaces hugging newlines
     cleaned = _BLANK_RUN_RE.sub("\n\n", cleaned)  # cap blank runs at one blank line
