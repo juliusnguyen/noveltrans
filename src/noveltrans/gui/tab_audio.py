@@ -342,6 +342,10 @@ class AudioTab(QWidget):
             workers=self.config.tts_workers,
             clean_text=self.config.tts_clean_text,
             clean_extra_remove=self.config.tts_clean_extra_remove,
+            gap_seconds=self.config.tts_gap_seconds,
+            speed=self.config.tts_speed,
+            volume=self.config.tts_volume,
+            temperature=self.config.tts_temperature,
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.chapter_done.connect(self._on_chapter_updated)

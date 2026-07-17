@@ -679,6 +679,78 @@ class TestConvert:
             worker.run()
         assert "★" in " ".join(engine.chunks)  # the toggle really reached the engine
 
+    def _plain_project(self, library_dir, sample_meta, sample_refs):
+        from noveltrans.storage import NovelProject
+
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_content(0, "原文")
+        project.save_translation(0, "Chương 1", "Nội dung đọc thử.", "vi")
+        return project
+
+    def test_worker_speed_rescales_stored_duration(self, library_dir, sample_meta, sample_refs):
+        from noveltrans.gui.workers import AudioWorker
+
+        project = self._plain_project(library_dir, sample_meta, sample_refs)
+        base = AudioWorker(project.path, voice="V", indices=[0])  # speed 1.0 → real duration
+        with patch("noveltrans.tts.get_tts_engine", return_value=FakeTtsEngine()):
+            base.run()
+        d1 = project.chapter(0).audio_seconds
+
+        # speed=2.0 with _apply_speed stubbed to just halve the duration (no ffmpeg)
+        fast = AudioWorker(project.path, voice="V", speed=2.0, indices=[0])
+        with (
+            patch("noveltrans.tts.get_tts_engine", return_value=FakeTtsEngine()),
+            patch("noveltrans.gui.workers.AudioWorker._apply_speed", lambda self, p, s: s / 2.0),
+        ):
+            fast.run()
+        assert project.chapter(0).audio_seconds == pytest.approx(d1 / 2.0)
+
+    def test_worker_speed_skipped_without_ffmpeg(self, library_dir, sample_meta, sample_refs):
+        from noveltrans.gui.workers import AudioWorker
+
+        project = self._plain_project(library_dir, sample_meta, sample_refs)
+        worker = AudioWorker(project.path, voice="V", speed=1.5)
+        calls = []
+        with (
+            patch("noveltrans.tts.get_tts_engine", return_value=FakeTtsEngine()),
+            patch("noveltrans.tts.convert.ffmpeg_available", return_value=False),
+            patch("noveltrans.tts.convert.apply_tempo", side_effect=calls.append),
+        ):
+            worker.run()
+        assert calls == []  # ffmpeg gone → no atempo, no crash
+        assert project.chapter(0).audio_seconds > 0  # duration left unscaled
+
+    def test_worker_defaults_reproduce_pre_feature_behaviour(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        # All knobs at their defaults: no ffmpeg call, engine gets no temperature,
+        # synthesize_chapter gets gap_seconds=None / volume=1.0.
+        from noveltrans.gui.workers import AudioWorker
+
+        project = self._plain_project(library_dir, sample_meta, sample_refs)
+        captured = {}
+        real_engine = FakeTtsEngine()
+        orig = real_engine.synthesize_chapter
+
+        def spy(*args, **kwargs):
+            captured.update(kwargs)
+            return orig(*args, **kwargs)
+
+        real_engine.synthesize_chapter = spy
+
+        def fake_get(name, *, voice="", temperature=None):
+            captured["temperature"] = temperature
+            return real_engine
+
+        with (
+            patch("noveltrans.tts.get_tts_engine", side_effect=fake_get),
+            patch("noveltrans.tts.convert.subprocess.run") as run,
+        ):
+            AudioWorker(project.path, voice="V").run()
+        assert captured["temperature"] is None  # unset → model default
+        assert captured["gap_seconds"] is None and captured["volume"] == 1.0
+        run.assert_not_called()  # speed 1.0 → ffmpeg never invoked
+
 
 @pytest.mark.live
 class TestVieneuLive:

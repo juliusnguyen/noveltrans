@@ -340,6 +340,10 @@ class AudioWorker(QThread):
         workers: int = 1,  # >1 synthesizes chapters in parallel (N engines in RAM)
         clean_text: bool = True,  # strip special chars before synthesis
         clean_extra_remove: str = "",  # extra chars to strip on top of the automatic clean
+        gap_seconds: float | None = None,  # silence between chunks (None = engine default)
+        speed: float = 1.0,  # playback tempo via ffmpeg atempo (1.0 = unchanged)
+        volume: float = 1.0,  # linear gain (1.0 = unchanged)
+        temperature: float = 0.0,  # VieNeu expressiveness (0.0 = model default)
         parent=None,
     ):
         super().__init__(parent)
@@ -351,10 +355,31 @@ class AudioWorker(QThread):
         self.workers = max(1, int(workers))
         self.clean_text = clean_text
         self.clean_extra_remove = clean_extra_remove
+        self.gap_seconds = gap_seconds
+        self.speed = speed
+        self.volume = volume
+        self.temperature = temperature
         self._cancelled = False
 
     def cancel(self) -> None:
         self._cancelled = True
+
+    def _effective_temperature(self) -> float | None:
+        """0.0 (the config "unset" sentinel) → None, so the engine passes nothing."""
+        return self.temperature if self.temperature and self.temperature > 0 else None
+
+    def _apply_speed(self, out_path: Path, seconds: float) -> float:
+        """Post-process the rendered WAV to `self.speed` and return the rescaled
+        duration. No-op at 1.0. Needs ffmpeg — silently skipped if absent (the Settings
+        control is gated on ffmpeg, so this only happens if ffmpeg was removed later)."""
+        if self.speed == 1.0:
+            return seconds
+        from noveltrans.tts.convert import apply_tempo, ffmpeg_available
+
+        if not ffmpeg_available():
+            return seconds
+        apply_tempo(out_path, self.speed)
+        return seconds / self.speed
 
     def run(self) -> None:
         from noveltrans.errors import TtsError
@@ -364,7 +389,9 @@ class AudioWorker(QThread):
             # The "probe" engine: fail fast on load errors and resolve the voice
             # once. With parallel workers it becomes the first pool thread's engine
             # (seeded below), so its ~334 MB load is never wasted.
-            probe = get_tts_engine("vieneu", voice=self.voice)
+            probe = get_tts_engine(
+                "vieneu", voice=self.voice, temperature=self._effective_temperature()
+            )
             self.progress.emit(0, 0, "Đang tải model VieNeu (~330 MB lần đầu)…")
             probe.load()
         except TtsError as exc:
@@ -433,7 +460,10 @@ class AudioWorker(QThread):
                     cancelled=lambda: self._cancelled,
                     clean=self.clean_text,
                     clean_extra_remove=self.clean_extra_remove,
+                    gap_seconds=self.gap_seconds,
+                    volume=self.volume,
                 )
+                seconds = self._apply_speed(out_path, seconds)
                 if self.out_format == "mp3":
                     from noveltrans.tts.convert import convert_to_mp3
 
@@ -472,7 +502,9 @@ class AudioWorker(QThread):
             except queue.Empty:
                 from noveltrans.tts import get_tts_engine
 
-                engine = get_tts_engine("vieneu", voice=self.voice)  # voice already resolved
+                engine = get_tts_engine(  # voice already resolved
+                    "vieneu", voice=self.voice, temperature=self._effective_temperature()
+                )
                 engine.load()  # lazy: only when a new thread actually starts
             tl.engine = engine
         return engine
@@ -497,7 +529,10 @@ class AudioWorker(QThread):
                 cancelled=lambda: self._cancelled,
                 clean=self.clean_text,
                 clean_extra_remove=self.clean_extra_remove,
+                gap_seconds=self.gap_seconds,
+                volume=self.volume,
             )
+            seconds = self._apply_speed(out_path, seconds)
             if self.out_format == "mp3":
                 from noveltrans.tts.convert import convert_to_mp3
 
