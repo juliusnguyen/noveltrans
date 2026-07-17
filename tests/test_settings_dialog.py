@@ -57,3 +57,46 @@ def test_extra_remove_field_disabled_when_cleaning_is_off(qapp, tmp_path):
     # re-enables live when the checkbox is ticked
     dialog.tts_clean_check.setChecked(True)
     assert dialog.tts_extra_remove_edit.isEnabled() is True
+
+
+def test_tts_adjust_controls_load_and_save(qapp, tmp_path):
+    config = _isolated_config(tmp_path)
+    config.tts_gap_seconds, config.tts_speed = 0.7, 1.2
+    config.tts_volume, config.tts_temperature = 1.5, 0.6
+    dialog = SettingsDialog(config)
+    assert dialog.tts_gap_spin.value() == 0.7
+    assert dialog.tts_speed_spin.value() == 1.2
+    assert dialog.tts_volume_spin.value() == 1.5
+    assert dialog.tts_temperature_spin.value() == 0.6
+
+    dialog.tts_gap_spin.setValue(0.2)
+    dialog.tts_temperature_spin.setValue(0.0)  # "Mặc định"
+    dialog.accept()
+    assert config.tts_gap_seconds == 0.2
+    assert config.tts_temperature == 0.0
+
+
+def test_temperature_zero_shows_as_default(qapp, tmp_path):
+    dialog = SettingsDialog(_isolated_config(tmp_path))
+    assert dialog.tts_temperature_spin.specialValueText() == "Mặc định"
+    assert dialog.tts_temperature_spin.minimum() == 0.0  # sentinel maps to the minimum
+
+
+def test_speed_control_disabled_without_ffmpeg(qapp, tmp_path, monkeypatch):
+    # WAV needs no ffmpeg, but atempo does — so the speed control gates on it.
+    monkeypatch.setattr("noveltrans.gui.settings_dialog.ffmpeg_available", lambda: False)
+    dialog = SettingsDialog(_isolated_config(tmp_path))
+    assert dialog.tts_speed_spin.isEnabled() is False
+    assert "ffmpeg" in dialog.tts_speed_spin.toolTip()
+
+
+def test_precision_dropdown_loads_and_saves(qapp, tmp_path):
+    config = _isolated_config(tmp_path)
+    config.tts_precision = "fp32"
+    dialog = SettingsDialog(config)
+    assert dialog.tts_precision_combo.currentData() == "fp32"
+
+    dialog.tts_precision_combo.setCurrentIndex(dialog.tts_precision_combo.findData("int8"))
+    dialog.accept()
+    assert config.tts_precision == "int8"
+    assert SettingsDialog(config).tts_precision_combo.currentData() == "int8"

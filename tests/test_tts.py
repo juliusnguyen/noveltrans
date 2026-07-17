@@ -62,8 +62,9 @@ class FakeTtsEngine(TtsEngine):
         return np.ones(len(text), dtype=np.float32)
 
     def save_wav(self, samples, out_path: Path) -> None:
-        out_path.write_bytes(b"RIFF" + bytes(int(s) for s in samples[:4]))
+        out_path.write_bytes(b"RIFF" + bytes(int(abs(s)) for s in samples[:4]))
         self.saved.append(out_path)
+        self.last_samples = np.asarray(samples)  # captured so gain/gap are assertable
 
 
 class TestSynthesizeChapter:
@@ -115,6 +116,44 @@ class TestSynthesizeChapter:
         assert engine.saved == []
 
 
+class TestGapAndVolume:
+    # FakeTtsEngine is 1000 Hz, 1 sample/char, so duration math is exact and gain is
+    # visible in the captured samples — no model needed.
+    def _text(self):
+        # Two sentences each over max_chunk_chars (30) so they land in separate chunks
+        # → exactly one gap between them.
+        return "a" * 25 + ". " + "b" * 25 + "."
+
+    def test_gap_seconds_overrides_the_default_and_moves_duration(self, tmp_path):
+        engine = FakeTtsEngine()
+        # two chunks → one gap between them. default gap 0.1s = 100 samples.
+        default = engine.synthesize_chapter("", self._text(), tmp_path / "d.wav")
+        wide = engine.synthesize_chapter("", self._text(), tmp_path / "w.wav", gap_seconds=0.3)
+        # 0.3s gap = 300 samples vs 100 → +200 samples = +0.2s
+        assert wide == pytest.approx(default + 0.2)
+
+    def test_zero_gap_inserts_no_silence(self, tmp_path):
+        engine = FakeTtsEngine()
+        default = engine.synthesize_chapter("", self._text(), tmp_path / "d.wav")
+        none = engine.synthesize_chapter("", self._text(), tmp_path / "z.wav", gap_seconds=0.0)
+        # gap_seconds=0 drops the 100-sample (0.1s) default pad between the two chunks
+        assert none == pytest.approx(default - 0.1)
+
+    def test_volume_scales_and_default_is_untouched(self, tmp_path):
+        engine = FakeTtsEngine()
+        engine.synthesize_chapter("", "aaaa.", tmp_path / "half.wav", volume=0.5)
+        assert engine.last_samples.max() == pytest.approx(0.5)  # ones → 0.5
+
+        engine.synthesize_chapter("", "aaaa.", tmp_path / "one.wav")  # default 1.0
+        assert engine.last_samples.max() == pytest.approx(1.0)
+
+    def test_volume_above_one_is_hard_clipped(self, tmp_path):
+        engine = FakeTtsEngine()
+        engine.synthesize_chapter("", "aaaa.", tmp_path / "loud.wav", volume=2.0)
+        # ones × 2 = 2.0, clipped back to 1.0 — no wraparound distortion
+        assert engine.last_samples.max() == pytest.approx(1.0)
+
+
 class TestRegistry:
     def test_unknown_engine(self):
         with pytest.raises(TtsError, match="Unknown TTS engine"):
@@ -134,7 +173,7 @@ class TestRegistry:
 
 
 class TestVieneuEngine:
-    def _engine_with_mock(self, voice="", presets=None, default_voice=None):
+    def _engine_with_mock(self, voice="", presets=None, default_voice=None, temperature=None):
         mock_tts = MagicMock()
         if presets is not None:
             mock_tts.list_preset_voices.return_value = presets
@@ -142,7 +181,7 @@ class TestVieneuEngine:
             mock_tts._default_voice = default_voice
         mock_module = MagicMock()
         mock_module.Vieneu.return_value = mock_tts
-        engine = get_tts_engine("vieneu", voice=voice)
+        engine = get_tts_engine("vieneu", voice=voice, temperature=temperature)
         with patch.dict(sys.modules, {"vieneu": mock_module}):
             engine.load()
         return engine, mock_tts
@@ -158,6 +197,45 @@ class TestVieneuEngine:
         mock_tts.infer.return_value = np.zeros(10)
         engine.synthesize("xin chào")
         mock_tts.infer.assert_called_once_with("xin chào")
+
+    def test_synthesize_passes_temperature_when_set(self):
+        engine, mock_tts = self._engine_with_mock(voice="Xuân Vĩnh", temperature=0.7)
+        mock_tts.infer.return_value = np.zeros(10)
+        engine.synthesize("xin chào")
+        mock_tts.infer.assert_called_once_with("xin chào", voice="Xuân Vĩnh", temperature=0.7)
+
+    def test_synthesize_omits_temperature_when_unset(self):
+        # Parity: an unset temperature must add NO kwarg, so infer uses the model default.
+        engine, mock_tts = self._engine_with_mock(temperature=None)
+        mock_tts.infer.return_value = np.zeros(10)
+        engine.synthesize("xin chào")
+        mock_tts.infer.assert_called_once_with("xin chào")
+
+    def test_load_passes_precision_to_the_model(self):
+        mock_tts = MagicMock()
+        mock_module = MagicMock()
+        mock_module.Vieneu.return_value = mock_tts
+        engine = get_tts_engine("vieneu", voice="V", precision="fp32")
+        with patch.dict(sys.modules, {"vieneu": mock_module}):
+            engine.load()
+        assert mock_module.Vieneu.call_args.kwargs == {"precision": "fp32"}
+
+    def test_precision_defaults_to_int8(self):
+        assert get_tts_engine("vieneu").precision == "int8"
+
+    def test_synthesize_passes_style_when_set(self):
+        engine, mock_tts = self._engine_with_mock(voice="V")
+        engine.style = "tin_tuc"
+        mock_tts.infer.return_value = np.zeros(10)
+        engine.synthesize("xin chào")
+        mock_tts.infer.assert_called_once_with("xin chào", voice="V", style="tin_tuc")
+
+    def test_synthesize_omits_style_when_empty(self):
+        # Parity: no style → model's own default (tu_nhien), same as today.
+        engine, mock_tts = self._engine_with_mock(voice="V")  # style "" by default
+        mock_tts.infer.return_value = np.zeros(10)
+        engine.synthesize("xin chào")
+        mock_tts.infer.assert_called_once_with("xin chào", voice="V")
 
     def test_voices_before_load_are_presets(self):
         engine = get_tts_engine("vieneu")
@@ -441,6 +519,59 @@ class TestConfigWorkers:
         assert config.tts_workers == 4
 
 
+class TestConfigTtsAdjust:
+    def _config(self, tmp_path):
+        from PySide6.QtCore import QSettings
+
+        from noveltrans.config import AppConfig
+
+        config = AppConfig()
+        config._s = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+        return config
+
+    def test_defaults_reproduce_current_behaviour(self, tmp_path):
+        c = self._config(tmp_path)
+        assert (c.tts_gap_seconds, c.tts_speed, c.tts_volume, c.tts_temperature) == (
+            0.4, 1.0, 1.0, 0.0
+        )
+
+    def test_each_knob_clamps_at_both_bounds(self, tmp_path):
+        c = self._config(tmp_path)
+        for name, lo, hi in [
+            ("tts_gap_seconds", 0.0, 2.0),
+            ("tts_speed", 0.5, 2.0),
+            ("tts_volume", 0.1, 3.0),
+            ("tts_temperature", 0.0, 1.5),
+        ]:
+            setattr(c, name, 999)
+            assert getattr(c, name) == hi, name
+            setattr(c, name, -999)
+            assert getattr(c, name) == lo, name
+
+    def test_roundtrips_valid_values(self, tmp_path):
+        c = self._config(tmp_path)
+        c.tts_gap_seconds, c.tts_speed, c.tts_volume, c.tts_temperature = 0.6, 1.25, 1.5, 0.7
+        assert (c.tts_gap_seconds, c.tts_speed, c.tts_volume, c.tts_temperature) == (
+            0.6, 1.25, 1.5, 0.7
+        )
+
+    def test_precision_default_and_validation(self, tmp_path):
+        c = self._config(tmp_path)
+        assert c.tts_precision == "int8"
+        c.tts_precision = "fp32"
+        assert c.tts_precision == "fp32"
+        c.tts_precision = "int4"  # not a real option → falls back
+        assert c.tts_precision == "int8"
+
+    def test_style_default_and_validation(self, tmp_path):
+        c = self._config(tmp_path)
+        assert c.tts_style == "tu_nhien"  # reproduces today's output
+        c.tts_style = "doc_truyen"
+        assert c.tts_style == "doc_truyen"
+        c.tts_style = "khong_ton_tai"  # not one of the three → falls back
+        assert c.tts_style == "tu_nhien"
+
+
 class TestConvert:
     def test_convert_replaces_wav_with_mp3(self, tmp_path):
         from noveltrans.tts.convert import convert_to_mp3
@@ -470,6 +601,68 @@ class TestConvert:
             with pytest.raises(TtsError, match="codec boom"):
                 convert_to_mp3(wav)
         assert wav.exists()
+
+    @pytest.mark.parametrize(
+        ("tempo", "expected"),
+        [
+            (1.0, [1.0]),
+            (1.5, [1.5]),
+            (2.0, [2.0]),
+            (2.5, [2.0, 1.25]),
+            (0.5, [0.5]),
+            (0.25, [0.5, 0.5]),
+        ],
+    )
+    def test_atempo_filters_decompose_into_valid_factors(self, tempo, expected):
+        from noveltrans.tts.convert import _atempo_filters
+
+        factors = _atempo_filters(tempo)
+        assert factors == pytest.approx(expected)
+        assert all(0.5 <= f <= 2.0 for f in factors)  # every factor in ffmpeg's range
+
+    def test_apply_tempo_one_is_a_noop_without_ffmpeg(self, tmp_path):
+        from noveltrans.tts.convert import apply_tempo
+
+        wav = tmp_path / "x.wav"
+        wav.write_bytes(b"RIFF")
+        with patch("noveltrans.tts.convert.subprocess.run") as run:
+            out = apply_tempo(wav, 1.0)
+        run.assert_not_called()  # tempo 1.0 never touches ffmpeg
+        assert out == wav
+
+    def test_apply_tempo_builds_the_chained_filter(self, tmp_path):
+        from noveltrans.tts.convert import apply_tempo
+
+        wav = tmp_path / "0001-test.wav"
+        wav.write_bytes(b"RIFF")
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = cmd
+            Path(cmd[-1]).write_bytes(b"RIFF-fast")  # the temp output
+            return MagicMock(returncode=0, stderr="")
+
+        with patch("noveltrans.tts.convert.subprocess.run", side_effect=fake_run):
+            out = apply_tempo(wav, 2.5)
+        # chained atempo for >2.0, passed as one -filter:a argument
+        filter_arg = seen["cmd"][seen["cmd"].index("-filter:a") + 1]
+        assert filter_arg == "atempo=2,atempo=1.25"
+        assert out == wav  # temp replaced the original in place
+        assert wav.read_bytes() == b"RIFF-fast"
+
+    def test_apply_tempo_error_cleans_up_and_raises(self, tmp_path):
+        from noveltrans.tts.convert import apply_tempo
+
+        wav = tmp_path / "x.wav"
+        wav.write_bytes(b"RIFF")
+        with patch(
+            "noveltrans.tts.convert.subprocess.run",
+            return_value=MagicMock(returncode=1, stderr="atempo boom"),
+        ):
+            with pytest.raises(TtsError, match="atempo boom"):
+                apply_tempo(wav, 1.5)
+        assert wav.exists() and wav.read_bytes() == b"RIFF"  # original untouched
+        assert not (tmp_path / "x.tempo.wav").exists()  # temp cleaned up
 
     def test_worker_mp3_format(self, library_dir, sample_meta, sample_refs):
         from noveltrans.storage import NovelProject
@@ -527,6 +720,82 @@ class TestConvert:
         with patch("noveltrans.tts.get_tts_engine", return_value=engine):
             worker.run()
         assert "★" in " ".join(engine.chunks)  # the toggle really reached the engine
+
+    def _plain_project(self, library_dir, sample_meta, sample_refs):
+        from noveltrans.storage import NovelProject
+
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_content(0, "原文")
+        project.save_translation(0, "Chương 1", "Nội dung đọc thử.", "vi")
+        return project
+
+    def test_worker_speed_rescales_stored_duration(self, library_dir, sample_meta, sample_refs):
+        from noveltrans.gui.workers import AudioWorker
+
+        project = self._plain_project(library_dir, sample_meta, sample_refs)
+        base = AudioWorker(project.path, voice="V", indices=[0])  # speed 1.0 → real duration
+        with patch("noveltrans.tts.get_tts_engine", return_value=FakeTtsEngine()):
+            base.run()
+        d1 = project.chapter(0).audio_seconds
+
+        # speed=2.0 with _apply_speed stubbed to just halve the duration (no ffmpeg)
+        fast = AudioWorker(project.path, voice="V", speed=2.0, indices=[0])
+        with (
+            patch("noveltrans.tts.get_tts_engine", return_value=FakeTtsEngine()),
+            patch("noveltrans.gui.workers.AudioWorker._apply_speed", lambda self, p, s: s / 2.0),
+        ):
+            fast.run()
+        assert project.chapter(0).audio_seconds == pytest.approx(d1 / 2.0)
+
+    def test_worker_speed_skipped_without_ffmpeg(self, library_dir, sample_meta, sample_refs):
+        from noveltrans.gui.workers import AudioWorker
+
+        project = self._plain_project(library_dir, sample_meta, sample_refs)
+        worker = AudioWorker(project.path, voice="V", speed=1.5)
+        calls = []
+        with (
+            patch("noveltrans.tts.get_tts_engine", return_value=FakeTtsEngine()),
+            patch("noveltrans.tts.convert.ffmpeg_available", return_value=False),
+            patch("noveltrans.tts.convert.apply_tempo", side_effect=calls.append),
+        ):
+            worker.run()
+        assert calls == []  # ffmpeg gone → no atempo, no crash
+        assert project.chapter(0).audio_seconds > 0  # duration left unscaled
+
+    def test_worker_defaults_reproduce_pre_feature_behaviour(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        # All knobs at their defaults: no ffmpeg call, engine gets no temperature,
+        # synthesize_chapter gets gap_seconds=None / volume=1.0.
+        from noveltrans.gui.workers import AudioWorker
+
+        project = self._plain_project(library_dir, sample_meta, sample_refs)
+        captured = {}
+        real_engine = FakeTtsEngine()
+        orig = real_engine.synthesize_chapter
+
+        def spy(*args, **kwargs):
+            captured.update(kwargs)
+            return orig(*args, **kwargs)
+
+        real_engine.synthesize_chapter = spy
+
+        def fake_get(name, *, voice="", temperature=None, precision="int8", style=""):
+            captured["temperature"] = temperature
+            captured["precision"] = precision
+            captured["style"] = style
+            return real_engine
+
+        with (
+            patch("noveltrans.tts.get_tts_engine", side_effect=fake_get),
+            patch("noveltrans.tts.convert.subprocess.run") as run,
+        ):
+            AudioWorker(project.path, voice="V").run()
+        assert captured["temperature"] is None  # unset → model default
+        assert captured["precision"] == "int8"  # fast default
+        assert captured["style"] == ""  # unset → model default (tu_nhien)
+        assert captured["gap_seconds"] is None and captured["volume"] == 1.0
+        run.assert_not_called()  # speed 1.0 → ffmpeg never invoked
 
 
 @pytest.mark.live

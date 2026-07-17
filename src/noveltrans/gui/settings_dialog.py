@@ -25,6 +25,7 @@ from noveltrans.config import TARGET_LANGS, AppConfig, translator_labels
 from noveltrans.discord_unlock import valid_channel_url
 from noveltrans.gui import keep_awake
 from noveltrans.gui.workers import DiscordLoginWorker
+from noveltrans.tts.convert import ffmpeg_available
 
 _MEDOCTRUYEN_LOGIN_URL = "https://medoctruyen.vn/auth/login"
 
@@ -224,6 +225,59 @@ class SettingsDialog(QDialog):
         self.tts_clean_check.toggled.connect(self.tts_extra_remove_edit.setEnabled)
         form.addRow("Bỏ thêm ký tự:", self.tts_extra_remove_edit)
 
+        # Output adjustments. Defaults reproduce the app's original audio.
+        self.tts_gap_spin = QDoubleSpinBox()
+        self.tts_gap_spin.setRange(0.0, 2.0)
+        self.tts_gap_spin.setSingleStep(0.1)
+        self.tts_gap_spin.setSuffix(" s")
+        self.tts_gap_spin.setValue(config.tts_gap_seconds)
+        self.tts_gap_spin.setToolTip("Khoảng lặng giữa các đoạn khi đọc. Mặc định 0.4 s.")
+        form.addRow("Khoảng lặng giữa đoạn:", self.tts_gap_spin)
+
+        self.tts_speed_spin = QDoubleSpinBox()
+        self.tts_speed_spin.setRange(0.5, 2.0)
+        self.tts_speed_spin.setSingleStep(0.05)
+        self.tts_speed_spin.setSuffix("×")
+        self.tts_speed_spin.setValue(config.tts_speed)
+        if ffmpeg_available():
+            self.tts_speed_spin.setToolTip("Tốc độ đọc (giữ nguyên cao độ). 1.0× = bình thường.")
+        else:
+            self.tts_speed_spin.setEnabled(False)
+            self.tts_speed_spin.setToolTip("Cần ffmpeg để đổi tốc độ (brew install ffmpeg).")
+        form.addRow("Tốc độ đọc:", self.tts_speed_spin)
+
+        self.tts_volume_spin = QDoubleSpinBox()
+        self.tts_volume_spin.setRange(0.1, 3.0)
+        self.tts_volume_spin.setSingleStep(0.1)
+        self.tts_volume_spin.setSuffix("×")
+        self.tts_volume_spin.setValue(config.tts_volume)
+        self.tts_volume_spin.setToolTip("Âm lượng. 1.0× = nguyên bản; trên 1.0× có thể bị rè.")
+        form.addRow("Âm lượng:", self.tts_volume_spin)
+
+        self.tts_temperature_spin = QDoubleSpinBox()
+        self.tts_temperature_spin.setRange(0.0, 1.5)
+        self.tts_temperature_spin.setSingleStep(0.05)
+        self.tts_temperature_spin.setValue(config.tts_temperature)
+        self.tts_temperature_spin.setSpecialValueText("Mặc định")  # 0.0 = use model default
+        self.tts_temperature_spin.setToolTip(
+            "Độ biểu cảm của giọng đọc. “Mặc định” (0.0) để model tự quyết; cao hơn = "
+            "biểu cảm/đa dạng hơn, thấp hơn = đều/ổn định hơn."
+        )
+        form.addRow("Độ biểu cảm:", self.tts_temperature_spin)
+
+        # Model precision (ONNX/CPU graph). fp32 is higher quality but slower and pulls
+        # a larger one-time model download; int8 is the fast default.
+        self.tts_precision_combo = QComboBox()
+        self.tts_precision_combo.addItem("Nhanh (int8 — mặc định)", "int8")
+        self.tts_precision_combo.addItem("Chất lượng cao (fp32 — chậm hơn)", "fp32")
+        idx = self.tts_precision_combo.findData(config.tts_precision)
+        self.tts_precision_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.tts_precision_combo.setToolTip(
+            "fp32 cho chất lượng cao hơn nhưng đọc chậm hơn và tải thêm model (~1 lần). "
+            "Đổi lựa chọn này sẽ tải graph mới ở lần tạo audio kế tiếp."
+        )
+        form.addRow("Chất lượng giọng:", self.tts_precision_combo)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -306,5 +360,10 @@ class SettingsDialog(QDialog):
         self.config.tts_workers = self.tts_workers_spin.value()
         self.config.tts_clean_text = self.tts_clean_check.isChecked()
         self.config.tts_clean_extra_remove = self.tts_extra_remove_edit.text()
+        self.config.tts_gap_seconds = self.tts_gap_spin.value()
+        self.config.tts_speed = self.tts_speed_spin.value()
+        self.config.tts_volume = self.tts_volume_spin.value()
+        self.config.tts_temperature = self.tts_temperature_spin.value()
+        self.config.tts_precision = self.tts_precision_combo.currentData()
         self.config.sync()
         super().accept()

@@ -25,8 +25,29 @@ DEFAULT_TTS_VOICE = "Ngọc Linh"
 DEFAULT_TTS_FORMAT = "mp3"  # falls back to wav when ffmpeg is missing
 DEFAULT_TTS_WORKERS = 1  # sequential; >1 loads one ~334MB engine per worker
 DEFAULT_TTS_CLEAN_TEXT = True  # strip special chars before TTS for smoother audio
+# Adjustable TTS output. Defaults reproduce the pre-018 behaviour exactly:
+DEFAULT_TTS_GAP = 0.4  # seconds of silence between chunks
+DEFAULT_TTS_SPEED = 1.0  # playback tempo (ffmpeg atempo); 1.0 = unchanged
+DEFAULT_TTS_VOLUME = 1.0  # linear gain; 1.0 = unchanged
+DEFAULT_TTS_TEMPERATURE = 0.0  # 0.0 = unset (pass nothing → the model's own default)
+DEFAULT_TTS_PRECISION = "int8"  # VieNeu ONNX/CPU graph: "int8" (fast) or "fp32" (accurate)
+TTS_PRECISIONS = ("int8", "fp32")
+# Reading style, independent of voice. Default "tu_nhien" reproduces today's output
+# (the engine's own default). Ordered (id, label) for the audio-tab dropdown.
+DEFAULT_TTS_STYLE = "tu_nhien"
+TTS_STYLES = (
+    ("tu_nhien", "Tự nhiên"),
+    ("doc_truyen", "Kể chuyện"),
+    ("tin_tuc", "Tin tức"),
+)
 
 TARGET_LANGS = {"vi": "Tiếng Việt", "en": "English"}
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
 TRANSLATORS = {
     "google": "Google Translate (miễn phí)",
     "claude": "Claude API",
@@ -214,6 +235,69 @@ class AppConfig:
     @tts_workers.setter
     def tts_workers(self, value: int) -> None:
         self._s.setValue("tts_workers", max(1, int(value)))
+
+    @property
+    def tts_gap_seconds(self) -> float:
+        """Silence between chunks/paragraphs in the audio (seconds). Default 0.4."""
+        return _clamp(self._s.value("tts_gap_seconds", DEFAULT_TTS_GAP, type=float), 0.0, 2.0)
+
+    @tts_gap_seconds.setter
+    def tts_gap_seconds(self, value: float) -> None:
+        self._s.setValue("tts_gap_seconds", _clamp(float(value), 0.0, 2.0))
+
+    @property
+    def tts_speed(self) -> float:
+        """Playback tempo, applied via ffmpeg atempo (pitch-preserving). 1.0 = normal."""
+        return _clamp(self._s.value("tts_speed", DEFAULT_TTS_SPEED, type=float), 0.5, 2.0)
+
+    @tts_speed.setter
+    def tts_speed(self, value: float) -> None:
+        self._s.setValue("tts_speed", _clamp(float(value), 0.5, 2.0))
+
+    @property
+    def tts_volume(self) -> float:
+        """Linear gain on the rendered audio. 1.0 = unchanged; >1.0 may clip."""
+        return _clamp(self._s.value("tts_volume", DEFAULT_TTS_VOLUME, type=float), 0.1, 3.0)
+
+    @tts_volume.setter
+    def tts_volume(self, value: float) -> None:
+        self._s.setValue("tts_volume", _clamp(float(value), 0.1, 3.0))
+
+    @property
+    def tts_temperature(self) -> float:
+        """VieNeu expressiveness. 0.0 = unset (pass nothing → the model's own default);
+        higher = more varied delivery, lower = steadier."""
+        return _clamp(self._s.value("tts_temperature", DEFAULT_TTS_TEMPERATURE, type=float), 0.0, 1.5)
+
+    @tts_temperature.setter
+    def tts_temperature(self, value: float) -> None:
+        self._s.setValue("tts_temperature", _clamp(float(value), 0.0, 1.5))
+
+    @property
+    def tts_precision(self) -> str:
+        """VieNeu model precision on the CPU/ONNX path. "int8" = fast default,
+        "fp32" = higher quality (slower, larger download). Unknown values → int8."""
+        value = str(self._s.value("tts_precision", DEFAULT_TTS_PRECISION))
+        return value if value in TTS_PRECISIONS else DEFAULT_TTS_PRECISION
+
+    @tts_precision.setter
+    def tts_precision(self, value: str) -> None:
+        self._s.setValue(
+            "tts_precision", value if value in TTS_PRECISIONS else DEFAULT_TTS_PRECISION
+        )
+
+    @property
+    def tts_style(self) -> str:
+        """Reading style, independent of voice: tu_nhien / doc_truyen / tin_tuc.
+        Unknown values fall back to the default (tu_nhien)."""
+        value = str(self._s.value("tts_style", DEFAULT_TTS_STYLE))
+        valid = {sid for sid, _ in TTS_STYLES}
+        return value if value in valid else DEFAULT_TTS_STYLE
+
+    @tts_style.setter
+    def tts_style(self, value: str) -> None:
+        valid = {sid for sid, _ in TTS_STYLES}
+        self._s.setValue("tts_style", value if value in valid else DEFAULT_TTS_STYLE)
 
     @property
     def keep_awake_enabled(self) -> bool:
