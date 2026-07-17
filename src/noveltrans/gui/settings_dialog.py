@@ -198,6 +198,17 @@ class SettingsDialog(QDialog):
         )
         form.addRow("Luồng tạo audio song song:", self.tts_workers_spin)
 
+        # Strip special characters (emoji, decorative symbols, stray CJK, markdown)
+        # before synthesis so the audio reads smoothly. Vietnamese is kept.
+        self.tts_clean_check = QCheckBox("Làm sạch ký tự đặc biệt trước khi đọc")
+        self.tts_clean_check.setChecked(config.tts_clean_text)
+        self.tts_clean_check.setToolTip(
+            "Bỏ emoji, ký hiệu trang trí (★ ※ 【】), chữ Hán còn sót và ký tự markdown "
+            "khỏi văn bản trước khi tạo audio. Giữ nguyên tiếng Việt và dấu câu. "
+            "Chỉ áp dụng cho bản đưa vào engine — không đổi văn bản đã lưu."
+        )
+        form.addRow("Đọc (TTS):", self.tts_clean_check)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -278,5 +289,6 @@ class SettingsDialog(QDialog):
         self.config.keep_awake_enabled = self.keep_awake_check.isChecked()
         keep_awake.set_enabled(self.keep_awake_check.isChecked())  # apply live
         self.config.tts_workers = self.tts_workers_spin.value()
+        self.config.tts_clean_text = self.tts_clean_check.isChecked()
         self.config.sync()
         super().accept()
