@@ -330,6 +330,7 @@ class AudioTab(QWidget):
             indices=indices,
             use_translation=use_translation,
             workers=self.config.tts_workers,
+            clean_text=self.config.tts_clean_text,
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.chapter_done.connect(self._on_chapter_updated)

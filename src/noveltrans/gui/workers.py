@@ -338,6 +338,7 @@ class AudioWorker(QThread):
         indices: list[int] | None = None,
         use_translation: bool = True,  # False = voice the original `content`
         workers: int = 1,  # >1 synthesizes chapters in parallel (N engines in RAM)
+        clean_text: bool = True,  # strip special chars before synthesis
         parent=None,
     ):
         super().__init__(parent)
@@ -347,6 +348,7 @@ class AudioWorker(QThread):
         self.indices = indices  # None = all pending; else re-generate exactly these
         self.use_translation = use_translation
         self.workers = max(1, int(workers))
+        self.clean_text = clean_text
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -427,6 +429,7 @@ class AudioWorker(QThread):
                     text,
                     out_path,
                     cancelled=lambda: self._cancelled,
+                    clean=self.clean_text,
                 )
                 if self.out_format == "mp3":
                     from noveltrans.tts.convert import convert_to_mp3
@@ -485,7 +488,7 @@ class AudioWorker(QThread):
         out_path = audio_dir / name
         try:
             seconds = engine.synthesize_chapter(
-                title, text, out_path, cancelled=lambda: self._cancelled
+                title, text, out_path, cancelled=lambda: self._cancelled, clean=self.clean_text
             )
             if self.out_format == "mp3":
                 from noveltrans.tts.convert import convert_to_mp3

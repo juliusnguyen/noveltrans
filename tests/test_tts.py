@@ -494,6 +494,40 @@ class TestConvert:
         assert chapter.audio_path.endswith(".mp3")
         assert (project.path / chapter.audio_path).exists()
 
+    def _project_with_symbols(self, library_dir, sample_meta, sample_refs):
+        from noveltrans.storage import NovelProject
+
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_content(0, "原文")
+        project.save_translation(0, "★ Chương 1 ★", "Nội dung 😀 中文 ở đây.", "vi")
+        return project
+
+    def test_worker_clean_text_true_strips_before_the_engine(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        from noveltrans.gui.workers import AudioWorker
+
+        project = self._project_with_symbols(library_dir, sample_meta, sample_refs)
+        engine = FakeTtsEngine()
+        worker = AudioWorker(project.path, voice="Ngọc Lan", clean_text=True)
+        with patch("noveltrans.tts.get_tts_engine", return_value=engine):
+            worker.run()
+        seen = " ".join(engine.chunks)
+        assert "★" not in seen and "😀" not in seen and "中" not in seen
+        assert "Chương 1" in seen  # Vietnamese survived
+
+    def test_worker_clean_text_false_leaves_specials_for_the_engine(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        from noveltrans.gui.workers import AudioWorker
+
+        project = self._project_with_symbols(library_dir, sample_meta, sample_refs)
+        engine = FakeTtsEngine()
+        worker = AudioWorker(project.path, voice="Ngọc Lan", clean_text=False)
+        with patch("noveltrans.tts.get_tts_engine", return_value=engine):
+            worker.run()
+        assert "★" in " ".join(engine.chunks)  # the toggle really reached the engine
+
 
 @pytest.mark.live
 class TestVieneuLive:
