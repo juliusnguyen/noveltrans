@@ -7,11 +7,14 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QButtonGroup,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QRadioButton,
@@ -129,6 +132,12 @@ class AudioTab(QWidget):
         self.cancel_button.clicked.connect(self._cancel)
         self.open_dir_button = QPushButton("Mở thư mục audio")
         self.open_dir_button.clicked.connect(self._open_audio_dir)
+        self.preview_button = QPushButton("Xem trước văn bản")
+        self.preview_button.setToolTip(
+            "Xem văn bản của chương đang chọn đúng như engine sẽ đọc "
+            "(đã làm sạch ký tự đặc biệt nếu bật trong Cài đặt)."
+        )
+        self.preview_button.clicked.connect(self._preview_text)
         self.progress = QProgressBar()
         self.progress.setFormat("%v / %m chương")
         self.status_label = QLabel("")
@@ -137,6 +146,7 @@ class AudioTab(QWidget):
         bottom_row.addWidget(self.regenerate_button)
         bottom_row.addWidget(self.cancel_button)
         bottom_row.addWidget(self.open_dir_button)
+        bottom_row.addWidget(self.preview_button)
         bottom_row.addWidget(self.progress, stretch=1)
 
         merge_box = self._build_merge_box()
@@ -330,6 +340,8 @@ class AudioTab(QWidget):
             indices=indices,
             use_translation=use_translation,
             workers=self.config.tts_workers,
+            clean_text=self.config.tts_clean_text,
+            clean_extra_remove=self.config.tts_clean_extra_remove,
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.chapter_done.connect(self._on_chapter_updated)
@@ -382,6 +394,62 @@ class AudioTab(QWidget):
         if chapter is None or self.project is None or not chapter.has_audio:
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.project.path / chapter.audio_path)))
+
+    def _engine_text_for(self, chapter) -> tuple[str, str, bool]:
+        """The (title, text, cleaned) a chapter would be synthesized as, right now.
+
+        Mirrors AudioWorker._title_text_for + synthesize_chapter so the preview shows
+        exactly what the engine will receive — same source (translated vs original),
+        same title+body join, same cleaning toggle.
+        """
+        from noveltrans.tts.clean import clean_for_tts
+
+        if self.config.tts_use_translation:
+            title = chapter.translated_title or chapter.title
+            body = chapter.translated
+        else:
+            title, body = chapter.title, chapter.content
+        text = f"{title}\n\n{body}" if title else body
+        cleaned = self.config.tts_clean_text
+        if cleaned:
+            text = clean_for_tts(text, self.config.tts_clean_extra_remove)
+        return title, text, cleaned
+
+    def _preview_text(self) -> None:
+        """Show the selected chapter's text exactly as the engine will receive it."""
+        if self.project is None:
+            QMessageBox.information(self, "Chưa chọn truyện", "Hãy chọn một truyện trước.")
+            return
+        index = self.table.currentIndex()
+        chapter = self.model.chapter_at(index.row()) if index.isValid() else None
+        if chapter is None:
+            QMessageBox.information(
+                self, "Chưa chọn chương", "Hãy chọn một chương trong bảng để xem trước."
+            )
+            return
+
+        title, text, cleaned = self._engine_text_for(chapter)
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Xem trước — {title}")
+        dialog.setMinimumSize(560, 480)
+        note = QLabel(
+            "✓ Đã làm sạch ký tự đặc biệt (như engine sẽ đọc)."
+            if cleaned
+            else "⚠️ Chưa làm sạch — bật trong Cài đặt để bỏ ký tự đặc biệt."
+        )
+        note.setWordWrap(True)
+        view = QPlainTextEdit()
+        view.setReadOnly(True)
+        view.setPlainText(text or "(trống)")
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(note)
+        layout.addWidget(view, stretch=1)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     def _open_audio_dir(self) -> None:
         if self.project is None:

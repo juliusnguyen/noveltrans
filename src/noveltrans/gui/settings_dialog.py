@@ -198,6 +198,32 @@ class SettingsDialog(QDialog):
         )
         form.addRow("Luồng tạo audio song song:", self.tts_workers_spin)
 
+        # Strip special characters (emoji, decorative symbols, stray CJK, markdown)
+        # before synthesis so the audio reads smoothly. Vietnamese is kept.
+        self.tts_clean_check = QCheckBox("Làm sạch ký tự đặc biệt trước khi đọc")
+        self.tts_clean_check.setChecked(config.tts_clean_text)
+        self.tts_clean_check.setToolTip(
+            "Bỏ emoji, ký hiệu trang trí (★ ※ 【】), chữ Hán còn sót và ký tự markdown "
+            "khỏi văn bản trước khi tạo audio. Giữ nguyên tiếng Việt và dấu câu. "
+            "Chỉ áp dụng cho bản đưa vào engine — không đổi văn bản đã lưu."
+        )
+        form.addRow("Đọc (TTS):", self.tts_clean_check)
+
+        # Extra characters the user wants stripped on top of the automatic cleaning.
+        # Only bites on characters normally KEPT (punctuation) — e.g. "()" so
+        # parentheses aren't voiced; anything already stripped is unaffected.
+        self.tts_extra_remove_edit = QLineEdit(config.tts_clean_extra_remove)
+        self.tts_extra_remove_edit.setPlaceholderText("ví dụ: ()“”—  (dán các ký tự cần bỏ)")
+        self.tts_extra_remove_edit.setToolTip(
+            "Các ký tự này sẽ bị bỏ thêm, ngoài phần làm sạch tự động. Chỉ có tác dụng "
+            "với ký tự vốn được GIỮ (như dấu ngoặc, dấu nháy) — dùng “Xem trước văn bản” "
+            "ở tab Audio để thấy ký tự nào còn lại rồi dán vào đây. Không cần liệt kê "
+            "emoji/ký hiệu vì chúng đã bị bỏ sẵn."
+        )
+        self.tts_extra_remove_edit.setEnabled(self.tts_clean_check.isChecked())
+        self.tts_clean_check.toggled.connect(self.tts_extra_remove_edit.setEnabled)
+        form.addRow("Bỏ thêm ký tự:", self.tts_extra_remove_edit)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -278,5 +304,7 @@ class SettingsDialog(QDialog):
         self.config.keep_awake_enabled = self.keep_awake_check.isChecked()
         keep_awake.set_enabled(self.keep_awake_check.isChecked())  # apply live
         self.config.tts_workers = self.tts_workers_spin.value()
+        self.config.tts_clean_text = self.tts_clean_check.isChecked()
+        self.config.tts_clean_extra_remove = self.tts_extra_remove_edit.text()
         self.config.sync()
         super().accept()

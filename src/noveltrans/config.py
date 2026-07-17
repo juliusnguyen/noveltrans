@@ -24,6 +24,7 @@ DEFAULT_LMSTUDIO_URL = "http://127.0.0.1:1234"
 DEFAULT_TTS_VOICE = "Ngọc Linh"
 DEFAULT_TTS_FORMAT = "mp3"  # falls back to wav when ffmpeg is missing
 DEFAULT_TTS_WORKERS = 1  # sequential; >1 loads one ~334MB engine per worker
+DEFAULT_TTS_CLEAN_TEXT = True  # strip special chars before TTS for smoother audio
 
 TARGET_LANGS = {"vi": "Tiếng Việt", "en": "English"}
 TRANSLATORS = {
@@ -181,6 +182,28 @@ class AppConfig:
     @tts_use_translation.setter
     def tts_use_translation(self, value: bool) -> None:
         self._s.setValue("tts_use_translation", bool(value))
+
+    @property
+    def tts_clean_text(self) -> bool:
+        """Strip special characters (emoji, decorative symbols, stray CJK, markdown)
+        from chapter text before TTS so the audio reads smoothly. Vietnamese is kept.
+        Only the copy fed to the engine is cleaned — stored text is untouched."""
+        return self._s.value("tts_clean_text", DEFAULT_TTS_CLEAN_TEXT, type=bool)
+
+    @tts_clean_text.setter
+    def tts_clean_text(self, value: bool) -> None:
+        self._s.setValue("tts_clean_text", bool(value))
+
+    @property
+    def tts_clean_extra_remove(self) -> str:
+        """Extra characters to strip before TTS, on top of the automatic cleaning.
+        Only affects characters that would otherwise be kept (e.g. "()" so parentheses
+        aren't voiced) — anything already stripped is unaffected."""
+        return str(self._s.value("tts_clean_extra_remove", ""))
+
+    @tts_clean_extra_remove.setter
+    def tts_clean_extra_remove(self, value: str) -> None:
+        self._s.setValue("tts_clean_extra_remove", value)
 
     @property
     def tts_workers(self) -> int:
