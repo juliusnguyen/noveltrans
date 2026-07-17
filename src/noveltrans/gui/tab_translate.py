@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from noveltrans.config import TARGET_LANGS, AppConfig, translator_labels
+from noveltrans.gui.find_replace_dialog import FindReplaceDialog
 from noveltrans.gui.keep_awake import track_worker
 from noveltrans.gui.widgets import (
     ChapterTableModel,
@@ -136,6 +137,11 @@ class TranslateTab(QWidget):
             "Xoá toàn bộ bản dịch hiện có rồi dịch lại (dùng khi đổi engine/cách dịch tên)."
         )
         self.retranslate_button.clicked.connect(self._retranslate_all)
+        self.find_replace_button = QPushButton("Tìm & thay thế")
+        self.find_replace_button.setToolTip(
+            "Thay thế hàng loạt trong bản dịch/bản gốc (ví dụ: sửa một tên nhân vật)."
+        )
+        self.find_replace_button.clicked.connect(self._open_find_replace)
         self.cancel_button = QPushButton("Dừng")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self._cancel)
@@ -145,6 +151,7 @@ class TranslateTab(QWidget):
         bottom_row = QHBoxLayout()
         bottom_row.addWidget(self.translate_button)
         bottom_row.addWidget(self.retranslate_button)
+        bottom_row.addWidget(self.find_replace_button)
         bottom_row.addWidget(self.cancel_button)
         bottom_row.addWidget(self.progress, stretch=1)
 
@@ -358,6 +365,7 @@ class TranslateTab(QWidget):
 
         self.translate_button.setEnabled(False)
         self.retranslate_button.setEnabled(False)
+        self.find_replace_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.picker.setEnabled(False)
         self.progress.setMaximum(max(total, 1))
@@ -409,6 +417,32 @@ class TranslateTab(QWidget):
         self.model.set_chapters(self.project.chapters())
         self._start_translate()
 
+    def _open_find_replace(self) -> None:
+        if self.project is None:
+            QMessageBox.information(self, "Chưa chọn truyện", "Hãy tải một truyện ở Tab 1 trước.")
+            return
+        if self._worker is not None and self._worker.isRunning():
+            self.status_label.setText("Đang có phiên dịch chạy — chờ xong rồi thử lại.")
+            return
+        # Flush a half-typed manual edit to disk FIRST, so the scan sees the latest text
+        # and a later focus-out can't overwrite the replacement. The modal then blocks
+        # further pane edits while it's open.
+        self._save_preview_edits()
+
+        dialog = FindReplaceDialog(self.project, self._preview_idx, self)
+        dialog.applied.connect(self._on_replacements_applied)
+        dialog.exec()
+
+    def _on_replacements_applied(self, indices: set) -> None:
+        if self.project is None:
+            return
+        # Titles and the preview panes may both have changed; refresh the table, then
+        # reload the open chapter. _load_preview clears the modified flag, so the
+        # reloaded pane won't trigger a redundant save-on-blur.
+        self.model.set_chapters(self.project.chapters())
+        if self._preview_idx is not None and self._preview_idx in indices:
+            self._load_preview(self.project.chapter(self._preview_idx))
+
     def _cancel(self) -> None:
         if self._worker is not None:
             self._worker.cancel()
@@ -443,6 +477,7 @@ class TranslateTab(QWidget):
     def _reset_buttons(self) -> None:
         self.translate_button.setEnabled(True)
         self.retranslate_button.setEnabled(True)
+        self.find_replace_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
         self.picker.setEnabled(True)
 

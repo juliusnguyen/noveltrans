@@ -136,6 +136,89 @@ class TestResumeQueries:
         after = project.chapter(0)
         assert after == before
 
+    def test_edit_content_keeps_status_and_translation(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        # The key contrast with save_content, which would flip status back to
+        # DOWNLOADED and re-queue the chapter for translation.
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_content(0, "原文 Lâm Phong")
+        project.save_translation(0, "Chương 1", "dịch", "vi", translator="CLI (agy)", seconds=3.0)
+
+        project.edit_content(0, "原文 Diệp Vân")
+        chapter = project.chapter(0)
+        assert chapter.content == "原文 Diệp Vân"
+        assert chapter.status == STATUS_TRANSLATED  # NOT reset to DOWNLOADED
+        assert chapter.translated == "dịch"  # translation untouched
+        assert chapter.translator == "CLI (agy)"
+
+    def test_edit_content_bumps_updated_at(self, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_content(0, "原文")
+        before = project.chapter(0).updated_at
+        project.edit_content(0, "原文 sửa")
+        after = project.chapter(0).updated_at
+        assert after != "" and after >= before
+
+
+class TestApplyReplacements:
+    def test_writes_multiple_columns_across_chapters(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_content(0, "Lâm Phong đến")
+        project.save_translation(0, "Lâm Phong", "Lâm Phong tới", "vi")
+        project.save_content(1, "Lâm Phong đi")
+
+        project.apply_replacements(
+            {
+                0: {"content": "Diệp Vân đến", "translated": "Diệp Vân tới",
+                    "translated_title": "Diệp Vân"},
+                1: {"content": "Diệp Vân đi"},
+            }
+        )
+        assert project.chapter(0).content == "Diệp Vân đến"
+        assert project.chapter(0).translated == "Diệp Vân tới"
+        assert project.chapter(0).translated_title == "Diệp Vân"
+        assert project.chapter(1).content == "Diệp Vân đi"
+
+    def test_leaves_status_untouched(self, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_content(0, "Lâm Phong")
+        project.save_translation(0, "t", "Lâm Phong", "vi")
+        project.apply_replacements({0: {"translated": "Diệp Vân"}})
+        assert project.chapter(0).status == STATUS_TRANSLATED
+
+    def test_can_write_the_original_title(self, library_dir, sample_meta, sample_refs):
+        # title is opted-in scope (the GUI warns it reverts on re-scan).
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.apply_replacements({0: {"title": "Tựa đề mới"}})
+        assert project.chapter(0).title == "Tựa đề mới"
+
+    def test_rejects_a_non_editable_column(self, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        # status is not in the whitelist — must not be writable via find/replace.
+        with pytest.raises(ValueError, match="non-editable"):
+            project.apply_replacements({0: {"status": "hacked"}})
+
+    def test_empty_changes_is_a_noop(self, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_content(0, "原文")
+        before = project.chapter(0)
+        project.apply_replacements({})
+        project.apply_replacements({0: {}})  # empty column dict skipped
+        assert project.chapter(0) == before
+
+    def test_a_bad_column_rolls_back_valid_writes_in_the_same_batch(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        # The whole point of one transaction: no half-applied replace across a novel.
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_content(0, "orig0")
+        with pytest.raises(ValueError):
+            project.apply_replacements({0: {"content": "NEW0"}, 1: {"status": "bad"}})
+        assert project.chapter(0).content == "orig0"  # ch.0's valid write rolled back
+
     def test_clear_translations_resets_translator(self, library_dir, sample_meta, sample_refs):
         project = NovelProject.create(library_dir, sample_meta, sample_refs)
         project.save_content(0, "原文")
