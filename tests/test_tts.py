@@ -560,6 +560,68 @@ class TestConvert:
                 convert_to_mp3(wav)
         assert wav.exists()
 
+    @pytest.mark.parametrize(
+        ("tempo", "expected"),
+        [
+            (1.0, [1.0]),
+            (1.5, [1.5]),
+            (2.0, [2.0]),
+            (2.5, [2.0, 1.25]),
+            (0.5, [0.5]),
+            (0.25, [0.5, 0.5]),
+        ],
+    )
+    def test_atempo_filters_decompose_into_valid_factors(self, tempo, expected):
+        from noveltrans.tts.convert import _atempo_filters
+
+        factors = _atempo_filters(tempo)
+        assert factors == pytest.approx(expected)
+        assert all(0.5 <= f <= 2.0 for f in factors)  # every factor in ffmpeg's range
+
+    def test_apply_tempo_one_is_a_noop_without_ffmpeg(self, tmp_path):
+        from noveltrans.tts.convert import apply_tempo
+
+        wav = tmp_path / "x.wav"
+        wav.write_bytes(b"RIFF")
+        with patch("noveltrans.tts.convert.subprocess.run") as run:
+            out = apply_tempo(wav, 1.0)
+        run.assert_not_called()  # tempo 1.0 never touches ffmpeg
+        assert out == wav
+
+    def test_apply_tempo_builds_the_chained_filter(self, tmp_path):
+        from noveltrans.tts.convert import apply_tempo
+
+        wav = tmp_path / "0001-test.wav"
+        wav.write_bytes(b"RIFF")
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = cmd
+            Path(cmd[-1]).write_bytes(b"RIFF-fast")  # the temp output
+            return MagicMock(returncode=0, stderr="")
+
+        with patch("noveltrans.tts.convert.subprocess.run", side_effect=fake_run):
+            out = apply_tempo(wav, 2.5)
+        # chained atempo for >2.0, passed as one -filter:a argument
+        filter_arg = seen["cmd"][seen["cmd"].index("-filter:a") + 1]
+        assert filter_arg == "atempo=2,atempo=1.25"
+        assert out == wav  # temp replaced the original in place
+        assert wav.read_bytes() == b"RIFF-fast"
+
+    def test_apply_tempo_error_cleans_up_and_raises(self, tmp_path):
+        from noveltrans.tts.convert import apply_tempo
+
+        wav = tmp_path / "x.wav"
+        wav.write_bytes(b"RIFF")
+        with patch(
+            "noveltrans.tts.convert.subprocess.run",
+            return_value=MagicMock(returncode=1, stderr="atempo boom"),
+        ):
+            with pytest.raises(TtsError, match="atempo boom"):
+                apply_tempo(wav, 1.5)
+        assert wav.exists() and wav.read_bytes() == b"RIFF"  # original untouched
+        assert not (tmp_path / "x.tempo.wav").exists()  # temp cleaned up
+
     def test_worker_mp3_format(self, library_dir, sample_meta, sample_refs):
         from noveltrans.storage import NovelProject
 
