@@ -5,9 +5,9 @@
 | Tab | Chức năng |
 |---|---|
 | **1. Tải truyện** | Dán URL truyện → Quét metadata (tên, tác giả, mô tả, mục lục) → Tải toàn bộ chương về máy. Sau khi dịch, tên dịch hiện kế bên tên gốc và mô tả hiển thị bản dịch (rê chuột xem bản gốc). Có progress bar, nút Dừng, và tự resume (chạy lại chỉ tải chương còn thiếu). |
-| **2. Dịch** | Dịch Trung → Việt/Anh bằng **Google Translate (miễn phí)**, **Claude API**, **CLI Agent** (agy/claude) hoặc **LM Studio** (model local). Xem song song bản gốc/bản dịch. Resume + retry chương lỗi, dịch lại từng chương. Sửa tay bản dịch: nháy đúp cột "Tên dịch" để đổi tên chương, bấm vào ô bản dịch để sửa nội dung (tự lưu). |
+| **2. Dịch** | Dịch Trung → Việt/Anh bằng **Google Translate (miễn phí)**, **Claude API**, **CLI Agent** (agy/claude) hoặc **LM Studio** (model local). Xem song song bản gốc/bản dịch. Resume + retry chương lỗi, dịch lại từng chương. Sửa tay bản dịch: nháy đúp cột "Tên dịch" để đổi tên chương, bấm vào ô bản dịch để sửa nội dung (tự lưu). **Tìm & thay thế** hàng loạt (một chương hoặc cả truyện) — xem trước số khớp rồi mới áp dụng. |
 | **3. Xuất file** | Xuất bản dịch (hoặc bản gốc) ra **DOCX**, **Markdown**, **EPUB**. Tên file mặc định lấy theo tên truyện đã dịch. |
-| **4. Nghe audio** | Đọc bản dịch thành audio bằng **VieNeu-TTS** (chạy local, 10 giọng tiếng Việt). MP3/WAV từng chương, resume, tạo lại từng chương, double-click để nghe. |
+| **4. Nghe audio** | Đọc bản dịch thành audio bằng **VieNeu-TTS** (chạy local, 14 giọng tiếng Việt × 3 phong cách). MP3/WAV từng chương, resume, tạo lại từng chương, double-click để nghe. Chọn **giọng** và **phong cách** riêng, xem trước văn bản engine sẽ đọc, và tinh chỉnh **tốc độ / âm lượng / khoảng lặng / độ biểu cảm / chất lượng** trong Cài đặt. |
 
 ## Trang web được hỗ trợ
 
@@ -15,6 +15,7 @@
 |---|---|
 | 半夏小說 (xbanxia.cc) | `https://www.xbanxia.cc/books/331303.html` |
 | 爱下电子书 (ixdzs8.com) | `https://ixdzs8.com/read/620438/` |
+| 69书吧 (69shuba.com) | `https://www.69shuba.com/book/59024/` (có kiểm tra Cloudflare — app tự mở trình duyệt để vượt qua; cần Google Chrome hoặc `playwright install chromium`) |
 | Mê Đọc Truyện (medoctruyen.vn) | `https://medoctruyen.vn/tu-bao-tien-bon` (nội dung tiếng Việt; cần dán cookie đăng nhập trong Cài đặt để tải chương) |
 
 Thêm site mới = thêm 1 file adapter trong `src/noveltrans/scrapers/` (kế thừa `SiteAdapter`, đăng ký bằng `@register`).
@@ -74,9 +75,13 @@ Tab 4 đọc bản dịch tiếng Việt thành audiobook, chạy hoàn toàn lo
 uv pip install -e ".[tts]"    # cài vieneu (ONNX, không cần PyTorch)
 ```
 
-- Lần chạy đầu tự tải model **~330 MB** từ HuggingFace (chờ hơi lâu, có thông báo).
-- 10 giọng đọc có sẵn (Ngọc Lan, Mỹ Duyên, Gia Bảo…); tốc độ ~4× real-time trên Apple Silicon (chương ~7 phút audio tạo trong ~2 phút).
-- MP3 cần `ffmpeg` (`brew install ffmpeg`); không có thì dùng WAV (~6 MB/phút).
+- Lần chạy đầu tự tải model **~330 MB** (build v3-Turbo) từ HuggingFace (chờ hơi lâu, có thông báo).
+- 14 giọng đọc có sẵn (Ngọc Linh, Minh Đức, Phạm Tuyên, Thái Sơn…); tốc độ ~4× real-time trên Apple Silicon (chương ~7 phút audio tạo trong ~2 phút).
+- **Giọng** (người đọc) và **phong cách** (Tự nhiên / Kể chuyện / Tin tức) chọn riêng — kết hợp giọng bất kỳ với phong cách bất kỳ.
+- **Làm sạch ký tự đặc biệt** trước khi đọc (emoji, ký hiệu, chữ Hán sót, markdown) để audio mượt hơn — giữ nguyên tiếng Việt và dấu câu; có ô "bỏ thêm ký tự" tuỳ chọn. Nút **Xem trước văn bản** cho thấy đúng những gì engine sẽ đọc.
+- **Tinh chỉnh trong Cài đặt**: khoảng lặng giữa đoạn, tốc độ đọc (cần ffmpeg), âm lượng, độ biểu cảm (temperature), và chất lượng model (int8 nhanh / fp32 chất lượng cao hơn). Mặc định giữ nguyên như cũ.
+- MP3 và **đổi tốc độ** cần `ffmpeg` (`brew install ffmpeg`); không có thì dùng WAV (~6 MB/phút).
+- Chạy nhiều luồng song song được (mỗi luồng ~334 MB RAM) để tạo audio nhanh hơn.
 - File nằm trong `exports/audio/` của từng truyện; đã tạo rồi thì lần sau chỉ tạo chương còn thiếu.
 
 ## Phát triển
