@@ -36,6 +36,7 @@ _RATE_LIMIT_MAX_RETRIES = 8
 class ScanWorker(QThread):
     """Fetch metadata + TOC for a URL and create/refresh the project."""
 
+    progress = Signal(str)  # human-readable status (e.g. "opening a browser…")
     scanned = Signal(str, object, int)  # project path, NovelMeta, chapter count
     failed = Signal(str)
 
@@ -49,6 +50,7 @@ class ScanWorker(QThread):
         self.cookies = cookies
 
     def run(self) -> None:
+        adapter = None
         try:
             client = HttpClient(delay_seconds=self.delay)
             adapter = adapter_for_url(self.url, client)
@@ -58,6 +60,7 @@ class ScanWorker(QThread):
                 )
             if adapter.name == "medoctruyen":
                 client.set_cookies(self.cookies)
+            adapter.on_status = self.progress.emit
             meta = adapter.fetch_metadata(self.url)
             refs = adapter.fetch_chapter_list(self.url)
 
@@ -75,6 +78,9 @@ class ScanWorker(QThread):
             self.failed.emit(str(exc))
         except Exception as exc:  # unexpected — still must not crash the app
             self.failed.emit(f"Lỗi không mong đợi: {exc!r}")
+        finally:
+            if adapter is not None:
+                adapter.close()  # 69shuba holds a browser; don't leak it
 
 
 class TranslateWorker(QThread):
@@ -765,6 +771,7 @@ class DownloadWorker(QThread):
 
     def run(self) -> None:
         project = NovelProject.open(self.project_path)
+        adapter = None
         try:
             client = HttpClient(delay_seconds=self.delay)
             adapter = adapter_for_url(project.meta.url, client)
@@ -778,6 +785,9 @@ class DownloadWorker(QThread):
             total = len(pending)
             done = 0
             errors = 0
+            # Reads `done`/`total` at call time (closure over run()'s locals), so a
+            # mid-batch browser relaunch reports the real position, not 0.
+            adapter.on_status = lambda msg: self.progress.emit(done, total, msg)
             for chapter in pending:
                 if self._cancelled:
                     break
@@ -808,6 +818,8 @@ class DownloadWorker(QThread):
             self.progress.emit(done, total, "")
             self.finished_ok.emit(done - errors, errors)
         finally:
+            if adapter is not None:
+                adapter.close()  # 69shuba holds a browser for the whole batch
             project.close()
 
 

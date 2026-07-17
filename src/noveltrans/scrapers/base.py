@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 
 import requests
 
@@ -95,10 +96,27 @@ class SiteAdapter(ABC):
 
     def __init__(self, client: HttpClient):
         self.client = client
+        # Workers assign this so an adapter can explain a long or surprising step to
+        # the user (69shuba opens a browser window). Left None outside the GUI.
+        self.on_status: Callable[[str], None] | None = None
+
+    def _status(self, message: str) -> None:
+        """Tell the user what's happening, if anyone's listening."""
+        if self.on_status is not None:
+            self.on_status(message)
 
     @classmethod
     def matches(cls, url: str) -> bool:
         return any(re.search(p, url) for p in cls.url_patterns)
+
+    def close(self) -> None:
+        """Release anything held for the batch. Default: nothing.
+
+        Most adapters fetch over the shared HttpClient and hold nothing of their own.
+        One (69shuba) drives a browser for the life of a scan/download, and a leaked
+        Chromium is a window the user has to force-quit — so workers call this in a
+        `finally`. Must be idempotent and must never raise.
+        """
 
     @abstractmethod
     def fetch_metadata(self, url: str) -> NovelMeta:

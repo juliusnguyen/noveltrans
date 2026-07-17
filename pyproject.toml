@@ -29,10 +29,16 @@ dev = [
 tts = [
     "vieneu>=3.0",  # VieNeu-TTS, torch-free ONNX runtime (~334 MB model on first run)
 ]
-discord = [
-    # Auto-unlock medoctruyen's 50/day cap by driving its Discord /mochuong command.
-    # After installing, run `playwright install chromium` once to fetch the browser.
+browser = [
+    # Features that drive a real browser: medoctruyen's Discord auto-unlock, and
+    # reading 69shuba (which sits behind a Cloudflare challenge only a real browser
+    # passes). After installing, run `playwright install chromium` once — or just have
+    # Google Chrome installed, which is preferred and used automatically.
     "playwright>=1.40",
+]
+discord = [
+    # Back-compat alias: this was the browser extra before 69shuba needed one too.
+    "noveltrans[browser]",
 ]
 build = [
     "pyinstaller>=6.0",  # package the macOS .app (see `make app` / `make dmg`)
