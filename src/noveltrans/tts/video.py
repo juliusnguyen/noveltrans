@@ -273,6 +273,84 @@ def _run_ffmpeg(
         raise TtsError(f"ffmpeg trả lỗi (mã {proc.returncode}) khi {what}: {detail}")
 
 
+# All chapter PCM is normalised to this before concatenation, so the raw byte stream is
+# uniform (a hard requirement for headerless concat) regardless of each file's own format.
+_PCM_RATE = 48000
+_PCM_ARGS = ("-f", "s16le", "-ac", "1", "-ar", str(_PCM_RATE))
+
+
+def _concat_audio(
+    paths: list[Path | str],
+    audio_file: Path,
+    err_file: Path,
+    cancelled: Callable[[], bool] | None,
+    deadline: float,
+) -> None:
+    """Concatenate chapter audio into one AAC track WITHOUT the concat demuxer.
+
+    Why not `-f concat`: that demuxer accumulates each input's timestamps, and (at least
+    in the ffmpeg build shipped here) overflows a signed 32-bit sample counter at
+    2**31 / 48000 Hz ≈ 12.4 hours — past which it emits a wrapped, non-monotonic DTS and
+    the muxer simply stops advancing, silently truncating any longer "toàn bộ" video to
+    ~12.4h. Instead we decode each file independently to raw 48 kHz mono PCM (headerless,
+    so it carries no timestamps at all) and stream the samples into a single encoder that
+    stamps one fresh monotonic timeline — correct for any total length.
+
+    The decoders run one at a time, each writing straight into the encoder's stdin, so the
+    encoder consumes concurrently and the pipe never deadlocks. Honours cancel/deadline.
+    """
+    with open(err_file, "w", encoding="utf-8") as err:
+        try:
+            enc = subprocess.Popen(
+                ["ffmpeg", "-y", *_PCM_ARGS, "-i", "pipe:0",
+                 "-c:a", "aac", "-b:a", "96k", str(audio_file)],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err,
+            )
+        except FileNotFoundError as exc:
+            raise TtsError("Không tìm thấy ffmpeg — cài ffmpeg để tạo video.") from exc
+
+        def _poll(proc: subprocess.Popen, *others: subprocess.Popen) -> None:
+            """Wait for `proc`, tearing everything down on cancel/deadline."""
+            while True:
+                try:
+                    proc.wait(timeout=0.3)
+                    return
+                except subprocess.TimeoutExpired:
+                    if cancelled is not None and cancelled():
+                        for p in (proc, *others):
+                            _terminate(p)
+                        raise MergeCancelled()
+                    if time.monotonic() > deadline:
+                        for p in (proc, *others):
+                            _terminate(p)
+                        raise TtsError("ffmpeg quá thời gian khi ghép âm thanh — thử lô nhỏ hơn.")
+
+        try:
+            for path in paths:
+                if enc.poll() is not None:
+                    break  # encoder exited early (e.g. disk full) — reported below
+                dec = subprocess.Popen(
+                    ["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), *_PCM_ARGS, "pipe:1"],
+                    stdout=enc.stdin, stderr=subprocess.DEVNULL,
+                )
+                _poll(dec, enc)
+                if dec.returncode != 0:
+                    _terminate(enc)
+                    raise TtsError(
+                        f"ffmpeg không giải mã được audio chương ({Path(path).name}) khi ghép."
+                    )
+            if enc.stdin:
+                enc.stdin.close()  # EOF → the encoder finalises the file
+            _poll(enc)
+        finally:
+            if enc.stdin and not enc.stdin.closed:
+                enc.stdin.close()
+
+    if enc.returncode != 0:
+        detail = err_file.read_text(encoding="utf-8", errors="replace").strip()[-300:]
+        raise TtsError(f"ffmpeg trả lỗi (mã {enc.returncode}) khi ghép âm thanh: {detail}")
+
+
 def _filtergraph(width: int, height: int, subs_path: Path, font_dir: Path,
                  total_seconds: float) -> str:
     """Overlay the animated bits onto the pre-baked player artwork.
@@ -336,7 +414,6 @@ def render_video(
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_dir = Path(tempfile.mkdtemp(prefix="noveltrans-video-"))
-    list_file = tmp_dir / "list.txt"
     subs_file = tmp_dir / "subs.ass"
     audio_file = tmp_dir / "audio.m4a"
     skin_file = tmp_dir / "skin.png"
@@ -353,7 +430,6 @@ def render_video(
     deadline = time.monotonic() + max(3600, int(total) * 6)
 
     try:
-        list_file.write_text(build_concat_list([s.path for s in segments]), encoding="utf-8")
         subs_file.write_text(
             build_ass_subtitles(segments, novel_title, width=width, height=height),
             encoding="utf-8",
@@ -365,13 +441,10 @@ def render_video(
         build_vinyl(font_dir / VINYL_LABEL, vinyl_file, size=lay.vinyl_size)
         build_knob(knob_file, radius=lay.knob_r)
 
-        # 1) Concatenate the per-chapter audio into one AAC track so -shortest and the
-        #    muxed duration are exact regardless of the inputs' codecs (WAV/MP3 mixed).
-        _run_ffmpeg(
-            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
-             "-c:a", "aac", "-b:a", "96k", str(audio_file)],
-            err_file, cancelled, deadline, "ghép âm thanh",
-        )
+        # 1) Concatenate the per-chapter audio into one AAC track (mixed WAV/MP3 inputs ok).
+        #    NOT via the concat demuxer — its 32-bit timestamp counter overflows at ~12.4h
+        #    and would truncate a full-novel video; _concat_audio decodes per file instead.
+        _concat_audio([s.path for s in segments], audio_file, err_file, cancelled, deadline)
 
         # 2) Loop the skin/vinyl/knob, spin the vinyl + slide the playhead + draw the bars,
         #    burn the titles, mux the audio, end with it. No -tune stillimage: it animates.
@@ -394,6 +467,6 @@ def render_video(
         )
         return out_path
     finally:
-        for f in (list_file, subs_file, audio_file, skin_file, vinyl_file, knob_file, err_file):
+        for f in (subs_file, audio_file, skin_file, vinyl_file, knob_file, err_file):
             f.unlink(missing_ok=True)
         tmp_dir.rmdir()

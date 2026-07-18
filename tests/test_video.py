@@ -242,6 +242,9 @@ class TestRenderArgv:
 
         monkeypatch.setattr(video.subprocess, "Popen", fake_popen)
         monkeypatch.setattr(video, "_with_real_durations", lambda segs: segs)  # skip ffprobe
+        # audio concat has its own subprocess/pipe dance (tested separately); stub it here
+        # so this test isolates the render argv.
+        monkeypatch.setattr(video, "_concat_audio", lambda *a, **k: None)
 
         segs = [MergeSegment(path=tmp_path / "a.wav", seconds=3.0, title="C1")]
         with video.font_dir_context() as font_dir:
@@ -255,6 +258,36 @@ class TestRenderArgv:
         assert "copy" in render  # -c:a copy (audio filtered AND copied — the crux)
         assert any("rotate=a=" in a for a in render)  # the vinyl spins
         assert render.count("-loop") == 3  # skin + vinyl + knob are looped stills
+
+    def test_audio_concat_avoids_the_concat_demuxer(self, tmp_path, monkeypatch):
+        # Regression guard for the >12.4h truncation bug: the concat demuxer overflows a
+        # 32-bit timestamp counter (2**31 / 48000Hz), silently cutting long "toàn bộ"
+        # videos. render_video must NOT shell out to `-f concat` for the audio.
+        import noveltrans.tts.video as video
+
+        cmds = []
+
+        class _FakeProc:
+            returncode = 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        def fake_popen(cmd, **kw):
+            cmds.append(cmd)
+            return _FakeProc()
+
+        monkeypatch.setattr(video.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(video, "_with_real_durations", lambda segs: segs)
+        monkeypatch.setattr(video, "_concat_audio", lambda *a, **k: None)
+
+        segs = [MergeSegment(path=tmp_path / "a.wav", seconds=3.0, title="C1")]
+        with video.font_dir_context() as font_dir:
+            video.render_video(segs, tmp_path / "bg.png", tmp_path / "out.mp4",
+                               font_dir, "Truyện", width=640, height=360, fps=25)
+
+        # exact-token membership (not substring — the tmp_path name contains "concat")
+        assert not any("concat" in cmd for cmd in cmds)  # no `-f concat` demuxer arg
 
 
 class TestPlayerLayout:
@@ -406,6 +439,55 @@ def test_project_has_a_video_dir(library_dir, sample_meta, sample_refs):
     project = NovelProject.create(library_dir, sample_meta, sample_refs)
     assert project.video_dir.name == "video"
     assert project.video_dir.parent == project.exports_dir
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+class TestConcatAudio:
+    """The audio concat that replaced the (32-bit-overflowing) concat demuxer."""
+
+    def _tone(self, path, seconds, freq=440, extra=()):
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi", "-i", f"sine=frequency={freq}:duration={seconds}",
+             "-ar", "48000", *extra, str(path)],
+            check=True, capture_output=True,
+        )
+
+    def _dur(self, path):
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nokey=1", str(path)],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        return float(out)
+
+    def test_concatenates_mixed_formats_to_the_summed_duration(self, tmp_path):
+        # Decodes each file independently (mixed wav/mp3, mono/stereo) and stitches the raw
+        # PCM, so the output length is the sum — this is the path that, unlike `-f concat`,
+        # does not truncate past ~12.4h.
+        from noveltrans.tts.video import _concat_audio
+
+        a = tmp_path / "a.wav"
+        b = tmp_path / "b.mp3"
+        c = tmp_path / "c.wav"
+        self._tone(a, 1.0, 300)
+        self._tone(b, 0.5, 500)
+        self._tone(c, 0.8, 700, extra=("-ac", "2"))  # stereo → normalised to mono
+        out = tmp_path / "audio.m4a"
+        _concat_audio([a, b, c], out, tmp_path / "err.txt", None, __import__("time").monotonic() + 60)
+        assert out.exists()
+        assert abs(self._dur(out) - 2.3) < 0.3  # 1.0 + 0.5 + 0.8, within codec padding
+
+    def test_raises_when_a_chapter_cannot_be_decoded(self, tmp_path):
+        from noveltrans.errors import TtsError
+        from noveltrans.tts.video import _concat_audio
+
+        good = tmp_path / "a.wav"
+        self._tone(good, 0.5)
+        bad = tmp_path / "broken.wav"
+        bad.write_bytes(b"not audio at all")
+        with pytest.raises(TtsError):
+            _concat_audio([good, bad], tmp_path / "o.m4a", tmp_path / "e.txt",
+                          None, __import__("time").monotonic() + 60)
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
