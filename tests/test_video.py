@@ -115,14 +115,18 @@ class TestBuildAssSubtitles:
         chapter = next(ln for ln in doc.splitlines() if ",Chapter," in ln)
         assert chapter.endswith("{\\fad(400,400)}Chương (evil)")  # fade outside the escaped title
 
-    def test_titles_are_placed_in_the_right_half(self):
-        # Split layout: the photo is on the left, so both titles sit in the RIGHT half —
-        # Alignment 8 with MarginL ≈ half the width. Chapter below the bars (larger MarginV).
+    def test_titles_are_placed_in_the_right_column(self):
+        # 'Now playing' block: both titles sit in the right column (photo is on the left)
+        # via Alignment 8 + PlayerLayout margins — novel above, chapter just below it.
+        from noveltrans.tts.player_skin import PlayerLayout
+
+        lay = PlayerLayout.of(1920, 1080)
         doc = build_ass_subtitles([_seg(10, "C1")], "Truyện", width=1920, height=1080)
         novel = next(ln for ln in doc.splitlines() if ln.startswith("Style: Novel,"))
         chapter = next(ln for ln in doc.splitlines() if ln.startswith("Style: Chapter,"))
-        assert novel.endswith(",8,960,57,140,1")  # right half, top
-        assert chapter.endswith(",8,960,57,820,1")  # right half, below bars
+        assert novel.endswith(f",8,{lay.text_margin_l},{lay.text_margin_r},{lay.novel_margin_v},1")
+        assert chapter.endswith(f",8,{lay.text_margin_l},{lay.text_margin_r},{lay.chapter_margin_v},1")
+        assert lay.novel_margin_v < lay.chapter_margin_v  # novel above the chapter line
 
 
 class TestYoutubeTimestamp:
@@ -175,18 +179,24 @@ class TestFiltergraph:
         g = self._graph()
         assert "[1:a]showfreqs=" in g  # bars driven by the audio (input 1)
         assert "mode=bar" in g
-        assert "[base][viz]overlay=" in g  # bars composited over the base
+        assert "[0:v][viz]overlay=" in g  # bars composited over the baked skin (input 0)
         assert "subtitles=" in g  # titles still burned on top
 
-    def test_photo_framed_on_the_left_over_a_blurred_backdrop(self):
+    def test_bars_span_the_bottom_and_are_purple(self):
+        # The skin is pre-baked (no photo/blur here); the graph only adds the big bottom
+        # spectrum — full-width and low, in a purple that reads over the light skin.
+        from noveltrans.tts.player_skin import PlayerLayout
+
+        lay = PlayerLayout.of(1920, 1080)
         g = self._graph()
-        assert "boxblur" in g  # blurred backdrop fills the frame
-        # the sharp photo is placed on the left (small x), not centered
-        assert "[bg][photo]overlay=90:" in g
+        assert "boxblur" not in g  # the backdrop is baked into the skin, not done here
+        assert f"showfreqs=s={lay.bars_w}x{lay.bars_h}" in g  # full-width, tall band
+        assert "colors=0x8a52c8" in g  # purple, visible on the pastel skin
+        assert f"[0:v][viz]overlay={lay.bars_x}:{lay.bars_y}" in g  # anchored bottom-left
 
 
 class TestRenderArgv:
-    def test_render_command_uses_waveform_and_drops_stillimage(self, tmp_path, monkeypatch):
+    def test_render_command_uses_bars_and_drops_stillimage(self, tmp_path, monkeypatch):
         # Capture the ffmpeg render argv without running ffmpeg.
         import noveltrans.tts.video as video
 
@@ -215,6 +225,54 @@ class TestRenderArgv:
         assert "veryfast" in render  # a normal preset instead
         assert "[v]" in render and "1:a" in render  # map filtered video + copy audio
         assert "copy" in render  # -c:a copy (audio filtered AND copied — the crux)
+
+
+class TestPlayerLayout:
+    def test_scales_with_output_size(self):
+        # Geometry is proportional to width/height, so any resolution stays laid out.
+        from noveltrans.tts.player_skin import PlayerLayout
+
+        small = PlayerLayout.of(960, 540)
+        big = PlayerLayout.of(1920, 1080)
+        assert big.bars_w == small.bars_w * 2
+        assert big.photo_h == small.photo_h * 2
+        assert big.chapter_font_px == small.chapter_font_px * 2
+
+    def test_photo_is_on_the_left_and_bars_span_the_bottom(self):
+        from noveltrans.tts.player_skin import PlayerLayout
+
+        lay = PlayerLayout.of(1920, 1080)
+        assert lay.photo_x + lay.photo_w < lay.width * 0.5  # photo stays in the left half
+        assert lay.bars_w > lay.width * 0.9  # bars run nearly the full width
+        assert lay.bars_y > lay.height * 0.7  # along the bottom
+
+
+class TestPlayerSkin:
+    def test_builds_a_png_of_the_requested_size(self, tmp_path):
+        from PIL import Image
+
+        from noveltrans.tts.player_skin import build_player_skin
+
+        # a small real photo to frame on the left
+        photo = tmp_path / "p.png"
+        Image.new("RGB", (400, 300), (200, 120, 60)).save(photo)
+        out = tmp_path / "skin.png"
+        build_player_skin(photo, out, width=640, height=360)
+        assert out.exists()
+        with Image.open(out) as im:
+            assert im.size == (640, 360)
+
+    def test_unreadable_photo_still_produces_a_skin(self, tmp_path):
+        # A missing/corrupt image must not crash the render — a placeholder card is drawn.
+        from PIL import Image
+
+        from noveltrans.tts.player_skin import build_player_skin
+
+        out = tmp_path / "skin.png"
+        build_player_skin(tmp_path / "nope.png", out, width=640, height=360)
+        assert out.exists()
+        with Image.open(out) as im:
+            assert im.size == (640, 360)
 
 
 class TestVideoWorker:

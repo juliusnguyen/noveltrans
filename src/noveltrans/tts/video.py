@@ -8,8 +8,10 @@ Popen/poll/cancel/deadline pattern. What's new here:
     whole video plus the current chapter title, timed to each chapter's audio boundary.
   * `build_youtube_description` — a companion text file where each chapter is a clickable
     YouTube timestamp (`0:00`, `2:05`, …), so viewers can jump to a chapter.
-  * `render_video` — the ffmpeg call: loop the background image, mux the concatenated
-    chapter audio, burn the ASS titles, end when the audio ends.
+  * `render_video` — bakes a "music player" skin (`player_skin.build_player_skin`: pastel
+    gradient + the chosen photo framed on the left + a record-player widget), then the
+    ffmpeg call loops that skin, overlays a full-width audio-driven bar spectrum, muxes the
+    concatenated chapter audio, burns the ASS titles, and ends when the audio ends.
 
 The builders are pure (no ffmpeg) so they unit-test without a render; only `render_video`
 shells out. Chapter title text is Vietnamese; the bundled Noto Sans font (assets/) renders
@@ -31,6 +33,7 @@ from pathlib import Path
 
 from noveltrans.errors import TtsError
 from noveltrans.tts.convert import ffmpeg_available  # noqa: F401 (re-exported for callers)
+from noveltrans.tts.player_skin import PlayerLayout, build_player_skin
 
 # Reused verbatim from merge — the selection, segment type, concat list, and cancel.
 from noveltrans.tts.merge import (  # noqa: F401
@@ -118,15 +121,16 @@ _ASS_STYLES = (
     "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
     "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
     "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-    # BorderStyle=4 + a translucent BackColour (&H80…) draws a dark scrim box behind the
-    # text so it stays legible over any background image.
-    # Split layout: the photo is on the LEFT, so both titles live in the RIGHT half —
-    # Alignment 8 (top-center) with MarginL≈half the width centres them in the right half.
-    # Novel near the top, Chapter below the bars (larger MarginV).
-    "Style: Novel,{font},{nsize},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"
-    "0,0,0,0,100,100,0,0,4,0,0,8,{mL},{mR},{nmargin},1\n"
-    "Style: Chapter,{font},{csize},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"
-    "0,0,0,0,100,100,0,0,4,0,0,8,{mL},{mR},{cmargin},1\n"
+    # Colours are ASS &HAABBGGRR. Over the light pastel skin the titles sit in the right
+    # column (over the gradient, not the photo), so no scrim is needed — BorderStyle=1 with
+    # Outline=0 draws plain text. The player's "now playing" block: the Novel title is the
+    # muted 'album' line (grey-purple), the Chapter title the bold 'track' line (dark
+    # purple). Alignment 8 (top-center) + MarginL≈right-column-start frames both into the
+    # right column; a soft shadow lifts them off the gradient.
+    "Style: Novel,{font},{nsize},&H00A06B8A,&H000000FF,&H00FFFFFF,&H00000000,"
+    "0,0,0,0,100,100,0,0,1,0,1,8,{mL},{mR},{nmargin},1\n"
+    "Style: Chapter,{font},{csize},&H00502A55,&H000000FF,&H00FFFFFF,&H30000000,"
+    "1,0,0,0,100,100,0,0,1,0,1,8,{mL},{mR},{cmargin},1\n"
 )
 
 _ASS_HEADER = (
@@ -165,28 +169,24 @@ def build_ass_subtitles(
     width: int = 1920,
     height: int = 1080,
     font_name: str = FONT_NAME,
-    novel_font_px: int = 52,
-    chapter_font_px: int = 46,
 ) -> str:
     """An ASS document: the novel title for the whole video + one event per chapter.
 
     Chapter events are timed by the cumulative sum of `MergeSegment.seconds` — the same
     offset math as merge's chapter markers, so titles change exactly at the audio
     boundaries. Each chapter title fades in/out (`\\fad`) so it changes smoothly; the
-    novel title stays solid the whole video. Both titles are centred in the RIGHT half
-    (the photo occupies the left): novel near the top, chapter below the bars.
+    novel title stays solid the whole video. Both titles form the player's "now playing"
+    block in the right column (`PlayerLayout` fixes the placement): the novel title is the
+    muted album line above, the chapter title the bold track line below it.
     """
-    # Right-half placement: MarginL ≈ half the width centres the text in the right side.
-    m_l = int(width * 0.50)
-    m_r = int(width * 0.03)
-    novel_margin_v = int(height * 0.13)  # top of the right half
-    chapter_margin_v = int(height * 0.76)  # below the bars band
+    lay = PlayerLayout.of(width, height)
     total = sum(s.seconds for s in segments)
     out = [
         _ASS_HEADER.format(w=width, h=height),
         _ASS_STYLES.format(
-            font=font_name, nsize=novel_font_px, csize=chapter_font_px,
-            mL=m_l, mR=m_r, nmargin=novel_margin_v, cmargin=chapter_margin_v,
+            font=font_name, nsize=lay.novel_font_px, csize=lay.chapter_font_px,
+            mL=lay.text_margin_l, mR=lay.text_margin_r,
+            nmargin=lay.novel_margin_v, cmargin=lay.chapter_margin_v,
         ),
         "\n",
         _ASS_EVENTS_HEADER,
@@ -263,31 +263,22 @@ def _run_ffmpeg(
 
 
 def _filtergraph(width: int, height: int, subs_path: Path, font_dir: Path) -> str:
-    """Split layout: the photo framed on the LEFT, audio bars + titles on the RIGHT.
+    """Overlay the animated bits onto the pre-baked player skin (input 0).
 
-    A blurred, darkened copy of the image fills the whole frame as a backdrop; the sharp
-    image is fitted into a box on the left; `showfreqs` bars (white, driven by the audio,
-    input 1) sit in the right half; the ASS titles are burned on top. `showfreqs` emits a
-    transparent background, so the bars composite cleanly. The bars animate at the output
-    frame rate (`-r`), so no `rate=` option is needed (showfreqs has none).
+    Input 0 is the full-frame skin PNG (`build_player_skin`): pastel gradient, framed
+    photo, and the record-player widget are all already drawn. Here we only add the parts
+    that move: a big full-width `showfreqs` spectrum along the bottom (purple, so it reads
+    over the light skin — driven by the audio, input 1) and the burned-in ASS titles.
+    `showfreqs` emits a transparent background, so the bars composite cleanly, and it
+    animates at the output frame rate (`-r`) — no `rate=` option (showfreqs has none).
     """
+    lay = PlayerLayout.of(width, height)
     subs = str(subs_path).replace("\\", "/").replace(":", r"\:")
     fonts = str(font_dir).replace("\\", "/").replace(":", r"\:")
-    photo_w = int(width * 0.43)
-    photo_h = int(height * 0.83)
-    photo_x = int(width * 0.047)
-    bar_w = int(width * 0.42)
-    bar_h = int(height * 0.31)
-    bar_x = int(width * 0.526)
-    bar_y = int(height * 0.40)
     return (
-        f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{height},boxblur=30:3,eq=brightness=-0.5[bg];"
-        f"[0:v]scale={photo_w}:{photo_h}:force_original_aspect_ratio=decrease[photo];"
-        f"[bg][photo]overlay={photo_x}:(H-h)/2[base];"
-        f"[1:a]showfreqs=s={bar_w}x{bar_h}:mode=bar:ascale=sqrt:fscale=log:"
-        f"win_size=1024:colors=white[viz];"
-        f"[base][viz]overlay={bar_x}:{bar_y},"
+        f"[1:a]showfreqs=s={lay.bars_w}x{lay.bars_h}:mode=bar:ascale=sqrt:fscale=log:"
+        f"win_size=2048:colors=0x8a52c8[viz];"
+        f"[0:v][viz]overlay={lay.bars_x}:{lay.bars_y},"
         f"subtitles='{subs}':fontsdir='{fonts}'[v]"
     )
 
@@ -306,11 +297,12 @@ def render_video(
 ) -> Path:
     """Render `segments` into an MP4 at `out_path`; also write the YouTube description.
 
-    The `image_path` is framed on the LEFT (over a blurred backdrop); audio-driven bars
-    and the titles sit on the RIGHT; the concatenated chapter audio plays, and the chapter
-    titles (fading on change) are burned in below the bars. `-shortest` ends the video with
-    the audio. A `<out>.txt` description with clickable timestamps is written next to the
-    video. Raises TtsError on ffmpeg failure, MergeCancelled if cancelled.
+    The `image_path` is framed on the LEFT of a "music player" skin (pastel gradient +
+    record-player widget); a big full-width audio-driven bar spectrum runs along the
+    bottom; the novel + chapter titles are the player's "now playing" text on the RIGHT
+    (chapter fading on change). The concatenated chapter audio plays and `-shortest` ends
+    the video with it. A `<out>.txt` description with clickable timestamps is written next
+    to the video. Raises TtsError on ffmpeg failure, MergeCancelled if cancelled.
     """
     if not segments:
         raise TtsError("Không có chương nào có audio để tạo video.")
@@ -323,6 +315,7 @@ def render_video(
     list_file = tmp_dir / "list.txt"
     subs_file = tmp_dir / "subs.ass"
     audio_file = tmp_dir / "audio.m4a"
+    skin_file = tmp_dir / "skin.png"
     err_file = tmp_dir / "err.txt"
 
     # Time the titles by the audio the video actually plays, not the (possibly 0/stale)
@@ -339,6 +332,9 @@ def render_video(
             build_ass_subtitles(segments, novel_title, width=width, height=height),
             encoding="utf-8",
         )
+        # Bake the static player skin (gradient + framed photo + widget) once; ffmpeg
+        # loops this PNG and only overlays the animated bars + titles on top of it.
+        build_player_skin(image_path, skin_file, width=width, height=height)
 
         # 1) Concatenate the per-chapter audio into one AAC track so -shortest and the
         #    muxed duration are exact regardless of the inputs' codecs (WAV/MP3 mixed).
@@ -348,11 +344,11 @@ def render_video(
             err_file, cancelled, deadline, "ghép âm thanh",
         )
 
-        # 2) Photo on the left, audio bars on the right, burn the titles, mux the audio,
-        #    end with the audio. No -tune stillimage: the bars animate every frame.
+        # 2) Loop the baked skin, overlay the bottom bar spectrum, burn the titles, mux
+        #    the audio, end with it. No -tune stillimage: the bars animate every frame.
         _run_ffmpeg(
             ["ffmpeg", "-y",
-             "-loop", "1", "-framerate", str(fps), "-i", str(image_path),
+             "-loop", "1", "-framerate", str(fps), "-i", str(skin_file),
              "-i", str(audio_file),
              "-filter_complex", _filtergraph(width, height, subs_file, font_dir),
              "-map", "[v]", "-map", "1:a",
@@ -367,6 +363,6 @@ def render_video(
         )
         return out_path
     finally:
-        for f in (list_file, subs_file, audio_file, err_file):
+        for f in (list_file, subs_file, audio_file, skin_file, err_file):
             f.unlink(missing_ok=True)
         tmp_dir.rmdir()
