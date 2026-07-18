@@ -300,8 +300,17 @@ class AppConfig:
         self._s.setValue("tts_style", value if value in valid else DEFAULT_TTS_STYLE)
 
     @property
+    def video_image_path(self) -> str:
+        """Last-used background image for the 'Xuất video' export ("" = none yet)."""
+        return str(self._s.value("video_image_path", ""))
+
+    @video_image_path.setter
+    def video_image_path(self, value: str) -> None:
+        self._s.setValue("video_image_path", value)
+
+    @property
     def keep_awake_enabled(self) -> bool:
-        """Keep the Mac awake while a download/translate/TTS/merge job is running."""
+        """Keep the Mac awake while a download/translate/TTS/merge/video job is running."""
         return self._s.value("keep_awake_enabled", True, type=bool)
 
     @keep_awake_enabled.setter

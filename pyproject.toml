@@ -51,7 +51,7 @@ noveltrans = "noveltrans.app:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-noveltrans = ["translators/data/*.json"]
+noveltrans = ["translators/data/*.json", "tts/assets/*.ttf", "tts/assets/*.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
