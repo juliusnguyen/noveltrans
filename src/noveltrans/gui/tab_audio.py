@@ -270,6 +270,8 @@ class AudioTab(QWidget):
         if not ffmpeg_available():
             self.video_button.setEnabled(False)
             self.video_button.setToolTip("Cần ffmpeg để tạo video (brew install ffmpeg).")
+        self.open_video_dir_button = QPushButton("Mở thư mục video")
+        self.open_video_dir_button.clicked.connect(self._open_video_dir)
 
         row = QHBoxLayout()
         row.addWidget(QLabel("Chế độ:"))
@@ -283,6 +285,7 @@ class AudioTab(QWidget):
         row.addWidget(self.video_image_edit, stretch=1)
         row.addWidget(self.video_image_button)
         row.addWidget(self.video_button)
+        row.addWidget(self.open_video_dir_button)
 
         box = QGroupBox("Xuất video (audio + tên chương + ảnh nền)")
         box.setLayout(row)
@@ -555,6 +558,12 @@ class AudioTab(QWidget):
         self.project.audio_dir.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.project.audio_dir)))
 
+    def _open_video_dir(self) -> None:
+        if self.project is None:
+            return
+        self.project.video_dir.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.project.video_dir)))
+
     def _on_progress(self, done: int, total: int, title: str) -> None:
         if total:
             self.progress.setMaximum(total)
@@ -752,7 +761,7 @@ class AudioTab(QWidget):
         self._reset_video_ui()
         if count:
             self.status_label.setText(
-                f"✅ Đã tạo {count} video (kèm mô tả .txt) trong exports/video/."
+                f"✅ Đã tạo {count} video (kèm mô tả .txt) — bấm “Mở thư mục video”."
             )
         else:
             self.status_label.setText("Đã dừng tạo video.")
