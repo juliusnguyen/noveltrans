@@ -204,6 +204,19 @@ class TestFiltergraph:
         assert "fillcolor=none" in g and "ow=iw:oh=ih" in g  # transparent, same frame
         assert f"[0:v][vin]overlay={lay.vinyl_x}:{lay.vinyl_y}" in g
 
+    def test_static_vinyl_skips_the_rotate(self):
+        # The "fastest" preset drops the per-frame rotate: the disc is overlaid statically.
+        from pathlib import Path
+
+        from noveltrans.tts.player_skin import PlayerLayout
+        from noveltrans.tts.video import _filtergraph
+
+        lay = PlayerLayout.of(1920, 1080)
+        g = _filtergraph(1920, 1080, Path("/tmp/s.ass"), Path("/tmp/f"), 100.0, spin_vinyl=False)
+        assert "rotate=" not in g  # no per-frame rotate → much faster encode
+        assert f"[0:v][2:v]overlay={lay.vinyl_x}:{lay.vinyl_y}" in g  # static overlay
+        assert "showfreqs=" in g and "subtitles=" in g  # bars + titles still there
+
     def test_knob_slides_along_the_track_with_progress(self):
         # The playhead (input 3) x is a linear function of t/total across the track.
         from noveltrans.tts.player_skin import PlayerLayout
@@ -221,6 +234,29 @@ class TestFiltergraph:
 
         g = _filtergraph(1920, 1080, Path("/tmp/s.ass"), Path("/tmp/f"), 0.0)
         assert "(t/0)" not in g  # guarded against a zero divide
+
+
+class TestVideoPresets:
+    def test_presets_cover_the_three_speed_tiers(self):
+        from noveltrans.tts.video import VIDEO_QUALITY_PRESETS
+
+        high = VIDEO_QUALITY_PRESETS["high"]
+        fast = VIDEO_QUALITY_PRESETS["fast"]
+        fastest = VIDEO_QUALITY_PRESETS["fastest"]
+        assert (high["width"], high["height"], high["spin_vinyl"]) == (1920, 1080, True)
+        assert (fast["width"], fast["height"]) == (1280, 720)  # 720p, still spinning
+        assert fast["spin_vinyl"] is True
+        # fastest trades the most for speed: 720p, lower fps, static disc
+        assert fastest["height"] == 720 and fastest["fps"] < high["fps"]
+        assert fastest["spin_vinyl"] is False
+        # the estimate speeds ascend high < fast < fastest (each tier is faster)
+        assert high["speed"] < fast["speed"] < fastest["speed"]
+
+    def test_unknown_preset_falls_back_to_high(self):
+        from noveltrans.tts.video import VIDEO_QUALITY_PRESETS, video_preset
+
+        assert video_preset("nope") == VIDEO_QUALITY_PRESETS["high"]
+        assert video_preset("fast") == VIDEO_QUALITY_PRESETS["fast"]
 
 
 class TestRenderArgv:

@@ -35,6 +35,7 @@ TTS_PRECISIONS = ("int8", "fp32")
 # Reading style, independent of voice. Default "tu_nhien" reproduces today's output
 # (the engine's own default). Ordered (id, label) for the audio-tab dropdown.
 DEFAULT_TTS_STYLE = "tu_nhien"
+DEFAULT_VIDEO_QUALITY = "high"  # video export preset: high (1080p) | fast (720p) | fastest
 TTS_STYLES = (
     ("tu_nhien", "Tự nhiên"),
     ("doc_truyen", "Kể chuyện"),
@@ -307,6 +308,15 @@ class AppConfig:
     @video_image_path.setter
     def video_image_path(self, value: str) -> None:
         self._s.setValue("video_image_path", value)
+
+    @property
+    def video_quality(self) -> str:
+        """Video export quality/speed preset key ("high" | "fast" | "fastest")."""
+        return str(self._s.value("video_quality", DEFAULT_VIDEO_QUALITY))
+
+    @video_quality.setter
+    def video_quality(self, value: str) -> None:
+        self._s.setValue("video_quality", value)
 
     @property
     def keep_awake_enabled(self) -> bool:

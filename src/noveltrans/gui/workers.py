@@ -751,6 +751,7 @@ class VideoWorker(QThread):
         width: int = 1920,
         height: int = 1080,
         fps: int = 25,  # motion video (waveform) — smoother than 019's static 12
+        spin_vinyl: bool = True,  # False → static disc (skips the costly per-frame rotate)
         parent=None,
     ):
         super().__init__(parent)
@@ -765,6 +766,7 @@ class VideoWorker(QThread):
         self.width = width
         self.height = height
         self.fps = fps
+        self.spin_vinyl = spin_vinyl
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -824,6 +826,7 @@ class VideoWorker(QThread):
                         render_video(
                             segments, self.image_path, out_path, font_dir, novel_title,
                             width=self.width, height=self.height, fps=self.fps,
+                            spin_vinyl=self.spin_vinyl,
                             cancelled=lambda: self._cancelled,
                         )
                         written += 1
