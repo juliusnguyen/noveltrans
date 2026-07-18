@@ -89,6 +89,14 @@ class ScrapeTab(QWidget):
         self.desc_label = QLabel("—")
         self.desc_label.setWordWrap(True)
         self.desc_label.setMaximumHeight(90)
+        # Let the user select/copy the title, author and description (e.g. for a video
+        # title/description). QLabels aren't selectable by default.
+        _selectable = (
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+        for _label in (self.title_label, self.author_label, self.count_label, self.desc_label):
+            _label.setTextInteractionFlags(_selectable)
         meta_box = QGroupBox("Thông tin truyện")
         meta_form = QFormLayout(meta_box)
         meta_form.addRow("Tên truyện:", self.title_label)
