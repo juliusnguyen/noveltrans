@@ -8,10 +8,12 @@ Popen/poll/cancel/deadline pattern. What's new here:
     whole video plus the current chapter title, timed to each chapter's audio boundary.
   * `build_youtube_description` — a companion text file where each chapter is a clickable
     YouTube timestamp (`0:00`, `2:05`, …), so viewers can jump to a chapter.
-  * `render_video` — bakes a "music player" skin (`player_skin.build_player_skin`: pastel
-    gradient + the chosen photo framed on the left + a record-player widget), then the
-    ffmpeg call loops that skin, overlays a full-width audio-driven bar spectrum, muxes the
-    concatenated chapter audio, burns the ASS titles, and ends when the audio ends.
+  * `render_video` — bakes three `player_skin` layers (the static skin: pastel gradient +
+    the chosen photo framed on the left + an empty progress track; a vinyl disc labelled
+    with the bundled logo; a playhead dot), then the ffmpeg call loops them and animates:
+    the vinyl spins, an audio-driven bar spectrum plays, the playhead slides along the
+    track with real progress, the chapter audio is muxed, the ASS titles are burned, and it
+    ends when the audio ends.
 
 The builders are pure (no ffmpeg) so they unit-test without a render; only `render_video`
 shells out. Chapter title text is Vietnamese; the bundled Noto Sans font (assets/) renders
@@ -33,7 +35,12 @@ from pathlib import Path
 
 from noveltrans.errors import TtsError
 from noveltrans.tts.convert import ffmpeg_available  # noqa: F401 (re-exported for callers)
-from noveltrans.tts.player_skin import PlayerLayout, build_player_skin
+from noveltrans.tts.player_skin import (
+    PlayerLayout,
+    build_knob,
+    build_player_skin,
+    build_vinyl,
+)
 
 # Reused verbatim from merge — the selection, segment type, concat list, and cancel.
 from noveltrans.tts.merge import (  # noqa: F401
@@ -47,6 +54,10 @@ from noveltrans.tts.merge import (  # noqa: F401
 )
 
 FONT_NAME = "Noto Sans"  # the bundled TTF's internal family name (assets/NotoSans-Regular.ttf)
+VINYL_LABEL = "vinyl_label.png"  # bundled logo used as the record's centre label (assets/)
+# One vinyl revolution every N seconds. A real 33⅓rpm record spins ~1.8s/rev, which
+# strobes at video frame rates; a slower turn reads calmly as "playing".
+_VINYL_SPIN_SECONDS = 8.0
 
 
 @contextmanager
@@ -262,24 +273,36 @@ def _run_ffmpeg(
         raise TtsError(f"ffmpeg trả lỗi (mã {proc.returncode}) khi {what}: {detail}")
 
 
-def _filtergraph(width: int, height: int, subs_path: Path, font_dir: Path) -> str:
-    """Overlay the animated bits onto the pre-baked player skin (input 0).
+def _filtergraph(width: int, height: int, subs_path: Path, font_dir: Path,
+                 total_seconds: float) -> str:
+    """Overlay the animated bits onto the pre-baked player artwork.
 
-    Input 0 is the full-frame skin PNG (`build_player_skin`): pastel gradient, framed
-    photo, and the record-player widget are all already drawn. Here we only add the parts
-    that move: a big full-width `showfreqs` spectrum along the bottom (purple, so it reads
-    over the light skin — driven by the audio, input 1) and the burned-in ASS titles.
-    `showfreqs` emits a transparent background, so the bars composite cleanly, and it
-    animates at the output frame rate (`-r`) — no `rate=` option (showfreqs has none).
+    Inputs: 0 = the static skin (`build_player_skin`: gradient, framed photo, empty
+    progress track), 1 = the audio, 2 = the vinyl disc, 3 = the playhead knob. Here we add
+    the four moving parts:
+      * the vinyl (input 2) `rotate`d by an angle that grows with time, so it spins in
+        place (`ow=iw:oh=ih` keeps the frame; `fillcolor=none` keeps the corners clear);
+      * the `showfreqs` bar spectrum (from the audio) in the right column (purple, so it
+        reads over the light skin — no `rate=` option, it animates at the output `-r`);
+      * the playhead knob (input 3) slid along the track, its x a linear function of
+        `t / total` so it tracks real playback progress;
+      * the burned-in ASS titles.
     """
     lay = PlayerLayout.of(width, height)
     subs = str(subs_path).replace("\\", "/").replace(":", r"\:")
     fonts = str(font_dir).replace("\\", "/").replace(":", r"\:")
+    total = max(total_seconds, 0.001)  # guard the knob's t/total against a zero divide
+    knob_x = f"{lay.track_x}+(t/{total})*{lay.track_w}-{lay.knob_half}"
+    knob_y = lay.track_y - lay.knob_half
     return (
         f"[1:a]showfreqs=s={lay.bars_w}x{lay.bars_h}:mode=bar:ascale=sqrt:fscale=log:"
         f"win_size=2048:colors=0x8a52c8[viz];"
-        f"[0:v][viz]overlay={lay.bars_x}:{lay.bars_y},"
-        f"subtitles='{subs}':fontsdir='{fonts}'[v]"
+        f"[2:v]format=rgba,rotate=a='2*PI*t/{_VINYL_SPIN_SECONDS}':fillcolor=none:"
+        f"ow=iw:oh=ih[vin];"
+        f"[0:v][vin]overlay={lay.vinyl_x}:{lay.vinyl_y}[s1];"
+        f"[s1][viz]overlay={lay.bars_x}:{lay.bars_y}[s2];"
+        f"[s2][3:v]overlay=x='{knob_x}':y={knob_y}[s3];"
+        f"[s3]subtitles='{subs}':fontsdir='{fonts}'[v]"
     )
 
 
@@ -297,12 +320,13 @@ def render_video(
 ) -> Path:
     """Render `segments` into an MP4 at `out_path`; also write the YouTube description.
 
-    The `image_path` is framed on the LEFT of a "music player" skin (pastel gradient +
-    record-player widget); a big full-width audio-driven bar spectrum runs along the
-    bottom; the novel + chapter titles are the player's "now playing" text on the RIGHT
-    (chapter fading on change). The concatenated chapter audio plays and `-shortest` ends
-    the video with it. A `<out>.txt` description with clickable timestamps is written next
-    to the video. Raises TtsError on ffmpeg failure, MergeCancelled if cancelled.
+    The `image_path` is framed on the LEFT of a "music player" skin (pastel gradient); on
+    the RIGHT: a spinning vinyl (its centre label is the bundled logo), the novel + chapter
+    titles as the "now playing" text (chapter fading on change), an audio-driven bar
+    spectrum, and a real progress bar whose playhead slides with playback. The concatenated
+    chapter audio plays and `-shortest` ends the video with it. A `<out>.txt` description
+    with clickable timestamps is written next to the video. Raises TtsError on ffmpeg
+    failure, MergeCancelled if cancelled.
     """
     if not segments:
         raise TtsError("Không có chương nào có audio để tạo video.")
@@ -316,6 +340,8 @@ def render_video(
     subs_file = tmp_dir / "subs.ass"
     audio_file = tmp_dir / "audio.m4a"
     skin_file = tmp_dir / "skin.png"
+    vinyl_file = tmp_dir / "vinyl.png"
+    knob_file = tmp_dir / "knob.png"
     err_file = tmp_dir / "err.txt"
 
     # Time the titles by the audio the video actually plays, not the (possibly 0/stale)
@@ -332,9 +358,12 @@ def render_video(
             build_ass_subtitles(segments, novel_title, width=width, height=height),
             encoding="utf-8",
         )
-        # Bake the static player skin (gradient + framed photo + widget) once; ffmpeg
-        # loops this PNG and only overlays the animated bars + titles on top of it.
+        # Bake the three artwork layers once; ffmpeg loops each and animates them: the
+        # static skin (backdrop), the vinyl disc (spun), and the playhead knob (slid).
+        lay = PlayerLayout.of(width, height)
         build_player_skin(image_path, skin_file, width=width, height=height)
+        build_vinyl(font_dir / VINYL_LABEL, vinyl_file, size=lay.vinyl_size)
+        build_knob(knob_file, radius=lay.knob_r)
 
         # 1) Concatenate the per-chapter audio into one AAC track so -shortest and the
         #    muxed duration are exact regardless of the inputs' codecs (WAV/MP3 mixed).
@@ -344,13 +373,15 @@ def render_video(
             err_file, cancelled, deadline, "ghép âm thanh",
         )
 
-        # 2) Loop the baked skin, overlay the bottom bar spectrum, burn the titles, mux
-        #    the audio, end with it. No -tune stillimage: the bars animate every frame.
+        # 2) Loop the skin/vinyl/knob, spin the vinyl + slide the playhead + draw the bars,
+        #    burn the titles, mux the audio, end with it. No -tune stillimage: it animates.
         _run_ffmpeg(
             ["ffmpeg", "-y",
              "-loop", "1", "-framerate", str(fps), "-i", str(skin_file),
              "-i", str(audio_file),
-             "-filter_complex", _filtergraph(width, height, subs_file, font_dir),
+             "-loop", "1", "-i", str(vinyl_file),
+             "-loop", "1", "-i", str(knob_file),
+             "-filter_complex", _filtergraph(width, height, subs_file, font_dir, total),
              "-map", "[v]", "-map", "1:a",
              "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-r", str(fps),
              "-c:a", "copy", "-shortest", str(out_path)],
@@ -363,6 +394,6 @@ def render_video(
         )
         return out_path
     finally:
-        for f in (list_file, subs_file, audio_file, skin_file, err_file):
+        for f in (list_file, subs_file, audio_file, skin_file, vinyl_file, knob_file, err_file):
             f.unlink(missing_ok=True)
         tmp_dir.rmdir()

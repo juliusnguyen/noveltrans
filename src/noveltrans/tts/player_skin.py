@@ -1,16 +1,21 @@
-"""Draw the static 'music player' skin that the video is composited over.
+"""Draw the music-player artwork the video is composited over.
 
-`render_video` bakes one of these PNGs per render, then ffmpeg just loops it and
-overlays the animated visualizer bars + the burned-in titles. Everything that ffmpeg
-can't draw well lives here: a soft pastel gradient, the chosen photo rounded with a drop
-shadow on the left, and a decorative record-player widget (vinyl + tonearm, a seek bar,
-and play/prev/next buttons) on the right. Pillow does gradients, rounded masks, blurred
-shadows, and anti-aliased circles cleanly — ffmpeg's drawing primitives do not.
+`render_video` bakes three PNGs per render and ffmpeg animates them:
 
-`PlayerLayout` is the single source of truth for the few coordinates that must agree
-across modules: the bars rectangle (used by `video._filtergraph`) and the title text
-placement (used by `video.build_ass_subtitles`). It is pure arithmetic on width/height,
-so those callers stay unit-testable without rendering anything.
+  * `build_player_skin` — the full-frame static backdrop: a pastel gradient, the chosen
+    photo framed (rounded + drop shadow) on the left, and the empty progress-bar track on
+    the right. Everything that never moves.
+  * `build_vinyl` — a transparent square record disc with the bundled logo as its centre
+    label; ffmpeg `rotate`s it every frame so it spins.
+  * `build_knob` — a small transparent accent dot; ffmpeg slides it along the track as a
+    real playhead (its x is a function of playback time / total duration).
+
+Pillow does gradients, rounded masks, blurred shadows, and anti-aliased circles cleanly —
+ffmpeg's drawing primitives do not. `PlayerLayout` is the single source of truth for the
+coordinates that must agree across modules: the spinning-vinyl box, the visualizer-bars
+rectangle, the progress track + playhead, and the title placement (all read by
+`video._filtergraph` / `video.build_ass_subtitles`). It is pure arithmetic on
+width/height, so those callers stay unit-testable without rendering anything.
 """
 
 from __future__ import annotations
@@ -20,21 +25,18 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFilter
 
-# A soft, warm-to-cool rainbow reused for the vinyl grooves and centre label.
-_RAINBOW = [
-    (255, 99, 132), (255, 159, 64), (255, 205, 86),
-    (75, 192, 132), (54, 162, 235), (153, 102, 255),
-]
+_ACCENT = (216, 130, 224)  # the pink-purple used for the playhead + progress fill
+_DISC = (24, 22, 30)       # vinyl body
+_KNOB_PAD = 4              # transparent margin around the knob dot (room for its ring)
 
 
 @dataclass(frozen=True)
 class PlayerLayout:
-    """Pixel geometry of the player skin, derived from the output size.
+    """Pixel geometry of the player, derived from the output size.
 
-    Only the fields the *other* modules need are exposed: the photo box (skin only),
-    the bars rectangle (the ffmpeg overlay), and the title placement (the ASS margins).
-    The decorative widget coordinates live inside `build_player_skin` — nothing else
-    reads them.
+    Exposes only what other modules read: the photo box + progress track (skin), the
+    spinning-vinyl box, the visualizer-bars rectangle, the playhead radius, and the title
+    placement. All proportional to width/height, so any resolution stays laid out.
     """
 
     width: int
@@ -45,11 +47,22 @@ class PlayerLayout:
     photo_w: int
     photo_h: int
     photo_radius: int
-    # full-width visualizer band along the bottom
+    # spinning vinyl (square box; the disc fills it edge-to-edge)
+    vinyl_x: int
+    vinyl_y: int
+    vinyl_size: int
+    # visualizer bars — right column, where the old progress bar sat
     bars_x: int
     bars_y: int
     bars_w: int
     bars_h: int
+    # progress track + sliding playhead knob (right column, below the bars)
+    track_x: int
+    track_y: int
+    track_w: int
+    track_thickness: int
+    knob_r: int
+    knob_half: int  # half the knob PNG's side, for centring the overlay
     # 'now playing' text (ASS Alignment 8, framed into the right column by L/R margins)
     text_margin_l: int
     text_margin_r: int
@@ -60,6 +73,8 @@ class PlayerLayout:
 
     @classmethod
     def of(cls, width: int, height: int) -> PlayerLayout:
+        vinyl_r = round(height * 0.139)
+        knob_r = max(6, round(height * 0.012))
         return cls(
             width=width,
             height=height,
@@ -68,10 +83,19 @@ class PlayerLayout:
             photo_w=round(width * 0.432),
             photo_h=round(height * 0.593),
             photo_radius=round(width * 0.019),
-            bars_x=round(width * 0.026),
-            bars_y=round(height * 0.778),
-            bars_w=round(width * 0.948),
-            bars_h=round(height * 0.194),
+            vinyl_x=round(width * 0.740) - vinyl_r,
+            vinyl_y=round(height * 0.231) - vinyl_r,
+            vinyl_size=vinyl_r * 2,
+            bars_x=round(width * 0.589),
+            bars_y=round(height * 0.555),
+            bars_w=round(width * 0.307),
+            bars_h=round(height * 0.111),
+            track_x=round(width * 0.589),
+            track_y=round(height * 0.720),
+            track_w=round(width * 0.307),
+            track_thickness=max(3, round(height * 0.005)),
+            knob_r=knob_r,
+            knob_half=knob_r + _KNOB_PAD,
             text_margin_l=round(width * 0.589),
             text_margin_r=round(width * 0.104),
             novel_margin_v=round(height * 0.435),
@@ -111,6 +135,12 @@ def _rounded_mask(size: tuple[int, int], radius: int) -> Image.Image:
     return m
 
 
+def _circle_mask(size: tuple[int, int]) -> Image.Image:
+    m = Image.new("L", size, 0)
+    ImageDraw.Draw(m).ellipse((0, 0, size[0] - 1, size[1] - 1), fill=255)
+    return m
+
+
 def _drop_shadow(base: Image.Image, box: tuple[int, int, int, int], radius: int,
                  blur: int, alpha: int) -> None:
     """Composite a soft, slightly-lowered drop shadow for a rounded box onto `base`."""
@@ -133,18 +163,17 @@ def _cover_fit(photo: Image.Image, w: int, h: int) -> Image.Image:
     return photo.crop((left, top, left + w, top + h))
 
 
-# -- the skin -----------------------------------------------------------------
+# -- the three baked layers ---------------------------------------------------
 
 def build_player_skin(image_path: Path, out_path: Path, *, width: int, height: int) -> Path:
-    """Render the full-frame player skin (gradient + framed photo + widget) to `out_path`.
+    """Render the static backdrop (gradient + framed photo + empty progress track).
 
-    Returns `out_path`. The visualizer bars and the titles are NOT drawn here — ffmpeg
-    overlays those so they animate; this PNG is the static backdrop everything sits on.
+    Returns `out_path`. The spinning vinyl, the bars, the sliding playhead, and the titles
+    are NOT drawn here — ffmpeg overlays those so they animate over this still.
     """
     lay = PlayerLayout.of(width, height)
     W, H = width, height
 
-    # Pastel lavender -> pink -> light-blue backdrop with two soft colour glows.
     bg = _vertical_gradient(W, H, [
         (0.0, (233, 213, 255)),
         (0.45, (252, 231, 243)),
@@ -159,7 +188,7 @@ def build_player_skin(image_path: Path, out_path: Path, *, width: int, height: i
     bg.alpha_composite(glow.filter(ImageFilter.GaussianBlur(round(H * 0.11))))
     draw = ImageDraw.Draw(bg)
 
-    # --- framed photo, left ---
+    # framed photo, left
     box = (lay.photo_x, lay.photo_y, lay.photo_w, lay.photo_h)
     _drop_shadow(bg, box, radius=lay.photo_radius, blur=round(H * 0.035), alpha=90)
     try:
@@ -167,7 +196,6 @@ def build_player_skin(image_path: Path, out_path: Path, *, width: int, height: i
         photo = _cover_fit(photo, lay.photo_w, lay.photo_h)
         bg.paste(photo, (lay.photo_x, lay.photo_y), _rounded_mask((lay.photo_w, lay.photo_h), lay.photo_radius))
     except OSError:
-        # Unreadable image: leave a soft placeholder card rather than failing the render.
         draw.rounded_rectangle(
             (lay.photo_x, lay.photo_y, lay.photo_x + lay.photo_w, lay.photo_y + lay.photo_h),
             radius=lay.photo_radius, fill=(230, 224, 240),
@@ -177,58 +205,57 @@ def build_player_skin(image_path: Path, out_path: Path, *, width: int, height: i
         radius=lay.photo_radius, outline=(255, 255, 255, 220), width=max(2, round(W * 0.0026)),
     )
 
-    # --- vinyl record widget, upper right ---
-    cx, cy, R = round(W * 0.740), round(H * 0.231), round(H * 0.139)
-    draw.ellipse((cx - R, cy - R, cx + R, cy + R), fill=(24, 22, 30))
-    for i, col in enumerate(_RAINBOW):  # rainbow grooves on the right arc
-        rr = R - round(R * 0.08) - round(i * R * 0.06)
-        draw.arc((cx - rr, cy - rr, cx + rr, cy + rr), start=-70, end=110,
-                 fill=col, width=max(2, round(R * 0.027)))
-    lab = round(R * 0.39)  # rainbow centre label
-    label = Image.new("RGBA", (lab * 2, lab * 2), (0, 0, 0, 0))
-    ld = ImageDraw.Draw(label)
-    for i in range(lab):
-        c = _RAINBOW[min(len(_RAINBOW) - 1, int(i / lab * len(_RAINBOW)))]
-        ld.ellipse((i, i, lab * 2 - i, lab * 2 - i), outline=c, width=2)
-    bg.alpha_composite(label, (cx - lab, cy - lab))
-    hole = round(R * 0.05)
-    draw.ellipse((cx - hole, cy - hole, cx + hole, cy + hole), fill=(30, 28, 36))
-    arm = (120, 180, 235)  # tonearm
-    draw.line((cx - R - round(R * 0.27), cy + round(R * 0.13), cx - round(R * 0.27), cy - round(R * 0.07)),
-              fill=arm, width=max(4, round(R * 0.067)))
-    ah = round(R * 0.1)
-    draw.ellipse((cx - round(R * 0.37) - ah, cy - round(R * 0.13) - ah,
-                  cx - round(R * 0.37) + ah, cy - round(R * 0.13) + ah), fill=arm)
-
-    # --- seek bar ---
-    bx0, bx1, by = round(W * 0.589), round(W * 0.896), round(H * 0.639)
-    th = max(3, round(H * 0.004))
-    draw.rounded_rectangle((bx0, by - th, bx1, by + th), radius=th, fill=(255, 255, 255, 180))
-    knobx = round(bx0 + (bx1 - bx0) * 0.42)
-    accent = (216, 130, 224)
-    draw.rounded_rectangle((bx0, by - th, knobx, by + th), radius=th, fill=accent)
-    kr = round(H * 0.011)
-    draw.ellipse((knobx - kr, by - kr, knobx + kr, by + kr), fill=accent, outline=(255, 255, 255),
-                 width=max(2, round(kr * 0.25)))
-
-    # --- playback buttons ---
-    bcy = round(H * 0.722)
-    tri = round(H * 0.02)
-    stem = max(3, round(W * 0.003))
-    pcx = round(W * 0.746)
-    prev_x, next_x = round(W * 0.651), round(W * 0.828)
-    flat = (150, 110, 190)
-    draw.polygon([(prev_x, bcy), (prev_x + tri, bcy - tri), (prev_x + tri, bcy + tri)], fill=flat)
-    draw.rectangle((prev_x - stem, bcy - tri, prev_x, bcy + tri), fill=flat)
-    draw.polygon([(next_x, bcy), (next_x - tri, bcy - tri), (next_x - tri, bcy + tri)], fill=flat)
-    draw.rectangle((next_x, bcy - tri, next_x + stem, bcy + tri), fill=flat)
-    pr = round(H * 0.044)
-    draw.ellipse((pcx - pr, bcy - pr, pcx + pr, bcy + pr), fill=accent)  # play/pause
-    bw = max(4, round(W * 0.0073))
-    bh = round(H * 0.024)
-    gap = round(W * 0.006)
-    draw.rounded_rectangle((pcx - gap - bw, bcy - bh, pcx - gap, bcy + bh), radius=th, fill=(255, 255, 255))
-    draw.rounded_rectangle((pcx + gap, bcy - bh, pcx + gap + bw, bcy + bh), radius=th, fill=(255, 255, 255))
+    # empty progress-bar track (the sliding playhead + fill are overlaid by ffmpeg)
+    t = lay.track_thickness
+    draw.rounded_rectangle(
+        (lay.track_x, lay.track_y - t, lay.track_x + lay.track_w, lay.track_y + t),
+        radius=t, fill=(255, 255, 255, 170),
+    )
 
     bg.convert("RGB").save(out_path)
+    return out_path
+
+
+def build_vinyl(logo_path: Path, out_path: Path, *, size: int) -> Path:
+    """Render a transparent `size`×`size` record disc with the logo as its centre label.
+
+    The disc fills the square edge-to-edge, so ffmpeg can `rotate` the PNG in place (keeping
+    the same frame size) and the disc stays put while the label spins. A readable logo is
+    circle-cropped into the label; if it can't be read, a plain accent label is drawn.
+    """
+    r = size // 2
+    disc = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(disc)
+    d.ellipse((0, 0, size - 1, size - 1), fill=(*_DISC, 255))
+    for i in range(6):  # subtle concentric grooves
+        rr = r - round(r * 0.09) - round(i * r * 0.093)
+        if rr > 0:
+            d.ellipse((r - rr, r - rr, r + rr, r + rr), outline=(70, 66, 78, 255), width=2)
+
+    lab = round(r * 0.62)
+    try:
+        logo = Image.open(logo_path).convert("RGB")
+        side = min(logo.size)
+        lx, ly = (logo.width - side) // 2, (logo.height - side) // 2
+        logo = logo.crop((lx, ly, lx + side, ly + side)).resize((lab * 2, lab * 2))
+        disc.paste(logo, (r - lab, r - lab), _circle_mask((lab * 2, lab * 2)))
+    except OSError:
+        d.ellipse((r - lab, r - lab, r + lab, r + lab), fill=(*_ACCENT, 255))
+    d.ellipse((r - lab, r - lab, r + lab, r + lab), outline=(255, 255, 255, 230), width=max(3, round(r * 0.027)))
+    spindle = max(4, round(r * 0.047))
+    d.ellipse((r - spindle, r - spindle, r + spindle, r + spindle), fill=(240, 240, 245, 255))
+
+    disc.save(out_path)
+    return out_path
+
+
+def build_knob(out_path: Path, *, radius: int) -> Path:
+    """Render the small transparent playhead dot (accent fill + white ring)."""
+    half = radius + _KNOB_PAD
+    knob = Image.new("RGBA", (half * 2, half * 2), (0, 0, 0, 0))
+    ImageDraw.Draw(knob).ellipse(
+        (_KNOB_PAD, _KNOB_PAD, half * 2 - _KNOB_PAD - 1, half * 2 - _KNOB_PAD - 1),
+        fill=(*_ACCENT, 255), outline=(255, 255, 255, 255), width=max(2, round(radius * 0.23)),
+    )
+    knob.save(out_path)
     return out_path

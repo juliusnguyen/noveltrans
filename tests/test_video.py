@@ -173,26 +173,54 @@ class TestFiltergraph:
 
         from noveltrans.tts.video import _filtergraph
 
-        return _filtergraph(1920, 1080, Path("/tmp/subs.ass"), Path("/tmp/fonts"))
+        return _filtergraph(1920, 1080, Path("/tmp/subs.ass"), Path("/tmp/fonts"), 100.0)
 
     def test_has_the_bars_from_the_audio_input(self):
         g = self._graph()
         assert "[1:a]showfreqs=" in g  # bars driven by the audio (input 1)
         assert "mode=bar" in g
-        assert "[0:v][viz]overlay=" in g  # bars composited over the baked skin (input 0)
+        assert "[s1][viz]overlay=" in g  # bars composited over the spun-vinyl base
         assert "subtitles=" in g  # titles still burned on top
 
-    def test_bars_span_the_bottom_and_are_purple(self):
-        # The skin is pre-baked (no photo/blur here); the graph only adds the big bottom
-        # spectrum — full-width and low, in a purple that reads over the light skin.
+    def test_bars_are_in_the_right_column_and_purple(self):
+        # The skin is pre-baked (no photo/blur here); the bars sit in the right column
+        # where the old progress bar was, in a purple that reads over the light skin.
         from noveltrans.tts.player_skin import PlayerLayout
 
         lay = PlayerLayout.of(1920, 1080)
         g = self._graph()
         assert "boxblur" not in g  # the backdrop is baked into the skin, not done here
-        assert f"showfreqs=s={lay.bars_w}x{lay.bars_h}" in g  # full-width, tall band
+        assert f"showfreqs=s={lay.bars_w}x{lay.bars_h}" in g
         assert "colors=0x8a52c8" in g  # purple, visible on the pastel skin
-        assert f"[0:v][viz]overlay={lay.bars_x}:{lay.bars_y}" in g  # anchored bottom-left
+        assert f"[s1][viz]overlay={lay.bars_x}:{lay.bars_y}" in g
+
+    def test_vinyl_spins_in_place_over_the_skin(self):
+        # The vinyl (input 2) rotates by an angle growing with time, overlaid at its box.
+        from noveltrans.tts.player_skin import PlayerLayout
+
+        lay = PlayerLayout.of(1920, 1080)
+        g = self._graph()
+        assert "[2:v]format=rgba,rotate=a='2*PI*t/" in g  # spins with playback time
+        assert "fillcolor=none" in g and "ow=iw:oh=ih" in g  # transparent, same frame
+        assert f"[0:v][vin]overlay={lay.vinyl_x}:{lay.vinyl_y}" in g
+
+    def test_knob_slides_along_the_track_with_progress(self):
+        # The playhead (input 3) x is a linear function of t/total across the track.
+        from noveltrans.tts.player_skin import PlayerLayout
+
+        lay = PlayerLayout.of(1920, 1080)
+        g = self._graph()
+        assert f"[s2][3:v]overlay=x='{lay.track_x}+(t/100.0)*{lay.track_w}-" in g
+        assert f":y={lay.track_y - lay.knob_half}" in g
+
+    def test_zero_total_does_not_divide_by_zero(self):
+        # An empty/zero-duration render must still build a valid knob expression.
+        from pathlib import Path
+
+        from noveltrans.tts.video import _filtergraph
+
+        g = _filtergraph(1920, 1080, Path("/tmp/s.ass"), Path("/tmp/f"), 0.0)
+        assert "(t/0)" not in g  # guarded against a zero divide
 
 
 class TestRenderArgv:
@@ -225,6 +253,8 @@ class TestRenderArgv:
         assert "veryfast" in render  # a normal preset instead
         assert "[v]" in render and "1:a" in render  # map filtered video + copy audio
         assert "copy" in render  # -c:a copy (audio filtered AND copied — the crux)
+        assert any("rotate=a=" in a for a in render)  # the vinyl spins
+        assert render.count("-loop") == 3  # skin + vinyl + knob are looped stills
 
 
 class TestPlayerLayout:
@@ -234,17 +264,20 @@ class TestPlayerLayout:
 
         small = PlayerLayout.of(960, 540)
         big = PlayerLayout.of(1920, 1080)
-        assert big.bars_w == small.bars_w * 2
         assert big.photo_h == small.photo_h * 2
+        assert big.vinyl_size == small.vinyl_size * 2
         assert big.chapter_font_px == small.chapter_font_px * 2
+        assert abs(big.bars_w - small.bars_w * 2) <= 1  # proportional (rounding aside)
 
-    def test_photo_is_on_the_left_and_bars_span_the_bottom(self):
+    def test_elements_are_stacked_in_the_right_column(self):
         from noveltrans.tts.player_skin import PlayerLayout
 
         lay = PlayerLayout.of(1920, 1080)
         assert lay.photo_x + lay.photo_w < lay.width * 0.5  # photo stays in the left half
-        assert lay.bars_w > lay.width * 0.9  # bars run nearly the full width
-        assert lay.bars_y > lay.height * 0.7  # along the bottom
+        assert lay.bars_x > lay.width * 0.5  # bars in the right column now, not full-width
+        # top-to-bottom on the right: chapter title, then bars, then the progress track
+        assert lay.chapter_margin_v < lay.bars_y < lay.track_y
+        assert lay.knob_half > lay.knob_r  # the knob PNG has room for its ring
 
 
 class TestPlayerSkin:
@@ -273,6 +306,45 @@ class TestPlayerSkin:
         assert out.exists()
         with Image.open(out) as im:
             assert im.size == (640, 360)
+
+    def test_vinyl_is_a_square_rgba_disc_with_a_label(self, tmp_path):
+        # ffmpeg rotates this in place, so it must be a square, transparent-cornered PNG.
+        from PIL import Image
+
+        from noveltrans.tts.player_skin import build_vinyl
+
+        logo = tmp_path / "logo.png"
+        Image.new("RGB", (300, 300), (180, 120, 60)).save(logo)
+        out = tmp_path / "vinyl.png"
+        build_vinyl(logo, out, size=200)
+        with Image.open(out) as im:
+            assert im.size == (200, 200)
+            assert im.mode == "RGBA"
+            assert im.getpixel((0, 0))[3] == 0  # corner is transparent (outside the disc)
+            assert im.getpixel((100, 100))[3] == 255  # centre (label) is opaque
+
+    def test_vinyl_survives_an_unreadable_logo(self, tmp_path):
+        from PIL import Image
+
+        from noveltrans.tts.player_skin import build_vinyl
+
+        out = tmp_path / "vinyl.png"
+        build_vinyl(tmp_path / "missing.png", out, size=160)  # no logo → plain label
+        with Image.open(out) as im:
+            assert im.size == (160, 160)
+
+    def test_knob_png_matches_the_layout_offset(self, tmp_path):
+        # The filtergraph centres the knob by subtracting knob_half, so the PNG side must
+        # be exactly 2*knob_half — otherwise the playhead would sit off the track.
+        from PIL import Image
+
+        from noveltrans.tts.player_skin import PlayerLayout, build_knob
+
+        lay = PlayerLayout.of(1920, 1080)
+        out = tmp_path / "knob.png"
+        build_knob(out, radius=lay.knob_r)
+        with Image.open(out) as im:
+            assert im.size == (lay.knob_half * 2, lay.knob_half * 2)
 
 
 class TestVideoWorker:
