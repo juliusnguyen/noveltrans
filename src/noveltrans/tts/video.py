@@ -78,6 +78,26 @@ def video_preset(key: str) -> dict:
     return VIDEO_QUALITY_PRESETS.get(key, VIDEO_QUALITY_PRESETS[DEFAULT_VIDEO_QUALITY])
 
 
+# Selectable title fonts — all bundled in assets/ (OFL, full Vietnamese coverage). libass
+# resolves a style by its `family` name among the TTFs in `fontsdir`, so `family` MUST equal
+# the TTF's name-table family (guarded by a test). `noto_sans`'s family == FONT_NAME, so the
+# default keeps the original behaviour.
+VIDEO_FONTS: dict[str, dict[str, str]] = {
+    "noto_sans":  {"label": "Noto Sans (mặc định)", "file": "NotoSans-Regular.ttf",       "family": "Noto Sans"},
+    "be_vietnam": {"label": "Be Vietnam Pro",        "file": "BeVietnamPro-Regular.ttf",    "family": "Be Vietnam Pro"},
+    "nunito":     {"label": "Nunito (bo tròn)",      "file": "Nunito-Regular.ttf",          "family": "Nunito"},
+    "montserrat": {"label": "Montserrat",            "file": "Montserrat-Regular.ttf",      "family": "Montserrat"},
+    "lora":       {"label": "Lora (serif)",          "file": "Lora-Regular.ttf",            "family": "Lora"},
+    "playfair":   {"label": "Playfair Display (serif)", "file": "PlayfairDisplay-Regular.ttf", "family": "Playfair Display"},
+}
+DEFAULT_VIDEO_FONT = "noto_sans"
+
+
+def video_font(key: str) -> dict[str, str]:
+    """Return the font descriptor for `key`, falling back to the default if unknown."""
+    return VIDEO_FONTS.get(key, VIDEO_FONTS[DEFAULT_VIDEO_FONT])
+
+
 @contextmanager
 def font_dir_context():
     """Yield a real filesystem path to the bundled-font directory.
@@ -421,6 +441,7 @@ def render_video(
     height: int = 1080,
     fps: int = 25,
     spin_vinyl: bool = True,
+    font_name: str = FONT_NAME,
     cancelled: Callable[[], bool] | None = None,
 ) -> Path:
     """Render `segments` into an MP4 at `out_path`; also write the YouTube description.
@@ -458,7 +479,8 @@ def render_video(
 
     try:
         subs_file.write_text(
-            build_ass_subtitles(segments, novel_title, width=width, height=height),
+            build_ass_subtitles(segments, novel_title, width=width, height=height,
+                                font_name=font_name),
             encoding="utf-8",
         )
         # Bake the three artwork layers once; ffmpeg loops each and animates them: the
@@ -495,5 +517,76 @@ def render_video(
         return out_path
     finally:
         for f in (subs_file, audio_file, skin_file, vinyl_file, knob_file, err_file):
+            f.unlink(missing_ok=True)
+        tmp_dir.rmdir()
+
+
+# -- preview frame ------------------------------------------------------------
+
+_PREVIEW_TOTAL = 3.0   # synthetic "video length" (s) so the playhead sits partway along
+_PREVIEW_GRAB_T = 1.0  # grab the frame at t=1s (knob ~1/3 across; rotate/bars settled)
+_PREVIEW_FPS = 25
+
+
+def render_preview_frame(
+    image_path: Path,
+    out_png: Path,
+    font_dir: Path,
+    novel_title: str,
+    sample_chapter_title: str,
+    *,
+    width: int = 1920,
+    height: int = 1080,
+    spin_vinyl: bool = True,
+    font_name: str = FONT_NAME,
+    cancelled: Callable[[], bool] | None = None,
+) -> Path:
+    """Render ONE still PNG of the music-player video — a fast preview, no encode/audio.
+
+    Bakes the same skin/vinyl/knob and reuses the exact `_filtergraph` as a real render, so
+    the preview is WYSIWYG (layout, photo, titles, font). Needs no chapter audio: a short
+    pink-noise `lavfi` source drives `showfreqs` so the bars look alive (silence would render
+    empty), and a single frame is grabbed at `_PREVIEW_GRAB_T` with a synthetic total so the
+    playhead sits partway along the track. Raises TtsError on ffmpeg failure.
+    """
+    out_png = Path(out_png)
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="noveltrans-preview-"))
+    subs_file = tmp_dir / "subs.ass"
+    skin_file = tmp_dir / "skin.png"
+    vinyl_file = tmp_dir / "vinyl.png"
+    knob_file = tmp_dir / "knob.png"
+    err_file = tmp_dir / "err.txt"
+    deadline = time.monotonic() + 120
+
+    try:
+        lay = PlayerLayout.of(width, height)
+        # One synthetic chapter spanning the whole preview so both titles show at grab time.
+        sample = [MergeSegment(path="", seconds=_PREVIEW_TOTAL, title=sample_chapter_title)]
+        subs_file.write_text(
+            build_ass_subtitles(sample, novel_title, width=width, height=height,
+                                font_name=font_name),
+            encoding="utf-8",
+        )
+        build_player_skin(image_path, skin_file, width=width, height=height)
+        build_vinyl(font_dir / VINYL_LABEL, vinyl_file, size=lay.vinyl_size)
+        build_knob(knob_file, radius=lay.knob_r)
+
+        _run_ffmpeg(
+            ["ffmpeg", "-y",
+             "-loop", "1", "-framerate", str(_PREVIEW_FPS), "-i", str(skin_file),
+             "-f", "lavfi", "-t", "2",
+             "-i", f"anoisesrc=color=pink:amplitude=0.5:sample_rate={_PCM_RATE}",
+             "-loop", "1", "-i", str(vinyl_file),
+             "-loop", "1", "-i", str(knob_file),
+             "-filter_complex",
+             _filtergraph(width, height, subs_file, font_dir, _PREVIEW_TOTAL, spin_vinyl),
+             "-map", "[v]", "-ss", str(_PREVIEW_GRAB_T), "-frames:v", "1", "-update", "1",
+             str(out_png)],
+            err_file, cancelled, deadline, "tạo ảnh xem trước",
+        )
+        return out_png
+    finally:
+        for f in (subs_file, skin_file, vinyl_file, knob_file, err_file):
             f.unlink(missing_ok=True)
         tmp_dir.rmdir()

@@ -259,6 +259,57 @@ class TestVideoPresets:
         assert video_preset("fast") == VIDEO_QUALITY_PRESETS["fast"]
 
 
+class TestVideoFonts:
+    def test_registry_shape_and_default(self):
+        from noveltrans.tts.video import (
+            DEFAULT_VIDEO_FONT,
+            FONT_NAME,
+            VIDEO_FONTS,
+            video_font,
+        )
+
+        assert DEFAULT_VIDEO_FONT in VIDEO_FONTS
+        for spec in VIDEO_FONTS.values():
+            assert {"label", "file", "family"} <= spec.keys()
+        # the default font's family is the original bundled family → default behaviour kept
+        assert VIDEO_FONTS[DEFAULT_VIDEO_FONT]["family"] == FONT_NAME
+        assert video_font("nope") == VIDEO_FONTS[DEFAULT_VIDEO_FONT]  # unknown → default
+        assert video_font("lora")["family"] == "Lora"
+
+    def test_every_font_file_is_bundled(self):
+        from importlib import resources
+
+        from noveltrans.tts.video import VIDEO_FONTS
+
+        assets = resources.files("noveltrans.tts").joinpath("assets")
+        for spec in VIDEO_FONTS.values():
+            assert assets.joinpath(spec["file"]).is_file(), spec["file"]
+
+    @pytest.mark.parametrize("key", ["noto_sans", "be_vietnam", "nunito", "montserrat", "lora", "playfair"])
+    def test_font_family_matches_and_covers_vietnamese(self, key):
+        # libass resolves a style by FAMILY name inside fontsdir, so the registry family must
+        # equal the TTF's own family — and every Vietnamese diacritic must render (no tofu).
+        from importlib import resources
+
+        from PIL import ImageFont
+
+        from noveltrans.tts.video import VIDEO_FONTS
+
+        spec = VIDEO_FONTS[key]
+        with resources.as_file(
+            resources.files("noveltrans.tts").joinpath("assets", spec["file"])
+        ) as path:
+            font = ImageFont.truetype(str(path), 40)
+            assert font.getname()[0] == spec["family"]  # family-name contract
+            for ch in "ệữỗậọằẽỹđĐơư":  # precomposed Vietnamese incl. đ Đ ơ ư
+                assert font.getmask(ch).getbbox() is not None, f"{spec['family']} missing {ch!r}"
+
+    def test_build_ass_uses_the_given_family(self):
+        doc = build_ass_subtitles([_seg(10, "C1")], "Truyện", font_name="Lora")
+        assert "Style: Novel,Lora," in doc
+        assert "Style: Chapter,Lora," in doc
+
+
 class TestRenderArgv:
     def test_render_command_uses_bars_and_drops_stillimage(self, tmp_path, monkeypatch):
         # Capture the ffmpeg render argv without running ffmpeg.
@@ -324,6 +375,80 @@ class TestRenderArgv:
 
         # exact-token membership (not substring — the tmp_path name contains "concat")
         assert not any("concat" in cmd for cmd in cmds)  # no `-f concat` demuxer arg
+
+    def test_render_threads_the_chosen_font(self, tmp_path, monkeypatch):
+        # The selected font must reach build_ass_subtitles (it used to be dropped there).
+        import noveltrans.tts.video as video
+
+        captured = {}
+        real = video.build_ass_subtitles
+
+        def spy(segments, novel_title, **kw):
+            captured["font_name"] = kw.get("font_name")
+            return real(segments, novel_title, **kw)
+
+        class _FakeProc:
+            returncode = 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        monkeypatch.setattr(video.subprocess, "Popen", lambda cmd, **kw: _FakeProc())
+        monkeypatch.setattr(video, "_with_real_durations", lambda segs: segs)
+        monkeypatch.setattr(video, "_concat_audio", lambda *a, **k: None)
+        monkeypatch.setattr(video, "build_ass_subtitles", spy)
+
+        segs = [MergeSegment(path=tmp_path / "a.wav", seconds=3.0, title="C1")]
+        with video.font_dir_context() as font_dir:
+            video.render_video(segs, tmp_path / "bg.png", tmp_path / "out.mp4",
+                               font_dir, "Truyện", width=640, height=360, font_name="Lora")
+        assert captured["font_name"] == "Lora"
+
+
+class TestPreviewFrame:
+    def test_preview_argv_is_a_single_still_grab(self, tmp_path, monkeypatch):
+        # One ffmpeg call: a synthetic audio drives the bars, a single frame is grabbed, and
+        # the font dir is passed — and it must NOT concat audio (no chapter files needed).
+        import noveltrans.tts.video as video
+
+        cmds = []
+
+        class _FakeProc:
+            returncode = 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        monkeypatch.setattr(video.subprocess, "Popen", lambda cmd, **kw: cmds.append(cmd) or _FakeProc())
+
+        with video.font_dir_context() as font_dir:
+            video.render_preview_frame(
+                tmp_path / "bg.png", tmp_path / "out.png", font_dir, "Truyện",
+                "Chương 1: mẫu", width=320, height=180,
+            )
+        assert len(cmds) == 1  # a single ffmpeg call, no audio concat
+        cmd = cmds[0]
+        assert "-frames:v" in cmd and cmd[cmd.index("-frames:v") + 1] == "1"
+        assert any("anoisesrc" in a for a in cmd)  # synthetic audio → lively bars
+        assert "[v]" in cmd and any("fontsdir=" in a for a in cmd)
+        assert not any("concat" in a for a in cmd)
+
+    @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+    def test_renders_a_real_preview_png_without_any_audio(self, tmp_path):
+        # The whole point: a preview with NO chapter audio, purely for design.
+        from PIL import Image
+
+        from noveltrans.tts.video import font_dir_context, render_preview_frame
+
+        bg = tmp_path / "bg.png"
+        Image.new("RGB", (400, 300), (120, 90, 160)).save(bg)
+        out = tmp_path / "preview.png"
+        with font_dir_context() as font_dir:
+            render_preview_frame(bg, out, font_dir, "Tựa truyện", "Chương 1: thử",
+                                 width=640, height=360, font_name="Lora")
+        assert out.exists()
+        with Image.open(out) as im:
+            assert im.size == (640, 360)
 
 
 class TestPlayerLayout:
@@ -422,9 +547,18 @@ class TestVideoWorker:
         from noveltrans.gui.workers import VideoWorker
 
         w = VideoWorker("/tmp/x", voice="v", mode="range", image_path="/tmp/bg.png",
-                        start=3, end=9)
+                        start=3, end=9, font="Lora")
         assert callable(w.start)  # the QThread method, not the int
         assert w.start_num == 3 and w.end_num == 9
+        assert w.font == "Lora"  # the chosen title font is carried to render_video
+
+    def test_preview_worker_carries_its_params(self, qapp):
+        from noveltrans.gui.workers import VideoPreviewWorker
+
+        w = VideoPreviewWorker("/tmp/bg.png", "Tựa", "Chương 1", width=1280, height=720,
+                               spin_vinyl=False, font="Nunito")
+        assert callable(w.start) and w.font == "Nunito"
+        assert (w.width, w.height, w.spin_vinyl) == (1280, 720, False)
 
     def test_no_audio_fails_cleanly(self, qapp, library_dir, sample_meta, sample_refs):
         from noveltrans.gui.workers import VideoWorker

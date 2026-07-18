@@ -752,6 +752,7 @@ class VideoWorker(QThread):
         height: int = 1080,
         fps: int = 25,  # motion video (waveform) — smoother than 019's static 12
         spin_vinyl: bool = True,  # False → static disc (skips the costly per-frame rotate)
+        font: str = "",  # title font family; "" → the bundled default (FONT_NAME)
         parent=None,
     ):
         super().__init__(parent)
@@ -767,6 +768,7 @@ class VideoWorker(QThread):
         self.height = height
         self.fps = fps
         self.spin_vinyl = spin_vinyl
+        self.font = font
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -781,7 +783,7 @@ class VideoWorker(QThread):
             chapter_marker_title,
             plan_merge_windows,
         )
-        from noveltrans.tts.video import font_dir_context, render_video
+        from noveltrans.tts.video import FONT_NAME, font_dir_context, render_video
 
         project = NovelProject.open(self.project_path)
         try:
@@ -826,7 +828,7 @@ class VideoWorker(QThread):
                         render_video(
                             segments, self.image_path, out_path, font_dir, novel_title,
                             width=self.width, height=self.height, fps=self.fps,
-                            spin_vinyl=self.spin_vinyl,
+                            spin_vinyl=self.spin_vinyl, font_name=self.font or FONT_NAME,
                             cancelled=lambda: self._cancelled,
                         )
                         written += 1
@@ -842,6 +844,54 @@ class VideoWorker(QThread):
             self.failed.emit(f"Lỗi khi tạo video: {exc!r}")
         finally:
             project.close()
+
+
+class VideoPreviewWorker(QThread):
+    """Render a single preview frame off-thread (a bake + one ffmpeg call — a couple secs)."""
+
+    done = Signal(str)  # path to the rendered preview PNG
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        image_path: Path,
+        novel_title: str,
+        sample_title: str,
+        *,
+        width: int = 1920,
+        height: int = 1080,
+        spin_vinyl: bool = True,
+        font: str = "",
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.image_path = Path(image_path)
+        self.novel_title = novel_title
+        self.sample_title = sample_title
+        self.width = width
+        self.height = height
+        self.spin_vinyl = spin_vinyl
+        self.font = font
+
+    def run(self) -> None:
+        import tempfile
+
+        from noveltrans.errors import TtsError
+        from noveltrans.tts.video import FONT_NAME, font_dir_context, render_preview_frame
+
+        try:
+            out = Path(tempfile.gettempdir()) / "noveltrans-preview.png"
+            with font_dir_context() as font_dir:
+                render_preview_frame(
+                    self.image_path, out, font_dir, self.novel_title, self.sample_title,
+                    width=self.width, height=self.height,
+                    spin_vinyl=self.spin_vinyl, font_name=self.font or FONT_NAME,
+                )
+            self.done.emit(str(out))
+        except TtsError as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:  # keep unexpected errors on-screen
+            self.failed.emit(f"Lỗi khi tạo ảnh xem trước: {exc!r}")
 
 
 class TtsVoicesWorker(QThread):
