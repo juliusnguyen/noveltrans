@@ -157,6 +157,37 @@ class TestVideoWorker:
         assert failures and "Không có chương" in failures[0]
 
 
+class TestRealDurations:
+    def test_falls_back_to_stored_when_probe_fails(self):
+        # ffprobe on a nonexistent file returns 0 → keep the stored seconds.
+        from noveltrans.tts.video import _with_real_durations
+
+        segs = [MergeSegment(path="/does/not/exist.wav", seconds=7.5, title="C1")]
+        assert _with_real_durations(segs)[0].seconds == 7.5
+
+    @pytest.mark.skipif(shutil.which("ffprobe") is None, reason="ffprobe not installed")
+    def test_probes_the_real_duration_over_a_wrong_stored_value(self, tmp_path):
+        # The bug: audio_seconds == 0 collapses every subtitle event to zero length.
+        # The probe must recover the real duration so the titles stay visible.
+        from noveltrans.tts.video import _with_real_durations, build_ass_subtitles
+
+        wav = tmp_path / "a.wav"
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+             "-ar", "48000", str(wav)],
+            check=True, capture_output=True,
+        )
+        seg = MergeSegment(path=wav, seconds=0.0, title="Chương 1")  # wrong stored 0
+        timed = _with_real_durations([seg])
+        assert 1.9 < timed[0].seconds < 2.1  # real ~2.0s recovered
+
+        # and the ASS event now has a non-zero span (would have been invisible before)
+        doc = build_ass_subtitles(timed, "Truyện")
+        chapter = next(ln for ln in doc.splitlines() if ",Chapter," in ln)
+        start, end = chapter.split(",")[1:3]
+        assert start != end  # visible
+
+
 def test_project_has_a_video_dir(library_dir, sample_meta, sample_refs):
     from noveltrans.storage import NovelProject
 

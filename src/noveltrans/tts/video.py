@@ -25,6 +25,7 @@ import tempfile
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import replace
 from importlib import resources
 from pathlib import Path
 
@@ -54,6 +55,39 @@ def font_dir_context():
     """
     with resources.as_file(resources.files("noveltrans.tts").joinpath("assets")) as p:
         yield p
+
+
+# -- audio duration probing ---------------------------------------------------
+
+def _probe_duration(path: Path | str) -> float:
+    """Real duration (seconds) of an audio file via ffprobe. 0.0 if it can't be read."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nokey=1", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return 0.0
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
+def _with_real_durations(segments: list[MergeSegment]) -> list[MergeSegment]:
+    """Return `segments` with each `seconds` set to the file's actual duration.
+
+    The subtitle/timestamp timing must match the audio the video actually plays — the
+    stored `audio_seconds` can be 0 (audio made before durations were tracked) or stale,
+    which would collapse the subtitle events to zero length and make them invisible.
+    Falls back to the stored value when a probe fails.
+    """
+    timed = []
+    for seg in segments:
+        probed = _probe_duration(seg.path)
+        timed.append(replace(seg, seconds=probed) if probed > 0 else seg)
+    return timed
 
 
 # -- timing helpers -----------------------------------------------------------
@@ -262,6 +296,9 @@ def render_video(
     audio_file = tmp_dir / "audio.m4a"
     err_file = tmp_dir / "err.txt"
 
+    # Time the titles by the audio the video actually plays, not the (possibly 0/stale)
+    # stored durations — otherwise the subtitle events collapse to zero length.
+    segments = _with_real_durations(segments)
     total = sum(s.seconds for s in segments)
     deadline = time.monotonic() + max(3600, int(total) * 3)  # encode is slower than merge
 
