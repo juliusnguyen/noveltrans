@@ -115,12 +115,14 @@ class TestBuildAssSubtitles:
         chapter = next(ln for ln in doc.splitlines() if ",Chapter," in ln)
         assert chapter.endswith("{\\fad(400,400)}Chương (evil)")  # fade outside the escaped title
 
-    def test_chapter_style_is_below_the_wave(self):
-        # Chapter uses Alignment 8 (top-anchored) with a MarginV ~52% of height so it
-        # sits under the waveform band, not at the frame bottom.
-        doc = build_ass_subtitles([_seg(10, "C1")], "Truyện", height=1080)
-        style = next(ln for ln in doc.splitlines() if ln.startswith("Style: Chapter,"))
-        assert style.endswith(",8,80,80,561,1") or style.endswith(",8,80,80,562,1")
+    def test_titles_are_placed_in_the_right_half(self):
+        # Split layout: the photo is on the left, so both titles sit in the RIGHT half —
+        # Alignment 8 with MarginL ≈ half the width. Chapter below the bars (larger MarginV).
+        doc = build_ass_subtitles([_seg(10, "C1")], "Truyện", width=1920, height=1080)
+        novel = next(ln for ln in doc.splitlines() if ln.startswith("Style: Novel,"))
+        chapter = next(ln for ln in doc.splitlines() if ln.startswith("Style: Chapter,"))
+        assert novel.endswith(",8,960,57,140,1")  # right half, top
+        assert chapter.endswith(",8,960,57,820,1")  # right half, below bars
 
 
 class TestYoutubeTimestamp:
@@ -162,24 +164,25 @@ class TestBuildYoutubeDescription:
 
 
 class TestFiltergraph:
-    def _graph(self, **kw):
+    def _graph(self):
         from pathlib import Path
 
         from noveltrans.tts.video import _filtergraph
 
-        return _filtergraph(1920, 1080, 25, Path("/tmp/subs.ass"), Path("/tmp/fonts"), **kw)
+        return _filtergraph(1920, 1080, Path("/tmp/subs.ass"), Path("/tmp/fonts"))
 
-    def test_has_the_waveform_from_the_audio_input(self):
+    def test_has_the_bars_from_the_audio_input(self):
         g = self._graph()
-        assert "[1:a]showwaves=" in g  # driven by the audio (input 1)
-        assert "mode=cline" in g
-        assert "rate=25" in g  # matches fps
-        assert "[base][viz]overlay=" in g  # wave composited over the background
+        assert "[1:a]showfreqs=" in g  # bars driven by the audio (input 1)
+        assert "mode=bar" in g
+        assert "[base][viz]overlay=" in g  # bars composited over the base
         assert "subtitles=" in g  # titles still burned on top
 
-    def test_keeps_the_blurred_fill_background(self):
+    def test_photo_framed_on_the_left_over_a_blurred_backdrop(self):
         g = self._graph()
-        assert "boxblur" in g and "force_original_aspect_ratio=increase" in g
+        assert "boxblur" in g  # blurred backdrop fills the frame
+        # the sharp photo is placed on the left (small x), not centered
+        assert "[bg][photo]overlay=90:" in g
 
 
 class TestRenderArgv:
@@ -207,7 +210,7 @@ class TestRenderArgv:
             video.render_video(segs, tmp_path / "bg.png", tmp_path / "out.mp4",
                                font_dir, "Truyện", width=640, height=360, fps=25)
 
-        render = next(c for c in cmds if any("showwaves" in a for a in c))
+        render = next(c for c in cmds if any("showfreqs" in a for a in c))
         assert "-tune" not in render  # stillimage tuning removed (motion video now)
         assert "veryfast" in render  # a normal preset instead
         assert "[v]" in render and "1:a" in render  # map filtered video + copy audio

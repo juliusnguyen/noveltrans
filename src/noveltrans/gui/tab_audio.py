@@ -287,7 +287,7 @@ class AudioTab(QWidget):
         row.addWidget(self.video_button)
         row.addWidget(self.open_video_dir_button)
 
-        box = QGroupBox("Xuất video (sóng âm + tên chương + ảnh nền)")
+        box = QGroupBox("Xuất video (ảnh + cột sóng nhạc + tên chương)")
         box.setLayout(row)
         self._on_video_mode_changed()  # set initial visibility
         return box

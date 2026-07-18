@@ -120,12 +120,13 @@ _ASS_STYLES = (
     "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
     # BorderStyle=4 + a translucent BackColour (&H80…) draws a dark scrim box behind the
     # text so it stays legible over any background image.
-    # Novel: Alignment 8 (top-center, MarginV from top). Chapter: also Alignment 8 with a
-    # larger MarginV so it sits just below the waveform band, not at the frame bottom.
+    # Split layout: the photo is on the LEFT, so both titles live in the RIGHT half —
+    # Alignment 8 (top-center) with MarginL≈half the width centres them in the right half.
+    # Novel near the top, Chapter below the bars (larger MarginV).
     "Style: Novel,{font},{nsize},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"
-    "0,0,0,0,100,100,0,0,4,0,0,8,80,80,60,1\n"
+    "0,0,0,0,100,100,0,0,4,0,0,8,{mL},{mR},{nmargin},1\n"
     "Style: Chapter,{font},{csize},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"
-    "0,0,0,0,100,100,0,0,4,0,0,8,80,80,{cmargin},1\n"
+    "0,0,0,0,100,100,0,0,4,0,0,8,{mL},{mR},{cmargin},1\n"
 )
 
 _ASS_HEADER = (
@@ -164,25 +165,28 @@ def build_ass_subtitles(
     width: int = 1920,
     height: int = 1080,
     font_name: str = FONT_NAME,
-    novel_font_px: int = 56,
-    chapter_font_px: int = 72,
-    chapter_margin_v: int | None = None,
+    novel_font_px: int = 52,
+    chapter_font_px: int = 46,
 ) -> str:
     """An ASS document: the novel title for the whole video + one event per chapter.
 
     Chapter events are timed by the cumulative sum of `MergeSegment.seconds` — the same
     offset math as merge's chapter markers, so titles change exactly at the audio
     boundaries. Each chapter title fades in/out (`\\fad`) so it changes smoothly; the
-    novel title stays solid the whole video. `chapter_margin_v` (default ~52% of height)
-    places the chapter title just below the waveform band.
+    novel title stays solid the whole video. Both titles are centred in the RIGHT half
+    (the photo occupies the left): novel near the top, chapter below the bars.
     """
-    if chapter_margin_v is None:
-        chapter_margin_v = int(height * 0.52)
+    # Right-half placement: MarginL ≈ half the width centres the text in the right side.
+    m_l = int(width * 0.50)
+    m_r = int(width * 0.03)
+    novel_margin_v = int(height * 0.13)  # top of the right half
+    chapter_margin_v = int(height * 0.76)  # below the bars band
     total = sum(s.seconds for s in segments)
     out = [
         _ASS_HEADER.format(w=width, h=height),
         _ASS_STYLES.format(
-            font=font_name, nsize=novel_font_px, csize=chapter_font_px, cmargin=chapter_margin_v
+            font=font_name, nsize=novel_font_px, csize=chapter_font_px,
+            mL=m_l, mR=m_r, nmargin=novel_margin_v, cmargin=chapter_margin_v,
         ),
         "\n",
         _ASS_EVENTS_HEADER,
@@ -258,26 +262,32 @@ def _run_ffmpeg(
         raise TtsError(f"ffmpeg trả lỗi (mã {proc.returncode}) khi {what}: {detail}")
 
 
-def _filtergraph(width: int, height: int, fps: int, subs_path: Path, font_dir: Path) -> str:
-    """Blurred-fill background + an audio-driven waveform + the ASS titles burned in.
+def _filtergraph(width: int, height: int, subs_path: Path, font_dir: Path) -> str:
+    """Split layout: the photo framed on the LEFT, audio bars + titles on the RIGHT.
 
-    [bg] the image scaled to COVER the frame, blurred + darkened; [fg] the image scaled to
-    FIT (undistorted) centred over it → [base]. The audio (input 1) drives a `showwaves`
-    band overlaid on [base], then the subtitles are burned on top. `showwaves` emits a
-    transparent background, so it composites cleanly.
+    A blurred, darkened copy of the image fills the whole frame as a backdrop; the sharp
+    image is fitted into a box on the left; `showfreqs` bars (white, driven by the audio,
+    input 1) sit in the right half; the ASS titles are burned on top. `showfreqs` emits a
+    transparent background, so the bars composite cleanly. The bars animate at the output
+    frame rate (`-r`), so no `rate=` option is needed (showfreqs has none).
     """
     subs = str(subs_path).replace("\\", "/").replace(":", r"\:")
     fonts = str(font_dir).replace("\\", "/").replace(":", r"\:")
-    wave_w = int(width * 0.9)
-    wave_h = int(height * 0.18)
-    wave_y = int(height * 0.30)
+    photo_w = int(width * 0.43)
+    photo_h = int(height * 0.83)
+    photo_x = int(width * 0.047)
+    bar_w = int(width * 0.42)
+    bar_h = int(height * 0.31)
+    bar_x = int(width * 0.526)
+    bar_y = int(height * 0.40)
     return (
         f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{height},boxblur=20:2,eq=brightness=-0.25[bg];"
-        f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease[fg];"
-        f"[bg][fg]overlay=(W-w)/2:(H-h)/2[base];"
-        f"[1:a]showwaves=s={wave_w}x{wave_h}:mode=cline:colors=aqua:rate={fps}:draw=full[viz];"
-        f"[base][viz]overlay=(W-w)/2:{wave_y},"
+        f"crop={width}:{height},boxblur=30:3,eq=brightness=-0.5[bg];"
+        f"[0:v]scale={photo_w}:{photo_h}:force_original_aspect_ratio=decrease[photo];"
+        f"[bg][photo]overlay={photo_x}:(H-h)/2[base];"
+        f"[1:a]showfreqs=s={bar_w}x{bar_h}:mode=bar:ascale=sqrt:fscale=log:"
+        f"win_size=1024:colors=white[viz];"
+        f"[base][viz]overlay={bar_x}:{bar_y},"
         f"subtitles='{subs}':fontsdir='{fonts}'[v]"
     )
 
@@ -296,10 +306,10 @@ def render_video(
 ) -> Path:
     """Render `segments` into an MP4 at `out_path`; also write the YouTube description.
 
-    The background `image_path` fills the frame (blurred fill), an audio-driven waveform
-    animates over it, the concatenated chapter audio plays, and the ASS chapter titles
-    (fading on change) are burned in below the wave. `-shortest` ends the video with the
-    audio. A `<out>.txt` description with clickable timestamps is written next to the
+    The `image_path` is framed on the LEFT (over a blurred backdrop); audio-driven bars
+    and the titles sit on the RIGHT; the concatenated chapter audio plays, and the chapter
+    titles (fading on change) are burned in below the bars. `-shortest` ends the video with
+    the audio. A `<out>.txt` description with clickable timestamps is written next to the
     video. Raises TtsError on ffmpeg failure, MergeCancelled if cancelled.
     """
     if not segments:
@@ -338,13 +348,13 @@ def render_video(
             err_file, cancelled, deadline, "ghép âm thanh",
         )
 
-        # 2) Loop the image, draw the waveform (from the audio), burn the titles, mux the
-        #    audio, end with the audio. No -tune stillimage: the wave animates every frame.
+        # 2) Photo on the left, audio bars on the right, burn the titles, mux the audio,
+        #    end with the audio. No -tune stillimage: the bars animate every frame.
         _run_ffmpeg(
             ["ffmpeg", "-y",
              "-loop", "1", "-framerate", str(fps), "-i", str(image_path),
              "-i", str(audio_file),
-             "-filter_complex", _filtergraph(width, height, fps, subs_file, font_dir),
+             "-filter_complex", _filtergraph(width, height, subs_file, font_dir),
              "-map", "[v]", "-map", "1:a",
              "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-r", str(fps),
              "-c:a", "copy", "-shortest", str(out_path)],
