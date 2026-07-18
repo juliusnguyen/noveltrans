@@ -248,6 +248,20 @@ class AudioTab(QWidget):
         self.video_mode.setCurrentIndex(self.video_mode.findData("batch"))  # sane default
         self.video_mode.currentIndexChanged.connect(self._on_video_mode_changed)
 
+        # Quality/speed preset — trades fidelity for a faster encode (see VIDEO_QUALITY_PRESETS).
+        self.video_quality = QComboBox()
+        self.video_quality.addItem("Cao — 1080p", "high")
+        self.video_quality.addItem("Nhanh — 720p", "fast")
+        self.video_quality.addItem("Nhanh nhất — 720p, không đĩa xoay", "fastest")
+        idx = self.video_quality.findData(self.config.video_quality)
+        self.video_quality.setCurrentIndex(idx if idx >= 0 else 0)
+        self.video_quality.setToolTip(
+            "Cao: đẹp nhất, chậm nhất (~1 giờ render / 3 giờ audio).\n"
+            "Nhanh: 720p, ~2× nhanh hơn — vẫn tốt cho YouTube.\n"
+            "Nhanh nhất: 720p + 15fps + đĩa không xoay — nhanh nhất."
+        )
+        self.video_quality.currentIndexChanged.connect(self._on_video_quality_changed)
+
         self.video_range_from = QSpinBox()
         self.video_range_from.setRange(1, 999999)
         self.video_range_to = QSpinBox()
@@ -281,6 +295,8 @@ class AudioTab(QWidget):
         row.addWidget(self.video_range_to)
         row.addWidget(self.video_batch_size)
         row.addWidget(self.video_batch_label)
+        row.addWidget(QLabel("Chất lượng:"))
+        row.addWidget(self.video_quality)
         row.addWidget(QLabel("Ảnh nền:"))
         row.addWidget(self.video_image_edit, stretch=1)
         row.addWidget(self.video_image_button)
@@ -298,6 +314,9 @@ class AudioTab(QWidget):
             w.setVisible(mode == "range")
         for w in (self.video_batch_size, self.video_batch_label):
             w.setVisible(mode == "batch")
+
+    def _on_video_quality_changed(self) -> None:
+        self.config.video_quality = self.video_quality.currentData()
 
     def _pick_video_image(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -715,14 +734,23 @@ class AudioTab(QWidget):
                 f"Không có chương nào có audio giọng {voice} trong phạm vi đã chọn.",
             )
             return
+        from noveltrans.tts.video import video_preset
+
+        preset = video_preset(self.video_quality.currentData())
         n_chapters = sum(len(w.chapters) for w in windows)
         total_secs = sum(c.audio_seconds for w in windows for c in w.chapters)
         hours = total_secs / 3600
+        render_hours = hours / preset["speed"]  # rough estimate at the chosen preset's speed
+        est = f"~{render_hours * 60:.0f} phút" if render_hours < 1 else f"~{render_hours:.1f} giờ"
         answer = QMessageBox.question(
             self, "Tạo video",
             f"Sẽ tạo {len(windows)} video từ {n_chapters} chương (giọng {voice}), "
-            f"tổng ~{hours:.1f} giờ.\n\nVideo có sóng âm động nên nặng hơn: có thể vài GB "
-            f"và mã hoá lâu — nên dùng chế độ “Theo lô”. Tiếp tục?",
+            f"tổng ~{hours:.1f} giờ audio.\n\n"
+            f"Chất lượng: {self.video_quality.currentText()} "
+            f"({preset['width']}×{preset['height']}).\n"
+            f"Ước tính thời gian render: {est} (chưa tính máy nóng/tải khác).\n\n"
+            f"Video dài có thể nặng vài GB — với truyện rất dài nên dùng chế độ “Theo lô”. "
+            f"Tiếp tục?",
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
@@ -736,6 +764,8 @@ class AudioTab(QWidget):
         self._video_worker = VideoWorker(
             self.project.path, voice=voice, mode=mode, image_path=image,
             start=start, end=end, batch=batch,
+            width=preset["width"], height=preset["height"], fps=preset["fps"],
+            spin_vinyl=preset["spin_vinyl"],
         )
         self._video_worker.progress.connect(self._on_video_progress)
         self._video_worker.file_done.connect(self._on_video_file_done)

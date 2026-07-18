@@ -59,6 +59,24 @@ VINYL_LABEL = "vinyl_label.png"  # bundled logo used as the record's centre labe
 # strobes at video frame rates; a slower turn reads calmly as "playing".
 _VINYL_SPIN_SECONDS = 8.0
 
+# Quality/speed presets for the video export. Lower fidelity → faster encode. `speed` is the
+# approximate encode rate (× real time) on Apple Silicon — measured for "high" (~3×), scaled
+# for the rest — used only to show a render-time estimate before starting. `spin_vinyl=False`
+# drops the per-frame rotate (the biggest filter cost), so the disc is static.
+# `speed` values are measured on Apple Silicon (high ~3.0×, fast ~10.6×, fastest ~17.1×
+# realtime), rounded down a touch so the shown estimate is conservative under thermal load.
+VIDEO_QUALITY_PRESETS: dict[str, dict] = {
+    "high":    {"width": 1920, "height": 1080, "fps": 25, "spin_vinyl": True,  "speed": 3.0},
+    "fast":    {"width": 1280, "height": 720,  "fps": 25, "spin_vinyl": True,  "speed": 9.0},
+    "fastest": {"width": 1280, "height": 720,  "fps": 15, "spin_vinyl": False, "speed": 15.0},
+}
+DEFAULT_VIDEO_QUALITY = "high"
+
+
+def video_preset(key: str) -> dict:
+    """Return the preset params for `key`, falling back to the default if unknown."""
+    return VIDEO_QUALITY_PRESETS.get(key, VIDEO_QUALITY_PRESETS[DEFAULT_VIDEO_QUALITY])
+
 
 @contextmanager
 def font_dir_context():
@@ -352,14 +370,16 @@ def _concat_audio(
 
 
 def _filtergraph(width: int, height: int, subs_path: Path, font_dir: Path,
-                 total_seconds: float) -> str:
+                 total_seconds: float, spin_vinyl: bool = True) -> str:
     """Overlay the animated bits onto the pre-baked player artwork.
 
     Inputs: 0 = the static skin (`build_player_skin`: gradient, framed photo, empty
     progress track), 1 = the audio, 2 = the vinyl disc, 3 = the playhead knob. Here we add
-    the four moving parts:
-      * the vinyl (input 2) `rotate`d by an angle that grows with time, so it spins in
-        place (`ow=iw:oh=ih` keeps the frame; `fillcolor=none` keeps the corners clear);
+    the moving parts:
+      * the vinyl (input 2): when `spin_vinyl`, `rotate`d by an angle that grows with time
+        so it spins in place (`ow=iw:oh=ih` keeps the frame; `fillcolor=none` keeps corners
+        clear); otherwise overlaid statically — skipping the per-frame rotate, the single
+        biggest filter cost, for a much faster encode;
       * the `showfreqs` bar spectrum (from the audio) in the right column (purple, so it
         reads over the light skin — no `rate=` option, it animates at the output `-r`);
       * the playhead knob (input 3) slid along the track, its x a linear function of
@@ -372,12 +392,18 @@ def _filtergraph(width: int, height: int, subs_path: Path, font_dir: Path,
     total = max(total_seconds, 0.001)  # guard the knob's t/total against a zero divide
     knob_x = f"{lay.track_x}+(t/{total})*{lay.track_w}-{lay.knob_half}"
     knob_y = lay.track_y - lay.knob_half
+    if spin_vinyl:
+        vinyl = (
+            f"[2:v]format=rgba,rotate=a='2*PI*t/{_VINYL_SPIN_SECONDS}':fillcolor=none:"
+            f"ow=iw:oh=ih[vin];"
+            f"[0:v][vin]overlay={lay.vinyl_x}:{lay.vinyl_y}[s1];"
+        )
+    else:
+        vinyl = f"[0:v][2:v]overlay={lay.vinyl_x}:{lay.vinyl_y}[s1];"  # static, no rotate
     return (
         f"[1:a]showfreqs=s={lay.bars_w}x{lay.bars_h}:mode=bar:ascale=sqrt:fscale=log:"
         f"win_size=2048:colors=0x8a52c8[viz];"
-        f"[2:v]format=rgba,rotate=a='2*PI*t/{_VINYL_SPIN_SECONDS}':fillcolor=none:"
-        f"ow=iw:oh=ih[vin];"
-        f"[0:v][vin]overlay={lay.vinyl_x}:{lay.vinyl_y}[s1];"
+        f"{vinyl}"
         f"[s1][viz]overlay={lay.bars_x}:{lay.bars_y}[s2];"
         f"[s2][3:v]overlay=x='{knob_x}':y={knob_y}[s3];"
         f"[s3]subtitles='{subs}':fontsdir='{fonts}'[v]"
@@ -394,6 +420,7 @@ def render_video(
     width: int = 1920,
     height: int = 1080,
     fps: int = 25,
+    spin_vinyl: bool = True,
     cancelled: Callable[[], bool] | None = None,
 ) -> Path:
     """Render `segments` into an MP4 at `out_path`; also write the YouTube description.
@@ -454,7 +481,7 @@ def render_video(
              "-i", str(audio_file),
              "-loop", "1", "-i", str(vinyl_file),
              "-loop", "1", "-i", str(knob_file),
-             "-filter_complex", _filtergraph(width, height, subs_file, font_dir, total),
+             "-filter_complex", _filtergraph(width, height, subs_file, font_dir, total, spin_vinyl),
              "-map", "[v]", "-map", "1:a",
              "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-r", str(fps),
              "-c:a", "copy", "-shortest", str(out_path)],
