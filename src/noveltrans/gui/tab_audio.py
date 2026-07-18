@@ -287,7 +287,7 @@ class AudioTab(QWidget):
         row.addWidget(self.video_button)
         row.addWidget(self.open_video_dir_button)
 
-        box = QGroupBox("Xuất video (audio + tên chương + ảnh nền)")
+        box = QGroupBox("Xuất video (trình phát nhạc: ảnh + cột sóng + tên chương)")
         box.setLayout(row)
         self._on_video_mode_changed()  # set initial visibility
         return box
@@ -721,8 +721,8 @@ class AudioTab(QWidget):
         answer = QMessageBox.question(
             self, "Tạo video",
             f"Sẽ tạo {len(windows)} video từ {n_chapters} chương (giọng {voice}), "
-            f"tổng ~{hours:.1f} giờ.\n\nVideo dài có thể vài GB và mất lâu để mã hoá — "
-            f"nên dùng chế độ “Theo lô”. Tiếp tục?",
+            f"tổng ~{hours:.1f} giờ.\n\nVideo có sóng âm động nên nặng hơn: có thể vài GB "
+            f"và mã hoá lâu — nên dùng chế độ “Theo lô”. Tiếp tục?",
         )
         if answer != QMessageBox.StandardButton.Yes:
             return

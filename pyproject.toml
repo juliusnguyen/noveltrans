@@ -18,6 +18,7 @@ dependencies = [
     "ebooklib>=0.18",
     "jieba>=0.42",
     "opencc-python-reimplemented>=0.1.7",
+    "pillow>=10.0",  # draw the video player skin (gradient, rounded photo, widget)
 ]
 
 [project.optional-dependencies]
@@ -51,7 +52,7 @@ noveltrans = "noveltrans.app:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-noveltrans = ["translators/data/*.json", "tts/assets/*.ttf", "tts/assets/*.txt"]
+noveltrans = ["translators/data/*.json", "tts/assets/*.ttf", "tts/assets/*.txt", "tts/assets/*.png"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

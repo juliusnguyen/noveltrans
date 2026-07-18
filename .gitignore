@@ -24,3 +24,6 @@ dist/
 
 # OS
 .DS_Store
+
+# large source logo (downscaled copy lives in assets/vinyl_label.png)
+/fox_logo.png

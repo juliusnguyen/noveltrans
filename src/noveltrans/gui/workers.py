@@ -750,7 +750,7 @@ class VideoWorker(QThread):
         batch: int | None = None,
         width: int = 1920,
         height: int = 1080,
-        fps: int = 12,
+        fps: int = 25,  # motion video (waveform) — smoother than 019's static 12
         parent=None,
     ):
         super().__init__(parent)
