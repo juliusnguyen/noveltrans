@@ -120,10 +120,12 @@ _ASS_STYLES = (
     "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
     # BorderStyle=4 + a translucent BackColour (&H80…) draws a dark scrim box behind the
     # text so it stays legible over any background image.
+    # Novel: Alignment 8 (top-center, MarginV from top). Chapter: also Alignment 8 with a
+    # larger MarginV so it sits just below the waveform band, not at the frame bottom.
     "Style: Novel,{font},{nsize},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"
     "0,0,0,0,100,100,0,0,4,0,0,8,80,80,60,1\n"
     "Style: Chapter,{font},{csize},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"
-    "0,0,0,0,100,100,0,0,4,0,0,2,80,80,120,1\n"
+    "0,0,0,0,100,100,0,0,4,0,0,8,80,80,{cmargin},1\n"
 )
 
 _ASS_HEADER = (
@@ -164,17 +166,24 @@ def build_ass_subtitles(
     font_name: str = FONT_NAME,
     novel_font_px: int = 56,
     chapter_font_px: int = 72,
+    chapter_margin_v: int | None = None,
 ) -> str:
     """An ASS document: the novel title for the whole video + one event per chapter.
 
     Chapter events are timed by the cumulative sum of `MergeSegment.seconds` — the same
     offset math as merge's chapter markers, so titles change exactly at the audio
-    boundaries.
+    boundaries. Each chapter title fades in/out (`\\fad`) so it changes smoothly; the
+    novel title stays solid the whole video. `chapter_margin_v` (default ~52% of height)
+    places the chapter title just below the waveform band.
     """
+    if chapter_margin_v is None:
+        chapter_margin_v = int(height * 0.52)
     total = sum(s.seconds for s in segments)
     out = [
         _ASS_HEADER.format(w=width, h=height),
-        _ASS_STYLES.format(font=font_name, nsize=novel_font_px, csize=chapter_font_px),
+        _ASS_STYLES.format(
+            font=font_name, nsize=novel_font_px, csize=chapter_font_px, cmargin=chapter_margin_v
+        ),
         "\n",
         _ASS_EVENTS_HEADER,
         f"Dialogue: 0,{_ass_time(0)},{_ass_time(total)},Novel,,0,0,0,,{_escape_ass(novel_title)}\n",
@@ -182,9 +191,11 @@ def build_ass_subtitles(
     start = 0.0
     for seg in segments:
         end = start + seg.seconds
+        # The \fad override is added OUTSIDE the escaped title, so a title's own braces
+        # (already neutralised by _escape_ass) can't break out of or corrupt the fade.
         out.append(
             f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Chapter,,0,0,0,,"
-            f"{_escape_ass(seg.title)}\n"
+            f"{{\\fad(400,400)}}{_escape_ass(seg.title)}\n"
         )
         start = end
     return "".join(out)
@@ -247,19 +258,26 @@ def _run_ffmpeg(
         raise TtsError(f"ffmpeg trả lỗi (mã {proc.returncode}) khi {what}: {detail}")
 
 
-def _filtergraph(width: int, height: int, subs_path: Path, font_dir: Path) -> str:
-    """Blurred-fill background (any aspect → no black bars) with the ASS titles burned in.
+def _filtergraph(width: int, height: int, fps: int, subs_path: Path, font_dir: Path) -> str:
+    """Blurred-fill background + an audio-driven waveform + the ASS titles burned in.
 
     [bg] the image scaled to COVER the frame, blurred + darkened; [fg] the image scaled to
-    FIT (undistorted) centred over it; then burn the subtitles.
+    FIT (undistorted) centred over it → [base]. The audio (input 1) drives a `showwaves`
+    band overlaid on [base], then the subtitles are burned on top. `showwaves` emits a
+    transparent background, so it composites cleanly.
     """
     subs = str(subs_path).replace("\\", "/").replace(":", r"\:")
     fonts = str(font_dir).replace("\\", "/").replace(":", r"\:")
+    wave_w = int(width * 0.9)
+    wave_h = int(height * 0.18)
+    wave_y = int(height * 0.30)
     return (
         f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
         f"crop={width}:{height},boxblur=20:2,eq=brightness=-0.25[bg];"
         f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease[fg];"
-        f"[bg][fg]overlay=(W-w)/2:(H-h)/2,"
+        f"[bg][fg]overlay=(W-w)/2:(H-h)/2[base];"
+        f"[1:a]showwaves=s={wave_w}x{wave_h}:mode=cline:colors=aqua:rate={fps}:draw=full[viz];"
+        f"[base][viz]overlay=(W-w)/2:{wave_y},"
         f"subtitles='{subs}':fontsdir='{fonts}'[v]"
     )
 
@@ -273,15 +291,16 @@ def render_video(
     *,
     width: int = 1920,
     height: int = 1080,
-    fps: int = 12,
+    fps: int = 25,
     cancelled: Callable[[], bool] | None = None,
 ) -> Path:
     """Render `segments` into an MP4 at `out_path`; also write the YouTube description.
 
-    The background `image_path` fills the frame (blurred fill), the concatenated chapter
-    audio plays, and the ASS chapter titles are burned in. `-shortest` ends the video
-    with the audio. A `<out>.txt` description with clickable timestamps is written next
-    to the video. Raises TtsError on ffmpeg failure, MergeCancelled if cancelled.
+    The background `image_path` fills the frame (blurred fill), an audio-driven waveform
+    animates over it, the concatenated chapter audio plays, and the ASS chapter titles
+    (fading on change) are burned in below the wave. `-shortest` ends the video with the
+    audio. A `<out>.txt` description with clickable timestamps is written next to the
+    video. Raises TtsError on ffmpeg failure, MergeCancelled if cancelled.
     """
     if not segments:
         raise TtsError("Không có chương nào có audio để tạo video.")
@@ -300,7 +319,9 @@ def render_video(
     # stored durations — otherwise the subtitle events collapse to zero length.
     segments = _with_real_durations(segments)
     total = sum(s.seconds for s in segments)
-    deadline = time.monotonic() + max(3600, int(total) * 3)  # encode is slower than merge
+    # The waveform makes this motion video (not a still), so the encode is slower than
+    # 019's stillimage pass — give it more headroom.
+    deadline = time.monotonic() + max(3600, int(total) * 6)
 
     try:
         list_file.write_text(build_concat_list([s.path for s in segments]), encoding="utf-8")
@@ -317,14 +338,15 @@ def render_video(
             err_file, cancelled, deadline, "ghép âm thanh",
         )
 
-        # 2) Loop the image, burn the titles, mux the audio, end with the audio.
+        # 2) Loop the image, draw the waveform (from the audio), burn the titles, mux the
+        #    audio, end with the audio. No -tune stillimage: the wave animates every frame.
         _run_ffmpeg(
             ["ffmpeg", "-y",
              "-loop", "1", "-framerate", str(fps), "-i", str(image_path),
              "-i", str(audio_file),
-             "-filter_complex", _filtergraph(width, height, subs_file, font_dir),
+             "-filter_complex", _filtergraph(width, height, fps, subs_file, font_dir),
              "-map", "[v]", "-map", "1:a",
-             "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p", "-r", str(fps),
+             "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-r", str(fps),
              "-c:a", "copy", "-shortest", str(out_path)],
             err_file, cancelled, deadline, "tạo video",
         )

@@ -96,6 +96,32 @@ class TestBuildAssSubtitles:
         assert "{evil}" not in doc
         assert "(evil)\\Nline2" in doc
 
+    def test_every_chapter_event_fades(self):
+        # Smooth transition: each chapter title fades in/out.
+        doc, _ = self._doc()
+        chapters = [ln for ln in doc.splitlines() if ",Chapter," in ln]
+        assert chapters and all(",,{\\fad(400,400)}" in ln for ln in chapters)
+
+    def test_novel_event_does_not_fade(self):
+        # The novel title is persistent — no fade.
+        doc, _ = self._doc()
+        novel = next(ln for ln in doc.splitlines() if ",Novel," in ln)
+        assert "\\fad" not in novel
+
+    def test_fade_prefix_sits_before_the_escaped_title(self):
+        # The \fad override must be outside the escaped title so a braced title can't
+        # break out of it.
+        doc = build_ass_subtitles([_seg(10, "Chương {evil}")], "Truyện")
+        chapter = next(ln for ln in doc.splitlines() if ",Chapter," in ln)
+        assert chapter.endswith("{\\fad(400,400)}Chương (evil)")  # fade outside the escaped title
+
+    def test_chapter_style_is_below_the_wave(self):
+        # Chapter uses Alignment 8 (top-anchored) with a MarginV ~52% of height so it
+        # sits under the waveform band, not at the frame bottom.
+        doc = build_ass_subtitles([_seg(10, "C1")], "Truyện", height=1080)
+        style = next(ln for ln in doc.splitlines() if ln.startswith("Style: Chapter,"))
+        assert style.endswith(",8,80,80,561,1") or style.endswith(",8,80,80,562,1")
+
 
 class TestYoutubeTimestamp:
     @pytest.mark.parametrize(
@@ -133,6 +159,59 @@ class TestBuildYoutubeDescription:
         desc, segs = self._desc()
         ts_lines = [ln for ln in desc.splitlines() if ln[:1].isdigit()]
         assert len(ts_lines) == len(segs)
+
+
+class TestFiltergraph:
+    def _graph(self, **kw):
+        from pathlib import Path
+
+        from noveltrans.tts.video import _filtergraph
+
+        return _filtergraph(1920, 1080, 25, Path("/tmp/subs.ass"), Path("/tmp/fonts"), **kw)
+
+    def test_has_the_waveform_from_the_audio_input(self):
+        g = self._graph()
+        assert "[1:a]showwaves=" in g  # driven by the audio (input 1)
+        assert "mode=cline" in g
+        assert "rate=25" in g  # matches fps
+        assert "[base][viz]overlay=" in g  # wave composited over the background
+        assert "subtitles=" in g  # titles still burned on top
+
+    def test_keeps_the_blurred_fill_background(self):
+        g = self._graph()
+        assert "boxblur" in g and "force_original_aspect_ratio=increase" in g
+
+
+class TestRenderArgv:
+    def test_render_command_uses_waveform_and_drops_stillimage(self, tmp_path, monkeypatch):
+        # Capture the ffmpeg render argv without running ffmpeg.
+        import noveltrans.tts.video as video
+
+        cmds = []
+
+        class _FakeProc:
+            returncode = 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        def fake_popen(cmd, **kw):
+            cmds.append(cmd)
+            return _FakeProc()
+
+        monkeypatch.setattr(video.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(video, "_with_real_durations", lambda segs: segs)  # skip ffprobe
+
+        segs = [MergeSegment(path=tmp_path / "a.wav", seconds=3.0, title="C1")]
+        with video.font_dir_context() as font_dir:
+            video.render_video(segs, tmp_path / "bg.png", tmp_path / "out.mp4",
+                               font_dir, "Truyện", width=640, height=360, fps=25)
+
+        render = next(c for c in cmds if any("showwaves" in a for a in c))
+        assert "-tune" not in render  # stillimage tuning removed (motion video now)
+        assert "veryfast" in render  # a normal preset instead
+        assert "[v]" in render and "1:a" in render  # map filtered video + copy audio
+        assert "copy" in render  # -c:a copy (audio filtered AND copied — the crux)
 
 
 class TestVideoWorker:
