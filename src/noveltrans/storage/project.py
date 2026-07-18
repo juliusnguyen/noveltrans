@@ -31,6 +31,7 @@ META_FILE = "meta.json"
 DB_FILE = "chapters.db"
 EXPORTS_DIR = "exports"
 AUDIO_DIR = "audio"  # inside exports/
+VIDEO_DIR = "video"  # inside exports/
 
 # Columns a find-and-replace may write. Whitelisted because apply_replacements
 # interpolates column names into SQL; `title` is included (the user opted in) even
@@ -175,6 +176,10 @@ class NovelProject:
     @property
     def audio_dir(self) -> Path:
         return self.exports_dir / AUDIO_DIR
+
+    @property
+    def video_dir(self) -> Path:
+        return self.exports_dir / VIDEO_DIR
 
     # ---------------------------------------------------------------- TOC
 

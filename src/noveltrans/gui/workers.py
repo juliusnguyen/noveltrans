@@ -726,6 +726,121 @@ class MergeWorker(QThread):
             project.close()
 
 
+class VideoWorker(QThread):
+    """Render per-chapter audio into MP4 video(s) (all / range / batch), off-thread.
+
+    A structural clone of MergeWorker: same window selection, same one-file-per-window
+    loop, same cancel handling. Each window becomes a video (background image + audio +
+    burned-in chapter titles) plus a companion YouTube-description .txt.
+    """
+
+    progress = Signal(int, int, str)  # windows done, total windows, label
+    file_done = Signal(str)  # each output .mp4 path as it finishes
+    finished_ok = Signal(int)  # number of videos written
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        project_path: Path,
+        voice: str,
+        mode: str,  # "all" | "range" | "batch"
+        image_path: Path,
+        start: int | None = None,
+        end: int | None = None,
+        batch: int | None = None,
+        width: int = 1920,
+        height: int = 1080,
+        fps: int = 12,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.project_path = Path(project_path)
+        self.voice = voice
+        self.mode = mode
+        self.image_path = Path(image_path)
+        # NOTE: not `self.start` — that shadows QThread.start() (same trap as MergeWorker).
+        self.start_num = start
+        self.end_num = end
+        self.batch_size = batch
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        from noveltrans.errors import TtsError
+        from noveltrans.storage.project import slugify
+        from noveltrans.tts.merge import (
+            MergeCancelled,
+            MergeSegment,
+            chapter_marker_title,
+            plan_merge_windows,
+        )
+        from noveltrans.tts.video import font_dir_context, render_video
+
+        project = NovelProject.open(self.project_path)
+        try:
+            windows = plan_merge_windows(
+                project.chapters(),
+                self.voice,
+                self.mode,
+                start=self.start_num,
+                end=self.end_num,
+                batch=self.batch_size,
+            )
+            if not windows:
+                self.failed.emit("Không có chương nào có audio giọng này trong phạm vi đã chọn.")
+                return
+            project.video_dir.mkdir(parents=True, exist_ok=True)
+            slug = slugify(project.meta.translated_title or project.meta.title)
+            novel_title = project.meta.translated_title or project.meta.title
+            total = len(windows)
+            written = 0
+            with font_dir_context() as font_dir:
+                for i, window in enumerate(windows):
+                    if self._cancelled:
+                        break
+                    segments = [
+                        MergeSegment(
+                            path=self.project_path / c.audio_path,
+                            seconds=c.audio_seconds,
+                            title=chapter_marker_title(c),
+                        )
+                        for c in window.chapters
+                        if (self.project_path / c.audio_path).is_file()
+                    ]
+                    if not segments:
+                        continue
+                    if total == 1 and self.mode == "all":
+                        name = f"{slug}.mp4"
+                    else:
+                        name = f"{slug}-{window.first_num:04d}-{window.last_num:04d}.mp4"
+                    out_path = project.video_dir / name
+                    self.progress.emit(i, total, name)
+                    try:
+                        render_video(
+                            segments, self.image_path, out_path, font_dir, novel_title,
+                            width=self.width, height=self.height, fps=self.fps,
+                            cancelled=lambda: self._cancelled,
+                        )
+                        written += 1
+                        self.file_done.emit(str(out_path))
+                    except MergeCancelled:
+                        break  # user stopped — partial files kept, not an error
+                    except TtsError as exc:
+                        self.failed.emit(str(exc))
+                        return
+            self.progress.emit(total, total, "")
+            self.finished_ok.emit(written)
+        except Exception as exc:  # keep unexpected errors on-screen
+            self.failed.emit(f"Lỗi khi tạo video: {exc!r}")
+        finally:
+            project.close()
+
+
 class TtsVoicesWorker(QThread):
     """List a TTS engine's voices without blocking the GUI."""
 
