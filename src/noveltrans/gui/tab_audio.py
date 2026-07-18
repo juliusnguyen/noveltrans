@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import re
 
-from PySide6.QtCore import QUrl
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
     QButtonGroup,
     QComboBox,
@@ -36,7 +36,13 @@ from noveltrans.gui.widgets import (
     RowButtonDelegate,
     enable_cell_copy,
 )
-from noveltrans.gui.workers import AudioWorker, MergeWorker, TtsVoicesWorker, VideoWorker
+from noveltrans.gui.workers import (
+    AudioWorker,
+    MergeWorker,
+    TtsVoicesWorker,
+    VideoPreviewWorker,
+    VideoWorker,
+)
 from noveltrans.storage import NovelProject
 
 
@@ -49,6 +55,7 @@ class AudioTab(QWidget):
         self._voices_worker: TtsVoicesWorker | None = None
         self._merge_worker: MergeWorker | None = None
         self._video_worker: VideoWorker | None = None
+        self._preview_worker: VideoPreviewWorker | None = None
 
         # --- top row: novel + voice
         self.picker = ProjectPicker()
@@ -262,6 +269,17 @@ class AudioTab(QWidget):
         )
         self.video_quality.currentIndexChanged.connect(self._on_video_quality_changed)
 
+        # Title font — several bundled OFL fonts with full Vietnamese coverage.
+        from noveltrans.tts.video import VIDEO_FONTS
+
+        self.video_font = QComboBox()
+        for key, spec in VIDEO_FONTS.items():
+            self.video_font.addItem(spec["label"], key)
+        fidx = self.video_font.findData(self.config.video_font)
+        self.video_font.setCurrentIndex(fidx if fidx >= 0 else 0)
+        self.video_font.setToolTip("Phông chữ cho tên truyện và tên chương trong video.")
+        self.video_font.currentIndexChanged.connect(self._on_video_font_changed)
+
         self.video_range_from = QSpinBox()
         self.video_range_from.setRange(1, 999999)
         self.video_range_to = QSpinBox()
@@ -279,11 +297,14 @@ class AudioTab(QWidget):
         self.video_image_button = QPushButton("Chọn ảnh…")
         self.video_image_button.clicked.connect(self._pick_video_image)
 
+        self.video_preview_button = QPushButton("Xem trước")
+        self.video_preview_button.clicked.connect(self._start_preview)
         self.video_button = QPushButton("Tạo video")
         self.video_button.clicked.connect(self._start_video)
         if not ffmpeg_available():
-            self.video_button.setEnabled(False)
-            self.video_button.setToolTip("Cần ffmpeg để tạo video (brew install ffmpeg).")
+            for b in (self.video_button, self.video_preview_button):
+                b.setEnabled(False)
+                b.setToolTip("Cần ffmpeg để tạo video (brew install ffmpeg).")
         self.open_video_dir_button = QPushButton("Mở thư mục video")
         self.open_video_dir_button.clicked.connect(self._open_video_dir)
 
@@ -297,9 +318,12 @@ class AudioTab(QWidget):
         row.addWidget(self.video_batch_label)
         row.addWidget(QLabel("Chất lượng:"))
         row.addWidget(self.video_quality)
+        row.addWidget(QLabel("Phông chữ:"))
+        row.addWidget(self.video_font)
         row.addWidget(QLabel("Ảnh nền:"))
         row.addWidget(self.video_image_edit, stretch=1)
         row.addWidget(self.video_image_button)
+        row.addWidget(self.video_preview_button)
         row.addWidget(self.video_button)
         row.addWidget(self.open_video_dir_button)
 
@@ -317,6 +341,60 @@ class AudioTab(QWidget):
 
     def _on_video_quality_changed(self) -> None:
         self.config.video_quality = self.video_quality.currentData()
+
+    def _on_video_font_changed(self) -> None:
+        self.config.video_font = self.video_font.currentData()
+
+    def _start_preview(self) -> None:
+        """Render one still frame of the video so the user can check it before rendering."""
+        from pathlib import Path
+
+        from noveltrans.tts.video import video_font, video_preset
+
+        image = self.video_image_edit.text().strip()
+        if not image or not Path(image).is_file():
+            QMessageBox.warning(self, "Chưa chọn ảnh", "Hãy chọn một ảnh nền hợp lệ để xem trước.")
+            return
+        if self._preview_worker is not None and self._preview_worker.isRunning():
+            return
+        preset = video_preset(self.video_quality.currentData())
+        family = video_font(self.video_font.currentData())["family"]
+        novel_title = "Tên truyện"
+        if self.project is not None:
+            novel_title = self.project.meta.translated_title or self.project.meta.title
+
+        self.video_preview_button.setEnabled(False)
+        self.status_label.setText("🖼️ Đang tạo ảnh xem trước…")
+        self._preview_worker = VideoPreviewWorker(
+            image, novel_title, "Chương 1: Chương mẫu",
+            width=preset["width"], height=preset["height"],
+            spin_vinyl=preset["spin_vinyl"], font=family,
+        )
+        self._preview_worker.done.connect(self._on_preview_ready)
+        self._preview_worker.failed.connect(self._on_preview_failed)
+        self._preview_worker.start()
+
+    def _on_preview_ready(self, png_path: str) -> None:
+        self.video_preview_button.setEnabled(True)
+        self.status_label.setText("")
+        pix = QPixmap(png_path)  # copies the pixels, so the temp file can be reused later
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Xem trước video")
+        label = QLabel()
+        label.setPixmap(pix.scaled(
+            900, 520, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+        ))
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(label)
+        layout.addWidget(buttons)
+        dialog.exec()
+
+    def _on_preview_failed(self, message: str) -> None:
+        self.video_preview_button.setEnabled(True)
+        self.status_label.setText("")
+        QMessageBox.warning(self, "Không tạo được xem trước", message)
 
     def _pick_video_image(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -734,9 +812,10 @@ class AudioTab(QWidget):
                 f"Không có chương nào có audio giọng {voice} trong phạm vi đã chọn.",
             )
             return
-        from noveltrans.tts.video import video_preset
+        from noveltrans.tts.video import video_font, video_preset
 
         preset = video_preset(self.video_quality.currentData())
+        font_family = video_font(self.video_font.currentData())["family"]
         n_chapters = sum(len(w.chapters) for w in windows)
         total_secs = sum(c.audio_seconds for w in windows for c in w.chapters)
         hours = total_secs / 3600
@@ -765,7 +844,7 @@ class AudioTab(QWidget):
             self.project.path, voice=voice, mode=mode, image_path=image,
             start=start, end=end, batch=batch,
             width=preset["width"], height=preset["height"], fps=preset["fps"],
-            spin_vinyl=preset["spin_vinyl"],
+            spin_vinyl=preset["spin_vinyl"], font=font_family,
         )
         self._video_worker.progress.connect(self._on_video_progress)
         self._video_worker.file_done.connect(self._on_video_file_done)
@@ -820,5 +899,7 @@ class AudioTab(QWidget):
         if self._video_worker is not None and self._video_worker.isRunning():
             self._video_worker.cancel()  # stops before the next window; current ffmpeg terminated
             self._video_worker.wait(120_000)
+        if self._preview_worker is not None and self._preview_worker.isRunning():
+            self._preview_worker.wait(60_000)  # a single-frame render — short
         if self._voices_worker is not None and self._voices_worker.isRunning():
             self._voices_worker.wait(5_000)

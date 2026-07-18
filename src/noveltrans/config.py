@@ -319,6 +319,18 @@ class AppConfig:
         self._s.setValue("video_quality", value)
 
     @property
+    def video_font(self) -> str:
+        """Video title font key (see VIDEO_FONTS). Unknown/stale values → default."""
+        from noveltrans.tts.video import DEFAULT_VIDEO_FONT, VIDEO_FONTS
+
+        value = str(self._s.value("video_font", DEFAULT_VIDEO_FONT))
+        return value if value in VIDEO_FONTS else DEFAULT_VIDEO_FONT
+
+    @video_font.setter
+    def video_font(self, value: str) -> None:
+        self._s.setValue("video_font", value)
+
+    @property
     def keep_awake_enabled(self) -> bool:
         """Keep the Mac awake while a download/translate/TTS/merge/video job is running."""
         return self._s.value("keep_awake_enabled", True, type=bool)
