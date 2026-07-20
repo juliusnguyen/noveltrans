@@ -4,19 +4,17 @@ from __future__ import annotations
 
 import re
 
-from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QDesktopServices, QPixmap
+from PySide6.QtCore import QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QButtonGroup,
     QComboBox,
     QDialog,
     QDialogButtonBox,
-    QFileDialog,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
-    QLineEdit,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
@@ -40,8 +38,6 @@ from noveltrans.gui.workers import (
     AudioWorker,
     MergeWorker,
     TtsVoicesWorker,
-    VideoPreviewWorker,
-    VideoWorker,
 )
 from noveltrans.storage import NovelProject
 
@@ -54,8 +50,6 @@ class AudioTab(QWidget):
         self._worker: AudioWorker | None = None
         self._voices_worker: TtsVoicesWorker | None = None
         self._merge_worker: MergeWorker | None = None
-        self._video_worker: VideoWorker | None = None
-        self._preview_worker: VideoPreviewWorker | None = None
 
         # --- top row: novel + voice
         self.picker = ProjectPicker()
@@ -172,14 +166,12 @@ class AudioTab(QWidget):
         bottom_row.addWidget(self.progress, stretch=1)
 
         merge_box = self._build_merge_box()
-        video_box = self._build_video_box()
 
         layout = QVBoxLayout(self)
         layout.addLayout(top_row)
         layout.addWidget(self.table, stretch=1)
         layout.addLayout(bottom_row)
         layout.addWidget(merge_box)
-        layout.addWidget(video_box)
         layout.addWidget(self.status_label)
 
     def _build_merge_box(self) -> QGroupBox:
@@ -243,167 +235,6 @@ class AudioTab(QWidget):
             w.setVisible(is_range)
         for w in (self.batch_size, self.batch_label):
             w.setVisible(is_batch)
-
-    def _build_video_box(self) -> QGroupBox:
-        """The 'Xuất video' controls: background image + mode (all/range/batch) + button."""
-        from noveltrans.tts.convert import ffmpeg_available
-
-        self.video_mode = QComboBox()
-        self.video_mode.addItem("Toàn bộ", "all")
-        self.video_mode.addItem("Từ chương … đến …", "range")
-        self.video_mode.addItem("Theo lô", "batch")
-        self.video_mode.setCurrentIndex(self.video_mode.findData("batch"))  # sane default
-        self.video_mode.currentIndexChanged.connect(self._on_video_mode_changed)
-
-        # Quality/speed preset — trades fidelity for a faster encode (see VIDEO_QUALITY_PRESETS).
-        self.video_quality = QComboBox()
-        self.video_quality.addItem("Cao — 1080p", "high")
-        self.video_quality.addItem("Nhanh — 720p", "fast")
-        self.video_quality.addItem("Nhanh nhất — 720p, không đĩa xoay", "fastest")
-        idx = self.video_quality.findData(self.config.video_quality)
-        self.video_quality.setCurrentIndex(idx if idx >= 0 else 0)
-        self.video_quality.setToolTip(
-            "Cao: đẹp nhất, chậm nhất (~1 giờ render / 3 giờ audio).\n"
-            "Nhanh: 720p, ~2× nhanh hơn — vẫn tốt cho YouTube.\n"
-            "Nhanh nhất: 720p + 15fps + đĩa không xoay — nhanh nhất."
-        )
-        self.video_quality.currentIndexChanged.connect(self._on_video_quality_changed)
-
-        # Title font — several bundled OFL fonts with full Vietnamese coverage.
-        from noveltrans.tts.video import VIDEO_FONTS
-
-        self.video_font = QComboBox()
-        for key, spec in VIDEO_FONTS.items():
-            self.video_font.addItem(spec["label"], key)
-        fidx = self.video_font.findData(self.config.video_font)
-        self.video_font.setCurrentIndex(fidx if fidx >= 0 else 0)
-        self.video_font.setToolTip("Phông chữ cho tên truyện và tên chương trong video.")
-        self.video_font.currentIndexChanged.connect(self._on_video_font_changed)
-
-        self.video_range_from = QSpinBox()
-        self.video_range_from.setRange(1, 999999)
-        self.video_range_to = QSpinBox()
-        self.video_range_to.setRange(1, 999999)
-        self.video_range_label = QLabel("→")
-        self.video_batch_size = QSpinBox()
-        self.video_batch_size.setRange(1, 999999)
-        self.video_batch_size.setValue(10)
-        self.video_batch_label = QLabel("chương/video")
-
-        self.video_image_edit = QLineEdit(self.config.video_image_path)
-        self.video_image_edit.setPlaceholderText("Ảnh nền cho video…")
-        self.video_image_edit.setReadOnly(True)
-        self.video_image_edit.setMinimumWidth(180)
-        self.video_image_button = QPushButton("Chọn ảnh…")
-        self.video_image_button.clicked.connect(self._pick_video_image)
-
-        self.video_preview_button = QPushButton("Xem trước")
-        self.video_preview_button.clicked.connect(self._start_preview)
-        self.video_button = QPushButton("Tạo video")
-        self.video_button.clicked.connect(self._start_video)
-        if not ffmpeg_available():
-            for b in (self.video_button, self.video_preview_button):
-                b.setEnabled(False)
-                b.setToolTip("Cần ffmpeg để tạo video (brew install ffmpeg).")
-        self.open_video_dir_button = QPushButton("Mở thư mục video")
-        self.open_video_dir_button.clicked.connect(self._open_video_dir)
-
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Chế độ:"))
-        row.addWidget(self.video_mode)
-        row.addWidget(self.video_range_from)
-        row.addWidget(self.video_range_label)
-        row.addWidget(self.video_range_to)
-        row.addWidget(self.video_batch_size)
-        row.addWidget(self.video_batch_label)
-        row.addWidget(QLabel("Chất lượng:"))
-        row.addWidget(self.video_quality)
-        row.addWidget(QLabel("Phông chữ:"))
-        row.addWidget(self.video_font)
-        row.addWidget(QLabel("Ảnh nền:"))
-        row.addWidget(self.video_image_edit, stretch=1)
-        row.addWidget(self.video_image_button)
-        row.addWidget(self.video_preview_button)
-        row.addWidget(self.video_button)
-        row.addWidget(self.open_video_dir_button)
-
-        box = QGroupBox("Xuất video (trình phát nhạc: ảnh + cột sóng + tên chương)")
-        box.setLayout(row)
-        self._on_video_mode_changed()  # set initial visibility
-        return box
-
-    def _on_video_mode_changed(self) -> None:
-        mode = self.video_mode.currentData()
-        for w in (self.video_range_from, self.video_range_label, self.video_range_to):
-            w.setVisible(mode == "range")
-        for w in (self.video_batch_size, self.video_batch_label):
-            w.setVisible(mode == "batch")
-
-    def _on_video_quality_changed(self) -> None:
-        self.config.video_quality = self.video_quality.currentData()
-
-    def _on_video_font_changed(self) -> None:
-        self.config.video_font = self.video_font.currentData()
-
-    def _start_preview(self) -> None:
-        """Render one still frame of the video so the user can check it before rendering."""
-        from pathlib import Path
-
-        from noveltrans.tts.video import video_font, video_preset
-
-        image = self.video_image_edit.text().strip()
-        if not image or not Path(image).is_file():
-            QMessageBox.warning(self, "Chưa chọn ảnh", "Hãy chọn một ảnh nền hợp lệ để xem trước.")
-            return
-        if self._preview_worker is not None and self._preview_worker.isRunning():
-            return
-        preset = video_preset(self.video_quality.currentData())
-        family = video_font(self.video_font.currentData())["family"]
-        novel_title = "Tên truyện"
-        if self.project is not None:
-            novel_title = self.project.meta.translated_title or self.project.meta.title
-
-        self.video_preview_button.setEnabled(False)
-        self.status_label.setText("🖼️ Đang tạo ảnh xem trước…")
-        self._preview_worker = VideoPreviewWorker(
-            image, novel_title, "Chương 1: Chương mẫu",
-            width=preset["width"], height=preset["height"],
-            spin_vinyl=preset["spin_vinyl"], font=family,
-        )
-        self._preview_worker.done.connect(self._on_preview_ready)
-        self._preview_worker.failed.connect(self._on_preview_failed)
-        self._preview_worker.start()
-
-    def _on_preview_ready(self, png_path: str) -> None:
-        self.video_preview_button.setEnabled(True)
-        self.status_label.setText("")
-        pix = QPixmap(png_path)  # copies the pixels, so the temp file can be reused later
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Xem trước video")
-        label = QLabel()
-        label.setPixmap(pix.scaled(
-            900, 520, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
-        ))
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        buttons.rejected.connect(dialog.reject)
-        layout = QVBoxLayout(dialog)
-        layout.addWidget(label)
-        layout.addWidget(buttons)
-        dialog.exec()
-
-    def _on_preview_failed(self, message: str) -> None:
-        self.video_preview_button.setEnabled(True)
-        self.status_label.setText("")
-        QMessageBox.warning(self, "Không tạo được xem trước", message)
-
-    def _pick_video_image(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Chọn ảnh nền", self.config.video_image_path or "",
-            "Ảnh (*.png *.jpg *.jpeg *.webp *.bmp)",
-        )
-        if path:
-            self.video_image_edit.setText(path)
-            self.config.video_image_path = path
 
     # -------------------------------------------------------------- projects
 
@@ -581,9 +412,6 @@ class AudioTab(QWidget):
         if self._merge_worker is not None and self._merge_worker.isRunning():
             self._merge_worker.cancel()
             self.status_label.setText("Đang dừng ghép…")
-        if self._video_worker is not None and self._video_worker.isRunning():
-            self._video_worker.cancel()
-            self.status_label.setText("Đang dừng tạo video…")
 
     # --------------------------------------------------------------- helpers
 
@@ -654,12 +482,6 @@ class AudioTab(QWidget):
             return
         self.project.audio_dir.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.project.audio_dir)))
-
-    def _open_video_dir(self) -> None:
-        if self.project is None:
-            return
-        self.project.video_dir.mkdir(parents=True, exist_ok=True)
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.project.video_dir)))
 
     def _on_progress(self, done: int, total: int, title: str) -> None:
         if total:
@@ -778,115 +600,12 @@ class AudioTab(QWidget):
         self.status_label.setText("")
         QMessageBox.warning(self, "Ghép audio thất bại", message)
 
-    # ----------------------------------------------------------------- video
-
-    def _start_video(self) -> None:
-        from pathlib import Path
-
-        from noveltrans.tts.merge import plan_merge_windows
-
-        if self.project is None:
-            QMessageBox.information(self, "Chưa chọn truyện", "Hãy chọn một truyện trước.")
-            return
-        if self._video_worker is not None and self._video_worker.isRunning():
-            return
-        image = self.video_image_edit.text().strip()
-        if not image or not Path(image).is_file():
-            QMessageBox.warning(self, "Chưa chọn ảnh", "Hãy chọn một ảnh nền hợp lệ cho video.")
-            return
-        voice = self.voice_combo.currentData() or self.voice_combo.currentText().strip()
-        mode = self.video_mode.currentData()
-        start = self.video_range_from.value() if mode == "range" else None
-        end = self.video_range_to.value() if mode == "range" else None
-        batch = self.video_batch_size.value() if mode == "batch" else None
-        if mode == "range" and start > end:
-            QMessageBox.warning(self, "Phạm vi sai", "Chương bắt đầu phải ≤ chương kết thúc.")
-            return
-
-        windows = plan_merge_windows(
-            self.project.chapters(), voice, mode, start=start, end=end, batch=batch
-        )
-        if not windows:
-            QMessageBox.information(
-                self, "Chưa có audio",
-                f"Không có chương nào có audio giọng {voice} trong phạm vi đã chọn.",
-            )
-            return
-        from noveltrans.tts.video import video_font, video_preset
-
-        preset = video_preset(self.video_quality.currentData())
-        font_family = video_font(self.video_font.currentData())["family"]
-        n_chapters = sum(len(w.chapters) for w in windows)
-        total_secs = sum(c.audio_seconds for w in windows for c in w.chapters)
-        hours = total_secs / 3600
-        render_hours = hours / preset["speed"]  # rough estimate at the chosen preset's speed
-        est = f"~{render_hours * 60:.0f} phút" if render_hours < 1 else f"~{render_hours:.1f} giờ"
-        answer = QMessageBox.question(
-            self, "Tạo video",
-            f"Sẽ tạo {len(windows)} video từ {n_chapters} chương (giọng {voice}), "
-            f"tổng ~{hours:.1f} giờ audio.\n\n"
-            f"Chất lượng: {self.video_quality.currentText()} "
-            f"({preset['width']}×{preset['height']}).\n"
-            f"Ước tính thời gian render: {est} (chưa tính máy nóng/tải khác).\n\n"
-            f"Video dài có thể nặng vài GB — với truyện rất dài nên dùng chế độ “Theo lô”. "
-            f"Tiếp tục?",
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-
-        self.video_button.setEnabled(False)
-        self.generate_button.setEnabled(False)
-        self.cancel_button.setEnabled(True)
-        self.progress.setMaximum(len(windows))
-        self.progress.setValue(0)
-        self.status_label.setText(f"🎬 Đang tạo video… ({len(windows)} file, có thể mất lâu)")
-        self._video_worker = VideoWorker(
-            self.project.path, voice=voice, mode=mode, image_path=image,
-            start=start, end=end, batch=batch,
-            width=preset["width"], height=preset["height"], fps=preset["fps"],
-            spin_vinyl=preset["spin_vinyl"], font=font_family,
-        )
-        self._video_worker.progress.connect(self._on_video_progress)
-        self._video_worker.file_done.connect(self._on_video_file_done)
-        self._video_worker.finished_ok.connect(self._on_video_finished)
-        self._video_worker.failed.connect(self._on_video_failed)
-        track_worker(self._video_worker)  # keep the Mac awake while encoding
-        self._video_worker.start()
-
-    def _on_video_progress(self, done: int, total: int, name: str) -> None:
-        self.progress.setValue(done)
-        if name:
-            self.status_label.setText(f"🎬 Đang tạo video ({done + 1}/{total}): {name}")
-
-    def _on_video_file_done(self, path: str) -> None:
-        self.progress.setValue(self.progress.value() + 1)
-
-    def _reset_video_ui(self) -> None:
-        self.video_button.setEnabled(True)
-        self.generate_button.setEnabled(True)
-        self.cancel_button.setEnabled(False)
-
-    def _on_video_finished(self, count: int) -> None:
-        self._reset_video_ui()
-        if count:
-            self.status_label.setText(
-                f"✅ Đã tạo {count} video (kèm mô tả .txt) — bấm “Mở thư mục video”."
-            )
-        else:
-            self.status_label.setText("Đã dừng tạo video.")
-
-    def _on_video_failed(self, message: str) -> None:
-        self._reset_video_ui()
-        self.status_label.setText("")
-        QMessageBox.warning(self, "Tạo video thất bại", message)
-
     def has_running_workers(self) -> bool:
         # Only TTS generation / merge are user-meaningful work worth a close-confirm; the
         # voices-list fetch is a short background metadata call (shutdown still joins it).
         return (
             (self._worker is not None and self._worker.isRunning())
             or (self._merge_worker is not None and self._merge_worker.isRunning())
-            or (self._video_worker is not None and self._video_worker.isRunning())
         )
 
     def shutdown(self) -> None:
@@ -896,10 +615,5 @@ class AudioTab(QWidget):
         if self._merge_worker is not None and self._merge_worker.isRunning():
             self._merge_worker.cancel()  # stops before the next window; current ffmpeg finishes
             self._merge_worker.wait(120_000)
-        if self._video_worker is not None and self._video_worker.isRunning():
-            self._video_worker.cancel()  # stops before the next window; current ffmpeg terminated
-            self._video_worker.wait(120_000)
-        if self._preview_worker is not None and self._preview_worker.isRunning():
-            self._preview_worker.wait(60_000)  # a single-frame render — short
         if self._voices_worker is not None and self._voices_worker.isRunning():
             self._voices_worker.wait(5_000)

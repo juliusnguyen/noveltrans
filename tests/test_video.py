@@ -68,6 +68,12 @@ class TestBuildAssSubtitles:
         assert "[Events]" in doc
         assert "PlayResX: 1920" in doc and "PlayResY: 1080" in doc
 
+    def test_auto_wrap_is_enabled_so_long_titles_dont_overflow(self):
+        # WrapStyle 0 lets libass break a long chapter title within the right-column margins
+        # instead of running off-frame / over the left photo.
+        doc, _ = self._doc()
+        assert "WrapStyle: 0" in doc
+
     def test_one_novel_event_plus_one_per_chapter(self):
         doc, segs = self._doc()
         dialogues = [ln for ln in doc.splitlines() if ln.startswith("Dialogue:")]
@@ -114,6 +120,27 @@ class TestBuildAssSubtitles:
         doc = build_ass_subtitles([_seg(10, "Chương {evil}")], "Truyện")
         chapter = next(ln for ln in doc.splitlines() if ",Chapter," in ln)
         assert chapter.endswith("{\\fad(400,400)}Chương (evil)")  # fade outside the escaped title
+
+    def test_default_uses_dark_text_on_light(self):
+        # No chosen background → the original dark-on-light palette, no outline.
+        doc, _ = self._doc()
+        assert "&H00A06B8A" in doc  # muted grey-purple novel line
+        assert "&H00502A55" in doc  # dark purple chapter line
+        novel = next(ln for ln in doc.splitlines() if ln.startswith("Style: Novel,"))
+        assert ",1,0,1,8," in novel  # BorderStyle=1, Outline=0, Shadow=1, Align=8
+
+    def test_dark_background_flips_titles_to_light_text_with_outline(self):
+        doc = build_ass_subtitles([_seg(10, "C1")], "Truyện", bg_color=(20, 24, 40))
+        assert "&H00A06B8A" not in doc  # not the light-backdrop palette
+        novel = next(ln for ln in doc.splitlines() if ln.startswith("Style: Novel,"))
+        chapter = next(ln for ln in doc.splitlines() if ln.startswith("Style: Chapter,"))
+        assert ",1,2,1,8," in novel    # a dark outline (width 2) added for legibility
+        assert ",1,2,1,8," in chapter
+
+    def test_light_custom_background_keeps_dark_text(self):
+        # A light chosen colour still reads best with the dark palette.
+        doc = build_ass_subtitles([_seg(10, "C1")], "Truyện", bg_color=(240, 235, 210))
+        assert "&H00A06B8A" in doc
 
     def test_titles_are_placed_in_the_right_column(self):
         # 'Now playing' block: both titles sit in the right column (photo is on the left)
@@ -252,11 +279,22 @@ class TestVideoPresets:
         # the estimate speeds ascend high < fast < fastest (each tier is faster)
         assert high["speed"] < fast["speed"] < fastest["speed"]
 
+    def test_high_static_is_1080p_without_a_spinning_disc(self):
+        from noveltrans.tts.video import VIDEO_QUALITY_PRESETS
+
+        hs = VIDEO_QUALITY_PRESETS["high_static"]
+        high = VIDEO_QUALITY_PRESETS["high"]
+        # same full resolution as "high" but no rotate → faster than "high", slower than "fast"
+        assert (hs["width"], hs["height"]) == (1920, 1080)
+        assert hs["spin_vinyl"] is False
+        assert high["speed"] < hs["speed"] < VIDEO_QUALITY_PRESETS["fast"]["speed"]
+
     def test_unknown_preset_falls_back_to_high(self):
         from noveltrans.tts.video import VIDEO_QUALITY_PRESETS, video_preset
 
         assert video_preset("nope") == VIDEO_QUALITY_PRESETS["high"]
         assert video_preset("fast") == VIDEO_QUALITY_PRESETS["fast"]
+        assert video_preset("high_static") == VIDEO_QUALITY_PRESETS["high_static"]
 
 
 class TestVideoFonts:
@@ -501,6 +539,32 @@ class TestPlayerSkin:
         with Image.open(out) as im:
             assert im.size == (640, 360)
 
+    def test_custom_bg_color_changes_the_backdrop(self, tmp_path):
+        # A chosen background color must actually change the rendered gradient.
+        from PIL import Image
+
+        from noveltrans.tts.player_skin import build_player_skin
+
+        default_out = tmp_path / "default.png"
+        color_out = tmp_path / "color.png"
+        build_player_skin(tmp_path / "nope.png", default_out, width=320, height=180)
+        build_player_skin(
+            tmp_path / "nope.png", color_out, width=320, height=180, bg_color=(20, 120, 90)
+        )
+        with Image.open(default_out) as a, Image.open(color_out) as b:
+            # sample a top-right point that sits over the gradient, not the framed photo
+            assert a.getpixel((300, 10)) != b.getpixel((300, 10))
+
+    def test_hex_to_rgb_parses_and_rejects(self):
+        from noveltrans.tts.player_skin import hex_to_rgb
+
+        assert hex_to_rgb("#1e785a") == (30, 120, 90)
+        assert hex_to_rgb("1e785a") == (30, 120, 90)
+        assert hex_to_rgb("#fff") == (255, 255, 255)
+        assert hex_to_rgb("") is None
+        assert hex_to_rgb("not-a-color") is None
+        assert hex_to_rgb("#12345") is None
+
     def test_vinyl_is_a_square_rgba_disc_with_a_label(self, tmp_path):
         # ffmpeg rotates this in place, so it must be a square, transparent-cornered PNG.
         from PIL import Image
@@ -541,7 +605,27 @@ class TestPlayerSkin:
             assert im.size == (lay.knob_half * 2, lay.knob_half * 2)
 
 
+class TestVideoPartName:
+    def test_windowed_part_name(self):
+        from noveltrans.tts.video import video_part_name
+
+        assert video_part_name("my-slug", 1, 10) == "my-slug-0001-0010.mp4"
+        assert video_part_name("my-slug", 21, 30) == "my-slug-0021-0030.mp4"
+
+    def test_whole_novel_name(self):
+        from noveltrans.tts.video import video_part_name
+
+        assert video_part_name("my-slug", 1, 199, whole_novel=True) == "my-slug.mp4"
+
+
 class TestVideoWorker:
+    def test_skip_existing_param_is_carried(self, qapp):
+        from noveltrans.gui.workers import VideoWorker
+
+        w = VideoWorker("/tmp/x", voice="v", mode="batch", image_path="/tmp/bg.png",
+                        batch=10, skip_existing=True)
+        assert w.skip_existing is True
+
     def test_start_is_not_shadowed_by_params(self, qapp):
         # Same trap as MergeWorker: `self.start = start` would clobber QThread.start().
         from noveltrans.gui.workers import VideoWorker

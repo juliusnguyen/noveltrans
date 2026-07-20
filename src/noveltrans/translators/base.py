@@ -46,10 +46,21 @@ class Translator(ABC):
     max_chunk_chars: int = 4000  # engines override; chapters are chunked to this
     max_retries: int = 3
     retry_delay: float = 2.0
+    # LLM engines (CLI agent, Claude, LM Studio) set this True and implement `complete`, so
+    # features like tag / image-prompt generation can prompt them freely. Google can only
+    # translate.
+    supports_completion: bool = False
 
     @abstractmethod
     def translate(self, text: str, source: str = "zh", target: str = "vi") -> str:
         """Translate one chunk of plain text. Raise TranslateError on failure."""
+
+    def complete(self, prompt: str) -> str:
+        """Run a free-form prompt and return the model's text. Raise TranslateError on
+        failure. Only LLM engines implement this; the default rejects the call."""
+        raise NotImplementedError(
+            f"{self.display_name or self.name} không hỗ trợ tạo nội dung tự do."
+        )
 
     def _translate_with_retry(self, text: str, source: str, target: str) -> str:
         last_error: Exception | None = None

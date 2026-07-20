@@ -18,6 +18,7 @@ from noveltrans.gui.tab_audio import AudioTab
 from noveltrans.gui.tab_export import ExportTab
 from noveltrans.gui.tab_scrape import ScrapeTab
 from noveltrans.gui.tab_translate import TranslateTab
+from noveltrans.gui.tab_video import VideoTab
 from noveltrans.storage import AppState
 
 
@@ -39,10 +40,12 @@ class Workspace(QWidget):
         self.translate_tab = TranslateTab(config)
         self.export_tab = ExportTab(config)
         self.audio_tab = AudioTab(config)
+        self.video_tab = VideoTab(config)
         self.tabs.addTab(self.scrape_tab, "1. Tải truyện")
         self.tabs.addTab(self.translate_tab, "2. Dịch")
         self.tabs.addTab(self.export_tab, "3. Xuất file")
         self.tabs.addTab(self.audio_tab, "4. Nghe audio")
+        self.tabs.addTab(self.video_tab, "5. Video")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -57,6 +60,7 @@ class Workspace(QWidget):
         self.translate_tab.picker.project_selected.connect(self.state.touch_project)
         self.export_tab.picker.project_selected.connect(self.state.touch_project)
         self.audio_tab.picker.project_selected.connect(self.state.touch_project)
+        self.video_tab.picker.project_selected.connect(self.state.touch_project)
 
         # the scrape tab consults the host before opening a project (same-project guard)
         self.scrape_tab.can_open_project = self._can_open_project
@@ -74,7 +78,8 @@ class Workspace(QWidget):
 
     def populate_lists(self) -> None:
         library_dir = self.config.library_dir
-        for tab in (self.scrape_tab, self.translate_tab, self.export_tab, self.audio_tab):
+        for tab in (self.scrape_tab, self.translate_tab, self.export_tab,
+                    self.audio_tab, self.video_tab):
             tab.picker.refresh(library_dir, default_to_first=False)
 
     def _on_scrape_project(self, path: str) -> None:
@@ -83,6 +88,7 @@ class Workspace(QWidget):
         self.translate_tab.refresh_projects(path)
         self.export_tab.refresh_projects(path)
         self.audio_tab.refresh_projects(path)
+        self.video_tab.refresh_projects(path)
         self.title_changed.emit(self.scrape_tab.current_title())
         self.project_opened.emit(path)
 
@@ -94,6 +100,7 @@ class Workspace(QWidget):
             self.translate_tab.refresh_projects(select_path=last)
             self.export_tab.refresh_projects(select_path=last)
             self.audio_tab.refresh_projects(select_path=last)
+            self.video_tab.refresh_projects(select_path=last)
 
     def current_project_path(self) -> str:
         project = self.scrape_tab.project
@@ -105,9 +112,11 @@ class Workspace(QWidget):
     def has_running_workers(self) -> bool:
         return any(
             tab.has_running_workers()
-            for tab in (self.scrape_tab, self.translate_tab, self.export_tab, self.audio_tab)
+            for tab in (self.scrape_tab, self.translate_tab, self.export_tab,
+                        self.audio_tab, self.video_tab)
         )
 
     def shutdown(self) -> None:
-        for tab in (self.scrape_tab, self.translate_tab, self.export_tab, self.audio_tab):
+        for tab in (self.scrape_tab, self.translate_tab, self.export_tab,
+                    self.audio_tab, self.video_tab):
             tab.shutdown()

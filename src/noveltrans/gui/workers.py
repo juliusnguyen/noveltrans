@@ -141,7 +141,8 @@ class TranslateWorker(QThread):
         done = 0
         if project.meta.translated_lang != self.target_lang:
             project.save_meta_translation(
-                project.meta.title, project.meta.description, self.target_lang
+                project.meta.title, project.meta.description, self.target_lang,
+                project.meta.author,  # identity: source already in the target language
             )
         for chapter in pending:
             if self._cancelled:
@@ -217,7 +218,16 @@ class TranslateWorker(QThread):
                         source=project.meta.source_lang,
                         target=self.target_lang,
                     )
-                    project.save_meta_translation(meta_title, meta_desc, self.target_lang)
+                    meta_author = ""
+                    if project.meta.author:
+                        meta_author, _ = translator.translate_chapter(
+                            apply_glossary(project.meta.author, glossary), "",
+                            source=project.meta.source_lang,
+                            target=self.target_lang,
+                        )
+                    project.save_meta_translation(
+                        meta_title, meta_desc, self.target_lang, meta_author
+                    )
                 except Exception:  # noqa: BLE001 — non-fatal, chapters still translate
                     pass
 
@@ -298,6 +308,152 @@ class LmStudioModelsWorker(QThread):
         from noveltrans.translators.lmstudio import list_models
 
         self.models_listed.emit(self.base_url, list_models(self.base_url))
+
+
+class TagsWorker(QThread):
+    """Generate the novel's YouTube tags via an LLM engine (like the '2. Dịch' engines).
+
+    Takes the same engine params as TranslateWorker, prompts the chosen engine's
+    `complete()`, parses/caps the reply to YouTube's 500-char budget, and persists the
+    tags on the project's meta. Emits the comma-joined tag string on success.
+    """
+
+    finished_ok = Signal(str)  # comma-joined tags
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        project_path: Path,
+        engine_name: str,
+        *,
+        api_key: str = "",
+        model: str = "",
+        cli_command: str = "",
+        base_url: str = "",
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.project_path = Path(project_path)
+        self.engine_name = engine_name
+        self.api_key = api_key
+        self.model = model
+        self.cli_command = cli_command
+        self.base_url = base_url
+
+    def run(self) -> None:
+        from noveltrans.translators import get_translator
+        from noveltrans.tts.tags import build_tags_prompt, format_tags, parse_tags
+
+        project = NovelProject.open(self.project_path)
+        try:
+            try:
+                translator = get_translator(
+                    self.engine_name,
+                    api_key=self.api_key,
+                    model=self.model,
+                    cli_command=self.cli_command,
+                    base_url=self.base_url,
+                )
+            except NovelTransError as exc:
+                self.failed.emit(str(exc))
+                return
+            if not translator.supports_completion:
+                self.failed.emit(
+                    "Engine này không tạo được tags — hãy chọn CLI Agent, Claude "
+                    "hoặc LM Studio."
+                )
+                return
+            meta = project.meta
+            prompt = build_tags_prompt(
+                vn_title=meta.translated_title or meta.title,
+                original_title=meta.title,
+                author=meta.translated_author or meta.author,
+                vn_description=meta.translated_description,
+            )
+            try:
+                raw = translator.complete(prompt)
+            except NovelTransError as exc:
+                self.failed.emit(str(exc))
+                return
+            except Exception as exc:  # noqa: BLE001 — engine/library-specific errors
+                self.failed.emit(f"Lỗi khi tạo tags: {exc!r}")
+                return
+            tags = format_tags(parse_tags(raw))
+            if not tags:
+                self.failed.emit("Không tạo được tags (phản hồi rỗng).")
+                return
+            project.save_tags(tags)
+            self.finished_ok.emit(tags)
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(f"Lỗi khi tạo tags: {exc!r}")
+        finally:
+            project.close()
+
+
+class CompletionWorker(QThread):
+    """Run one free-form LLM prompt on a chosen engine and return its text.
+
+    A generic helper (used e.g. to generate an image-generation prompt for the thumbnail):
+    it takes the same engine params as TranslateWorker plus a prompt string, calls the
+    engine's `complete()`, and emits the raw reply. Persistence, parsing, etc. are left to
+    the caller. Requires an LLM engine (`supports_completion`).
+    """
+
+    finished_ok = Signal(str)  # the model's text reply
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        engine_name: str,
+        prompt: str,
+        *,
+        api_key: str = "",
+        model: str = "",
+        cli_command: str = "",
+        base_url: str = "",
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.engine_name = engine_name
+        self.prompt = prompt
+        self.api_key = api_key
+        self.model = model
+        self.cli_command = cli_command
+        self.base_url = base_url
+
+    def run(self) -> None:
+        from noveltrans.translators import get_translator
+
+        try:
+            translator = get_translator(
+                self.engine_name,
+                api_key=self.api_key,
+                model=self.model,
+                cli_command=self.cli_command,
+                base_url=self.base_url,
+            )
+        except NovelTransError as exc:
+            self.failed.emit(str(exc))
+            return
+        if not translator.supports_completion:
+            self.failed.emit(
+                "Engine này không tạo được nội dung — hãy chọn CLI Agent, Claude "
+                "hoặc LM Studio."
+            )
+            return
+        try:
+            reply = translator.complete(self.prompt)
+        except NovelTransError as exc:
+            self.failed.emit(str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001 — engine/library-specific errors
+            self.failed.emit(f"Lỗi: {exc!r}")
+            return
+        reply = (reply or "").strip()
+        if not reply:
+            self.failed.emit("Phản hồi rỗng.")
+            return
+        self.finished_ok.emit(reply)
 
 
 @dataclass
@@ -753,6 +909,13 @@ class VideoWorker(QThread):
         fps: int = 25,  # motion video (waveform) — smoother than 019's static 12
         spin_vinyl: bool = True,  # False → static disc (skips the costly per-frame rotate)
         font: str = "",  # title font family; "" → the bundled default (FONT_NAME)
+        font_key: str = "",  # font registry key, to resolve the thumbnail's TTF file
+        bg_color: str = "",  # background hex "#rrggbb"; "" → the default pastel gradient
+        skip_existing: bool = False,  # skip parts whose .mp4 already exists (batch "continue")
+        credit: str = "",  # "Tạo bởi: …" line; "" → the default (Fox Novel)
+        tagline: str = "",  # thumbnail subtitle under "PHẦN N"
+        thumb_image_path: Path | str = "",  # thumbnail base image; "" → reuse image_path
+        tags: str = "",  # novel-level YouTube tags (comma-joined) written per part
         parent=None,
     ):
         super().__init__(parent)
@@ -769,6 +932,13 @@ class VideoWorker(QThread):
         self.fps = fps
         self.spin_vinyl = spin_vinyl
         self.font = font
+        self.font_key = font_key
+        self.bg_color = bg_color
+        self.skip_existing = skip_existing
+        self.credit = credit
+        self.tagline = tagline
+        self.thumb_image_path = str(thumb_image_path or "")
+        self.tags = tags
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -783,7 +953,20 @@ class VideoWorker(QThread):
             chapter_marker_title,
             plan_merge_windows,
         )
-        from noveltrans.tts.video import FONT_NAME, font_dir_context, render_video
+        from noveltrans.tts.player_skin import hex_to_rgb
+        from noveltrans.tts.thumbnail import render_thumbnail
+        from noveltrans.tts.video import (
+            FONT_NAME,
+            _with_real_durations,
+            build_upload_title,
+            build_video_description,
+            font_dir_context,
+            render_video,
+            video_font,
+            video_part_name,
+        )
+
+        bg_rgb = hex_to_rgb(self.bg_color)
 
         project = NovelProject.open(self.project_path)
         try:
@@ -818,18 +1001,27 @@ class VideoWorker(QThread):
                     ]
                     if not segments:
                         continue
-                    if total == 1 and self.mode == "all":
-                        name = f"{slug}.mp4"
-                    else:
-                        name = f"{slug}-{window.first_num:04d}-{window.last_num:04d}.mp4"
+                    whole_novel = total == 1 and self.mode == "all"
+                    name = video_part_name(
+                        slug, window.first_num, window.last_num, whole_novel=whole_novel
+                    )
                     out_path = project.video_dir / name
+                    if self.skip_existing and out_path.is_file():
+                        self.progress.emit(i + 1, total, "")  # already made — skip
+                        continue
                     self.progress.emit(i, total, name)
+                    part_num = None if whole_novel else (i + 1)
                     try:
                         render_video(
                             segments, self.image_path, out_path, font_dir, novel_title,
                             width=self.width, height=self.height, fps=self.fps,
                             spin_vinyl=self.spin_vinyl, font_name=self.font or FONT_NAME,
-                            cancelled=lambda: self._cancelled,
+                            bg_color=bg_rgb, cancelled=lambda: self._cancelled,
+                        )
+                        self._write_metadata(
+                            project, out_path, novel_title, segments, part_num, font_dir,
+                            _with_real_durations, build_upload_title,
+                            build_video_description, video_font, render_thumbnail,
                         )
                         written += 1
                         self.file_done.emit(str(out_path))
@@ -844,6 +1036,51 @@ class VideoWorker(QThread):
             self.failed.emit(f"Lỗi khi tạo video: {exc!r}")
         finally:
             project.close()
+
+    def _write_metadata(
+        self, project, out_path, novel_title, segments, part_num, font_dir,
+        with_real_durations, build_upload_title, build_video_description,
+        video_font, render_thumbnail,
+    ) -> None:
+        """Write the title / description / tags / thumbnail sidecars next to `out_path`.
+
+        A thumbnail failure is swallowed (a bad base image must not discard an otherwise
+        good video); the text sidecars are cheap and always written.
+        """
+        def sidecar(ext: str) -> Path:
+            return out_path.parent / (out_path.stem + ext)
+
+        timed = with_real_durations(segments)
+        title = build_upload_title(novel_title, part_num)
+        sidecar(".title.txt").write_text(title + "\n", encoding="utf-8")
+
+        desc = build_video_description(
+            timed,
+            original_title=project.meta.title,
+            vn_title=novel_title,
+            original_author=project.meta.author,
+            vn_author=project.meta.translated_author,
+            total_chapters=project.counts()["total"],
+            credit=self.credit or "Fox Novel",
+        )
+        sidecar(".txt").write_text(desc, encoding="utf-8")  # richer than render_video's
+
+        if self.tags.strip():
+            sidecar(".tags.txt").write_text(self.tags.strip() + "\n", encoding="utf-8")
+
+        try:
+            font_file = video_font(self.font_key)["file"]
+            render_thumbnail(
+                self.thumb_image_path or str(self.image_path),
+                sidecar(".jpg"),
+                vn_title=novel_title,
+                part_num=part_num or 1,
+                tagline=self.tagline,
+                font_path=font_dir / font_file,
+                width=1280, height=720,
+            )
+        except Exception:  # noqa: BLE001 — never fail a good render over a thumbnail
+            pass
 
 
 class VideoPreviewWorker(QThread):
@@ -862,6 +1099,7 @@ class VideoPreviewWorker(QThread):
         height: int = 1080,
         spin_vinyl: bool = True,
         font: str = "",
+        bg_color: str = "",  # background hex "#rrggbb"; "" → the default pastel gradient
         parent=None,
     ):
         super().__init__(parent)
@@ -872,11 +1110,13 @@ class VideoPreviewWorker(QThread):
         self.height = height
         self.spin_vinyl = spin_vinyl
         self.font = font
+        self.bg_color = bg_color
 
     def run(self) -> None:
         import tempfile
 
         from noveltrans.errors import TtsError
+        from noveltrans.tts.player_skin import hex_to_rgb
         from noveltrans.tts.video import FONT_NAME, font_dir_context, render_preview_frame
 
         try:
@@ -886,6 +1126,7 @@ class VideoPreviewWorker(QThread):
                     self.image_path, out, font_dir, self.novel_title, self.sample_title,
                     width=self.width, height=self.height,
                     spin_vinyl=self.spin_vinyl, font_name=self.font or FONT_NAME,
+                    bg_color=hex_to_rgb(self.bg_color),
                 )
             self.done.emit(str(out))
         except TtsError as exc:

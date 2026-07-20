@@ -36,6 +36,7 @@ class ClaudeTranslator(Translator):
     display_name = "Claude API"
     # A whole chapter usually fits one request; chunk only very long ones.
     max_chunk_chars = 12000
+    supports_completion = True
 
     def __init__(self, api_key: str, model: str = "claude-haiku-4-5-20251001"):
         if not api_key:
@@ -50,17 +51,20 @@ class ClaudeTranslator(Translator):
         system = _SYSTEM_PROMPT.format(
             language=language, name_rule=_NAME_RULES.get(target, "")
         )
+        result = self.complete(text, system=system)
+        if not result:
+            raise TranslateError("Claude returned an empty translation")
+        return result
+
+    def complete(self, prompt: str, *, system: str = "") -> str:
         try:
             response = self._client.messages.create(
                 model=self.model,
                 max_tokens=8192,
-                system=system,
-                messages=[{"role": "user", "content": text}],
+                system=system or "You are a helpful assistant.",
+                messages=[{"role": "user", "content": prompt}],
             )
         except anthropic.AuthenticationError as exc:
             raise TranslateError(f"Claude API key không hợp lệ: {exc}") from exc
         parts = [block.text for block in response.content if block.type == "text"]
-        result = "".join(parts).strip()
-        if not result:
-            raise TranslateError("Claude returned an empty translation")
-        return result
+        return "".join(parts).strip()

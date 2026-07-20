@@ -19,7 +19,12 @@ class NovelMeta:
     # filled in by the first translation run
     translated_title: str = ""
     translated_description: str = ""
+    translated_author: str = ""
     translated_lang: str = ""
+    # YouTube tag list (comma-joined), generated on demand for the video export
+    tags: str = ""
+    # AI image-generation prompt for the thumbnail base image, generated on demand
+    thumbnail_prompt: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)

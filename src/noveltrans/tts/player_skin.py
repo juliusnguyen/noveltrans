@@ -111,6 +111,29 @@ def _lerp(a: tuple, b: tuple, t: float) -> tuple:
     return tuple(round(a[i] + (b[i] - a[i]) * t) for i in range(3))
 
 
+def _lighten(rgb: tuple, amt: float) -> tuple:
+    """Blend `rgb` toward white by `amt` (0..1)."""
+    return _lerp(rgb, (255, 255, 255), amt)
+
+
+def _darken(rgb: tuple, amt: float) -> tuple:
+    """Blend `rgb` toward black by `amt` (0..1)."""
+    return _lerp(rgb, (0, 0, 0), amt)
+
+
+def hex_to_rgb(value: str) -> tuple[int, int, int] | None:
+    """Parse a "#rrggbb" (or "#rgb") string to an (r, g, b) tuple; None if invalid/empty."""
+    value = (value or "").strip().lstrip("#")
+    if len(value) == 3:
+        value = "".join(c * 2 for c in value)
+    if len(value) != 6:
+        return None
+    try:
+        return (int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16))
+    except ValueError:
+        return None
+
+
 def _vertical_gradient(w: int, h: int, stops: list[tuple[float, tuple]]) -> Image.Image:
     """A vertical multi-stop gradient. `stops` is ascending (pos 0..1, (r,g,b))."""
     img = Image.new("RGB", (w, h))
@@ -165,26 +188,45 @@ def _cover_fit(photo: Image.Image, w: int, h: int) -> Image.Image:
 
 # -- the three baked layers ---------------------------------------------------
 
-def build_player_skin(image_path: Path, out_path: Path, *, width: int, height: int) -> Path:
+def build_player_skin(
+    image_path: Path, out_path: Path, *, width: int, height: int,
+    bg_color: tuple[int, int, int] | None = None,
+) -> Path:
     """Render the static backdrop (gradient + framed photo + empty progress track).
 
     Returns `out_path`. The spinning vinyl, the bars, the sliding playhead, and the titles
     are NOT drawn here — ffmpeg overlays those so they animate over this still.
+
+    `bg_color` (r, g, b) replaces the default pastel gradient with one derived from that hue
+    (a light-to-slightly-darker vertical gradient plus soft tinted glows); `None` keeps the
+    original pastel look.
     """
     lay = PlayerLayout.of(width, height)
     W, H = width, height
 
-    bg = _vertical_gradient(W, H, [
-        (0.0, (233, 213, 255)),
-        (0.45, (252, 231, 243)),
-        (1.0, (219, 234, 254)),
-    ]).convert("RGBA")
+    if bg_color is None:
+        bg = _vertical_gradient(W, H, [
+            (0.0, (233, 213, 255)),
+            (0.45, (252, 231, 243)),
+            (1.0, (219, 234, 254)),
+        ]).convert("RGBA")
+        glow_colors = ((255, 182, 217, 70), (199, 210, 254, 80))
+    else:
+        bg = _vertical_gradient(W, H, [
+            (0.0, _lighten(bg_color, 0.22)),
+            (0.5, bg_color),
+            (1.0, _darken(bg_color, 0.10)),
+        ]).convert("RGBA")
+        glow_colors = (
+            (*_lighten(bg_color, 0.40), 70),
+            (*_lighten(bg_color, 0.25), 80),
+        )
     glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     gd = ImageDraw.Draw(glow)
     gd.ellipse((round(-W * 0.1), round(H * 0.46), round(W * 0.26), round(H * 1.1)),
-               fill=(255, 182, 217, 70))
+               fill=glow_colors[0])
     gd.ellipse((round(W * 0.78), round(-H * 0.18), round(W * 1.09), round(H * 0.37)),
-               fill=(199, 210, 254, 80))
+               fill=glow_colors[1])
     bg.alpha_composite(glow.filter(ImageFilter.GaussianBlur(round(H * 0.11))))
     draw = ImageDraw.Draw(bg)
 

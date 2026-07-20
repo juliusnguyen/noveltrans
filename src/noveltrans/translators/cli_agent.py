@@ -65,6 +65,7 @@ class CliAgentTranslator(Translator):
     name = "cli"
     display_name = "CLI Agent (agy, claude…)"
     max_chunk_chars = 8000  # agents handle whole chapters comfortably
+    supports_completion = True
 
     def __init__(self, command: str = "agy -p", timeout: float = 360.0, model: str = ""):
         command = (command or "").strip()
@@ -88,6 +89,9 @@ class CliAgentTranslator(Translator):
             name_rule=_NAME_RULES.get(target, ""),
             text=text,
         )
+        return self.complete(prompt)
+
+    def complete(self, prompt: str) -> str:
         # agy hết quota thì thoát mã 0 với stdout/stderr rỗng — bắt nó ghi log
         # ra file tạm để còn trích được thông báo lỗi thật.
         log_path = ""
