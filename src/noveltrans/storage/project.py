@@ -409,16 +409,40 @@ class NovelProject:
                 (_now(),),
             )
 
-    def save_meta_translation(self, title: str, description: str, lang: str) -> None:
-        """Persist the translated novel title/description into meta.json."""
+    def save_meta_translation(
+        self, title: str, description: str, lang: str, author: str = ""
+    ) -> None:
+        """Persist the translated novel title/description/author into meta.json."""
         self.meta.translated_title = title
         self.meta.translated_description = description
+        self.meta.translated_author = author
         self.meta.translated_lang = lang
         meta_path = self.path / META_FILE
         data = json.loads(meta_path.read_text(encoding="utf-8"))
         data.update(
-            translated_title=title, translated_description=description, translated_lang=lang
+            translated_title=title, translated_description=description,
+            translated_author=author, translated_lang=lang,
         )
+        meta_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    def save_tags(self, tags: str) -> None:
+        """Persist the generated YouTube tag list (comma-joined) into meta.json."""
+        self.meta.tags = tags
+        meta_path = self.path / META_FILE
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+        data.update(tags=tags)
+        meta_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    def save_thumbnail_prompt(self, prompt: str) -> None:
+        """Persist the AI image-generation prompt for the thumbnail into meta.json."""
+        self.meta.thumbnail_prompt = prompt
+        meta_path = self.path / META_FILE
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+        data.update(thumbnail_prompt=prompt)
         meta_path.write_text(
             json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
         )

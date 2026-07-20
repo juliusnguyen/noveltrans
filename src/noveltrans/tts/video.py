@@ -66,9 +66,12 @@ _VINYL_SPIN_SECONDS = 8.0
 # `speed` values are measured on Apple Silicon (high ~3.0×, fast ~10.6×, fastest ~17.1×
 # realtime), rounded down a touch so the shown estimate is conservative under thermal load.
 VIDEO_QUALITY_PRESETS: dict[str, dict] = {
-    "high":    {"width": 1920, "height": 1080, "fps": 25, "spin_vinyl": True,  "speed": 3.0},
-    "fast":    {"width": 1280, "height": 720,  "fps": 25, "spin_vinyl": True,  "speed": 9.0},
-    "fastest": {"width": 1280, "height": 720,  "fps": 15, "spin_vinyl": False, "speed": 15.0},
+    "high":        {"width": 1920, "height": 1080, "fps": 25, "spin_vinyl": True,  "speed": 3.0},
+    # Full 1080p but with a static disc — dropping the per-frame rotate (the biggest filter
+    # cost) makes it markedly faster than "high" while keeping the resolution.
+    "high_static": {"width": 1920, "height": 1080, "fps": 25, "spin_vinyl": False, "speed": 5.0},
+    "fast":        {"width": 1280, "height": 720,  "fps": 25, "spin_vinyl": True,  "speed": 9.0},
+    "fastest":     {"width": 1280, "height": 720,  "fps": 15, "spin_vinyl": False, "speed": 15.0},
 }
 DEFAULT_VIDEO_QUALITY = "high"
 
@@ -170,22 +173,55 @@ _ASS_STYLES = (
     "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
     "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
     "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-    # Colours are ASS &HAABBGGRR. Over the light pastel skin the titles sit in the right
-    # column (over the gradient, not the photo), so no scrim is needed — BorderStyle=1 with
-    # Outline=0 draws plain text. The player's "now playing" block: the Novel title is the
-    # muted 'album' line (grey-purple), the Chapter title the bold 'track' line (dark
-    # purple). Alignment 8 (top-center) + MarginL≈right-column-start frames both into the
-    # right column; a soft shadow lifts them off the gradient.
-    "Style: Novel,{font},{nsize},&H00A06B8A,&H000000FF,&H00FFFFFF,&H00000000,"
-    "0,0,0,0,100,100,0,0,1,0,1,8,{mL},{mR},{nmargin},1\n"
-    "Style: Chapter,{font},{csize},&H00502A55,&H000000FF,&H00FFFFFF,&H30000000,"
-    "1,0,0,0,100,100,0,0,1,0,1,8,{mL},{mR},{cmargin},1\n"
+    # Colours are ASS &HAABBGGRR. The player's "now playing" block: the Novel title is the
+    # muted 'album' line, the Chapter title the bold 'track' line. Alignment 8 (top-center) +
+    # MarginL≈right-column-start frames both into the right column (over the gradient, not the
+    # photo). The palette adapts to the backdrop: dark text + no outline over a light skin;
+    # light text + a dark outline over a dark chosen background (see `_text_palette`).
+    "Style: Novel,{font},{nsize},{npri},&H000000FF,{ocol},&H00000000,"
+    "0,0,0,0,100,100,0,0,1,{ow},1,8,{mL},{mR},{nmargin},1\n"
+    "Style: Chapter,{font},{csize},{cpri},&H000000FF,{ocol},&H30000000,"
+    "1,0,0,0,100,100,0,0,1,{ow},1,8,{mL},{mR},{cmargin},1\n"
 )
 
+# Below this backdrop luminance (0..255) the titles flip to light-on-dark.
+_TEXT_LUMA_THRESHOLD = 140
+
+
+def _ass_colour(rgb: tuple[int, int, int], alpha: int = 0) -> str:
+    """An ASS colour literal `&HAABBGGRR` from an (r, g, b) tuple."""
+    r, g, b = rgb
+    return f"&H{alpha:02X}{b:02X}{g:02X}{r:02X}"
+
+
+# Dark text + white(unused, outline 0) over the light pastel skin — the original look.
+_LIGHT_BG_TEXT = {"npri": "&H00A06B8A", "cpri": "&H00502A55", "ocol": "&H00FFFFFF", "ow": 0}
+# Light text + a dark outline so it reads over a dark/mid chosen background.
+_DARK_BG_TEXT = {
+    "npri": _ass_colour((214, 202, 230)),  # soft light lavender (album line)
+    "cpri": _ass_colour((246, 246, 250)),  # near-white (track line)
+    "ocol": _ass_colour((18, 16, 26)),     # dark edge for legibility on mid-tones
+    "ow": 2,
+}
+
+
+def _text_palette(bg_color: tuple[int, int, int] | None) -> dict:
+    """Pick the title colour palette for a backdrop: light-on-dark when `bg_color` is dark,
+    else the default dark-on-light. `None` (default gradient) always uses dark-on-light."""
+    if bg_color is None:
+        return _LIGHT_BG_TEXT
+    r, g, b = bg_color
+    luma = 0.299 * r + 0.587 * g + 0.114 * b
+    return _DARK_BG_TEXT if luma < _TEXT_LUMA_THRESHOLD else _LIGHT_BG_TEXT
+
+# WrapStyle 0 = smart auto-wrapping: a long title breaks onto balanced lines that fit within
+# the right column (PlayResX − MarginL − MarginR), so it never overflows the frame or spills
+# left onto the photo. (Was 2 = no wrapping, which let long chapter titles run off-frame.)
+# We still emit hard breaks as `\N` in `_escape_ass`, which break under any wrap style.
 _ASS_HEADER = (
     "[Script Info]\n"
     "ScriptType: v4.00+\n"
-    "WrapStyle: 2\n"
+    "WrapStyle: 0\n"
     "ScaledBorderAndShadow: yes\n"
     "PlayResX: {w}\n"
     "PlayResY: {h}\n\n"
@@ -218,6 +254,7 @@ def build_ass_subtitles(
     width: int = 1920,
     height: int = 1080,
     font_name: str = FONT_NAME,
+    bg_color: tuple[int, int, int] | None = None,
 ) -> str:
     """An ASS document: the novel title for the whole video + one event per chapter.
 
@@ -226,9 +263,11 @@ def build_ass_subtitles(
     boundaries. Each chapter title fades in/out (`\\fad`) so it changes smoothly; the
     novel title stays solid the whole video. Both titles form the player's "now playing"
     block in the right column (`PlayerLayout` fixes the placement): the novel title is the
-    muted album line above, the chapter title the bold track line below it.
+    muted album line above, the chapter title the bold track line below it. The title colours
+    follow `bg_color` — light-on-dark over a dark chosen background, dark-on-light otherwise.
     """
     lay = PlayerLayout.of(width, height)
+    palette = _text_palette(bg_color)
     total = sum(s.seconds for s in segments)
     out = [
         _ASS_HEADER.format(w=width, h=height),
@@ -236,6 +275,8 @@ def build_ass_subtitles(
             font=font_name, nsize=lay.novel_font_px, csize=lay.chapter_font_px,
             mL=lay.text_margin_l, mR=lay.text_margin_r,
             nmargin=lay.novel_margin_v, cmargin=lay.chapter_margin_v,
+            npri=palette["npri"], cpri=palette["cpri"],
+            ocol=palette["ocol"], ow=palette["ow"],
         ),
         "\n",
         _ASS_EVENTS_HEADER,
@@ -273,6 +314,96 @@ def build_youtube_description(segments: list[MergeSegment], novel_title: str) ->
     for seg in segments:
         lines.append(f"{_yt_timestamp(start)} {seg.title}")
         start += seg.seconds
+    return "\n".join(lines) + "\n"
+
+
+# -- rich per-part title & description (feature 025) --------------------------
+
+DEFAULT_VIDEO_CREDIT = "Fox Novel"
+
+
+def video_part_name(slug: str, first_num: int, last_num: int, *, whole_novel: bool = False) -> str:
+    """The output file name for one part video — the single source of truth for naming.
+
+    A single whole-novel video is just `{slug}.mp4`; every windowed part is
+    `{slug}-{first:04d}-{last:04d}.mp4`. The GUI uses this to tell which parts already exist.
+    """
+    if whole_novel:
+        return f"{slug}.mp4"
+    return f"{slug}-{first_num:04d}-{last_num:04d}.mp4"
+
+
+def build_upload_title(vn_title: str, part_num: int | None) -> str:
+    """The video title: `{vn_title} - Phần {N}`, or just `vn_title` for a whole-novel video.
+
+    `part_num is None` means the single video covers the whole novel (no part split), so the
+    "- Phần N" suffix is omitted.
+    """
+    vn_title = (vn_title or "").strip()
+    if part_num is None:
+        return vn_title
+    return f"{vn_title} - Phần {part_num}"
+
+
+def _chapter_timestamp_lines(segments: list[MergeSegment]) -> list[str]:
+    """`<timestamp> <title>` lines for the chapter table; first is always `0:00`."""
+    lines = []
+    start = 0.0
+    for seg in segments:
+        lines.append(f"{_yt_timestamp(start)} {seg.title}")
+        start += seg.seconds
+    return lines
+
+
+def build_video_description(
+    segments: list[MergeSegment],
+    *,
+    original_title: str,
+    vn_title: str,
+    original_author: str,
+    vn_author: str,
+    total_chapters: int,
+    credit: str = DEFAULT_VIDEO_CREDIT,
+) -> str:
+    """A YouTube description for one part: header block + clickable chapter table + credit.
+
+    Shape (see 025.00-PROMPT.md)::
+
+        Tên truyện: {original_title} — "{vn_title}"
+        Tác giả: {original_author} "{vn_author}"
+        Số chương: {total_chapters}
+
+        Mục lục chương:
+        0:00 {ch1}
+        ...
+
+        Tạo bởi: {credit}
+
+    The `Tác giả:` line drops the trailing quoted Vietnamese clause when `vn_author` is empty
+    (older projects translated before the field existed), rather than printing empty quotes.
+    Chapter timestamps come from the cumulative `MergeSegment.seconds`, so pass segments that
+    already carry real durations (the caller runs `_with_real_durations` first).
+    """
+    original_title = (original_title or "").strip()
+    vn_title = (vn_title or "").strip()
+    original_author = (original_author or "").strip()
+    vn_author = (vn_author or "").strip()
+
+    if vn_author:
+        author_line = f'Tác giả: {original_author} "{vn_author}"'
+    else:
+        author_line = f"Tác giả: {original_author}"
+
+    lines = [
+        f'Tên truyện: {original_title} — "{vn_title}"',
+        author_line,
+        f"Số chương: {total_chapters}",
+        "",
+        "Mục lục chương:",
+        *_chapter_timestamp_lines(segments),
+        "",
+        f"Tạo bởi: {credit}",
+    ]
     return "\n".join(lines) + "\n"
 
 
@@ -442,6 +573,7 @@ def render_video(
     fps: int = 25,
     spin_vinyl: bool = True,
     font_name: str = FONT_NAME,
+    bg_color: tuple[int, int, int] | None = None,
     cancelled: Callable[[], bool] | None = None,
 ) -> Path:
     """Render `segments` into an MP4 at `out_path`; also write the YouTube description.
@@ -480,13 +612,13 @@ def render_video(
     try:
         subs_file.write_text(
             build_ass_subtitles(segments, novel_title, width=width, height=height,
-                                font_name=font_name),
+                                font_name=font_name, bg_color=bg_color),
             encoding="utf-8",
         )
         # Bake the three artwork layers once; ffmpeg loops each and animates them: the
         # static skin (backdrop), the vinyl disc (spun), and the playhead knob (slid).
         lay = PlayerLayout.of(width, height)
-        build_player_skin(image_path, skin_file, width=width, height=height)
+        build_player_skin(image_path, skin_file, width=width, height=height, bg_color=bg_color)
         build_vinyl(font_dir / VINYL_LABEL, vinyl_file, size=lay.vinyl_size)
         build_knob(knob_file, radius=lay.knob_r)
 
@@ -539,6 +671,7 @@ def render_preview_frame(
     height: int = 1080,
     spin_vinyl: bool = True,
     font_name: str = FONT_NAME,
+    bg_color: tuple[int, int, int] | None = None,
     cancelled: Callable[[], bool] | None = None,
 ) -> Path:
     """Render ONE still PNG of the music-player video — a fast preview, no encode/audio.
@@ -565,10 +698,10 @@ def render_preview_frame(
         sample = [MergeSegment(path="", seconds=_PREVIEW_TOTAL, title=sample_chapter_title)]
         subs_file.write_text(
             build_ass_subtitles(sample, novel_title, width=width, height=height,
-                                font_name=font_name),
+                                font_name=font_name, bg_color=bg_color),
             encoding="utf-8",
         )
-        build_player_skin(image_path, skin_file, width=width, height=height)
+        build_player_skin(image_path, skin_file, width=width, height=height, bg_color=bg_color)
         build_vinyl(font_dir / VINYL_LABEL, vinyl_file, size=lay.vinyl_size)
         build_knob(knob_file, radius=lay.knob_r)
 

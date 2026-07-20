@@ -319,6 +319,63 @@ class AppConfig:
         self._s.setValue("video_quality", value)
 
     @property
+    def video_thumbnail_image(self) -> str:
+        """Base image for the auto-generated thumbnail ("" = reuse the video background)."""
+        return str(self._s.value("video_thumbnail_image", ""))
+
+    @video_thumbnail_image.setter
+    def video_thumbnail_image(self, value: str) -> None:
+        self._s.setValue("video_thumbnail_image", value)
+
+    @property
+    def video_bg_color(self) -> str:
+        """Background color for the video player skin, as "#rrggbb" ("" = default gradient)."""
+        return str(self._s.value("video_bg_color", ""))
+
+    @video_bg_color.setter
+    def video_bg_color(self, value: str) -> None:
+        self._s.setValue("video_bg_color", value)
+
+    @property
+    def video_credit(self) -> str:
+        """The "Tạo bởi: …" credit line in the auto-generated description."""
+        return str(self._s.value("video_credit", "Fox Novel"))
+
+    @video_credit.setter
+    def video_credit(self, value: str) -> None:
+        self._s.setValue("video_credit", value)
+
+    @property
+    def video_tagline(self) -> str:
+        """The thumbnail subtitle line shown under "PHẦN N" ("" = none)."""
+        return str(self._s.value("video_tagline", ""))
+
+    @video_tagline.setter
+    def video_tagline(self, value: str) -> None:
+        self._s.setValue("video_tagline", value)
+
+    @property
+    def video_ai_engine(self) -> str:
+        """LLM engine used for the video tab's AI helpers (tags, thumbnail image prompt).
+        Defaults to the translator engine when that is an LLM, else CLI Agent. Google
+        (translate-only) can't be used here."""
+        default = self.translator if self.translator in ("cli", "claude_cli", "claude", "lmstudio") else "cli"
+        return str(self._s.value("video_ai_engine", default))
+
+    @video_ai_engine.setter
+    def video_ai_engine(self, value: str) -> None:
+        self._s.setValue("video_ai_engine", value)
+
+    @property
+    def video_ai_model(self) -> str:
+        """Optional model override for the video tab's AI helpers ("" = engine default)."""
+        return str(self._s.value("video_ai_model", ""))
+
+    @video_ai_model.setter
+    def video_ai_model(self, value: str) -> None:
+        self._s.setValue("video_ai_model", value.strip())
+
+    @property
     def video_font(self) -> str:
         """Video title font key (see VIDEO_FONTS). Unknown/stale values → default."""
         from noveltrans.tts.video import DEFAULT_VIDEO_FONT, VIDEO_FONTS

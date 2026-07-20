@@ -56,6 +56,7 @@ class LmStudioTranslator(Translator):
     display_name = "LM Studio (local)"
     # local models often run with an 8k context window; stay well under it
     max_chunk_chars = 4000
+    supports_completion = True
 
     def __init__(self, base_url: str = DEFAULT_LMSTUDIO_URL, model: str = "",
                  timeout: float = 600.0):
@@ -81,13 +82,17 @@ class LmStudioTranslator(Translator):
             language=_LANG_NAMES.get(target, target),
             name_rule=_NAME_RULES.get(target, ""),
         )
+        return self.complete(text, system=system)
+
+    def complete(self, prompt: str, *, system: str = "", temperature: float = 0.3) -> str:
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
         payload = {
             "model": self._resolve_model(),
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": text},
-            ],
-            "temperature": 0.3,
+            "messages": messages,
+            "temperature": temperature,
             "stream": False,
         }
         try:
