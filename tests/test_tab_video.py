@@ -94,6 +94,30 @@ class TestVideoTab:
         assert tab.bg_color_button.text() == "Chọn màu…"
         tab.shutdown()
 
+    def test_mode_and_batch_size_persist_to_config(self, qapp, tmp_path):
+        config = _config(tmp_path)
+        config.video_mode = "range"
+        config.video_batch_size = 25
+        tab = VideoTab(config)
+        # the remembered choices are restored…
+        assert tab.video_mode.currentData() == "range"
+        assert tab.video_batch_size.value() == 25
+        # …and a change writes straight back to config
+        tab.video_mode.setCurrentIndex(tab.video_mode.findData("batch"))
+        tab.video_batch_size.setValue(7)
+        assert config.video_mode == "batch"
+        assert config.video_batch_size == 7
+        tab.shutdown()
+
+    def test_thumbnail_font_loads_from_config_and_persists(self, qapp, tmp_path):
+        config = _config(tmp_path)
+        config.video_thumbnail_font = "be_vietnam"
+        tab = VideoTab(config)
+        assert tab.thumb_font.currentData() == "be_vietnam"
+        tab.thumb_font.setCurrentIndex(tab.thumb_font.findData("montserrat"))
+        assert config.video_thumbnail_font == "montserrat"
+        tab.shutdown()
+
 
 class TestVideoPartsList:
     def _project_with_audio(self, library_dir, sample_meta, sample_refs):
@@ -176,6 +200,35 @@ class TestVideoPartsList:
         assert tab.video_list.item(1, 4).text() == "⬜ Chưa tạo"  # the others still pending
         tab.shutdown()
 
+    def test_each_part_renders_into_its_own_subfolder(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)
+        windows = tab._windows_for_current_selection()
+        out = tab._part_output_path(windows[0], whole_novel=False)
+        # video lives in a folder named after itself, inside video_dir
+        assert out.parent.name == out.stem
+        assert out.parent.parent == tab.project.video_dir
+        tab.shutdown()
+
+    def test_legacy_flat_render_is_still_recognised(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)
+        windows = tab._windows_for_current_selection()
+        out = tab._part_output_path(windows[0], whole_novel=False)
+        # simulate a pre-existing flat file directly under video_dir (old layout)
+        legacy = tab.project.video_dir / out.name
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_bytes(b"fake mp4")
+        # the exists check resolves to the legacy file, so the part shows as done
+        assert tab._part_output_path(windows[0], whole_novel=False) == legacy
+        tab._refresh_video_list()
+        assert tab.video_list.item(0, 4).text() == "✅ Đã tạo"
+        tab.shutdown()
+
     def test_part_metadata_reads_sidecars_then_falls_back(
         self, qapp, tmp_path, library_dir, sample_meta, sample_refs
     ):
@@ -213,6 +266,57 @@ class TestVideoPartsList:
         tab._refresh_video_list()
         thumb_btn = tab.video_list.cellWidget(0, 5).findChildren(QPushButton)[2]
         assert thumb_btn.isEnabled()
+        tab.shutdown()
+
+    def test_regen_part_thumbnail_writes_jpg_without_a_render(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        from PIL import Image
+
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)
+        # a real base image so render_thumbnail has something to cover-fit
+        base = tmp_path / "cover.png"
+        Image.new("RGB", (640, 360), (40, 60, 90)).save(base)
+        tab.thumb_image_edit.setText(str(base))
+        windows = tab._windows_for_current_selection()
+        jpg = tab._part_sidecar(windows[0], False, ".jpg")
+        assert not jpg.is_file()
+        assert tab._regen_part_thumbnail(windows[0], 1, False) is True
+        assert jpg.is_file()  # cover written even though no video was rendered
+        tab.shutdown()
+
+    def test_regen_all_thumbnails_covers_every_part(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        from PIL import Image
+
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)  # 5 chapters, batch 2 → 3 parts
+        base = tmp_path / "cover.png"
+        Image.new("RGB", (640, 360), (40, 60, 90)).save(base)
+        tab.thumb_image_edit.setText(str(base))
+        windows = tab._windows_for_current_selection()
+        assert len(windows) == 3
+        tab._regen_all_thumbnails()
+        for w in windows:
+            assert tab._part_sidecar(w, False, ".jpg").is_file()
+        tab.shutdown()
+
+    def test_regen_without_a_base_image_is_a_no_op(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)
+        tab.thumb_image_edit.setText("")
+        tab.video_image_edit.setText("")
+        # suppress the warning dialog so the test stays headless
+        monkeypatch.setattr(
+            "noveltrans.gui.tab_video.QMessageBox.warning", lambda *a, **k: None
+        )
+        windows = tab._windows_for_current_selection()
+        assert tab._regen_part_thumbnail(windows[0], 1, False) is False
+        assert not tab._part_sidecar(windows[0], False, ".jpg").is_file()
         tab.shutdown()
 
     def test_render_one_uses_range_mode_for_that_part(

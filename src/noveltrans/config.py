@@ -319,6 +319,26 @@ class AppConfig:
         self._s.setValue("video_quality", value)
 
     @property
+    def video_mode(self) -> str:
+        """Video export mode remembered between sessions: "all" | "range" | "batch".
+        Unknown/stale values fall back to the default ("batch")."""
+        value = str(self._s.value("video_mode", "batch"))
+        return value if value in ("all", "range", "batch") else "batch"
+
+    @video_mode.setter
+    def video_mode(self, value: str) -> None:
+        self._s.setValue("video_mode", value if value in ("all", "range", "batch") else "batch")
+
+    @property
+    def video_batch_size(self) -> int:
+        """Chapters per video in "Theo lô" mode, remembered between sessions (default 10)."""
+        return max(1, self._s.value("video_batch_size", 10, type=int))
+
+    @video_batch_size.setter
+    def video_batch_size(self, value: int) -> None:
+        self._s.setValue("video_batch_size", max(1, int(value)))
+
+    @property
     def video_thumbnail_image(self) -> str:
         """Base image for the auto-generated thumbnail ("" = reuse the video background)."""
         return str(self._s.value("video_thumbnail_image", ""))
@@ -386,6 +406,51 @@ class AppConfig:
     @video_font.setter
     def video_font(self, value: str) -> None:
         self._s.setValue("video_font", value)
+
+    @property
+    def video_thumbnail_font(self) -> str:
+        """Font key for the thumbnail (Ảnh bìa) text, chosen independently of the video font.
+        Defaults to Nunito — a soft, rounded face with full Vietnamese coverage. Unknown/stale
+        values fall back to that default."""
+        from noveltrans.tts.video import VIDEO_FONTS
+
+        value = str(self._s.value("video_thumbnail_font", "nunito"))
+        return value if value in VIDEO_FONTS else "nunito"
+
+    @video_thumbnail_font.setter
+    def video_thumbnail_font(self, value: str) -> None:
+        self._s.setValue("video_thumbnail_font", value)
+
+    @property
+    def video_thumbnail_title_pos(self) -> tuple[float, float]:
+        """Where the novel title sits on the cover — (x, y) fractions of the frame, the
+        title block's top-left anchor. Adjusted in the thumbnail editor, applied to every
+        rendered cover. Defaults reproduce the original fixed layout."""
+        from noveltrans.tts.thumbnail import DEFAULT_TITLE_POS
+
+        x = _clamp(self._s.value("video_thumbnail_title_x", DEFAULT_TITLE_POS[0], type=float), 0.0, 1.0)
+        y = _clamp(self._s.value("video_thumbnail_title_y", DEFAULT_TITLE_POS[1], type=float), 0.0, 1.0)
+        return (x, y)
+
+    @video_thumbnail_title_pos.setter
+    def video_thumbnail_title_pos(self, value: tuple[float, float]) -> None:
+        self._s.setValue("video_thumbnail_title_x", _clamp(float(value[0]), 0.0, 1.0))
+        self._s.setValue("video_thumbnail_title_y", _clamp(float(value[1]), 0.0, 1.0))
+
+    @property
+    def video_thumbnail_part_pos(self) -> tuple[float, float]:
+        """Where the "PHẦN N" block sits — (x, y) fractions of the frame, its top-centre
+        anchor (x is the centre). Adjusted in the thumbnail editor, applied to every cover."""
+        from noveltrans.tts.thumbnail import DEFAULT_PART_POS
+
+        x = _clamp(self._s.value("video_thumbnail_part_x", DEFAULT_PART_POS[0], type=float), 0.0, 1.0)
+        y = _clamp(self._s.value("video_thumbnail_part_y", DEFAULT_PART_POS[1], type=float), 0.0, 1.0)
+        return (x, y)
+
+    @video_thumbnail_part_pos.setter
+    def video_thumbnail_part_pos(self, value: tuple[float, float]) -> None:
+        self._s.setValue("video_thumbnail_part_x", _clamp(float(value[0]), 0.0, 1.0))
+        self._s.setValue("video_thumbnail_part_y", _clamp(float(value[1]), 0.0, 1.0))
 
     @property
     def keep_awake_enabled(self) -> bool:

@@ -68,3 +68,33 @@ class TestRenderThumbnail:
         with Image.open(out) as im:
             assert im.format == "PNG"
             assert im.size == (1280, 720)
+
+
+class TestComposeThumbnail:
+    def _compose(self, **overrides):
+        from noveltrans.tts.thumbnail import compose_thumbnail
+
+        with font_dir_context() as d:
+            kwargs = dict(
+                vn_title="Tụ Bảo Tiên Bồn", part_num=1, tagline="",
+                font_path=d / video_font("noto_sans")["file"],
+                width=320, height=180,
+            )
+            kwargs.update(overrides)
+            return compose_thumbnail("/no/such/file.png", **kwargs)
+
+    def test_returns_an_rgb_image_of_the_requested_size(self):
+        img = self._compose()
+        assert img.mode == "RGB"
+        assert img.size == (320, 180)
+
+    def test_moving_the_part_block_changes_the_pixels(self):
+        # same content, only the PHẦN N position differs → the rendered pixels must differ
+        default = self._compose()
+        moved = self._compose(part_pos=(0.5, 0.20))
+        assert default.tobytes() != moved.tobytes()
+
+    def test_moving_the_title_block_changes_the_pixels(self):
+        default = self._compose()
+        moved = self._compose(title_pos=(0.4, 0.5))
+        assert default.tobytes() != moved.tobytes()

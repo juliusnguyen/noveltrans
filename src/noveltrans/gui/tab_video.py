@@ -116,7 +116,8 @@ class VideoTab(QWidget):
         self.video_mode.addItem("Toàn bộ", "all")
         self.video_mode.addItem("Từ chương … đến …", "range")
         self.video_mode.addItem("Theo lô", "batch")
-        self.video_mode.setCurrentIndex(self.video_mode.findData("batch"))  # sane default
+        midx = self.video_mode.findData(self.config.video_mode)  # remembered between sessions
+        self.video_mode.setCurrentIndex(midx if midx >= 0 else self.video_mode.findData("batch"))
         self.video_mode.currentIndexChanged.connect(self._on_video_mode_changed)
 
         self.video_quality = QComboBox()
@@ -149,7 +150,10 @@ class VideoTab(QWidget):
         self.video_range_label = QLabel("→")
         self.video_batch_size = QSpinBox()
         self.video_batch_size.setRange(1, 999999)
-        self.video_batch_size.setValue(10)
+        self.video_batch_size.setValue(self.config.video_batch_size)  # remembered between sessions
+        self.video_batch_size.valueChanged.connect(
+            lambda v: setattr(self.config, "video_batch_size", v)
+        )
         self.video_batch_label = QLabel("chương/video")
 
         # background color for the player skin ("" = the default pastel gradient)
@@ -274,7 +278,15 @@ class VideoTab(QWidget):
         )
 
     def _part_output_path(self, window, *, whole_novel: bool):
-        """The .mp4 path a given window would render to (for the exists check)."""
+        """The .mp4 path a given window would render to (for the exists check).
+
+        Each part lives in its OWN subfolder — `video_dir/<stem>/<stem>.mp4` — so a single
+        video (with its sidecars) can be uploaded without hunting through the others. Older
+        parts rendered flat in `video_dir` are still recognised, so they keep showing as
+        “đã tạo” and their thumbnail/detail keep opening after this change.
+        """
+        from pathlib import Path
+
         from noveltrans.storage.project import slugify
         from noveltrans.tts.video import video_part_name
 
@@ -282,7 +294,11 @@ class VideoTab(QWidget):
         name = video_part_name(
             slug, window.first_num, window.last_num, whole_novel=whole_novel
         )
-        return self.project.video_dir / name
+        per_folder = self.project.video_dir / Path(name).stem / name
+        legacy = self.project.video_dir / name
+        if not per_folder.is_file() and legacy.is_file():
+            return legacy
+        return per_folder
 
     def _part_sidecar(self, window, whole_novel: bool, ext: str):
         """Path of a companion file (`.title.txt` / `.txt` / `.tags.txt` / `.jpg`) for a part."""
@@ -463,12 +479,25 @@ class VideoTab(QWidget):
         open_thumb = QPushButton("Mở ảnh bìa")
         open_thumb.setEnabled(self._part_sidecar(window, whole_novel, ".jpg").is_file())
         open_thumb.clicked.connect(lambda: self._open_part_thumbnail(window, whole_novel))
+        regen_thumb = QPushButton("Tạo lại ảnh bìa")
+        regen_thumb.setToolTip(
+            "Vẽ lại ảnh bìa với phông chữ / tagline / ảnh hiện tại — không cần render lại video."
+        )
+
+        def _regen() -> None:
+            if self._regen_part_thumbnail(window, part_num, whole_novel):
+                open_thumb.setEnabled(True)
+                status.setText("✅ Đã tạo lại ảnh bìa.")
+
+        regen_thumb.clicked.connect(_regen)
         open_dir = QPushButton("Mở thư mục video")
-        open_dir.clicked.connect(self._open_video_dir)
+        open_dir.setToolTip("Mở đúng thư mục riêng của phần này (video + tiêu đề/mô tả/tags/ảnh bìa).")
+        open_dir.clicked.connect(lambda: self._open_part_dir(window, whole_novel))
         close = QPushButton("Đóng")
         close.clicked.connect(dialog.close)
         bottom = QHBoxLayout()
         bottom.addWidget(open_thumb)
+        bottom.addWidget(regen_thumb)
         bottom.addWidget(open_dir)
         bottom.addWidget(status)
         bottom.addStretch()
@@ -476,6 +505,14 @@ class VideoTab(QWidget):
         layout.addLayout(bottom)
 
         dialog.exec()
+
+    def _open_part_dir(self, window, whole_novel) -> None:
+        """Open the folder holding just this part's video + sidecars (created if missing)."""
+        if self.project is None:
+            return
+        folder = self._part_output_path(window, whole_novel=whole_novel).parent
+        folder.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
     def _open_part_thumbnail(self, window, whole_novel) -> None:
         thumb = self._part_sidecar(window, whole_novel, ".jpg")
@@ -487,14 +524,153 @@ class VideoTab(QWidget):
                 "Phần này chưa được tạo video nên chưa có ảnh bìa — bấm “Tạo” trước.",
             )
 
+    # -------------------------------------------- regenerate the cover only
+
+    def _thumbnail_base_image(self) -> str | None:
+        """The base photo for a cover: the dedicated 'Ảnh bìa' if set, else the video 'Ảnh nền'.
+        Warns and returns None when neither is a valid file."""
+        from pathlib import Path
+
+        base = self.thumb_image_edit.text().strip() or self.video_image_edit.text().strip()
+        if not base or not Path(base).is_file():
+            QMessageBox.warning(
+                self, "Chưa chọn ảnh",
+                "Hãy chọn 'Ảnh bìa' hoặc 'Ảnh nền' hợp lệ trước khi tạo lại ảnh bìa.",
+            )
+            return None
+        return base
+
+    def _render_thumbnail_now(self, window, part_num, whole_novel, *, base, font_dir) -> None:
+        """Render one part's `.jpg` cover from the saved cover settings (font + title/part
+        positions) — pure Pillow, no ffmpeg, so it's near-instant and needs no video render."""
+        from noveltrans.tts.thumbnail import render_thumbnail
+        from noveltrans.tts.video import video_font
+
+        novel_title = self.project.meta.translated_title or self.project.meta.title
+        font_file = video_font(self.config.video_thumbnail_font)["file"]
+        render_thumbnail(
+            base,
+            self._part_sidecar(window, whole_novel, ".jpg"),
+            vn_title=novel_title,
+            part_num=part_num or 1,
+            tagline=self.tagline_edit.text().strip(),
+            font_path=font_dir / font_file,
+            width=1280, height=720,
+            title_pos=self.config.video_thumbnail_title_pos,
+            part_pos=self.config.video_thumbnail_part_pos,
+        )
+
+    def _regen_part_thumbnail(self, window, part_num, whole_novel) -> bool:
+        """Regenerate just this part's cover. Returns True on success (for callers to react)."""
+        if self.project is None:
+            return False
+        from noveltrans.tts.video import font_dir_context
+
+        base = self._thumbnail_base_image()
+        if base is None:
+            return False
+        try:
+            with font_dir_context() as font_dir:
+                self._render_thumbnail_now(window, part_num, whole_novel, base=base, font_dir=font_dir)
+        except Exception as exc:  # noqa: BLE001 — surface a bad image/font to the user
+            QMessageBox.warning(self, "Tạo ảnh bìa thất bại", str(exc))
+            return False
+        self.status_label.setText("✅ Đã tạo lại ảnh bìa.")
+        self._refresh_video_list()  # re-enables the "Ảnh bìa" open button on the row
+        return True
+
+    def _regen_all_thumbnails(self) -> None:
+        """Regenerate the covers for every part in the current selection (font/tagline/image
+        applied to all at once) — no video re-render."""
+        if self.project is None:
+            QMessageBox.information(self, "Chưa chọn truyện", "Hãy chọn một truyện trước.")
+            return
+        from noveltrans.tts.video import font_dir_context
+
+        windows = self._windows_for_current_selection()
+        if not windows:
+            QMessageBox.information(
+                self, "Không có phần nào", "Chưa có phần video nào trong phạm vi đã chọn."
+            )
+            return
+        base = self._thumbnail_base_image()
+        if base is None:
+            return
+        mode = self.video_mode.currentData()
+        total = len(windows)
+        done = 0
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            with font_dir_context() as font_dir:
+                for i, window in enumerate(windows):
+                    whole_novel = total == 1 and mode == "all"
+                    part_num = None if whole_novel else (i + 1)
+                    self.status_label.setText(f"🖼️ Đang tạo lại ảnh bìa ({i + 1}/{total})…")
+                    QApplication.processEvents()
+                    try:
+                        self._render_thumbnail_now(
+                            window, part_num, whole_novel, base=base, font_dir=font_dir
+                        )
+                        done += 1
+                    except Exception:  # noqa: BLE001 — one bad part must not stop the rest
+                        pass
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.status_label.setText(f"✅ Đã tạo lại {done}/{total} ảnh bìa.")
+        self._refresh_video_list()
+
+    def _open_thumbnail_editor(self) -> None:
+        """Open the live cover editor (drag title/part, try fonts) — saves to config and can
+        apply to every part at once."""
+        if self.project is None:
+            QMessageBox.information(self, "Chưa chọn truyện", "Hãy chọn một truyện trước.")
+            return
+        from noveltrans.gui.thumbnail_editor import ThumbnailEditorDialog
+
+        base = self.thumb_image_edit.text().strip() or self.video_image_edit.text().strip()
+        novel_title = self.project.meta.translated_title or self.project.meta.title
+        dialog = ThumbnailEditorDialog(
+            self.config,
+            base_image=base,
+            novel_title=novel_title,
+            part_num=1,
+            tagline=self.tagline_edit.text().strip(),
+            on_apply_all=self._regen_all_thumbnails,
+            parent=self,
+        )
+        dialog.exec()
+        # reflect any font change made in the editor back into the box's font combo
+        fidx = self.thumb_font.findData(self.config.video_thumbnail_font)
+        if fidx >= 0 and fidx != self.thumb_font.currentIndex():
+            self.thumb_font.blockSignals(True)
+            self.thumb_font.setCurrentIndex(fidx)
+            self.thumb_font.blockSignals(False)
+
     def _build_thumbnail_box(self) -> QGroupBox:
-        """Thumbnail base image + tagline + credit for the auto-generated metadata."""
+        """Thumbnail base image + font + tagline + credit for the auto-generated metadata."""
+        from noveltrans.tts.video import VIDEO_FONTS
+
         self.thumb_image_edit = QLineEdit(self.config.video_thumbnail_image)
         self.thumb_image_edit.setPlaceholderText("Dùng chung ảnh nền video nếu để trống…")
         self.thumb_image_edit.setReadOnly(True)
         self.thumb_image_edit.setMinimumWidth(160)
         self.thumb_image_button = QPushButton("Chọn ảnh bìa…")
         self.thumb_image_button.clicked.connect(self._pick_thumb_image)
+
+        # Font for the thumbnail text — chosen independently of the video font (same picker
+        # style as “Xuất video”), so the cover can use a softer, Vietnamese-friendly face.
+        self.thumb_font = QComboBox()
+        for key, spec in VIDEO_FONTS.items():
+            self.thumb_font.addItem(spec["label"], key)
+        tfidx = self.thumb_font.findData(self.config.video_thumbnail_font)
+        self.thumb_font.setCurrentIndex(tfidx if tfidx >= 0 else 0)
+        self.thumb_font.setToolTip(
+            "Phông chữ cho chữ trên ảnh bìa (thumbnail) — nên chọn phông mềm mại, "
+            "hỗ trợ tiếng Việt (mặc định Nunito bo tròn)."
+        )
+        self.thumb_font.currentIndexChanged.connect(
+            lambda: setattr(self.config, "video_thumbnail_font", self.thumb_font.currentData())
+        )
 
         self.tagline_edit = QLineEdit(self.config.video_tagline)
         self.tagline_edit.setPlaceholderText("Câu tagline dưới 'PHẦN N' (tuỳ chọn)…")
@@ -509,17 +685,45 @@ class VideoTab(QWidget):
             lambda: setattr(self.config, "video_credit", self.credit_edit.text().strip() or "Fox Novel")
         )
 
+        # Live cover editor: drag the title / PHẦN N, try fonts with a preview, then save +
+        # apply to all — the visual way to get the layout right.
+        self.thumb_edit_button = QPushButton("Tùy chỉnh ảnh bìa…")
+        self.thumb_edit_button.setToolTip(
+            "Mở cửa sổ chỉnh ảnh bìa: kéo để đặt vị trí tiêu đề / PHẦN N, đổi phông xem trực "
+            "tiếp, rồi lưu và áp dụng cho mọi phần."
+        )
+        self.thumb_edit_button.clicked.connect(self._open_thumbnail_editor)
+
+        # Regenerate every cover from the saved font/tagline/positions/image — near-instant
+        # (Pillow only), so changes apply without re-rendering any video.
+        self.thumb_regen_button = QPushButton("Tạo lại tất cả ảnh bìa")
+        self.thumb_regen_button.setToolTip(
+            "Tạo lại ảnh bìa cho mọi phần trong phạm vi đang chọn theo phông chữ / tagline / "
+            "vị trí / ảnh hiện tại — không cần render lại video."
+        )
+        self.thumb_regen_button.clicked.connect(self._regen_all_thumbnails)
+
         row = QHBoxLayout()
         row.addWidget(QLabel("Ảnh bìa:"))
         row.addWidget(self.thumb_image_edit, stretch=1)
         row.addWidget(self.thumb_image_button)
+        row.addWidget(QLabel("Phông bìa:"))
+        row.addWidget(self.thumb_font)
         row.addWidget(QLabel("Tagline:"))
         row.addWidget(self.tagline_edit, stretch=1)
         row.addWidget(QLabel("Tạo bởi:"))
         row.addWidget(self.credit_edit)
 
+        action_row = QHBoxLayout()
+        action_row.addStretch()
+        action_row.addWidget(self.thumb_edit_button)
+        action_row.addWidget(self.thumb_regen_button)
+
+        inner = QVBoxLayout()
+        inner.addLayout(row)
+        inner.addLayout(action_row)
         box = QGroupBox("Ảnh bìa (thumbnail) & metadata")
-        box.setLayout(row)
+        box.setLayout(inner)
         return box
 
     def _build_engine_row(self) -> QHBoxLayout:
@@ -616,6 +820,7 @@ class VideoTab(QWidget):
 
     def _on_video_mode_changed(self) -> None:
         mode = self.video_mode.currentData()
+        self.config.video_mode = mode  # remember the choice between sessions
         for w in (self.video_range_from, self.video_range_label, self.video_range_to):
             w.setVisible(mode == "range")
         for w in (self.video_batch_size, self.video_batch_label):
@@ -1070,6 +1275,9 @@ class VideoTab(QWidget):
             start=start, end=end, batch=batch,
             width=preset["width"], height=preset["height"], fps=preset["fps"],
             spin_vinyl=preset["spin_vinyl"], font=font_family, font_key=font_key,
+            thumb_font_key=self.config.video_thumbnail_font,
+            thumb_title_pos=self.config.video_thumbnail_title_pos,
+            thumb_part_pos=self.config.video_thumbnail_part_pos,
             bg_color=self.bg_color, skip_existing=skip_existing,
             credit=self.credit_edit.text().strip() or "Fox Novel",
             tagline=self.tagline_edit.text().strip(),
