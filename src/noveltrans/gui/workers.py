@@ -909,7 +909,10 @@ class VideoWorker(QThread):
         fps: int = 25,  # motion video (waveform) — smoother than 019's static 12
         spin_vinyl: bool = True,  # False → static disc (skips the costly per-frame rotate)
         font: str = "",  # title font family; "" → the bundled default (FONT_NAME)
-        font_key: str = "",  # font registry key, to resolve the thumbnail's TTF file
+        font_key: str = "",  # font registry key for the in-video title font
+        thumb_font_key: str = "",  # font registry key for the thumbnail text; "" → font_key
+        thumb_title_pos: tuple[float, float] | None = None,  # cover title (x, y) fractions
+        thumb_part_pos: tuple[float, float] | None = None,  # cover "PHẦN N" (x, y) fractions
         bg_color: str = "",  # background hex "#rrggbb"; "" → the default pastel gradient
         skip_existing: bool = False,  # skip parts whose .mp4 already exists (batch "continue")
         credit: str = "",  # "Tạo bởi: …" line; "" → the default (Fox Novel)
@@ -933,6 +936,9 @@ class VideoWorker(QThread):
         self.spin_vinyl = spin_vinyl
         self.font = font
         self.font_key = font_key
+        self.thumb_font_key = thumb_font_key
+        self.thumb_title_pos = thumb_title_pos
+        self.thumb_part_pos = thumb_part_pos
         self.bg_color = bg_color
         self.skip_existing = skip_existing
         self.credit = credit
@@ -1005,8 +1011,11 @@ class VideoWorker(QThread):
                     name = video_part_name(
                         slug, window.first_num, window.last_num, whole_novel=whole_novel
                     )
-                    out_path = project.video_dir / name
-                    if self.skip_existing and out_path.is_file():
+                    # Each part goes in its own folder (video + sidecars) so it can be
+                    # uploaded on its own; legacy flat renders still count for skip_existing.
+                    out_path = project.video_dir / Path(name).stem / name
+                    legacy_path = project.video_dir / name
+                    if self.skip_existing and (out_path.is_file() or legacy_path.is_file()):
                         self.progress.emit(i + 1, total, "")  # already made — skip
                         continue
                     self.progress.emit(i, total, name)
@@ -1047,6 +1056,8 @@ class VideoWorker(QThread):
         A thumbnail failure is swallowed (a bad base image must not discard an otherwise
         good video); the text sidecars are cheap and always written.
         """
+        from noveltrans.tts.thumbnail import DEFAULT_PART_POS, DEFAULT_TITLE_POS
+
         def sidecar(ext: str) -> Path:
             return out_path.parent / (out_path.stem + ext)
 
@@ -1069,7 +1080,7 @@ class VideoWorker(QThread):
             sidecar(".tags.txt").write_text(self.tags.strip() + "\n", encoding="utf-8")
 
         try:
-            font_file = video_font(self.font_key)["file"]
+            font_file = video_font(self.thumb_font_key or self.font_key)["file"]
             render_thumbnail(
                 self.thumb_image_path or str(self.image_path),
                 sidecar(".jpg"),
@@ -1078,6 +1089,8 @@ class VideoWorker(QThread):
                 tagline=self.tagline,
                 font_path=font_dir / font_file,
                 width=1280, height=720,
+                title_pos=self.thumb_title_pos or DEFAULT_TITLE_POS,
+                part_pos=self.thumb_part_pos or DEFAULT_PART_POS,
             )
         except Exception:  # noqa: BLE001 — never fail a good render over a thumbnail
             pass

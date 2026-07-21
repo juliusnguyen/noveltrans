@@ -111,9 +111,15 @@ def _font(font_path: Path | str, size: int) -> ImageFont.FreeTypeFont:
             return ImageFont.load_default()
 
 
-def render_thumbnail(
+# Default placements, as (x, y) fractions of the frame. The title block is anchored by its
+# TOP-LEFT corner; the "PHẦN N" block by its TOP-CENTRE (x is the centre). These reproduce
+# the original fixed layout exactly, and are what the thumbnail editor lets the user move.
+DEFAULT_TITLE_POS = (0.035, 0.0625)
+DEFAULT_PART_POS = (0.5, 0.66)
+
+
+def compose_thumbnail(
     base_image_path: Path | str,
-    out_path: Path,
     *,
     vn_title: str,
     part_num: int,
@@ -121,15 +127,16 @@ def render_thumbnail(
     font_path: Path | str,
     width: int = 1280,
     height: int = 720,
-) -> Path:
-    """Render a `width`×`height` thumbnail to `out_path` and return it.
+    title_pos: tuple[float, float] = DEFAULT_TITLE_POS,
+    part_pos: tuple[float, float] = DEFAULT_PART_POS,
+) -> Image.Image:
+    """Compose the thumbnail and return it as an RGB `Image` (no disk write).
 
-    An unreadable/empty base image still yields a valid thumbnail (a neutral dark
-    backdrop) so a bad photo never fails a render. Saved as JPEG unless `out_path` ends
-    `.png`.
+    Separated from `render_thumbnail` so the editor can render live previews straight to a
+    pixmap without touching disk. `title_pos` places the title block's top-left; `part_pos`
+    places the "PHẦN N" block's top-centre — both as (x, y) fractions of (width, height).
+    An unreadable/empty base image still yields a valid thumbnail (a neutral dark backdrop).
     """
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     W, H = width, height
 
     # background: the photo, cover-fit; a neutral dark panel if it can't be read.
@@ -145,30 +152,34 @@ def render_thumbnail(
 
     margin = round(W * 0.035)
 
-    # -- top-left: the wrapped novel title -----------------------------------
+    # -- the wrapped novel title (anchored top-left at title_pos) -------------
+    title_x = round(W * title_pos[0])
     title_px = round(H * 0.11)
     title_font = _font(font_path, title_px)
     title_stroke = max(2, round(title_px * 0.06))
-    max_text_w = round(W * 0.62)  # leave the right side for the photo's subject
+    # wrap within whatever width remains to the right of the anchor, capped at the original
+    # 62% budget so the title never runs under the photo's subject on the far right
+    max_text_w = max(round(W * 0.2), min(round(W * 0.62), W - title_x - margin))
     lines = _wrap_title(vn_title, title_font, max_text_w)
-    y = margin
+    y = round(H * title_pos[1])
     line_gap = round(title_px * 0.18)
     for line in lines:
         _draw_glow_line(
-            bg, (margin, y), line, title_font,
+            bg, (title_x, y), line, title_font,
             stroke_width=title_stroke, glow_radius=max(4, round(title_px * 0.18)),
         )
         _, line_h = _line_size(title_font, line, title_stroke)
         y += line_h + line_gap
 
-    # -- bottom-center: PHẦN {N} + tagline -----------------------------------
+    # -- PHẦN {N} + tagline (anchored top-centre at part_pos) ----------------
+    part_cx = round(W * part_pos[0])
     part_px = round(H * 0.15)
     part_font = _font(font_path, part_px)
     part_stroke = max(3, round(part_px * 0.06))
     part_text = f"PHẦN {part_num}"
     part_w, part_h = _line_size(part_font, part_text, part_stroke)
-    part_x = (W - part_w) // 2
-    part_y = round(H * 0.66)
+    part_x = part_cx - part_w // 2
+    part_y = round(H * part_pos[1])
     _draw_glow_line(
         bg, (part_x, part_y), part_text, part_font,
         stroke_width=part_stroke, glow_radius=max(6, round(part_px * 0.2)),
@@ -185,15 +196,44 @@ def render_thumbnail(
             tag_font = _font(font_path, tag_px)
         tag_stroke = max(2, round(tag_px * 0.08))
         tag_w, tag_h = _line_size(tag_font, tagline, tag_stroke)
-        tag_x = (W - tag_w) // 2
+        tag_x = part_cx - tag_w // 2
         tag_y = part_y + part_h + round(H * 0.03)
         _draw_glow_line(
             bg, (tag_x, tag_y), tagline, tag_font,
             stroke_width=tag_stroke, glow_radius=max(3, round(tag_px * 0.18)),
         )
 
+    return bg.convert("RGB")
+
+
+def render_thumbnail(
+    base_image_path: Path | str,
+    out_path: Path,
+    *,
+    vn_title: str,
+    part_num: int,
+    tagline: str,
+    font_path: Path | str,
+    width: int = 1280,
+    height: int = 720,
+    title_pos: tuple[float, float] = DEFAULT_TITLE_POS,
+    part_pos: tuple[float, float] = DEFAULT_PART_POS,
+) -> Path:
+    """Render a `width`×`height` thumbnail to `out_path` and return it.
+
+    An unreadable/empty base image still yields a valid thumbnail (a neutral dark
+    backdrop) so a bad photo never fails a render. Saved as JPEG unless `out_path` ends
+    `.png`. See `compose_thumbnail` for the `title_pos` / `part_pos` placement.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    img = compose_thumbnail(
+        base_image_path,
+        vn_title=vn_title, part_num=part_num, tagline=tagline, font_path=font_path,
+        width=width, height=height, title_pos=title_pos, part_pos=part_pos,
+    )
     if out_path.suffix.lower() == ".png":
-        bg.convert("RGB").save(out_path)
+        img.save(out_path)
     else:
-        bg.convert("RGB").save(out_path, "JPEG", quality=85, optimize=True)
+        img.save(out_path, "JPEG", quality=85, optimize=True)
     return out_path

@@ -90,8 +90,15 @@ VIDEO_FONTS: dict[str, dict[str, str]] = {
     "be_vietnam": {"label": "Be Vietnam Pro",        "file": "BeVietnamPro-Regular.ttf",    "family": "Be Vietnam Pro"},
     "nunito":     {"label": "Nunito (bo tròn)",      "file": "Nunito-Regular.ttf",          "family": "Nunito"},
     "montserrat": {"label": "Montserrat",            "file": "Montserrat-Regular.ttf",      "family": "Montserrat"},
+    "roboto":     {"label": "Roboto",                "file": "Roboto-Regular.ttf",          "family": "Roboto"},
+    "museomoderno": {"label": "MuseoModerno (hiện đại)", "file": "MuseoModerno-Regular.ttf", "family": "MuseoModerno"},
     "lora":       {"label": "Lora (serif)",          "file": "Lora-Regular.ttf",            "family": "Lora"},
+    "noto_serif": {"label": "Noto Serif (serif)",    "file": "NotoSerif-Regular.ttf",       "family": "Noto Serif"},
     "playfair":   {"label": "Playfair Display (serif)", "file": "PlayfairDisplay-Regular.ttf", "family": "Playfair Display"},
+    "pacifico":   {"label": "Pacifico (chữ viết)",   "file": "Pacifico-Regular.ttf",        "family": "Pacifico"},
+    "dancing_script": {"label": "Dancing Script (chữ viết)", "file": "DancingScript-Regular.ttf", "family": "Dancing Script"},
+    "sedgwick_ave": {"label": "Sedgwick Ave (chữ viết)", "file": "SedgwickAve-Regular.ttf", "family": "Sedgwick Ave"},
+    "amatic_sc":  {"label": "Amatic SC (mảnh)",      "file": "AmaticSC-Regular.ttf",        "family": "Amatic SC"},
 }
 DEFAULT_VIDEO_FONT = "noto_sans"
 
@@ -331,6 +338,17 @@ def video_part_name(slug: str, first_num: int, last_num: int, *, whole_novel: bo
     if whole_novel:
         return f"{slug}.mp4"
     return f"{slug}-{first_num:04d}-{last_num:04d}.mp4"
+
+
+def video_part_dir_name(slug: str, first_num: int, last_num: int, *, whole_novel: bool = False) -> str:
+    """The per-part output SUBFOLDER name — one folder per video.
+
+    Each part video and its sidecars (`.title.txt` / `.txt` / `.tags.txt` / `.jpg`) live in
+    their own folder so a single part can be uploaded without picking it out from among all
+    the other parts. The folder name is just the part's file stem (`video_part_name` minus
+    the `.mp4`).
+    """
+    return Path(video_part_name(slug, first_num, last_num, whole_novel=whole_novel)).stem
 
 
 def build_upload_title(vn_title: str, part_num: int | None) -> str:

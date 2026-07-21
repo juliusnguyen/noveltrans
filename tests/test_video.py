@@ -323,7 +323,11 @@ class TestVideoFonts:
         for spec in VIDEO_FONTS.values():
             assert assets.joinpath(spec["file"]).is_file(), spec["file"]
 
-    @pytest.mark.parametrize("key", ["noto_sans", "be_vietnam", "nunito", "montserrat", "lora", "playfair"])
+    @pytest.mark.parametrize("key", [
+        "noto_sans", "be_vietnam", "nunito", "montserrat", "roboto", "museomoderno",
+        "lora", "noto_serif", "playfair", "pacifico", "dancing_script", "sedgwick_ave",
+        "amatic_sc",
+    ])
     def test_font_family_matches_and_covers_vietnamese(self, key):
         # libass resolves a style by FAMILY name inside fontsdir, so the registry family must
         # equal the TTF's own family — and every Vietnamese diacritic must render (no tofu).
@@ -616,6 +620,13 @@ class TestVideoPartName:
         from noveltrans.tts.video import video_part_name
 
         assert video_part_name("my-slug", 1, 199, whole_novel=True) == "my-slug.mp4"
+
+    def test_part_dir_name_is_the_stem(self):
+        from noveltrans.tts.video import video_part_dir_name
+
+        # each part's subfolder is its file name without the .mp4
+        assert video_part_dir_name("my-slug", 1, 10) == "my-slug-0001-0010"
+        assert video_part_dir_name("my-slug", 1, 199, whole_novel=True) == "my-slug"
 
 
 class TestVideoWorker:
