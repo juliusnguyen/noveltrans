@@ -139,30 +139,49 @@ class WtdBrowserSession:
         if elapsed < self.delay_seconds:
             time.sleep(self.delay_seconds - elapsed)
 
-    def _goto(self, url: str) -> None:
+    def _goto(self, url: str):
+        """Navigate and return the main navigation Response (or None)."""
         if self._page is None:
             self._launch()
         self._throttle()
         self._last_request_at = time.monotonic()
         try:
-            self._page.goto(url, wait_until="domcontentloaded")
+            return self._page.goto(url, wait_until="domcontentloaded")
         except Exception as exc:  # closed window, crash, navigation timeout
             self.close()  # the session is dead; don't let the rest of the batch retry it
             raise WtdBrowserSessionError(f"Browser navigation failed: {exc}") from exc
 
-    def get_html(self, url: str, *, scroll_item_selector: str | None = None) -> str:
-        """Navigate to `url` and return the rendered HTML (landing page / TOC).
+    def get_html(
+        self,
+        url: str,
+        *,
+        prefer_document: bool = False,
+        scroll_item_selector: str | None = None,
+    ) -> str:
+        """Navigate to `url` and return its HTML.
 
-        With `scroll_item_selector`, the page is treated as a lazy-loaded/
-        infinite-scroll list: scroll to the bottom until the number of matching
-        elements stops growing before reading the HTML. The webtruyendich chapter
-        list renders only its first ~135 chapters up front and appends the rest on
-        scroll, so a plain read would miss most of a long novel.
+        `prefer_document` returns the **raw navigation response body** — the
+        server-rendered HTML before JavaScript mutates the DOM. The webtruyendich
+        chapter list is fully server-rendered but JS then *virtualizes* the live
+        DOM down to ~135 rows; the raw document holds every chapter, so this reads
+        the whole list instantly with no scrolling. Falls back to the DOM path if
+        the document response is a Cloudflare interstitial.
+
+        `scroll_item_selector` is the DOM-path fallback: scroll to the bottom until
+        the matching-element count stops growing before reading `page.content()`.
 
         Raises WtdBrowserSessionError if the browser is gone or a Cloudflare
         interstitial is still up after giving the managed challenge time to clear.
         """
-        self._goto(url)
+        response = self._goto(url)
+        if prefer_document and response is not None:
+            body = None
+            try:
+                body = response.text()
+            except Exception:
+                body = None  # body already consumed / navigation raced — use the DOM
+            if body and not looks_like_challenge(body):
+                return body
         markup = self._content_after_challenge(url)
         if scroll_item_selector:
             markup = self._scroll_until_stable(scroll_item_selector)
