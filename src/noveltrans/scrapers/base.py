@@ -94,6 +94,14 @@ class SiteAdapter(ABC):
     display_name: str = ""  # human label shown in the GUI
     url_patterns: list[str] = []  # regexes matched against novel URLs
 
+    # Most sites serve original-language text that NovelTrans translates later. A
+    # few (e.g. webtruyendich) serve an already-finished translation — for those,
+    # fetch_chapter returns the TRANSLATION, and the download worker lands it as
+    # `translated` directly instead of `content`, skipping our own translators.
+    content_is_translated: bool = False
+    translated_lang: str = ""  # language of that translation, e.g. "vi"
+    translator_label: str = ""  # recorded in Chapter.translator
+
     def __init__(self, client: HttpClient):
         self.client = client
         # Workers assign this so an adapter can explain a long or surprising step to

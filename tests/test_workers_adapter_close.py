@@ -130,6 +130,48 @@ class TestDownloadWorker:
         worker.run()
         assert adapter.closed == 1
 
+    def test_pre_translated_source_lands_content_as_translation(
+        self, qapp, library_dir, fake_adapter
+    ):
+        # A source like webtruyendich serves a finished translation. The worker must
+        # store it as `translated` (skipping our own translators) AND as `content`
+        # (else pending_download re-queues it forever).
+        adapter = fake_adapter()
+        adapter.content_is_translated = True
+        adapter.translated_lang = "vi"
+        adapter.translator_label = "webtruyendich (Gemini Flash 3.5)"
+
+        path = _project(library_dir)
+        DownloadWorker(path, delay=0).run()
+
+        reopened = NovelProject.open(path)
+        try:
+            c0 = reopened.chapter(0)
+            assert c0.content == "nội dung"  # written so it isn't re-downloaded
+            assert c0.translated == "nội dung"  # landed as the translation
+            assert c0.translated_title == "C1"
+            assert c0.target_lang == "vi"
+            assert c0.translator == "webtruyendich (Gemini Flash 3.5)"
+            assert c0.is_translated
+            assert reopened.pending_download() == []  # not re-queued
+        finally:
+            reopened.close()
+
+    def test_ordinary_source_only_sets_content(self, qapp, library_dir, fake_adapter):
+        # The default path is unchanged: content set, translation left for later.
+        fake_adapter()  # content_is_translated defaults to False
+        path = _project(library_dir)
+        DownloadWorker(path, delay=0).run()
+
+        reopened = NovelProject.open(path)
+        try:
+            c0 = reopened.chapter(0)
+            assert c0.content == "nội dung"
+            assert c0.translated == ""
+            assert not c0.is_translated
+        finally:
+            reopened.close()
+
 
 class TestStatusPlumbing:
     def test_adapter_status_is_a_noop_without_a_listener(self):
