@@ -150,34 +150,76 @@ class WtdBrowserSession:
             self.close()  # the session is dead; don't let the rest of the batch retry it
             raise WtdBrowserSessionError(f"Browser navigation failed: {exc}") from exc
 
-    def get_html(self, url: str) -> str:
+    def get_html(self, url: str, *, scroll_item_selector: str | None = None) -> str:
         """Navigate to `url` and return the rendered HTML (landing page / TOC).
+
+        With `scroll_item_selector`, the page is treated as a lazy-loaded/
+        infinite-scroll list: scroll to the bottom until the number of matching
+        elements stops growing before reading the HTML. The webtruyendich chapter
+        list renders only its first ~135 chapters up front and appends the rest on
+        scroll, so a plain read would miss most of a long novel.
 
         Raises WtdBrowserSessionError if the browser is gone or a Cloudflare
         interstitial is still up after giving the managed challenge time to clear.
         """
         self._goto(url)
-        return self._content_after_challenge(url)
+        markup = self._content_after_challenge(url)
+        if scroll_item_selector:
+            markup = self._scroll_until_stable(scroll_item_selector)
+        return markup
+
+    def _scroll_until_stable(
+        self,
+        item_selector: str,
+        *,
+        settle_ms: int = 600,
+        stable_rounds: int = 3,
+        max_rounds: int = 300,
+    ) -> str:
+        """Scroll to the bottom until `item_selector`'s count stops growing, then
+        return the fully-rendered HTML. `max_rounds` bounds a list that never
+        settles; `stable_rounds` guards against a slow append between scrolls."""
+        page = self._page
+        prev, stable = -1, 0
+        try:
+            for _ in range(max_rounds):
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(settle_ms)
+                count = page.eval_on_selector_all(item_selector, "els => els.length")
+                if count == prev:
+                    stable += 1
+                    if stable >= stable_rounds:
+                        break
+                else:
+                    stable = 0
+                prev = count
+            return page.content()
+        except Exception as exc:
+            self.close()
+            raise WtdBrowserSessionError(f"Lost the page while loading the list: {exc}") from exc
 
     def _content_after_challenge(self, url: str, wait_seconds: float = 15.0) -> str:
         """Return the page HTML, first waiting out a managed Cloudflare challenge.
 
         A real browser sees "Just a moment…" for a beat, then JS redirects to the
         real page. Reading `content()` the instant navigation settles can catch that
-        interstitial, so poll until the challenge markers clear (or give up)."""
+        interstitial — or throw "page is navigating" mid-redirect — so poll,
+        tolerating both, until the challenge clears (or the deadline passes)."""
         page = self._page
         deadline = time.monotonic() + wait_seconds
-        try:
-            markup = page.content()
-            while looks_like_challenge(markup) and time.monotonic() < deadline:
-                time.sleep(1.0)
-                markup = page.content()
-        except Exception as exc:
-            self.close()
-            raise WtdBrowserSessionError(f"Lost the page while clearing challenge: {exc}") from exc
-        if looks_like_challenge(markup):
-            raise WtdBrowserSessionError(f"Cloudflare returned a challenge for {url}")
-        return markup
+        last: str | None = None
+        while time.monotonic() < deadline:
+            try:
+                last = page.content()
+            except Exception:
+                # Page is mid-navigation (Cloudflare redirect / client-side routing).
+                # Not fatal — wait a beat and try again.
+                time.sleep(0.5)
+                continue
+            if not looks_like_challenge(last):
+                return last
+            time.sleep(1.0)
+        raise WtdBrowserSessionError(f"Cloudflare returned a challenge for {url}")
 
     def read_translated_chapter(
         self,

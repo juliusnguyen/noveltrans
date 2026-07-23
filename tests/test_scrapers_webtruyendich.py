@@ -173,11 +173,13 @@ class _FakeSession:
         self.pages = pages
         self.chapter_html = chapter_html
         self.requested: list[str] = []
+        self.scrolled: list[str | None] = []  # scroll_item_selector per get_html call
         self.translated: list[tuple[str, str]] = []  # (url, model)
         self.closed = False
 
-    def get_html(self, url: str) -> str:
+    def get_html(self, url: str, *, scroll_item_selector: str | None = None) -> str:
         self.requested.append(url)
+        self.scrolled.append(scroll_item_selector)
         if url not in self.pages:
             raise AssertionError(f"adapter fetched an unexpected URL: {url}")
         return self.pages[url]
@@ -216,6 +218,14 @@ class TestAdapterWiring:
         refs = adapter.fetch_chapter_list(NOVEL_URL)
         assert session.requested == [TOC_URL]
         assert len(refs) > 1
+
+    def test_toc_is_fetched_with_scroll_mode_but_metadata_is_not(self):
+        # The TOC lazy-loads on scroll, so it must be fetched in scroll mode;
+        # the landing page is static and must not pay for scrolling.
+        adapter, session = make_adapter()
+        adapter.fetch_metadata(NOVEL_URL)
+        adapter.fetch_chapter_list(NOVEL_URL)
+        assert session.scrolled == [None, 'a[href*="/fanqie/chuong-"]']
 
     def test_fetch_chapter_selects_the_gemini_model_and_parses(self):
         adapter, session = make_adapter()
