@@ -25,6 +25,7 @@ AI-quota-gated — hammering it risks a block that would kill the only path it h
 
 from __future__ import annotations
 
+import html
 import re
 from urllib.parse import urljoin
 
@@ -52,6 +53,15 @@ RETRANSLATE_BUTTON = "Dịch lại"
 
 SEL_TOC_LINKS = 'a[href*="/fanqie/chuong-"]'
 _CH_NUM_RE = re.compile(r"/chuong-(\d+)(?:[-/]|$)")
+# Chapter anchor: href + inner title. Parsed by regex, not an HTML parser — the
+# raw TOC document is malformed enough that lxml/html.parser drop the title text
+# of all but the first ~135 chapters (see parse_chapter_list).
+_CH_ANCHOR_RE = re.compile(
+    r'<a\b[^>]*?\bhref="([^"]*/fanqie/chuong-\d+[^"]*)"[^>]*>(.*?)</a>',
+    re.IGNORECASE | re.DOTALL,
+)
+_TAG_RE = re.compile(r"<[^>]+>")
+_WS_RE = re.compile(r"\s+")
 _SLUG_RE = re.compile(r"webtruyendich\.com/truyen/([a-z0-9-]+)")
 # The <h1> reads "Truyện <title>"; drop that leading label.
 _TITLE_PREFIX_RE = re.compile(r"^\s*Truyện\s+")
@@ -114,22 +124,28 @@ def parse_metadata(markup: str, url: str, site: str) -> NovelMeta:
 
 
 def parse_chapter_list(markup: str, base_url: str) -> list[ChapterRef]:
-    """Read the full TOC (one page). Links are newest-first and a chapter number
-    can occasionally carry two different title-slugs, so dedup by URL and order by
-    chapter number (falling back to first-seen order for equal numbers)."""
-    soup = BeautifulSoup(markup, "lxml")
+    """Read the full TOC. Links are newest-first and a chapter number can
+    occasionally carry two different title-slugs, so dedup by URL and order by
+    chapter number (falling back to first-seen order for equal numbers).
+
+    Uses a regex over the raw markup rather than an HTML parser on purpose: the
+    server-rendered TOC document (read whole to avoid scrolling the JS-virtualized
+    list) is malformed enough that lxml and html.parser both drop the title text of
+    all but the first ~135 chapters. The regex recovers every title, and works
+    equally on the well-formed browser DOM used as the fallback."""
     seen: set[str] = set()
     entries: list[tuple[int, int, str, str]] = []  # (num, order, title, url)
-    for a in soup.select(SEL_TOC_LINKS):
-        href = a.get("href") or ""
-        match = _CH_NUM_RE.search(href)
-        if not match:
+    for match in _CH_ANCHOR_RE.finditer(markup):
+        href = match.group(1)
+        num = _CH_NUM_RE.search(href)
+        if not num:
             continue
         absolute = urljoin(base_url, href)
         if absolute in seen:
             continue
         seen.add(absolute)
-        entries.append((int(match.group(1)), len(entries), a.get_text(" ", strip=True), absolute))
+        title = _WS_RE.sub(" ", html.unescape(_TAG_RE.sub(" ", match.group(2)))).strip()
+        entries.append((int(num.group(1)), len(entries), title, absolute))
 
     if not entries:
         raise ScrapeError("Chapter list not found — page layout may have changed", base_url)
@@ -194,10 +210,12 @@ class WebtruyendichAdapter(SiteAdapter):
             )
         return self._session
 
-    def _get_html(self, url: str, *, scroll_item_selector: str | None = None) -> str:
+    def _get_html(
+        self, url: str, *, prefer_document: bool = False, scroll_item_selector: str | None = None
+    ) -> str:
         try:
             return self._ensure_session().get_html(
-                url, scroll_item_selector=scroll_item_selector
+                url, prefer_document=prefer_document, scroll_item_selector=scroll_item_selector
             )
         except BrowserUnavailableError as exc:
             raise self._browser_needed_error(url) from exc
@@ -228,9 +246,12 @@ class WebtruyendichAdapter(SiteAdapter):
         return parse_metadata(self._get_html(landing_url(url)), url, self.name)
 
     def fetch_chapter_list(self, url: str) -> list[ChapterRef]:
-        # The TOC lazy-loads on scroll; fetch with scroll mode so every chapter is
-        # in the DOM before parsing (a plain read catches only the first ~135).
-        markup = self._get_html(toc_url(url), scroll_item_selector=SEL_TOC_LINKS)
+        # The TOC is fully server-rendered but JS virtualizes the live DOM down to
+        # ~135 rows. Read the raw document (all chapters, instant); if that response
+        # is a Cloudflare challenge, fall back to scrolling the rebuilt DOM.
+        markup = self._get_html(
+            toc_url(url), prefer_document=True, scroll_item_selector=SEL_TOC_LINKS
+        )
         return parse_chapter_list(markup, url)
 
     def fetch_chapter(self, ref: ChapterRef) -> str:

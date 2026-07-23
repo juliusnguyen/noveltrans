@@ -174,12 +174,20 @@ class _FakeSession:
         self.chapter_html = chapter_html
         self.requested: list[str] = []
         self.scrolled: list[str | None] = []  # scroll_item_selector per get_html call
+        self.prefer_document: list[bool] = []  # prefer_document per get_html call
         self.translated: list[tuple[str, str]] = []  # (url, model)
         self.closed = False
 
-    def get_html(self, url: str, *, scroll_item_selector: str | None = None) -> str:
+    def get_html(
+        self,
+        url: str,
+        *,
+        prefer_document: bool = False,
+        scroll_item_selector: str | None = None,
+    ) -> str:
         self.requested.append(url)
         self.scrolled.append(scroll_item_selector)
+        self.prefer_document.append(prefer_document)
         if url not in self.pages:
             raise AssertionError(f"adapter fetched an unexpected URL: {url}")
         return self.pages[url]
@@ -219,12 +227,14 @@ class TestAdapterWiring:
         assert session.requested == [TOC_URL]
         assert len(refs) > 1
 
-    def test_toc_is_fetched_with_scroll_mode_but_metadata_is_not(self):
-        # The TOC lazy-loads on scroll, so it must be fetched in scroll mode;
-        # the landing page is static and must not pay for scrolling.
+    def test_toc_reads_the_raw_document_with_a_scroll_fallback(self):
+        # The TOC is fully server-rendered but JS virtualizes it, so it's fetched
+        # from the raw document (prefer_document) with scrolling as the fallback;
+        # the landing page needs neither.
         adapter, session = make_adapter()
         adapter.fetch_metadata(NOVEL_URL)
         adapter.fetch_chapter_list(NOVEL_URL)
+        assert session.prefer_document == [False, True]
         assert session.scrolled == [None, 'a[href*="/fanqie/chuong-"]']
 
     def test_fetch_chapter_selects_the_gemini_model_and_parses(self):
