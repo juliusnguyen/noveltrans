@@ -194,9 +194,11 @@ class WebtruyendichAdapter(SiteAdapter):
             )
         return self._session
 
-    def _get_html(self, url: str) -> str:
+    def _get_html(self, url: str, *, scroll_item_selector: str | None = None) -> str:
         try:
-            return self._ensure_session().get_html(url)
+            return self._ensure_session().get_html(
+                url, scroll_item_selector=scroll_item_selector
+            )
         except BrowserUnavailableError as exc:
             raise self._browser_needed_error(url) from exc
         except WtdBrowserSessionError as exc:
@@ -226,7 +228,10 @@ class WebtruyendichAdapter(SiteAdapter):
         return parse_metadata(self._get_html(landing_url(url)), url, self.name)
 
     def fetch_chapter_list(self, url: str) -> list[ChapterRef]:
-        return parse_chapter_list(self._get_html(toc_url(url)), url)
+        # The TOC lazy-loads on scroll; fetch with scroll mode so every chapter is
+        # in the DOM before parsing (a plain read catches only the first ~135).
+        markup = self._get_html(toc_url(url), scroll_item_selector=SEL_TOC_LINKS)
+        return parse_chapter_list(markup, url)
 
     def fetch_chapter(self, ref: ChapterRef) -> str:
         try:
