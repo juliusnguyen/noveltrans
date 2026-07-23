@@ -1217,13 +1217,34 @@ class DownloadWorker(QThread):
     finished_ok = Signal(int, int)  # downloaded count, error count
 
     def __init__(
-        self, project_path: Path, delay: float, cookies: str = "", parent=None
+        self,
+        project_path: Path,
+        delay: float,
+        cookies: str = "",
+        parent=None,
+        *,
+        start_index: int = 0,
+        end_index: int | None = None,
+        force: bool = False,
     ):
         super().__init__(parent)
         self.project_path = Path(project_path)
         self.delay = delay
         self.cookies = cookies
+        # 0-based, inclusive chapter-index bounds for a partial download. Defaults
+        # cover the whole novel, so the plain "download all" caller is unchanged.
+        # `force` re-fetches chapters in range even if they already have content
+        # (a single-chapter refresh); otherwise only missing chapters are fetched.
+        self.start_index = start_index
+        self.end_index = end_index
+        self.force = force
         self._cancelled = False
+
+    def _select_chapters(self, project) -> list:
+        """The chapters this run will fetch, honouring the range and `force`."""
+        if self.force:
+            return project.chapters_in_range(self.start_index, self.end_index)
+        return project.pending_download(self.start_index, self.end_index)
 
     def cancel(self) -> None:
         self._cancelled = True
@@ -1261,7 +1282,7 @@ class DownloadWorker(QThread):
             if adapter.name == "medoctruyen":
                 client.set_cookies(self.cookies)
 
-            pending = project.pending_download()
+            pending = self._select_chapters(project)
             total = len(pending)
             done = 0
             errors = 0

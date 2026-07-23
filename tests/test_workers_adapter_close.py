@@ -103,9 +103,12 @@ class TestScanWorker:
         assert failures and "Chưa hỗ trợ" in failures[0]
 
 
-def _project(library_dir: Path) -> Path:
+def _project(library_dir: Path, n: int = 1) -> Path:
     meta = NovelMeta(url=URL, site="fake", title="Tựa đề")
-    refs = [ChapterRef(index=0, title="C1", url="https://fake.test/txt/1/1")]
+    refs = [
+        ChapterRef(index=i, title=f"C{i + 1}", url=f"https://fake.test/txt/1/{i + 1}")
+        for i in range(n)
+    ]
     project = NovelProject.create(library_dir, meta, refs)
     path = project.path
     project.close()
@@ -169,6 +172,53 @@ class TestDownloadWorker:
             assert c0.content == "nội dung"
             assert c0.translated == ""
             assert not c0.is_translated
+        finally:
+            reopened.close()
+
+    def test_download_from_a_start_index_only(self, qapp, library_dir, fake_adapter):
+        fake_adapter()
+        path = _project(library_dir, n=5)
+        DownloadWorker(path, delay=0, start_index=2).run()  # "from chapter 3"
+
+        reopened = NovelProject.open(path)
+        try:
+            got = [reopened.chapter(i).content for i in range(5)]
+            assert got == ["", "", "nội dung", "nội dung", "nội dung"]
+        finally:
+            reopened.close()
+
+    def test_download_a_range_skips_already_downloaded(self, qapp, library_dir, fake_adapter):
+        fake_adapter()
+        path = _project(library_dir, n=5)
+        pre = NovelProject.open(path)
+        pre.save_content(2, "cũ")  # already downloaded, inside the range
+        pre.close()
+
+        DownloadWorker(path, delay=0, start_index=1, end_index=3).run()
+
+        reopened = NovelProject.open(path)
+        try:
+            got = [reopened.chapter(i).content for i in range(5)]
+            # idx 1 & 3 fetched; idx 2 left untouched (not re-fetched); 0 & 4 out of range
+            assert got == ["", "nội dung", "cũ", "nội dung", ""]
+        finally:
+            reopened.close()
+
+    def test_force_redownloads_even_downloaded_chapters(self, qapp, library_dir, fake_adapter):
+        fake_adapter()
+        path = _project(library_dir, n=5)
+        pre = NovelProject.open(path)
+        pre.save_content(2, "cũ")  # already downloaded
+        pre.close()
+
+        # "Chỉ tải lại chương 3" → force a single-chapter refresh
+        DownloadWorker(path, delay=0, start_index=2, end_index=2, force=True).run()
+
+        reopened = NovelProject.open(path)
+        try:
+            assert reopened.chapter(2).content == "nội dung"  # overwritten
+            assert reopened.chapter(1).content == ""  # neighbours untouched
+            assert reopened.chapter(3).content == ""
         finally:
             reopened.close()
 

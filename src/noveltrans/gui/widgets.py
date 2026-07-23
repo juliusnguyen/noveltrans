@@ -372,9 +372,14 @@ def _copy_index_text(index) -> None:
         QApplication.clipboard().setText(str(text))
 
 
-def enable_cell_copy(table: QTableView) -> None:
+def enable_cell_copy(table: QTableView, extra_actions=None) -> None:
     """Let the user copy a table cell (e.g. a long error message) via Ctrl+C or a
-    right-click "Sao chép" menu, so it's easy to paste elsewhere."""
+    right-click "Sao chép" menu, so it's easy to paste elsewhere.
+
+    `extra_actions`, if given, is called as `extra_actions(menu, index)` while the
+    right-click menu is being built, so a caller can append its own actions (e.g.
+    "download from this chapter") to the same menu rather than fighting over the
+    table's single context-menu signal."""
     table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
     table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
@@ -388,6 +393,8 @@ def enable_cell_copy(table: QTableView) -> None:
         table.setCurrentIndex(index)
         menu = QMenu(table)
         menu.addAction("Sao chép", lambda: _copy_index_text(index))
+        if extra_actions is not None:
+            extra_actions(menu, index)
         menu.exec(table.viewport().mapToGlobal(pos))
 
     shortcut = QShortcut(QKeySequence.StandardKey.Copy, table)

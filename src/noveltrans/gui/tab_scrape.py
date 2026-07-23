@@ -13,9 +13,11 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSpinBox,
     QTableView,
     QVBoxLayout,
     QWidget,
@@ -60,7 +62,14 @@ class ScrapeTab(QWidget):
         # self so shutdown() can stop it before the widget is torn down.
         self._resume_timer = QTimer(self)
         self._resume_timer.setSingleShot(True)
-        self._resume_timer.timeout.connect(self._start_download)
+        # Resume after an unlock re-runs the download with the SAME scope that was
+        # interrupted (stored below), not always "all pending".
+        self._resume_timer.timeout.connect(self._launch_download)
+        # Current download scope: 0-based inclusive [start, end] and whether to
+        # force re-fetch. Defaults = the whole novel (plain "download all").
+        self._dl_start = 0
+        self._dl_end: int | None = None
+        self._dl_force = False
 
         # --- recent projects row: continue a novel without pasting its URL
         self.picker = ProjectPicker()
@@ -112,13 +121,15 @@ class ScrapeTab(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
-        enable_cell_copy(self.table)  # Ctrl+C / right-click to copy a cell (e.g. errors)
+        # Ctrl+C copies a cell; the right-click menu also offers "download from here"
+        # / "only this chapter" via the extra_actions hook (see _add_download_actions).
+        enable_cell_copy(self.table, extra_actions=self._add_download_actions)
 
         # --- download row
         self.download_button = QPushButton("Tải các chương")
         self.download_button.setProperty("primary", True)
         self.download_button.setEnabled(False)
-        self.download_button.clicked.connect(self._start_download)
+        self.download_button.clicked.connect(self._download_all)
         self.cancel_button = QPushButton("Dừng")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self._cancel_download)
@@ -131,12 +142,34 @@ class ScrapeTab(QWidget):
         download_row.addWidget(self.cancel_button)
         download_row.addWidget(self.progress, stretch=1)
 
+        # --- range row: download a chosen span of chapters (1-based chapter numbers)
+        self.range_from = QSpinBox()
+        self.range_from.setMinimum(1)
+        self.range_from.setMaximum(1)
+        self.range_to = QSpinBox()
+        self.range_to.setMinimum(1)
+        self.range_to.setMaximum(1)
+        self.range_button = QPushButton("Tải khoảng")
+        self.range_button.setEnabled(False)
+        self.range_button.clicked.connect(self._download_range)
+        range_row = QHBoxLayout()
+        range_row.addWidget(QLabel("Tải khoảng chương — từ"))
+        range_row.addWidget(self.range_from)
+        range_row.addWidget(QLabel("đến"))
+        range_row.addWidget(self.range_to)
+        range_row.addWidget(self.range_button)
+        range_row.addStretch(1)
+        range_row.addWidget(
+            QLabel("(hoặc chuột phải một chương để tải từ đó)"),
+        )
+
         layout = QVBoxLayout(self)
         layout.addLayout(recent_row)
         layout.addLayout(url_row)
         layout.addWidget(meta_box)
         layout.addWidget(self.table, stretch=1)
         layout.addLayout(download_row)
+        layout.addLayout(range_row)
         layout.addWidget(self.status_label)
 
     # --------------------------------------------------------- load existing
@@ -172,6 +205,7 @@ class ScrapeTab(QWidget):
         counts = self.project.counts()
         self.count_label.setText(str(counts["total"]))
         self.download_button.setEnabled(True)
+        self.range_button.setEnabled(True)
         self.status_label.setText(
             f"Đang làm: {counts['downloaded']}/{counts['total']} chương đã tải, "
             f"{counts['translated']} đã dịch. Bấm 'Quét' nếu truyện có chương mới."
@@ -186,6 +220,7 @@ class ScrapeTab(QWidget):
             return
         self.scan_button.setEnabled(False)
         self.download_button.setEnabled(False)
+        self.range_button.setEnabled(False)
         self.status_label.setText("Đang quét metadata và mục lục…")
 
         self._scan_worker = ScanWorker(
@@ -209,6 +244,7 @@ class ScrapeTab(QWidget):
         self.count_label.setText(str(count))
         self._reload_table()
         self.download_button.setEnabled(True)
+        self.range_button.setEnabled(True)
         counts = self.project.counts()
         self.status_label.setText(
             f"Đã quét xong: {counts['total']} chương, {counts['downloaded']} đã tải."
@@ -222,19 +258,63 @@ class ScrapeTab(QWidget):
 
     # -------------------------------------------------------------- download
 
-    def _start_download(self) -> None:
+    def _add_download_actions(self, menu: QMenu, index) -> None:
+        """Append per-chapter download actions to the table's right-click menu."""
+        chapter = self.model.chapter_at(index.row())
+        if chapter is None:
+            return
+        running = self._download_worker is not None and self._download_worker.isRunning()
+        menu.addSeparator()
+        from_here = menu.addAction(f"Tải từ chương {chapter.index + 1}")
+        from_here.setEnabled(not running)
+        from_here.triggered.connect(lambda: self._begin_download(chapter.index, None, False))
+        only_this = menu.addAction(f"Chỉ tải lại chương {chapter.index + 1}")
+        only_this.setEnabled(not running)
+        only_this.triggered.connect(
+            lambda: self._begin_download(chapter.index, chapter.index, True)
+        )
+
+    def _download_all(self) -> None:
+        self._begin_download(0, None, False)
+
+    def _download_range(self) -> None:
+        start = self.range_from.value() - 1  # UI is 1-based; storage idx is 0-based
+        end = self.range_to.value() - 1
+        if end < start:
+            start, end = end, start  # tolerate a reversed range
+        self._begin_download(start, end, False)
+
+    def _begin_download(self, start_index: int, end_index: int | None, force: bool) -> None:
+        """Record the scope, then launch. Resume-after-unlock reuses this scope."""
+        self._dl_start = start_index
+        self._dl_end = end_index
+        self._dl_force = force
+        self._launch_download()
+
+    def _selected_pending(self) -> list:
+        """The chapters the current scope will fetch — matches the worker's choice."""
+        if self.project is None:
+            return []
+        if self._dl_force:
+            return self.project.chapters_in_range(self._dl_start, self._dl_end)
+        return self.project.pending_download(self._dl_start, self._dl_end)
+
+    def _launch_download(self) -> None:
         # The unlock's resume lands here; we're downloading again, so the "unlock in
         # flight" state is over. If this resumed batch immediately re-hits the cap,
         # _on_daily_limit re-sets the flag before _on_download_finished reads it.
         self._auto_unlocking = False
         if self.project is None:
             return
-        pending = len(self.project.pending_download())
+        pending = len(self._selected_pending())
         if pending == 0:
-            QMessageBox.information(self, "Đã đủ", "Tất cả các chương đã được tải về.")
+            QMessageBox.information(
+                self, "Đã đủ", "Không có chương nào cần tải trong phạm vi đã chọn."
+            )
             return
 
         self.download_button.setEnabled(False)
+        self.range_button.setEnabled(False)
         self.scan_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.progress.setMaximum(pending)
@@ -245,6 +325,9 @@ class ScrapeTab(QWidget):
             self.project.path,
             self.config.request_delay,
             cookies=self.config.medoctruyen_cookies,
+            start_index=self._dl_start,
+            end_index=self._dl_end,
+            force=self._dl_force,
         )
         self._download_worker.progress.connect(self._on_progress)
         self._download_worker.chapter_done.connect(self._on_chapter_done)
@@ -317,6 +400,7 @@ class ScrapeTab(QWidget):
         self._unlock_attempts += 1
         self._auto_unlocking = True
         self.download_button.setEnabled(False)
+        self.range_button.setEnabled(False)
         self.status_label.setText("🔓 Đang tự mở khoá qua Discord (/mochuong)… giữ cửa sổ mở.")
         self._unlock_worker = UnlockWorker(self.config.discord_channel_url, code)
         self._unlock_worker.unlocked.connect(self._on_unlocked)
@@ -336,6 +420,7 @@ class ScrapeTab(QWidget):
     def _on_unlock_needs_login(self, message: str) -> None:
         self._auto_unlocking = False
         self.download_button.setEnabled(True)
+        self.range_button.setEnabled(True)
         set_dock_badge(1)
         request_attention(self.window())
         QMessageBox.warning(
@@ -349,6 +434,7 @@ class ScrapeTab(QWidget):
         # Auto-unlock failed — fall back to the manual flow so the user isn't stuck.
         self._auto_unlocking = False
         self.download_button.setEnabled(True)
+        self.range_button.setEnabled(True)
         set_dock_badge(1)
         request_attention(self.window())
         QMessageBox.warning(
@@ -389,6 +475,7 @@ class ScrapeTab(QWidget):
             # on the cap); leave the download button disabled and the status as-is.
             return
         self.download_button.setEnabled(True)
+        self.range_button.setEnabled(True)
         message = f"Tải xong: {ok} chương thành công"
         if errors:
             message += f", {errors} lỗi (bấm 'Tải các chương' để thử lại)"
@@ -424,6 +511,15 @@ class ScrapeTab(QWidget):
     def _reload_table(self) -> None:
         if self.project is not None:
             self.model.set_chapters(self.project.chapters())
+            self._sync_range_bounds()
+
+    def _sync_range_bounds(self) -> None:
+        """Clamp the From/To spin boxes to the novel's chapter count."""
+        count = self.model.rowCount()
+        top = max(1, count)
+        for box in (self.range_from, self.range_to):
+            box.setMaximum(top)
+        self.range_to.setValue(top)  # default: to the last chapter
 
     def current_title(self) -> str:
         """The loaded novel's title (for the workspace tab label), or ""."""

@@ -212,11 +212,37 @@ class NovelProject:
         row = self._db.execute("SELECT * FROM chapters WHERE idx = ?", (idx,)).fetchone()
         return _row_to_chapter(row) if row else None
 
-    def pending_download(self) -> list[Chapter]:
-        """Chapters that still need their original content fetched."""
-        rows = self._db.execute(
-            "SELECT * FROM chapters WHERE content = '' ORDER BY idx"
-        ).fetchall()
+    def pending_download(
+        self, start_idx: int = 0, end_idx: int | None = None
+    ) -> list[Chapter]:
+        """Chapters that still need their original content fetched.
+
+        `start_idx`/`end_idx` bound the search to a 0-based, inclusive chapter-index
+        range (default = the whole novel), so the caller can download from a chosen
+        chapter or a range without re-fetching the ones before it.
+        """
+        sql = "SELECT * FROM chapters WHERE content = '' AND idx >= ?"
+        params: list[object] = [start_idx]
+        if end_idx is not None:
+            sql += " AND idx <= ?"
+            params.append(end_idx)
+        sql += " ORDER BY idx"
+        rows = self._db.execute(sql, params).fetchall()
+        return [_row_to_chapter(r) for r in rows]
+
+    def chapters_in_range(self, start_idx: int, end_idx: int | None = None) -> list[Chapter]:
+        """All chapters in a 0-based inclusive index range, regardless of status.
+
+        Used for a forced re-download, which re-fetches even chapters that already
+        have content.
+        """
+        sql = "SELECT * FROM chapters WHERE idx >= ?"
+        params: list[object] = [start_idx]
+        if end_idx is not None:
+            sql += " AND idx <= ?"
+            params.append(end_idx)
+        sql += " ORDER BY idx"
+        rows = self._db.execute(sql, params).fetchall()
         return [_row_to_chapter(r) for r in rows]
 
     def pending_translation(self, target_lang: str) -> list[Chapter]:

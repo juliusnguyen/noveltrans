@@ -72,6 +72,22 @@ class TestResumeQueries:
         pending = project.pending_download()
         assert [c.index for c in pending] == [1, 3, 4]
 
+    def test_pending_download_from_a_start_index(self, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        # "download from chapter 3" (idx 2) → only pending chapters at idx >= 2
+        assert [c.index for c in project.pending_download(2)] == [2, 3, 4]
+
+    def test_pending_download_within_a_range(self, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_content(2, "text")  # already downloaded → skipped even in-range
+        assert [c.index for c in project.pending_download(1, 3)] == [1, 3]
+
+    def test_chapters_in_range_ignores_status(self, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_content(2, "text")  # downloaded — still included (force path)
+        assert [c.index for c in project.chapters_in_range(1, 3)] == [1, 2, 3]
+        assert [c.index for c in project.chapters_in_range(3)] == [3, 4]
+
     def test_pending_translation_requires_content(self, library_dir, sample_meta, sample_refs):
         project = NovelProject.create(library_dir, sample_meta, sample_refs)
         assert project.pending_translation("vi") == []
