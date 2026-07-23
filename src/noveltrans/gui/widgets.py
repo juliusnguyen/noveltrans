@@ -140,13 +140,14 @@ class RetranslateButtonDelegate(RowButtonDelegate):
 class AudioChapterTableModel(QAbstractTableModel):
     """Read-only table over Chapter rows, audio-pipeline view."""
 
-    COLUMNS = ("#", "Tên chương (dịch)", "Âm thanh", "Thời lượng", "Giọng", "Lỗi", "")
+    COLUMNS = ("#", "Tên chương (dịch)", "Ký tự", "Âm thanh", "Thời lượng", "Giọng", "Lỗi", "")
     TITLE_COLUMN = 1
-    STATUS_COLUMN = 2
-    DURATION_COLUMN = 3
-    VOICE_COLUMN = 4
-    ERROR_COLUMN = 5
-    REGENERATE_COLUMN = 6
+    CHARS_COLUMN = 2
+    STATUS_COLUMN = 3
+    DURATION_COLUMN = 4
+    VOICE_COLUMN = 5
+    ERROR_COLUMN = 6
+    REGENERATE_COLUMN = 7
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -210,6 +211,9 @@ class AudioChapterTableModel(QAbstractTableModel):
                 if self._use_translation:
                     return chapter.translated_title or chapter.title
                 return chapter.title
+            if column == self.CHARS_COLUMN:
+                text = chapter.translated if self._use_translation else chapter.content
+                return f"{len(text):,}" if text else ""
             if column == self.STATUS_COLUMN:
                 return self._audio_status(chapter)[0]
             if column == self.DURATION_COLUMN:
@@ -226,7 +230,10 @@ class AudioChapterTableModel(QAbstractTableModel):
             return chapter.audio_error  # full text on hover (cell is truncated)
         if role == Qt.ItemDataRole.ForegroundRole and column == self.STATUS_COLUMN:
             return self._audio_status(chapter)[1]
-        if role == Qt.ItemDataRole.TextAlignmentRole and column == self.DURATION_COLUMN:
+        if role == Qt.ItemDataRole.TextAlignmentRole and column in (
+            self.CHARS_COLUMN,
+            self.DURATION_COLUMN,
+        ):
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         if column == self.REGENERATE_COLUMN:
             has_source = bool(chapter.translated if self._use_translation else chapter.content)

@@ -41,12 +41,44 @@ def split_sentences(text: str, max_chars: int = 400) -> list[str]:
     return chunks
 
 
+def merge_short_chunks(chunks: list[str], min_chars: int, max_chars: int) -> list[str]:
+    """Coalesce sub-`min_chars` fragments into a neighbour, capped at `max_chars`.
+
+    Autoregressive TTS (VieNeu) reliably garbles very short inputs — a stray
+    number or a one-word line gives the model too little context, so its
+    end-of-speech prediction misfires and it babbles until the token cap.
+    Measured drift rate is ~80% under 10 chars and 0% at 40+ (see change 028).
+
+    A chunk is merged into the previous one (joined with a space) when either it
+    or the running chunk is below the floor and the result still fits max_chars.
+    A fragment that can't merge without overflowing is left as-is — rare, and the
+    alternative (an oversized chunk) has its own, worse failure mode.
+    """
+    if min_chars <= 0:
+        return chunks
+    out: list[str] = []
+    for chunk in chunks:
+        if (
+            out
+            and (len(chunk) < min_chars or len(out[-1]) < min_chars)
+            and len(out[-1]) + 1 + len(chunk) <= max_chars
+        ):
+            out[-1] = f"{out[-1]} {chunk}"
+        else:
+            out.append(chunk)
+    return out
+
+
 class TtsEngine(ABC):
     """One text-to-speech backend. Chunks long text and concatenates audio."""
 
     name: str = ""
     display_name: str = ""
     max_chunk_chars: int = 400
+    # Chunks shorter than this are merged into a neighbour before synthesis —
+    # short fragments make autoregressive TTS drift/babble (see change 028).
+    # 0 disables merging.
+    min_chunk_chars: int = 30
     sample_rate: int = 48000
     paragraph_gap_seconds: float = 0.4  # silence inserted between chunks
 
@@ -96,6 +128,7 @@ class TtsEngine(ABC):
         if clean:
             text = clean_for_tts(text, clean_extra_remove)
         chunks = split_sentences(text, self.max_chunk_chars)
+        chunks = merge_short_chunks(chunks, self.min_chunk_chars, self.max_chunk_chars)
         if not chunks:
             raise TtsError("Chương không có nội dung để đọc.")
 

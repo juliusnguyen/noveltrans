@@ -132,6 +132,7 @@ class AudioTab(QWidget):
             AudioChapterTableModel.REGENERATE_COLUMN, self._row_button_delegate
         )
         self.table.setColumnWidth(AudioChapterTableModel.REGENERATE_COLUMN, 100)
+        self.table.setColumnWidth(AudioChapterTableModel.CHARS_COLUMN, 70)
         self.table.doubleClicked.connect(self._on_row_double_clicked)
 
         # --- bottom row
