@@ -1275,7 +1275,23 @@ class DownloadWorker(QThread):
                 self.progress.emit(done, total, ref_title)
                 try:
                     text = self._fetch_with_backoff(adapter, chapter, done, total)
-                    project.save_content(chapter.index, text)
+                    if adapter.content_is_translated:
+                        # This source (e.g. webtruyendich) serves a finished
+                        # translation, not source text. Land it as `translated`
+                        # directly and skip our own translators. `content` is also
+                        # written: it *is* the text we fetched, and leaving it empty
+                        # would make pending_download re-queue this chapter forever
+                        # (and it keeps original-text TTS/export working).
+                        project.save_content(chapter.index, text)
+                        project.save_translation(
+                            chapter.index,
+                            chapter.title,
+                            text,
+                            adapter.translated_lang,
+                            adapter.translator_label,
+                        )
+                    else:
+                        project.save_content(chapter.index, text)
                     self.chapter_done.emit(chapter.index)
                 except DailyLimitError as exc:
                     # A per-day cap blocks every remaining chapter — stop the batch
