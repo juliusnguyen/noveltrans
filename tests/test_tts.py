@@ -7,7 +7,7 @@ import pytest
 
 from noveltrans.errors import TtsError
 from noveltrans.tts import get_tts_engine
-from noveltrans.tts.base import TtsEngine, split_sentences
+from noveltrans.tts.base import TtsEngine, merge_short_chunks, split_sentences
 
 
 class TestSplitSentences:
@@ -36,6 +36,45 @@ class TestSplitSentences:
         text = "Anh nói. Cô cười! Họ đi về…\n\nHôm sau trời mưa."
         chunks = split_sentences(text, 20)
         assert " ".join(chunks).replace(" ", "") == text.replace("\n\n", "").replace(" ", "")
+
+
+class TestMergeShortChunks:
+    def test_absorbs_tiny_fragment_into_neighbour(self):
+        # "5" is the kind of stray fragment that makes VieNeu drift.
+        assert merge_short_chunks(["5", "Câu dài đủ để đứng một mình ở đây."], 30, 400) == [
+            "5 Câu dài đủ để đứng một mình ở đây."
+        ]
+
+    def test_leaves_long_chunks_untouched(self):
+        chunks = ["a" * 50, "b" * 60, "c" * 40]
+        assert merge_short_chunks(chunks, 30, 400) == chunks
+
+    def test_respects_max_chars_and_leaves_fragment_when_it_cannot_fit(self):
+        # short fragment + a chunk that's already near the cap → merging would
+        # overflow, so the fragment is left as-is rather than create an oversized chunk.
+        chunks = ["Đi.", "x" * 399]
+        assert merge_short_chunks(chunks, 30, 400) == chunks
+
+    def test_chains_several_shorts_without_exceeding_max(self):
+        merged = merge_short_chunks(["A.", "B.", "C.", "D."], 30, 400)
+        assert merged == ["A. B. C. D."]
+        assert all(len(c) <= 400 for c in merged)
+
+    def test_min_zero_disables_merging(self):
+        chunks = ["5", "Ngắn.", "Dài hơn một chút ở đây."]
+        assert merge_short_chunks(chunks, 0, 400) == chunks
+
+    def test_empty_list(self):
+        assert merge_short_chunks([], 30, 400) == []
+
+    def test_synthesize_chapter_merges_short_fragments(self, tmp_path):
+        # A body of tiny one-word "paragraphs" would otherwise be many micro-chunks;
+        # the merge pass collapses them so the engine sees far fewer, healthier chunks.
+        engine = FakeTtsEngine()  # max_chunk_chars=30, min_chunk_chars=30 (inherited)
+        body = "\n\n".join(["Ừ.", "Được.", "Đi thôi.", "Nhanh lên nào các bạn ơi."])
+        engine.synthesize_chapter("", body, tmp_path / "x.wav")
+        assert len(engine.chunks) < 4  # the three tiny lines no longer stand alone
+        assert all(len(c) <= 30 for c in engine.chunks)
 
 
 class FakeTtsEngine(TtsEngine):
