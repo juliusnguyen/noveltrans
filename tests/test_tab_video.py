@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QDate, QDateTime, QSettings, QTime
 
 from noveltrans.config import AppConfig
 from noveltrans.gui.tab_video import VideoTab
@@ -140,7 +140,7 @@ class TestVideoPartsList:
     def _make_button(self, tab, row):
         from PySide6.QtWidgets import QPushButton
 
-        return tab.video_list.cellWidget(row, 5).findChildren(QPushButton)[0]
+        return tab.video_list.cellWidget(row, 6).findChildren(QPushButton)[0]
 
     def test_lists_one_row_per_part_all_pending(
         self, qapp, tmp_path, library_dir, sample_meta, sample_refs
@@ -256,7 +256,7 @@ class TestVideoPartsList:
 
         path = self._project_with_audio(library_dir, sample_meta, sample_refs)
         tab = self._tab_on_project(tmp_path, path)
-        thumb_btn = tab.video_list.cellWidget(0, 5).findChildren(QPushButton)[2]
+        thumb_btn = tab.video_list.cellWidget(0, 6).findChildren(QPushButton)[2]
         assert thumb_btn.text() == "Ảnh bìa"
         assert not thumb_btn.isEnabled()  # no thumbnail yet
         windows = tab._windows_for_current_selection()
@@ -264,7 +264,7 @@ class TestVideoPartsList:
         jpg.parent.mkdir(parents=True, exist_ok=True)
         jpg.write_bytes(b"fake jpg")
         tab._refresh_video_list()
-        thumb_btn = tab.video_list.cellWidget(0, 5).findChildren(QPushButton)[2]
+        thumb_btn = tab.video_list.cellWidget(0, 6).findChildren(QPushButton)[2]
         assert thumb_btn.isEnabled()
         tab.shutdown()
 
@@ -335,6 +335,898 @@ class TestVideoPartsList:
             "skip_existing": False,
         }
         tab.shutdown()
+
+
+class TestRedoAllVideos:
+    """“Tạo lại tất cả video” — re-render everything, overwriting what's already there."""
+
+    def _project_with_audio(self, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)  # 5 chapters
+        for i in range(5):
+            project.save_audio(i, f"exports/audio/{i}.mp3", "V", 60.0)
+        path = project.path
+        project.close()
+        return path
+
+    def _tab_on_project(self, tmp_path, path):
+        tab = VideoTab(_config(tmp_path))
+        tab.voice_combo.addItem("V", "V")
+        tab.voice_combo.setCurrentIndex(tab.voice_combo.findData("V"))
+        tab.video_mode.setCurrentIndex(tab.video_mode.findData("batch"))
+        tab.video_batch_size.setValue(2)
+        tab.video_image_edit.setText(str(path))  # any existing file passes the image check
+        tab._on_project_selected(str(path))
+        return tab
+
+    def _yes(self, monkeypatch):
+        from PySide6.QtWidgets import QMessageBox
+
+        asked = []
+        monkeypatch.setattr(
+            QMessageBox, "question",
+            lambda *a, **k: (asked.append(a), QMessageBox.StandardButton.Yes)[1],
+        )
+        return asked
+
+    def test_button_exists_next_to_create(self, qapp, tmp_path):
+        tab = VideoTab(_config(tmp_path))
+        assert tab.redo_all_button.text() == "Tạo lại tất cả video"
+        tab.shutdown()
+
+    def test_renders_every_part_without_skipping(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        """The whole point: unlike “Tạo video”, it must NOT skip parts that already exist."""
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        window = tab._windows_for_current_selection()[0]
+        out = tab._part_output_path(window, whole_novel=False)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"already rendered")
+
+        self._yes(monkeypatch)
+        captured = {}
+        monkeypatch.setattr(tab, "_launch_video", lambda **kw: captured.update(kw))
+        tab._redo_all_videos()
+        assert captured == {"skip_existing": False}
+        tab.shutdown()
+
+    def test_confirm_dialog_mentions_the_overwrite_count(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        for i in range(2):
+            w = tab._windows_for_current_selection()[i]
+            out = tab._part_output_path(w, whole_novel=False)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(b"x")
+
+        asked = self._yes(monkeypatch)
+        monkeypatch.setattr(tab, "_launch_video", lambda **kw: None)
+        tab._redo_all_videos()
+        assert "Ghi đè 2 video đã có" in asked[0][2]
+        tab.shutdown()
+
+    def test_warns_when_parts_are_already_on_youtube(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        """Re-rendering does not change a published video — say so before an hours-long job."""
+        from noveltrans.youtube_upload import STATE_PUBLISHED, write_upload_state
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        w = tab._windows_for_current_selection()[0]
+        out = tab._part_output_path(w, whole_novel=False)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"x")
+        write_upload_state(out, status=STATE_PUBLISHED)
+
+        asked = self._yes(monkeypatch)
+        monkeypatch.setattr(tab, "_launch_video", lambda **kw: None)
+        tab._redo_all_videos()
+        assert "đã tải lên YouTube" in asked[0][2]
+        tab.shutdown()
+
+    def test_declining_the_confirm_renders_nothing(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from PySide6.QtWidgets import QMessageBox
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        monkeypatch.setattr(
+            QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.No
+        )
+        launched = []
+        monkeypatch.setattr(tab, "_launch_video", lambda **kw: launched.append(kw))
+        tab._redo_all_videos()
+        assert launched == []
+        tab.shutdown()
+
+    def test_no_project_starts_nothing(self, qapp, tmp_path, monkeypatch):
+        from PySide6.QtWidgets import QMessageBox
+
+        tab = VideoTab(_config(tmp_path))
+        shown = []
+        monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: shown.append(a))
+        launched = []
+        monkeypatch.setattr(tab, "_launch_video", lambda **kw: launched.append(kw))
+        tab._redo_all_videos()
+        assert shown and launched == []
+        tab.shutdown()
+
+    def test_render_and_upload_buttons_lock_each_other_out(self, qapp, tmp_path):
+        """Rendering overwrites the very files an upload reads — they must not overlap."""
+        tab = VideoTab(_config(tmp_path))
+        tab._reset_video_ui()
+        assert tab.upload_button.isEnabled() and tab.redo_all_button.isEnabled()
+        tab._reset_upload_ui()
+        assert tab.video_button.isEnabled() and tab.redo_all_button.isEnabled()
+        tab.shutdown()
+
+
+class TestYouTubeUploadUi:
+    """The upload box, the "Đã tải lên" column, and the queue-selection rule."""
+
+    def _project_with_audio(self, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)  # 5 chapters
+        for i in range(5):
+            project.save_audio(i, f"exports/audio/{i}.mp3", "V", 60.0)
+        path = project.path
+        project.close()
+        return path
+
+    def _tab_on_project(self, tmp_path, path):
+        tab = VideoTab(_config(tmp_path))
+        tab.voice_combo.addItem("V", "V")
+        tab.voice_combo.setCurrentIndex(tab.voice_combo.findData("V"))
+        tab.video_mode.setCurrentIndex(tab.video_mode.findData("batch"))
+        tab.video_batch_size.setValue(2)
+        tab._on_project_selected(str(path))
+        return tab
+
+    def _render_part(self, tab, index):
+        """Fake a rendered part: create its .mp4 so it becomes upload-eligible."""
+        window = tab._windows_for_current_selection()[index]
+        out = tab._part_output_path(window, whole_novel=False)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"fake mp4")
+        return window, out
+
+    def test_parts_table_has_an_upload_column(self, qapp, tmp_path, library_dir,
+                                              sample_meta, sample_refs):
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        assert tab.video_list.columnCount() == 7
+        assert tab.video_list.horizontalHeaderItem(5).text() == "Đã tải lên"
+        tab.shutdown()
+
+    def test_upload_cell_reflects_each_state(self, qapp, tmp_path, library_dir,
+                                             sample_meta, sample_refs):
+        from noveltrans.youtube_upload import (
+            STATE_COMMITTED,
+            STATE_PUBLISHED,
+            write_upload_state,
+        )
+
+        from PySide6.QtCore import Qt
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        _, out = self._render_part(tab, 0)
+        tab._refresh_video_list()
+        cell = tab.video_list.item(0, 5)
+        assert cell.checkState() == Qt.CheckState.Unchecked
+        assert cell.text() == "Chưa tải"
+        assert cell.flags() & Qt.ItemFlag.ItemIsUserCheckable  # the tick is the control
+
+        write_upload_state(out, status=STATE_PUBLISHED, published_at="2026-07-27T20:00:00",
+                           url="https://youtu.be/dQw4w9WgXcQ")
+        tab._refresh_video_list()
+        assert tab.video_list.item(0, 5).checkState() == Qt.CheckState.Checked
+
+        # An interrupted attempt must be visibly different from "chưa tải" — showing it
+        # as not-uploaded is what would invite the duplicate.
+        write_upload_state(out, status=STATE_COMMITTED)
+        tab._refresh_video_list()
+        cell = tab.video_list.item(0, 5)
+        assert "Dở dang" in cell.text()
+        assert cell.checkState() == Qt.CheckState.Unchecked
+        tab.shutdown()
+
+    def test_repopulating_the_table_does_not_fire_the_toggle_handler(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        """Setting check states while rebuilding would pop a confirmation nobody asked for."""
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.youtube_upload import STATE_PUBLISHED, write_upload_state
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        _, out = self._render_part(tab, 0)
+        write_upload_state(out, status=STATE_PUBLISHED)
+        asked = []
+        monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: asked.append(a))
+        tab._refresh_video_list()
+        tab._refresh_video_list()
+        assert asked == []
+        tab.shutdown()
+
+    def test_pending_rows_skip_unrendered_published_and_interrupted(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        from noveltrans.youtube_upload import STATE_PUBLISHED, STATE_STARTED, write_upload_state
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        # 3 parts; render all three, then mark one published and one interrupted.
+        outs = [self._render_part(tab, i)[1] for i in range(3)]
+        write_upload_state(outs[0], status=STATE_PUBLISHED)
+        write_upload_state(outs[1], status=STATE_STARTED)
+        pending = tab._pending_upload_rows()
+        assert [label for _, label, _, _ in pending] == ["Phần 3"]
+        tab.shutdown()
+
+    def test_pending_rows_ignores_parts_with_no_video(self, qapp, tmp_path, library_dir,
+                                                     sample_meta, sample_refs):
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        assert tab._pending_upload_rows() == []  # nothing rendered yet
+        self._render_part(tab, 1)
+        assert [label for _, label, _, _ in tab._pending_upload_rows()] == ["Phần 2"]
+        tab.shutdown()
+
+    def test_upload_request_reads_the_sidecars(self, qapp, tmp_path, library_dir,
+                                               sample_meta, sample_refs):
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        window, out = self._render_part(tab, 0)
+        (out.parent / (out.stem + ".title.txt")).write_text("Tiêu đề riêng", encoding="utf-8")
+        (out.parent / (out.stem + ".tags.txt")).write_text("a, b, c", encoding="utf-8")
+        (out.parent / (out.stem + ".jpg")).write_bytes(b"jpeg")
+        tab.upload_playlist.setText("Danh sách của tôi")
+
+        request = tab._upload_request(window, "Phần 1", 1, False, publish_at=None)
+        assert request.title == "Tiêu đề riêng"
+        assert request.tags == "a, b, c"
+        assert request.thumbnail == out.parent / (out.stem + ".jpg")
+        assert request.playlist == "Danh sách của tôi"
+        tab.shutdown()
+
+    def test_upload_request_falls_back_when_sidecars_are_missing(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """Parts rendered before the sidecars existed must still be uploadable."""
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        window, _ = self._render_part(tab, 0)
+        request = tab._upload_request(window, "Phần 1", 1, False, publish_at=None)
+        assert request.title.endswith("- Phần 1")  # computed, not read
+        assert request.description  # the timestamp table, computed on the fly
+        assert request.thumbnail is None
+        tab.shutdown()
+
+    def test_schedule_controls_only_show_for_scheduling(self, qapp, tmp_path):
+        tab = VideoTab(_config(tmp_path))
+        tab.upload_visibility.setCurrentIndex(tab.upload_visibility.findData("private"))
+        assert not tab.upload_start.isVisibleTo(tab)
+        tab.upload_visibility.setCurrentIndex(tab.upload_visibility.findData("schedule"))
+        assert tab.upload_start.isVisibleTo(tab)
+        tab.shutdown()
+
+    def test_default_visibility_is_private(self, qapp, tmp_path):
+        """The safe failure mode for a feature whose worst bug is publishing something."""
+        tab = VideoTab(_config(tmp_path))
+        assert tab.upload_visibility.currentData() == "private"
+        tab.shutdown()
+
+    def test_schedule_preview_lists_the_pending_parts(self, qapp, tmp_path, library_dir,
+                                                     sample_meta, sample_refs):
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        for i in range(3):
+            self._render_part(tab, i)
+        tab.upload_visibility.setCurrentIndex(tab.upload_visibility.findData("schedule"))
+        tab.upload_start.setDateTime(QDateTime(QDate(2026, 8, 1), QTime(20, 0)))
+        tab.upload_spacing.setValue(2)
+        tab._refresh_schedule_preview()
+        text = tab.schedule_preview.text()
+        assert "Phần 1: 01/08 20:00" in text
+        assert "Phần 2: 03/08 20:00" in text
+        assert "Phần 3: 05/08 20:00" in text
+        tab.shutdown()
+
+    def test_start_upload_with_nothing_eligible_starts_no_worker(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from PySide6.QtWidgets import QMessageBox
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        shown = []
+        monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: shown.append(a))
+        tab._start_upload()  # nothing rendered
+        assert shown
+        assert tab._upload_worker is None
+        tab.shutdown()
+
+    def test_launch_upload_builds_and_starts_a_worker(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        """Drive `_launch_upload` all the way to `worker.start()`.
+
+        Regression: `track_worker` was called with an extra argument, which only blew up
+        once a real upload was attempted — every earlier test stopped at the "nothing
+        eligible" guard and never reached this path. The wake-lock *manager* is stubbed
+        here, but `track_worker` itself is the real one, so its call signature is
+        exercised.
+        """
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.gui import keep_awake
+        from noveltrans.gui.workers import YouTubeUploadWorker
+
+        class _DummyManager:
+            def acquire(self):
+                pass
+
+            def release(self):
+                pass
+
+        monkeypatch.setattr(keep_awake, "_manager", _DummyManager())
+        monkeypatch.setattr(
+            QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes
+        )
+        started = []
+        monkeypatch.setattr(YouTubeUploadWorker, "start", lambda self: started.append(self))
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        for i in range(2):
+            self._render_part(tab, i)
+
+        tab._start_upload()
+        assert len(started) == 1
+        assert [r.label for r in tab._upload_worker.requests] == ["Phần 1", "Phần 2"]
+        # the run locks out the render buttons that would overwrite the files being sent
+        assert not tab.upload_button.isEnabled()
+        assert not tab.video_button.isEnabled()
+        assert not tab.redo_all_button.isEnabled()
+        assert tab.upload_cancel_button.isEnabled()
+        tab._upload_worker = None  # never really started; don't let shutdown() wait on it
+        tab.shutdown()
+
+    def test_launch_upload_attaches_the_computed_schedule(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.gui import keep_awake
+        from noveltrans.gui.workers import YouTubeUploadWorker
+
+        class _DummyManager:
+            def acquire(self):
+                pass
+
+            def release(self):
+                pass
+
+        monkeypatch.setattr(keep_awake, "_manager", _DummyManager())
+        monkeypatch.setattr(
+            QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes
+        )
+        monkeypatch.setattr(YouTubeUploadWorker, "start", lambda self: None)
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        for i in range(3):
+            self._render_part(tab, i)
+        tab.upload_visibility.setCurrentIndex(tab.upload_visibility.findData("schedule"))
+        start = QDateTime.currentDateTime().addDays(1)
+        tab.upload_start.setDateTime(start)
+        tab.upload_spacing.setValue(2)
+
+        tab._start_upload()
+        times = [r.publish_at for r in tab._upload_worker.requests]
+        assert [t.date() for t in times] == [
+            start.addDays(d).toPython().date() for d in (0, 2, 4)
+        ]
+        assert all(r.visibility == "schedule" for r in tab._upload_worker.requests)
+        tab._upload_worker = None
+        tab.shutdown()
+
+    def test_stuck_row_offers_reset_instead_of_a_dead_button(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """A “dở dang” part must have a way forward in the UI, not just a disabled button."""
+        from PySide6.QtWidgets import QPushButton
+
+        from noveltrans.youtube_upload import STATE_STARTED, write_upload_state
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        _, out = self._render_part(tab, 0)
+        tab._refresh_video_list()
+        assert tab.video_list.cellWidget(0, 6).findChildren(QPushButton)[3].text() == "Tải lên"
+
+        write_upload_state(out, status=STATE_STARTED)
+        tab._refresh_video_list()
+        btn = tab.video_list.cellWidget(0, 6).findChildren(QPushButton)[3]
+        assert btn.text() == "Đặt lại"
+        assert btn.isEnabled()
+        tab.shutdown()
+
+    def test_reset_clears_the_record_and_requeues_the_part(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.youtube_upload import (
+            STATE_STARTED,
+            read_upload_state,
+            write_upload_state,
+        )
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        window, out = self._render_part(tab, 0)
+        write_upload_state(out, status=STATE_STARTED)
+        assert tab._pending_upload_rows() == []  # stuck: excluded from the queue
+
+        asked = []
+        monkeypatch.setattr(
+            QMessageBox, "question",
+            lambda *a, **k: (asked.append(a), QMessageBox.StandardButton.Yes)[1],
+        )
+        tab._reset_upload_state(window, False)
+        assert read_upload_state(out) == {}
+        assert [label for _, label, _, _ in tab._pending_upload_rows()] == ["Phần 1"]
+        # no video id was recorded, so the warning must say nothing reached YouTube
+        assert "KHÔNG có" in asked[0][2]
+        tab.shutdown()
+
+    def test_reset_warns_differently_when_a_draft_exists_on_the_channel(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        """With a video id recorded, clearing can create a duplicate — say so."""
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.youtube_upload import STATE_DRAFT, write_upload_state
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        window, out = self._render_part(tab, 0)
+        write_upload_state(out, status=STATE_DRAFT, video_id="dQw4w9WgXcQ",
+                           url="https://youtu.be/dQw4w9WgXcQ")
+        asked = []
+        monkeypatch.setattr(
+            QMessageBox, "question",
+            lambda *a, **k: (asked.append(a), QMessageBox.StandardButton.No)[1],
+        )
+        tab._reset_upload_state(window, False)
+        assert "HAI bản" in asked[0][2]
+        assert "youtu.be/dQw4w9WgXcQ" in asked[0][2]
+        tab.shutdown()
+
+    def test_declining_the_reset_keeps_the_record(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.youtube_upload import (
+            STATE_STARTED,
+            read_upload_state,
+            write_upload_state,
+        )
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        window, out = self._render_part(tab, 0)
+        write_upload_state(out, status=STATE_STARTED)
+        monkeypatch.setattr(
+            QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.No
+        )
+        tab._reset_upload_state(window, False)
+        assert read_upload_state(out).get("status") == STATE_STARTED
+        tab.shutdown()
+
+    def _accept_reset_dialog(self, monkeypatch, *, stuck=True, published=False):
+        """Drive the reset dialog without showing it: tick boxes, then accept.
+
+        `exec()` is modal and would block the offscreen test run forever, so it is
+        replaced by a function that sets the checkboxes the way a user would and returns
+        Accepted.
+        """
+        from PySide6.QtWidgets import QCheckBox, QDialog
+
+        captured = {}
+
+        def _exec(dialog):
+            boxes = dialog.findChildren(QCheckBox)
+            captured["labels"] = [b.text() for b in boxes]
+            captured["defaults"] = [b.isChecked() for b in boxes]
+            for box in boxes:
+                if "dở dang" in box.text():
+                    box.setChecked(stuck and box.isEnabled())
+                elif "đã tải lên" in box.text():
+                    box.setChecked(published and box.isEnabled())
+            return QDialog.DialogCode.Accepted
+
+        monkeypatch.setattr(QDialog, "exec", _exec)
+        return captured
+
+    def test_batch_reset_clears_every_stuck_part(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        """A failed batch strands every part at once — one click has to fix all of them."""
+        from noveltrans.youtube_upload import (
+            STATE_COMMITTED,
+            STATE_STARTED,
+            is_uploadable,
+            write_upload_state,
+        )
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        outs = [self._render_part(tab, i)[1] for i in range(3)]
+        write_upload_state(outs[0], status=STATE_STARTED)
+        write_upload_state(outs[1], status=STATE_COMMITTED, video_id="dQw4w9WgXcQ")
+        self._accept_reset_dialog(monkeypatch, stuck=True)
+        tab._reset_all_upload_states()
+        assert all(is_uploadable(p) for p in outs)
+        assert len(tab._pending_upload_rows()) == 3
+        tab.shutdown()
+
+    def test_published_parts_are_not_cleared_unless_explicitly_chosen(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        """The dangerous category must never ride along with the safe one."""
+        from noveltrans.youtube_upload import (
+            STATE_PUBLISHED,
+            STATE_STARTED,
+            is_published,
+            is_uploadable,
+            write_upload_state,
+        )
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        outs = [self._render_part(tab, i)[1] for i in range(3)]
+        write_upload_state(outs[0], status=STATE_STARTED)
+        write_upload_state(outs[1], status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
+        captured = self._accept_reset_dialog(monkeypatch, stuck=True, published=False)
+        tab._reset_all_upload_states()
+        assert is_uploadable(outs[0])  # the stuck one went
+        assert is_published(outs[1])  # the published one stayed
+        # and the dangerous box is never pre-ticked
+        assert captured["defaults"] == [True, False]
+        tab.shutdown()
+
+    def test_unmarking_published_parts_when_chosen(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        """The 'published but the transfer never landed' case this exists for."""
+        from noveltrans.youtube_upload import (
+            STATE_PUBLISHED,
+            is_uploadable,
+            write_upload_state,
+        )
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        outs = [self._render_part(tab, i)[1] for i in range(3)]
+        for out in outs:
+            write_upload_state(out, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
+        self._accept_reset_dialog(monkeypatch, stuck=False, published=True)
+        tab._reset_all_upload_states()
+        assert all(is_uploadable(p) for p in outs)
+        assert len(tab._pending_upload_rows()) == 3
+        tab.shutdown()
+
+    def test_cancelling_the_reset_dialog_changes_nothing(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from PySide6.QtWidgets import QDialog
+
+        from noveltrans.youtube_upload import STATE_STARTED, read_upload_state, write_upload_state
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        _, out = self._render_part(tab, 0)
+        write_upload_state(out, status=STATE_STARTED)
+        monkeypatch.setattr(QDialog, "exec", lambda self: QDialog.DialogCode.Rejected)
+        tab._reset_all_upload_states()
+        assert read_upload_state(out).get("status") == STATE_STARTED
+        tab.shutdown()
+
+    def _answer(self, monkeypatch, button):
+        from PySide6.QtWidgets import QMessageBox
+
+        asked = []
+        monkeypatch.setattr(
+            QMessageBox, "question", lambda *a, **k: (asked.append(a), button)[1]
+        )
+        return asked
+
+    def test_unticking_a_published_part_marks_it_not_uploaded(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        """The tick is the control — this is the action the user asked for."""
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.youtube_upload import (
+            STATE_PUBLISHED,
+            is_uploadable,
+            write_upload_state,
+        )
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        _, out = self._render_part(tab, 0)
+        write_upload_state(out, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ",
+                           url="https://youtu.be/dQw4w9WgXcQ")
+        tab._refresh_video_list()
+        asked = self._answer(monkeypatch, QMessageBox.StandardButton.Yes)
+
+        tab.video_list.item(0, 5).setCheckState(Qt.CheckState.Unchecked)
+
+        assert is_uploadable(out)
+        assert [label for _, label, _, _ in tab._pending_upload_rows()] == ["Phần 1"]
+        # the strongest warning: names the duplicate risk and the link
+        assert "HAI bản" in asked[0][2]
+        assert "youtu.be/dQw4w9WgXcQ" in asked[0][2]
+        tab.shutdown()
+
+    def test_declining_the_untick_restores_the_tick_and_the_record(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.youtube_upload import (
+            STATE_PUBLISHED,
+            is_published,
+            write_upload_state,
+        )
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        _, out = self._render_part(tab, 0)
+        write_upload_state(out, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
+        tab._refresh_video_list()
+        self._answer(monkeypatch, QMessageBox.StandardButton.No)
+
+        tab.video_list.item(0, 5).setCheckState(Qt.CheckState.Unchecked)
+
+        assert is_published(out)  # record untouched
+        assert tab.video_list.item(0, 5).checkState() == Qt.CheckState.Checked  # tick back
+        tab.shutdown()
+
+    def test_ticking_an_unuploaded_part_marks_it_uploaded_by_hand(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        """For a part the user uploaded themselves — batches must then skip it."""
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.youtube_upload import is_published, read_upload_state
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        _, out = self._render_part(tab, 0)
+        tab._refresh_video_list()
+        assert [label for _, label, _, _ in tab._pending_upload_rows()] == ["Phần 1"]
+        self._answer(monkeypatch, QMessageBox.StandardButton.Yes)
+
+        tab.video_list.item(0, 5).setCheckState(Qt.CheckState.Checked)
+
+        assert is_published(out)
+        # no video id, and flagged as hand-marked so nothing treats it as a real link
+        assert read_upload_state(out).get("marked_by_hand") is True
+        assert read_upload_state(out).get("video_id", "") == ""
+        assert tab._pending_upload_rows() == []
+        tab.shutdown()
+
+    def test_declining_the_tick_leaves_the_part_unmarked(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.youtube_upload import is_uploadable
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        _, out = self._render_part(tab, 0)
+        tab._refresh_video_list()
+        self._answer(monkeypatch, QMessageBox.StandardButton.No)
+
+        tab.video_list.item(0, 5).setCheckState(Qt.CheckState.Checked)
+
+        assert is_uploadable(out)
+        assert tab.video_list.item(0, 5).checkState() == Qt.CheckState.Unchecked
+        tab.shutdown()
+
+    def test_batch_reset_with_nothing_stuck_says_so(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from PySide6.QtWidgets import QMessageBox
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        self._render_part(tab, 0)
+        shown = []
+        monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: shown.append(a))
+        tab._reset_all_upload_states()
+        assert shown
+        tab.shutdown()
+
+    def test_header_indicator_tracks_all_none_some(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        from PySide6.QtCore import Qt
+
+        from noveltrans.youtube_upload import (
+            STATE_PUBLISHED,
+            clear_upload_state,
+            write_upload_state,
+        )
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        outs = [self._render_part(tab, i)[1] for i in range(3)]
+        tab._refresh_video_list()
+        assert tab.upload_header.check_state() == Qt.CheckState.Unchecked
+
+        write_upload_state(outs[0], status=STATE_PUBLISHED)
+        tab._refresh_video_list()
+        assert tab.upload_header.check_state() == Qt.CheckState.PartiallyChecked
+
+        for out in outs:
+            write_upload_state(out, status=STATE_PUBLISHED)
+        tab._refresh_video_list()
+        assert tab.upload_header.check_state() == Qt.CheckState.Checked
+
+        for out in outs:
+            clear_upload_state(out)
+        tab._refresh_video_list()
+        assert tab.upload_header.check_state() == Qt.CheckState.Unchecked
+        tab.shutdown()
+
+    def test_header_check_all_marks_every_part(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.youtube_upload import is_published, read_upload_state
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        outs = [self._render_part(tab, i)[1] for i in range(3)]
+        tab._refresh_video_list()
+        asked = self._answer(monkeypatch, QMessageBox.StandardButton.Yes)
+
+        tab._on_upload_header_toggled(True)
+
+        assert all(is_published(p) for p in outs)
+        assert all(read_upload_state(p).get("marked_by_hand") for p in outs)
+        assert tab._pending_upload_rows() == []
+        assert "3 phần" in asked[0][2]
+        tab.shutdown()
+
+    def test_header_uncheck_all_clears_every_record(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.youtube_upload import (
+            STATE_PUBLISHED,
+            is_uploadable,
+            write_upload_state,
+        )
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        outs = [self._render_part(tab, i)[1] for i in range(3)]
+        for out in outs:
+            write_upload_state(out, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
+        tab._refresh_video_list()
+        asked = self._answer(monkeypatch, QMessageBox.StandardButton.Yes)
+
+        tab._on_upload_header_toggled(False)
+
+        assert all(is_uploadable(p) for p in outs)
+        assert len(tab._pending_upload_rows()) == 3
+        assert "HAI bản" in asked[0][2]  # the bulk warning still names the duplicate risk
+        tab.shutdown()
+
+    def test_header_toggle_only_touches_rows_that_would_change(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.youtube_upload import (
+            STATE_PUBLISHED,
+            is_published,
+            read_upload_state,
+            write_upload_state,
+        )
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        outs = [self._render_part(tab, i)[1] for i in range(3)]
+        # one is already published by a real upload — its record must survive untouched
+        write_upload_state(outs[0], status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
+        tab._refresh_video_list()
+        asked = self._answer(monkeypatch, QMessageBox.StandardButton.Yes)
+
+        tab._on_upload_header_toggled(True)
+
+        assert all(is_published(p) for p in outs)
+        assert read_upload_state(outs[0])["video_id"] == "dQw4w9WgXcQ"
+        assert not read_upload_state(outs[0]).get("marked_by_hand")
+        assert "2 phần" in asked[0][2]  # only the two that actually changed
+        tab.shutdown()
+
+    def test_header_toggle_declined_changes_nothing(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.youtube_upload import is_uploadable
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        outs = [self._render_part(tab, i)[1] for i in range(3)]
+        tab._refresh_video_list()
+        self._answer(monkeypatch, QMessageBox.StandardButton.No)
+
+        tab._on_upload_header_toggled(True)
+
+        assert all(is_uploadable(p) for p in outs)
+        tab.shutdown()
+
+    def test_header_toggle_with_nothing_to_do_says_so(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from PySide6.QtWidgets import QMessageBox
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        tab._refresh_video_list()  # nothing rendered → no rows to toggle
+        shown = []
+        monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: shown.append(a))
+        tab._on_upload_header_toggled(True)
+        assert shown
+        tab.shutdown()
+
+    def test_row_upload_button_disabled_once_published(self, qapp, tmp_path, library_dir,
+                                                      sample_meta, sample_refs):
+        from PySide6.QtWidgets import QPushButton
+
+        from noveltrans.youtube_upload import STATE_PUBLISHED, write_upload_state
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        _, out = self._render_part(tab, 0)
+        tab._refresh_video_list()
+        btn = tab.video_list.cellWidget(0, 6).findChildren(QPushButton)[3]
+        assert btn.text() == "Tải lên" and btn.isEnabled()
+
+        write_upload_state(out, status=STATE_PUBLISHED)
+        tab._refresh_video_list()
+        # No direct re-upload path for a published part — un-marking is the tick in the
+        # "Đã tải lên" column, so this button just goes dead.
+        assert not tab.video_list.cellWidget(0, 6).findChildren(QPushButton)[3].isEnabled()
+        tab.shutdown()
+
+    def test_shutdown_and_running_check_account_for_the_upload_worker(self, qapp, tmp_path):
+        tab = VideoTab(_config(tmp_path))
+        assert tab.has_running_workers() is False
+        tab.shutdown()  # must not raise with no upload worker
 
 
 class TestWorkspaceRegistration:

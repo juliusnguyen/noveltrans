@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
 from noveltrans.config import TARGET_LANGS, AppConfig, translator_labels
 from noveltrans.discord_unlock import valid_channel_url
 from noveltrans.gui import keep_awake
-from noveltrans.gui.workers import DiscordLoginWorker
+from noveltrans.gui.workers import DiscordLoginWorker, YouTubeLoginWorker
 from noveltrans.tts.convert import ffmpeg_available
 
 _MEDOCTRUYEN_LOGIN_URL = "https://medoctruyen.vn/auth/login"
@@ -182,6 +182,40 @@ class SettingsDialog(QDialog):
         discord_hint.setWordWrap(True)
         form.addRow("", discord_hint)
 
+        # YouTube upload: the Video tab drives Studio in a dedicated browser profile.
+        # Only the one-time login lives here; everything else about a run (visibility,
+        # schedule) is per-run and belongs next to the parts list in the Video tab.
+        youtube_login = QPushButton("Đăng nhập YouTube")
+        youtube_login.setToolTip(
+            "Mở cửa sổ Chrome riêng để đăng nhập kênh YouTube một lần, cho tính năng "
+            "tự tải video lên ở tab Video."
+        )
+        youtube_login.clicked.connect(self._youtube_login)
+        youtube_switch = QPushButton("Đổi kênh…")
+        youtube_switch.setToolTip(
+            "Đăng xuất kênh hiện tại rồi đăng nhập lại — dùng khi lỡ đăng nhập nhầm kênh."
+        )
+        youtube_switch.clicked.connect(self._youtube_switch)
+        self.youtube_status = QLabel("")
+        self.youtube_status.setProperty("muted", True)
+        self._refresh_youtube_status()
+        youtube_row = QHBoxLayout()
+        youtube_row.addWidget(youtube_login)
+        youtube_row.addWidget(youtube_switch)
+        youtube_row.addWidget(self.youtube_status, stretch=1)
+        form.addRow("Tải lên YouTube:", youtube_row)
+
+        youtube_hint = QLabel(
+            "Đăng nhập một lần vào kênh sẽ đăng video; phiên được lưu trong profile "
+            "riêng của ứng dụng. Đăng nhập nhầm kênh thì bấm “Đổi kênh…”. Tự động hoá "
+            "YouTube Studio là vi phạm điều khoản của YouTube — dùng ở mức vừa phải. "
+            "Cần cài Playwright: pip install 'noveltrans[browser]' rồi playwright "
+            "install chromium."
+        )
+        youtube_hint.setProperty("muted", True)
+        youtube_hint.setWordWrap(True)
+        form.addRow("", youtube_hint)
+
         # Keep the Mac awake while a job runs so it doesn't idle-sleep mid-download.
         self.keep_awake_check = QCheckBox("Giữ máy thức khi đang chạy (tải/dịch/tạo audio)")
         self.keep_awake_check.setChecked(config.keep_awake_enabled)
@@ -322,6 +356,61 @@ class SettingsDialog(QDialog):
             "Một cửa sổ trình duyệt riêng sẽ mở ra. Đăng nhập tài khoản Discord phụ "
             "và mở tới server có kênh #mở-khoá, rồi đóng lại.",
         )
+
+    def _refresh_youtube_status(self) -> None:
+        """Show whether a channel is currently connected, so a wrong one is noticeable."""
+        from noveltrans.youtube_upload import profile_dir
+
+        connected = profile_dir().is_dir()
+        self.youtube_status.setText(
+            "✅ Đã kết nối một kênh" if connected else "⬜ Chưa đăng nhập kênh nào"
+        )
+
+    def _youtube_login(self, *, switch: bool = False) -> None:
+        """Open the Google login window for the channel that will publish.
+
+        `switch` drops the saved session first, which is the only way to change channel:
+        with a valid session Studio loads straight through and the window closes before
+        the user can pick anything.
+        """
+        if switch:
+            confirm = QMessageBox.question(
+                self,
+                "Đổi kênh YouTube",
+                "Sẽ đăng xuất kênh đang kết nối và mở lại cửa sổ đăng nhập để bạn chọn "
+                "tài khoản/kênh khác.\n\nCác phần đã tải lên kênh cũ vẫn còn trên "
+                "YouTube — việc này chỉ đổi kênh cho những lần tải lên sau. Tiếp tục?",
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+
+        def _done(channel_id: str, name: str) -> None:
+            self._refresh_youtube_status()
+            which = name or channel_id or "(không đọc được tên kênh)"
+            QMessageBox.information(
+                self,
+                "Đăng nhập YouTube",
+                f"Đã kết nối kênh: {which}\n\nKiểm tra đúng kênh chưa — nếu sai, bấm "
+                "“Đổi kênh…” để chọn lại.",
+            )
+
+        self._yt_login_worker = YouTubeLoginWorker(self, switch=switch)
+        self._yt_login_worker.done.connect(_done)
+        self._yt_login_worker.failed.connect(
+            lambda msg: (self._refresh_youtube_status(),
+                         QMessageBox.warning(self, "Đăng nhập YouTube", msg))
+        )
+        self._yt_login_worker.start()
+        QMessageBox.information(
+            self,
+            "Đăng nhập YouTube",
+            "Một cửa sổ trình duyệt riêng sẽ mở ra. Đăng nhập tài khoản Google của kênh "
+            "(nếu tài khoản có nhiều kênh, chọn đúng kênh muốn đăng) và chờ tới khi "
+            "YouTube Studio hiện ra, rồi đóng cửa sổ lại.",
+        )
+
+    def _youtube_switch(self) -> None:
+        self._youtube_login(switch=True)
 
     def _browse_library(self) -> None:
         path = QFileDialog.getExistingDirectory(

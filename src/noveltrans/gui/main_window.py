@@ -193,7 +193,27 @@ class MainWindow(QMainWindow):
         super().changeEvent(event)
 
     def _open_settings(self) -> None:
+        before = self.config.library_dir
         SettingsDialog(self.config, self).exec()
+        if self.config.library_dir != before:
+            self._reload_library()
+
+    def _reload_library(self) -> None:
+        """Re-list every workspace's project pickers after the library folder changed.
+
+        The pickers are otherwise only filled when a workspace is built, so switching
+        library kept showing the old folder's novels until the app was restarted.
+
+        Each picker keeps its selection if that project exists in the new library and
+        drops it otherwise (`refresh` re-emits `project_selected`, so the tabs close a
+        novel that is no longer there). Open workers are unaffected — they hold absolute
+        project paths and finish against the folder they started in.
+        """
+        library_dir = self.config.library_dir
+        # The user may have typed a folder that doesn't exist yet; listing it would raise.
+        library_dir.mkdir(parents=True, exist_ok=True)
+        for index in range(self.workspaces.count()):
+            self.workspaces.widget(index).populate_lists()
 
     def _open_library(self) -> None:
         library_dir = self.config.library_dir

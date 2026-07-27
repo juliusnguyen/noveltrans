@@ -141,3 +141,97 @@ class TestFormatDuration:
 
     def test_hours(self):
         assert format_duration(3725) == "1h02m"
+
+
+class TestCheckableHeaderView:
+    """The "toggle every row" indicator in a table header.
+
+    QHeaderView has no checkable section, so both the indicator's geometry and the
+    click-target logic are ours and can regress silently — the painting can't be
+    asserted, but where the indicator sits and what counts as a click on it can.
+    """
+
+    def _header(self, qapp, column=5, sections=7):
+        from PySide6.QtWidgets import QTableWidget
+
+        from noveltrans.gui.widgets import CheckableHeaderView
+
+        table = QTableWidget(0, sections)
+        header = CheckableHeaderView(column, table)
+        table.setHorizontalHeader(header)
+        table.resize(900, 100)
+        return table, header
+
+    def test_starts_unchecked(self, qapp):
+        from PySide6.QtCore import Qt
+
+        _table, header = self._header(qapp)
+        assert header.check_state() == Qt.CheckState.Unchecked
+
+    def test_set_state_round_trips(self, qapp):
+        from PySide6.QtCore import Qt
+
+        _table, header = self._header(qapp)
+        for state in (
+            Qt.CheckState.Checked,
+            Qt.CheckState.PartiallyChecked,
+            Qt.CheckState.Unchecked,
+        ):
+            header.set_state(state)
+            assert header.check_state() == state
+
+    def test_indicator_sits_inside_its_own_section(self, qapp):
+        """A stray indicator would be unclickable, or would hijack the wrong column."""
+        from PySide6.QtCore import QRect
+
+        _table, header = self._header(qapp)
+        section = QRect(header.sectionViewportPosition(5), 0, header.sectionSize(5), 20)
+        indicator = header._indicator_rect(section)
+        assert section.contains(indicator)
+        assert indicator.width() > 0
+
+    def _click(self, header, x):
+        from PySide6.QtCore import QEvent, QPointF, Qt
+        from PySide6.QtGui import QMouseEvent
+
+        got = []
+        header.toggled.connect(got.append)
+        point = QPointF(x, header.height() / 2)
+        event = QMouseEvent(  # local + global positions: the 5-arg form is deprecated
+            QEvent.Type.MouseButtonPress,
+            point,
+            point,
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        header.mousePressEvent(event)
+        return got
+
+    def test_clicking_the_indicator_asks_to_check_all(self, qapp):
+        _table, header = self._header(qapp)
+        x = header.sectionViewportPosition(5) + 6
+        assert self._click(header, x) == [True]
+
+    def test_clicking_the_indicator_when_all_checked_asks_to_uncheck(self, qapp):
+        from PySide6.QtCore import Qt
+
+        _table, header = self._header(qapp)
+        header.set_state(Qt.CheckState.Checked)
+        x = header.sectionViewportPosition(5) + 6
+        assert self._click(header, x) == [False]
+
+    def test_partially_checked_asks_to_check_all(self, qapp):
+        """"Some" reads as "not all", so the useful next step is to finish the job."""
+        from PySide6.QtCore import Qt
+
+        _table, header = self._header(qapp)
+        header.set_state(Qt.CheckState.PartiallyChecked)
+        x = header.sectionViewportPosition(5) + 6
+        assert self._click(header, x) == [True]
+
+    def test_clicking_another_column_does_not_toggle(self, qapp):
+        """Only the indicator counts — toggling every row is too big for a stray click."""
+        _table, header = self._header(qapp)
+        x = header.sectionViewportPosition(1) + 6
+        assert self._click(header, x) == []

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractTableModel, QEvent, QModelIndex, QPoint, Qt, Signal
+from PySide6.QtCore import QAbstractTableModel, QEvent, QModelIndex, QPoint, QRect, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QComboBox,
+    QHeaderView,
     QMenu,
     QStyle,
     QStyledItemDelegate,
@@ -96,6 +97,72 @@ class ProjectPicker(QComboBox):
 
     def _on_index_changed(self, _index: int) -> None:
         self.project_selected.emit(self.selected_path())
+
+
+class CheckableHeaderView(QHeaderView):
+    """A horizontal header with a check indicator in one section — "toggle every row".
+
+    QHeaderView has no checkable section, so the indicator is painted over the ordinary
+    section and clicks landing inside it are intercepted. Only clicks on the indicator
+    itself count: the section is wide and toggling every row at once is consequential,
+    so a stray click on the label must not trigger it.
+
+    The view only *displays* a state. What toggling means is the owner's decision — it
+    handles `toggled` and calls `set_state` to reflect whatever actually happened.
+    """
+
+    toggled = Signal(bool)  # True = the user asked to check all, False = uncheck all
+
+    def __init__(self, column: int, parent=None):
+        super().__init__(Qt.Orientation.Horizontal, parent)
+        self._column = column
+        self._state = Qt.CheckState.Unchecked
+        self.setSectionsClickable(True)
+
+    def set_state(self, state: Qt.CheckState) -> None:
+        if state != self._state:
+            self._state = state
+            self.updateSection(self._column)
+
+    def check_state(self) -> Qt.CheckState:
+        return self._state
+
+    def _indicator_rect(self, rect: QRect) -> QRect:
+        size = self.style().pixelMetric(
+            QStyle.PixelMetric.PM_IndicatorWidth, QStyleOptionButton(), self
+        )
+        return QRect(
+            rect.left() + 4, rect.top() + (rect.height() - size) // 2, size, size
+        )
+
+    def paintSection(self, painter, rect, logicalIndex) -> None:
+        painter.save()
+        super().paintSection(painter, rect, logicalIndex)
+        painter.restore()
+        if logicalIndex != self._column:
+            return
+        option = QStyleOptionButton()
+        option.rect = self._indicator_rect(rect)
+        option.state = QStyle.StateFlag.State_Enabled | {
+            Qt.CheckState.Checked: QStyle.StateFlag.State_On,
+            Qt.CheckState.Unchecked: QStyle.StateFlag.State_Off,
+            Qt.CheckState.PartiallyChecked: QStyle.StateFlag.State_NoChange,
+        }[self._state]
+        self.style().drawPrimitive(
+            QStyle.PrimitiveElement.PE_IndicatorCheckBox, option, painter, self
+        )
+
+    def mousePressEvent(self, event) -> None:
+        index = self.logicalIndexAt(event.position().toPoint())
+        if index == self._column:
+            section = QRect(
+                self.sectionViewportPosition(index), 0, self.sectionSize(index), self.height()
+            )
+            if self._indicator_rect(section).contains(event.position().toPoint()):
+                # Partially checked reads as "not all" → the useful action is check-all.
+                self.toggled.emit(self._state != Qt.CheckState.Checked)
+                return
+        super().mousePressEvent(event)
 
 
 class RowButtonDelegate(QStyledItemDelegate):
