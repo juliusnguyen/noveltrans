@@ -1392,3 +1392,103 @@ class DiscordLoginWorker(QThread):
             self.failed.emit(repr(exc))
         else:
             self.done.emit()
+
+
+class YouTubeLoginWorker(QThread):
+    """Open the one-time YouTube/Google login window for the channel, off-thread.
+
+    `switch=True` drops the saved profile first so Google shows its account chooser —
+    the way to move to a different channel once one is already connected.
+    """
+
+    done = Signal(str, str)  # channel id, channel name (either may be "")
+    failed = Signal(str)
+
+    def __init__(self, parent=None, *, switch: bool = False):
+        super().__init__(parent)
+        self.switch = switch
+
+    def run(self) -> None:
+        from noveltrans.youtube_upload import YouTubeUploadError, open_login
+
+        try:
+            channel_id, name = open_login(switch=self.switch)
+        except YouTubeUploadError as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:
+            self.failed.emit(repr(exc))
+        else:
+            self.done.emit(channel_id, name)
+
+
+class YouTubeUploadWorker(QThread):
+    """Upload a list of rendered parts to YouTube through one browser session.
+
+    Structurally a sibling of VideoWorker — same progress/finished/failed signal shape,
+    same cooperative `cancel()` — so the Video tab can drive it with the wiring it
+    already has. The requests are built on the GUI thread (they only read sidecar files)
+    and handed over whole; this worker never touches a NovelProject.
+    """
+
+    progress = Signal(int, int, str)  # parts done, total parts, status line
+    part_done = Signal(int, str, str)  # index, video url ("" if skipped/failed), error
+    finished_ok = Signal(int, int)  # uploaded count, failed count
+    failed = Signal(str)  # the whole run could not start
+    needs_login = Signal(str)  # profile has no valid Google session
+
+    def __init__(self, requests: list, parent=None):
+        super().__init__(parent)
+        self.requests = list(requests)
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        # Imported here so a missing Playwright (optional dep) only bites when the user
+        # actually uploads, not at app import time.
+        from noveltrans.youtube_upload import (
+            UploadCancelled,
+            YouTubeUploadError,
+            upload_batch,
+        )
+
+        total = len(self.requests)
+        done = 0
+        errors = 0
+
+        def on_part_done(index: int, result, error: str) -> None:
+            nonlocal done, errors
+            done += 1
+            if error:
+                errors += 1
+            self.part_done.emit(index, getattr(result, "url", "") or "", error)
+            label = self.requests[index].label or f"phần {index + 1}"
+            self.progress.emit(done, total, f"{label}: {'lỗi' if error else 'xong'}")
+
+        try:
+            upload_batch(
+                self.requests,
+                on_progress=lambda msg: self.progress.emit(done, total, msg),
+                on_part_done=on_part_done,
+                should_cancel=lambda: self._cancelled,
+            )
+        except UploadCancelled as exc:
+            # Cancelling mid-part can leave a draft on the channel; say so rather than
+            # letting the user assume nothing happened.
+            if exc.video_id:
+                self.failed.emit(
+                    f"Đã huỷ. Một video đang dở nằm trên kênh dưới dạng bản nháp "
+                    f"(https://youtu.be/{exc.video_id}) — kiểm tra và xoá nếu không cần."
+                )
+            else:
+                self.failed.emit("Đã huỷ tải lên.")
+        except YouTubeUploadError as exc:
+            if exc.needs_login:
+                self.needs_login.emit(str(exc))
+            else:
+                self.failed.emit(str(exc))
+        except Exception as exc:  # keep unexpected automation errors on-screen
+            self.failed.emit(repr(exc))
+        else:
+            self.finished_ok.emit(done - errors, errors)

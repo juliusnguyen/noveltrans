@@ -15,14 +15,17 @@ from __future__ import annotations
 
 import re
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import QDateTime, Qt, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QColorDialog,
     QComboBox,
+    QDateTimeEdit,
     QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -42,13 +45,14 @@ from PySide6.QtWidgets import (
 
 from noveltrans.config import AppConfig, translator_labels
 from noveltrans.gui.keep_awake import track_worker
-from noveltrans.gui.widgets import ProjectPicker
+from noveltrans.gui.widgets import CheckableHeaderView, ProjectPicker
 from noveltrans.gui.workers import (
     CompletionWorker,
     TagsWorker,
     TtsVoicesWorker,
     VideoPreviewWorker,
     VideoWorker,
+    YouTubeUploadWorker,
 )
 from noveltrans.storage import NovelProject
 
@@ -63,11 +67,14 @@ class VideoTab(QWidget):
         self.config = config
         self.project: NovelProject | None = None
         self._video_worker: VideoWorker | None = None
+        self._upload_worker: YouTubeUploadWorker | None = None
         self._preview_worker: VideoPreviewWorker | None = None
         self._voices_worker: TtsVoicesWorker | None = None
         self._tags_worker: TagsWorker | None = None
         self._image_prompt_worker: CompletionWorker | None = None
         self._render_after_tags = False  # auto-generate tags, then start the render
+        # guards the "Đã tải lên" checkbox handler while the table is being repopulated
+        self._suppress_upload_toggle = False
         # a persistent, non-modal preview window so the color can be tuned live
         self._preview_dialog: QDialog | None = None
         self._preview_label: QLabel | None = None
@@ -99,6 +106,7 @@ class VideoTab(QWidget):
         layout.addLayout(self._build_engine_row())  # one AI engine for tags + image prompt
         layout.addWidget(self._build_video_box())
         layout.addWidget(self._build_video_list_box(), stretch=1)
+        layout.addWidget(self._build_upload_box())
         layout.addWidget(self._build_thumbnail_box())
         layout.addWidget(self._build_image_prompt_box())
         layout.addWidget(self._build_tags_box())
@@ -177,11 +185,17 @@ class VideoTab(QWidget):
         self.video_button = QPushButton("Tạo video")
         self.video_button.setProperty("primary", True)
         self.video_button.clicked.connect(self._start_video)
+        self.redo_all_button = QPushButton("Tạo lại tất cả video")
+        self.redo_all_button.setToolTip(
+            "Render lại MỌI phần trong phạm vi đang chọn, kể cả phần đã có video — "
+            "dùng khi đổi ảnh nền, màu, phông chữ hay chất lượng."
+        )
+        self.redo_all_button.clicked.connect(self._redo_all_videos)
         self.cancel_button = QPushButton("Dừng")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self._cancel)
         if not ffmpeg_available():
-            for b in (self.video_button, self.video_preview_button):
+            for b in (self.video_button, self.redo_all_button, self.video_preview_button):
                 b.setEnabled(False)
                 b.setToolTip("Cần ffmpeg để tạo video (brew install ffmpeg).")
         self.open_video_dir_button = QPushButton("Mở thư mục video")
@@ -209,6 +223,7 @@ class VideoTab(QWidget):
         row2.addWidget(self.video_image_button)
         row2.addWidget(self.video_preview_button)
         row2.addWidget(self.video_button)
+        row2.addWidget(self.redo_all_button)
         row2.addWidget(self.cancel_button)
         row2.addWidget(self.open_video_dir_button)
 
@@ -227,25 +242,34 @@ class VideoTab(QWidget):
         Mirrors the audio tab's chapter table: each row is one part, with a per-row
         "Tạo"/"Tạo lại" button, so the user can render only the missing parts.
         """
-        self.video_list = QTableWidget(0, 6)
+        self.video_list = QTableWidget(0, 7)
         self.video_list.setHorizontalHeaderLabels(
-            ["Phần", "Chương", "Thời lượng", "Tiêu đề", "Trạng thái", "Thao tác"]
+            ["Phần", "Chương", "Thời lượng", "Tiêu đề", "Trạng thái", "Đã tải lên", "Thao tác"]
         )
         self.video_list.verticalHeader().setVisible(False)
         self.video_list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.video_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.video_list.setAlternatingRowColors(True)
+        # A check-all indicator in the "Đã tải lên" header. Installed before the resize
+        # modes below, since setting a header view resets them.
+        self.upload_header = CheckableHeaderView(5, self.video_list)
+        self.video_list.setHorizontalHeader(self.upload_header)
+        self.upload_header.toggled.connect(self._on_upload_header_toggled)
         header = self.video_list.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)  # thời lượng
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)  # tiêu đề
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)  # đã tải lên
         # ResizeToContents ignores cell *widgets*, so the action column must be sized
-        # explicitly or the three buttons get crushed unreadably narrow.
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
-        self.video_list.setColumnWidth(5, 250)
+        # explicitly or the four buttons get crushed unreadably narrow.
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
+        self.video_list.setColumnWidth(6, 320)
         self.video_list.verticalHeader().setDefaultSectionSize(34)
+
+        # the "Đã tải lên" tick is a control, not just a status — see _on_upload_toggled
+        self.video_list.itemChanged.connect(self._on_upload_toggled)
 
         # refresh the list whenever the selection that defines the parts changes
         self.voice_combo.currentIndexChanged.connect(self._refresh_video_list)
@@ -259,6 +283,150 @@ class VideoTab(QWidget):
         inner.addWidget(self.video_list)
         box.setLayout(inner)
         return box
+
+    def _build_upload_box(self) -> QGroupBox:
+        """Controls for the YouTube upload run: visibility/schedule, playlist, go.
+
+        Deliberately per-run rather than per-project settings: the release plan for a
+        novel ("một phần mỗi tối 20h từ thứ hai") is a decision the user makes once at
+        upload time, not a property of the project worth persisting.
+        """
+        self.upload_visibility = QComboBox()
+        # Private first, and the default: an accidental click can't publish anything.
+        for label, key in (
+            ("Riêng tư", "private"),
+            ("Không công khai (unlisted)", "unlisted"),
+            ("Công khai ngay", "public"),
+            ("Hẹn giờ đăng", "schedule"),
+        ):
+            self.upload_visibility.addItem(label, key)
+        self.upload_visibility.currentIndexChanged.connect(self._on_visibility_changed)
+
+        self.upload_start = QDateTimeEdit()
+        self.upload_start.setDisplayFormat("dd/MM/yyyy HH:mm")
+        self.upload_start.setCalendarPopup(True)
+        # Tomorrow evening: YouTube rejects a schedule in the past, and by the time a
+        # multi-GB part finishes uploading "in an hour" can easily be one.
+        tomorrow = QDateTime.currentDateTime().addDays(1)
+        tomorrow.setTime(tomorrow.time().fromString("20:00", "HH:mm"))
+        self.upload_start.setDateTime(tomorrow)
+        self.upload_start.dateTimeChanged.connect(self._refresh_schedule_preview)
+
+        self.upload_spacing = QSpinBox()
+        self.upload_spacing.setRange(0, 30)
+        self.upload_spacing.setValue(1)
+        self.upload_spacing.setSuffix(" ngày")
+        self.upload_spacing.setToolTip(
+            "Khoảng cách giữa các phần. 0 = đăng tất cả cùng một thời điểm."
+        )
+        self.upload_spacing.valueChanged.connect(self._refresh_schedule_preview)
+
+        sched_row = QHBoxLayout()
+        sched_row.addWidget(QLabel("Chế độ hiển thị:"))
+        sched_row.addWidget(self.upload_visibility)
+        sched_row.addSpacing(12)
+        self.upload_start_label = QLabel("Bắt đầu:")
+        sched_row.addWidget(self.upload_start_label)
+        sched_row.addWidget(self.upload_start)
+        self.upload_spacing_label = QLabel("Mỗi phần cách nhau:")
+        sched_row.addWidget(self.upload_spacing_label)
+        sched_row.addWidget(self.upload_spacing)
+        sched_row.addStretch(1)
+
+        self.upload_playlist = QLineEdit()
+        self.upload_playlist.setPlaceholderText(
+            "Tên danh sách phát (để trống = không thêm vào playlist)"
+        )
+        self.upload_playlist.setToolTip(
+            "Mỗi phần sẽ được thêm vào danh sách phát này; nếu chưa có, YouTube sẽ tạo mới."
+        )
+
+        self.upload_button = QPushButton("⬆️ Tải lên YouTube")
+        self.upload_button.setToolTip(
+            "Tải mọi phần đã tạo mà chưa tải lên, tuần tự trong một cửa sổ trình duyệt."
+        )
+        self.upload_button.clicked.connect(self._start_upload)
+        self.upload_reset_button = QPushButton("Đặt lại trạng thái…")
+        self.upload_reset_button.setToolTip(
+            "Xoá trạng thái của những phần bị gián đoạn, hoặc bỏ đánh dấu những phần bị "
+            "ghi nhầm là đã tải lên, để có thể tải lên lại."
+        )
+        self.upload_reset_button.clicked.connect(self._reset_all_upload_states)
+        self.upload_cancel_button = QPushButton("Dừng")
+        self.upload_cancel_button.setEnabled(False)
+        self.upload_cancel_button.clicked.connect(self._cancel_upload)
+
+        action_row = QHBoxLayout()
+        action_row.addWidget(QLabel("Danh sách phát:"))
+        action_row.addWidget(self.upload_playlist, stretch=1)
+        action_row.addWidget(self.upload_reset_button)
+        action_row.addWidget(self.upload_button)
+        action_row.addWidget(self.upload_cancel_button)
+
+        self.schedule_preview = QLabel("")
+        self.schedule_preview.setProperty("muted", True)
+        self.schedule_preview.setWordWrap(True)
+
+        hint = QLabel(
+            "Một cửa sổ Chrome riêng sẽ mở ra và tự điền form YouTube Studio — đừng "
+            "bấm vào nó khi đang chạy. Cần “Đăng nhập YouTube” trong Settings một lần "
+            "trước đó. Phần nào đã tải lên sẽ được bỏ qua."
+        )
+        hint.setProperty("muted", True)
+        hint.setWordWrap(True)
+
+        box = QGroupBox("Tải lên YouTube (tự động qua trình duyệt)")
+        inner = QVBoxLayout()
+        inner.addLayout(sched_row)
+        inner.addWidget(self.schedule_preview)
+        inner.addLayout(action_row)
+        inner.addWidget(hint)
+        box.setLayout(inner)
+        self._on_visibility_changed()
+        return box
+
+    def _on_visibility_changed(self) -> None:
+        """Show the schedule controls only when they mean something."""
+        scheduling = self.upload_visibility.currentData() == "schedule"
+        for widget in (
+            self.upload_start_label,
+            self.upload_start,
+            self.upload_spacing_label,
+            self.upload_spacing,
+        ):
+            widget.setVisible(scheduling)
+        self.schedule_preview.setVisible(scheduling)
+        self._refresh_schedule_preview()
+
+    def _refresh_schedule_preview(self) -> None:
+        """Spell out when each pending part would actually go live.
+
+        The arithmetic is trivial but the mistake it prevents isn't: "cách nhau 1 ngày"
+        from a start date already in the past silently means YouTube refuses several
+        parts mid-run, and seeing the real dates catches that before the browser opens.
+        """
+        if not hasattr(self, "schedule_preview"):
+            return
+        if self.upload_visibility.currentData() != "schedule":
+            self.schedule_preview.setText("")
+            return
+        pending = self._pending_upload_rows()
+        if not pending:
+            self.schedule_preview.setText("Không có phần nào cần tải lên.")
+            return
+        from noveltrans.youtube_upload import schedule_times
+
+        times = schedule_times(
+            self.upload_start.dateTime().toPython(),
+            len(pending),
+            self.upload_spacing.value(),
+        )
+        shown = [
+            f"{label}: {when:%d/%m %H:%M}"
+            for (_, label, _, _), when in list(zip(pending, times))[:4]
+        ]
+        more = f" … (+{len(pending) - 4} phần)" if len(pending) > 4 else ""
+        self.schedule_preview.setText("→ " + "   ".join(shown) + more)
 
     def _windows_for_current_selection(self) -> list:
         """The parts (`MergeWindow`s) implied by the current voice/mode/range/batch."""
@@ -336,6 +504,101 @@ class VideoTab(QWidget):
         """Rebuild the parts table with each part's title + created/not-created status."""
         if not hasattr(self, "video_list"):
             return
+        # Populating the table sets check states, which would re-enter the toggle handler
+        # and pop a confirmation for a change the user never made.
+        self._suppress_upload_toggle = True
+        try:
+            self._rebuild_video_rows()
+        finally:
+            self._suppress_upload_toggle = False
+        self._sync_upload_header()
+
+    def _upload_rows(self) -> list:
+        """(row, path) for every listed part that has a rendered video."""
+        from pathlib import Path
+
+        rows = []
+        for row in range(self.video_list.rowCount()):
+            item = self.video_list.item(row, 5)
+            if item is None:
+                continue
+            path = Path(item.data(Qt.ItemDataRole.UserRole) or "")
+            if path.name and path.is_file():
+                rows.append((row, path))
+        return rows
+
+    def _sync_upload_header(self) -> None:
+        """Point the header indicator at all / none / some of the rows being uploaded."""
+        from noveltrans.youtube_upload import is_published
+
+        if not hasattr(self, "upload_header"):
+            return
+        rows = self._upload_rows()
+        marked = sum(1 for _row, path in rows if is_published(path))
+        if not rows or marked == 0:
+            state = Qt.CheckState.Unchecked
+        elif marked == len(rows):
+            state = Qt.CheckState.Checked
+        else:
+            state = Qt.CheckState.PartiallyChecked
+        self.upload_header.set_state(state)
+
+    def _on_upload_header_toggled(self, check_all: bool) -> None:
+        """Mark every listed part uploaded / not-uploaded, from the header indicator.
+
+        Toggling one row is consequential; toggling thirty is more so, so this confirms
+        once with the count and only touches rows that would actually change.
+        """
+        from noveltrans.youtube_upload import (
+            clear_upload_state,
+            is_published,
+            mark_uploaded_by_hand,
+        )
+
+        targets = [
+            path for _row, path in self._upload_rows() if is_published(path) != check_all
+        ]
+        if not targets:
+            QMessageBox.information(
+                self,
+                "Đã tải lên",
+                "Tất cả các phần đã ở đúng trạng thái rồi."
+                if self._upload_rows()
+                else "Chưa có phần nào đã tạo video.",
+            )
+            return
+
+        if check_all:
+            message = (
+                f"Đánh dấu {len(targets)} phần là ĐÃ TẢI LÊN?\n\n"
+                "Dùng khi bạn đã tự tải chúng lên YouTube. Ứng dụng sẽ bỏ qua các phần "
+                "này trong những lần tải lên sau."
+            )
+        else:
+            message = (
+                f"Bỏ đánh dấu {len(targets)} phần đang được ghi là ĐÃ TẢI LÊN?\n\n"
+                "Chỉ làm vậy nếu các video đó KHÔNG thực sự có trên kênh.\n\n"
+                "⚠️ Nếu video vẫn còn trên YouTube và bạn tải lại, kênh sẽ có HAI bản "
+                "cho mỗi phần."
+            )
+        if QMessageBox.question(self, "Đã tải lên", message) != (
+            QMessageBox.StandardButton.Yes
+        ):
+            return
+
+        for path in targets:
+            if check_all:
+                mark_uploaded_by_hand(path)
+            else:
+                clear_upload_state(path)
+        self._refresh_video_list()
+        self.status_label.setText(
+            f"Đã đánh dấu {len(targets)} phần là đã tải lên."
+            if check_all
+            else f"Đã bỏ đánh dấu {len(targets)} phần — có thể tải lên lại."
+        )
+
+    def _rebuild_video_rows(self) -> None:
         self.video_list.setRowCount(0)
         if self.project is None:
             return
@@ -361,12 +624,140 @@ class VideoTab(QWidget):
             self.video_list.setItem(
                 i, 4, QTableWidgetItem("✅ Đã tạo" if exists else "⬜ Chưa tạo")
             )
+            self.video_list.setItem(i, 5, self._upload_item(window, whole_novel))
             self.video_list.setCellWidget(
-                i, 5, self._build_row_actions(window, part_num, whole_novel, exists)
+                i, 6, self._build_row_actions(window, part_num, whole_novel, exists)
             )
 
+    def _upload_item(self, window, whole_novel: bool) -> QTableWidgetItem:
+        """The "Đã tải lên" cell: a tick the user can toggle, plus a short status.
+
+        The tick *is* the control — untick a part to mark it not-uploaded (when the
+        record is wrong), tick one to record an upload done by hand. Both directions go
+        through a confirmation in `_on_upload_toggled`; the checkbox only shows state.
+
+        An interrupted attempt stays unticked but is flagged in red rather than reading
+        as a plain "chưa tải": it's the one state that needs a human to go look at the
+        channel, and showing it as simply not-uploaded would invite exactly the duplicate
+        the sidecar exists to prevent.
+        """
+        from noveltrans.youtube_upload import is_published, needs_attention, read_upload_state
+
+        path = self._part_output_path(window, whole_novel=whole_novel)
+        state = read_upload_state(path)
+        published = is_published(path)
+        if published:
+            when = (state.get("published_at") or "")[:10]
+            item = QTableWidgetItem(when or "Đã tải")
+            item.setToolTip(
+                (state.get("url") or "")
+                + ("\n\n" if state.get("url") else "")
+                + "Bỏ tick nếu video không thực sự có trên kênh."
+            )
+        elif needs_attention(path):
+            # `needs_attention` owns the "unresolved" set (started / draft / committed /
+            # unknown); duplicating it here is how the two drift apart and a `committed`
+            # part quietly starts reading as "chưa tải".
+            item = QTableWidgetItem("⚠️ Dở dang")
+            item.setForeground(QColor("#e06c75"))
+            item.setToolTip(
+                "Lần tải trước bị gián đoạn. Kiểm tra bản nháp trên kênh, rồi bấm "
+                "“Đặt lại” để tải lại."
+                + (f"\n{state['url']}" if state.get("url") else "")
+            )
+        else:
+            item = QTableWidgetItem("Chưa tải")
+            item.setToolTip("Tick nếu bạn đã tự tải phần này lên YouTube.")
+
+        item.setFlags(
+            (item.flags() | Qt.ItemFlag.ItemIsUserCheckable) & ~Qt.ItemFlag.ItemIsEditable
+        )
+        item.setCheckState(
+            Qt.CheckState.Checked if published else Qt.CheckState.Unchecked
+        )
+        # The path travels with the cell so the handler never has to re-derive which part
+        # a row is — the row→window mapping shifts whenever the batch size changes.
+        item.setData(Qt.ItemDataRole.UserRole, str(path))
+        return item
+
+    def _on_upload_toggled(self, item: QTableWidgetItem) -> None:
+        """Handle the user ticking / unticking "Đã tải lên" on a row.
+
+        Both directions are consequential, so both confirm first and both revert the tick
+        if declined: unticking a live video invites a duplicate re-upload, and ticking one
+        that was never uploaded silently excludes it from every future batch.
+        """
+        from pathlib import Path
+
+        from noveltrans.youtube_upload import (
+            clear_upload_state,
+            has_remote_draft,
+            is_published,
+            mark_uploaded_by_hand,
+            read_upload_state,
+        )
+
+        if item.column() != 5 or self._suppress_upload_toggle:
+            return
+        path = Path(item.data(Qt.ItemDataRole.UserRole) or "")
+        if not path.name:
+            return
+        wanted = item.checkState() == Qt.CheckState.Checked
+        if wanted == is_published(path):
+            return  # nothing actually changed
+
+        state = read_upload_state(path)
+        link = state.get("url") or state.get("video_id") or ""
+        if wanted:
+            title = "Đánh dấu đã tải lên"
+            message = (
+                "Đánh dấu phần này là ĐÃ TẢI LÊN?\n\n"
+                "Dùng khi bạn đã tự tải nó lên YouTube. Ứng dụng sẽ bỏ qua phần này "
+                "trong các lần tải lên sau."
+            )
+        elif is_published(path) and link:
+            title = "Bỏ đánh dấu đã tải lên"
+            message = (
+                f"Phần này đang được đánh dấu ĐÃ TẢI LÊN.\n{link}\n\n"
+                "Chỉ bỏ tick nếu video KHÔNG thực sự có trên kênh — ví dụ lần tải trước "
+                "bị dừng giữa chừng nên video không hoàn tất.\n\n"
+                "⚠️ Nếu video vẫn còn trên YouTube và bạn tải lại, kênh sẽ có HAI bản.\n\n"
+                "Đã kiểm tra trên kênh và vẫn muốn bỏ tick?"
+            )
+        else:
+            title = "Bỏ đánh dấu đã tải lên"
+            message = (
+                "Bỏ đánh dấu để có thể tải phần này lên lại?"
+                + ("\n\n⚠️ Kiểm tra kênh trước — có thể đã có bản nháp." if has_remote_draft(path) else "")
+            )
+
+        if QMessageBox.question(self, title, message) != QMessageBox.StandardButton.Yes:
+            # Put the tick back where it was; the refresh below would do it anyway, but
+            # doing it here keeps the cell honest even if the refresh is a no-op.
+            self._set_check_silently(item, not wanted)
+            return
+
+        if wanted:
+            mark_uploaded_by_hand(path)
+        else:
+            clear_upload_state(path)
+        self._refresh_video_list()
+        self.status_label.setText(
+            "Đã đánh dấu là đã tải lên." if wanted else "Đã bỏ đánh dấu — có thể tải lên lại."
+        )
+
+    def _set_check_silently(self, item: QTableWidgetItem, checked: bool) -> None:
+        """Set a check state without re-entering `_on_upload_toggled`."""
+        self._suppress_upload_toggle = True
+        try:
+            item.setCheckState(
+                Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+            )
+        finally:
+            self._suppress_upload_toggle = False
+
     def _build_row_actions(self, window, part_num, whole_novel, exists):
-        """The per-row action buttons: (re)render, copyable detail, open thumbnail."""
+        """Per-row actions: (re)render, copyable detail, open thumbnail, upload."""
         container = QWidget()
         row = QHBoxLayout(container)
         row.setContentsMargins(4, 2, 4, 2)
@@ -385,12 +776,45 @@ class VideoTab(QWidget):
         thumb.clicked.connect(
             lambda _=False, w=window, wn=whole_novel: self._open_part_thumbnail(w, wn)
         )
+        # Two shapes for one slot: "Đặt lại" clears an interrupted record so the part can
+        # be retried, otherwise "Tải lên". Un-marking a *published* part is the tick in
+        # the "Đã tải lên" column rather than a button here — the checkbox already shows
+        # that state, so toggling it is the obvious way to change it.
+        from noveltrans.youtube_upload import is_published, needs_attention
+
+        path = self._part_output_path(window, whole_novel=whole_novel)
+        if exists and needs_attention(path):
+            upload = QPushButton("Đặt lại")
+            upload.setToolTip(
+                "Xoá trạng thái “dở dang” để có thể tải lên lại. Kiểm tra kênh trước "
+                "nếu lần tải trước đã kịp tạo video."
+            )
+            upload.clicked.connect(
+                lambda _=False, w=window, wn=whole_novel: self._reset_upload_state(w, wn)
+            )
+        else:
+            upload = QPushButton("Tải lên")
+            upload.setToolTip(
+                "Tải riêng phần này lên YouTube."
+                if not is_published(path)
+                else "Phần này đã tải lên — bỏ tick ở cột “Đã tải lên” nếu muốn tải lại."
+            )
+            # A published part is un-marked by unticking its cell, not by a button.
+            upload.setEnabled(exists and not is_published(path))
+            upload.clicked.connect(
+                lambda _=False, w=window, pn=part_num, wn=whole_novel: self._upload_one(w, pn, wn)
+            )
         # compact padding + a sensible min width so the labels never truncate
-        for b, min_w in ((make, 58), (detail, 66), (thumb, 66)):
+        for b, min_w in ((make, 58), (detail, 66), (thumb, 66), (upload, 66)):
             b.setStyleSheet("padding: 3px 8px;")
             b.setMinimumWidth(min_w)
             row.addWidget(b)
         return container
+
+    def _part_uploaded(self, window, whole_novel: bool) -> bool:
+        from noveltrans.youtube_upload import is_published
+
+        return is_published(self._part_output_path(window, whole_novel=whole_novel))
 
     def _compute_part_description(self, window, novel_title: str) -> str:
         """Build a part's description on the fly (before it's rendered) from stored audio."""
@@ -1225,6 +1649,81 @@ class VideoTab(QWidget):
         else:
             self._launch_video(skip_existing=True)
 
+    def _redo_all_videos(self) -> None:
+        """Re-render every part in the current range, overwriting the videos already there.
+
+        The counterpart to "Tạo video", which only fills in what's missing. This is the
+        button you want after changing the background image, colour, font or quality —
+        those settings are baked into the .mp4, so the existing files are simply wrong
+        and there's no per-part change to hunt for.
+        """
+        from noveltrans.tts.merge import plan_merge_windows
+        from noveltrans.tts.video import video_preset
+
+        if self.project is None:
+            QMessageBox.information(self, "Tạo lại tất cả video", "Chọn truyện trước.")
+            return
+        if self._video_worker is not None and self._video_worker.isRunning():
+            QMessageBox.information(
+                self, "Đang bận", "Đang tạo một video khác — hãy đợi hoặc bấm “Dừng”."
+            )
+            return
+
+        voice = self.voice_combo.currentData() or self.voice_combo.currentText().strip()
+        mode = self.video_mode.currentData()
+        start = self.video_range_from.value() if mode == "range" else None
+        end = self.video_range_to.value() if mode == "range" else None
+        if mode == "range" and start > end:
+            QMessageBox.warning(self, "Phạm vi sai", "Chương bắt đầu phải ≤ chương kết thúc.")
+            return
+        batch = self.video_batch_size.value() if mode == "batch" else None
+
+        windows = plan_merge_windows(
+            self.project.chapters(), voice, mode, start=start, end=end, batch=batch
+        )
+        if not windows:
+            QMessageBox.information(
+                self, "Chưa có audio",
+                f"Không có chương nào có audio giọng {voice} trong phạm vi đã chọn.",
+            )
+            return
+
+        whole = len(windows) == 1 and mode == "all"
+        existing = sum(
+            1 for w in windows if self._part_output_path(w, whole_novel=whole).is_file()
+        )
+        preset = video_preset(self.video_quality.currentData())
+        total_secs = sum(c.audio_seconds for w in windows for c in w.chapters)
+        hours = total_secs / 3600
+        render_hours = hours / preset["speed"]
+        est = f"~{render_hours * 60:.0f} phút" if render_hours < 1 else f"~{render_hours:.1f} giờ"
+
+        # Re-rendering a part that is already on YouTube does NOT change the published
+        # video — the user would have to re-upload, and the upload sidecar will keep
+        # saying "đã tải lên". Worth saying out loud before an hours-long render.
+        uploaded = sum(1 for w in windows if self._part_uploaded(w, whole))
+        uploaded_note = (
+            f"\n\n⚠️ {uploaded} phần đã tải lên YouTube. Render lại KHÔNG đổi video đã "
+            "đăng — muốn thay thì phải xoá trạng thái tải lên và tải lại thủ công."
+            if uploaded
+            else ""
+        )
+        overwrite_note = (
+            f" Ghi đè {existing} video đã có." if existing else " (chưa phần nào có video)"
+        )
+        answer = QMessageBox.question(
+            self, "Tạo lại tất cả video",
+            f"Sẽ render lại toàn bộ {len(windows)} phần "
+            f"({sum(len(w.chapters) for w in windows)} chương, giọng {voice}).{overwrite_note}\n\n"
+            f"Chất lượng: {self.video_quality.currentText()} "
+            f"({preset['width']}×{preset['height']}).\n"
+            f"Ước tính thời gian render: {est} (chưa tính máy nóng/tải khác).\n\n"
+            f"Tiếp tục?{uploaded_note}",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._launch_video(skip_existing=False)
+
     def _render_one(self, window) -> None:
         """Render (or re-render) just one part, via a range-mode worker for its chapters."""
         if self.project is None:
@@ -1266,6 +1765,10 @@ class VideoTab(QWidget):
         tags = self.tags_edit.toPlainText().strip()
 
         self.video_button.setEnabled(False)
+        self.redo_all_button.setEnabled(False)
+        # An upload reads the .mp4 files this worker is about to overwrite, so the two
+        # can't run together.
+        self.upload_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.progress.setMaximum(1)
         self.progress.setValue(0)
@@ -1302,6 +1805,8 @@ class VideoTab(QWidget):
 
     def _reset_video_ui(self) -> None:
         self.video_button.setEnabled(True)
+        self.redo_all_button.setEnabled(True)
+        self.upload_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
 
     def _on_video_finished(self, count: int) -> None:
@@ -1319,6 +1824,350 @@ class VideoTab(QWidget):
         self._reset_video_ui()
         self.status_label.setText("")
         QMessageBox.warning(self, "Tạo video thất bại", message)
+
+    # ------------------------------------------------------ upload to YouTube
+
+    def _pending_upload_rows(self) -> list:
+        """The parts that are rendered and not yet uploaded, as (window, label, num, whole).
+
+        Rendered-but-not-uploaded is the whole selection rule: a part with no `.mp4` has
+        nothing to send, and one already `published` must never go up twice. Parts left
+        `⚠️ Dở dang` by an interrupted run are excluded too — they need a human, and the
+        core module would refuse them anyway.
+        """
+        if self.project is None:
+            return []
+        from noveltrans.youtube_upload import needs_attention
+
+        windows = self._windows_for_current_selection()
+        mode = self.video_mode.currentData()
+        total = len(windows)
+        rows = []
+        for i, window in enumerate(windows):
+            whole_novel = total == 1 and mode == "all"
+            part_num = None if whole_novel else (i + 1)
+            path = self._part_output_path(window, whole_novel=whole_novel)
+            if not path.is_file():
+                continue
+            if self._part_uploaded(window, whole_novel) or needs_attention(path):
+                continue
+            label = "Toàn bộ" if whole_novel else f"Phần {i + 1}"
+            rows.append((window, label, part_num, whole_novel))
+        return rows
+
+    def _read_sidecar(self, window, whole_novel: bool, ext: str) -> str:
+        """Text of a part's sidecar, or "" if it was never written."""
+        path = self._part_sidecar(window, whole_novel, ext)
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+
+    def _upload_request(self, window, label, part_num, whole_novel, *, publish_at):
+        """Build one `UploadRequest` from the sidecars already sitting beside the .mp4.
+
+        Falls back to computing the title/description when a sidecar is missing (parts
+        rendered before those were written) so an older project can still be uploaded.
+        """
+        from noveltrans.youtube_upload import UploadRequest
+
+        video = self._part_output_path(window, whole_novel=whole_novel)
+        thumbnail = self._part_sidecar(window, whole_novel, ".jpg")
+        novel_title = self.project.meta.translated_title or self.project.meta.title
+        return UploadRequest(
+            video=video,
+            title=self._read_sidecar(window, whole_novel, ".title.txt")
+            or self._part_title(part_num),
+            description=self._read_sidecar(window, whole_novel, ".txt")
+            or self._compute_part_description(window, novel_title),
+            tags=self._read_sidecar(window, whole_novel, ".tags.txt")
+            or (self.project.meta.tags or ""),
+            thumbnail=thumbnail if thumbnail.is_file() else None,
+            playlist=self.upload_playlist.text().strip(),
+            visibility=self.upload_visibility.currentData(),
+            publish_at=publish_at,
+            label=label,
+        )
+
+    def _start_upload(self) -> None:
+        """Upload every rendered-but-not-yet-uploaded part, in one browser session."""
+        if self.project is None:
+            QMessageBox.information(self, "Tải lên YouTube", "Chọn truyện trước.")
+            return
+        rows = self._pending_upload_rows()
+        if not rows:
+            QMessageBox.information(
+                self,
+                "Tải lên YouTube",
+                "Không có phần nào để tải lên (chưa tạo video, hoặc đã tải lên hết).",
+            )
+            return
+        self._launch_upload(rows)
+
+    def _upload_one(self, window, part_num, whole_novel) -> None:
+        """Upload a single part — the retry path for one row."""
+        label = "Toàn bộ" if whole_novel else f"Phần {part_num}"
+        self._launch_upload([(window, label, part_num, whole_novel)])
+
+    def _reset_upload_state(self, window, whole_novel) -> None:
+        """Clear one part's “dở dang” record so it can be queued again.
+
+        The app refuses to retry those states by itself because it can't tell whether a
+        video exists on the channel. This is where a human answers that — so the warning
+        has to be specific about which case they're in.
+        """
+        from noveltrans.youtube_upload import (
+            clear_upload_state,
+            has_remote_draft,
+            is_published,
+            read_upload_state,
+        )
+
+        path = self._part_output_path(window, whole_novel=whole_novel)
+        state = read_upload_state(path)
+        link = state.get("url") or state.get("video_id") or ""
+        if is_published(path):
+            # The strongest case: we believe this part is live. The record is only wrong
+            # when the publish click landed but the transfer didn't — which is exactly
+            # what a batch that abandoned its uploads leaves behind.
+            title, warning = (
+                "Bỏ đánh dấu đã tải lên",
+                f"Phần này đang được đánh dấu ĐÃ TẢI LÊN.\n{link}\n\n"
+                "Chỉ bỏ đánh dấu nếu video KHÔNG thực sự có trên kênh — ví dụ lần tải "
+                "trước bị dừng giữa chừng nên video không hoàn tất.\n\n"
+                "⚠️ Nếu video vẫn còn trên YouTube và bạn tải lại, kênh sẽ có HAI bản.\n\n"
+                "Đã kiểm tra trên kênh và vẫn muốn bỏ đánh dấu?",
+            )
+        elif has_remote_draft(path):
+            # Something really is on the channel; re-uploading would duplicate it.
+            title, warning = (
+                "Đặt lại trạng thái tải lên",
+                f"Lần tải trước ĐÃ tạo video trên kênh:\n{link}\n\n"
+                "Hãy mở link đó kiểm tra trước. Nếu video vẫn còn và bạn tải lại, kênh sẽ "
+                "có HAI bản. Xoá video đó trên YouTube trước rồi hãy đặt lại.\n\nVẫn đặt lại?",
+            )
+        else:
+            # No video id was ever recorded → nothing reached YouTube. Safe.
+            title, warning = (
+                "Đặt lại trạng thái tải lên",
+                "Lần tải trước dừng trước khi gửi được file, nên nhiều khả năng KHÔNG có "
+                "video nào trên kênh.\n\nĐặt lại để tải phần này lên lại?",
+            )
+        if QMessageBox.question(self, title, warning) != QMessageBox.StandardButton.Yes:
+            return
+        clear_upload_state(path)
+        self._refresh_video_list()
+        self.status_label.setText("Đã đặt lại trạng thái — có thể tải lên lại phần này.")
+
+    def _upload_state_groups(self) -> tuple[list, list]:
+        """(stuck, published) parts in the current selection, as (label, path) pairs.
+
+        The two categories carry very different risk, so they are counted separately and
+        never cleared by the same click.
+        """
+        from noveltrans.youtube_upload import is_published, needs_attention
+
+        if self.project is None:
+            return [], []
+        windows = self._windows_for_current_selection()
+        mode = self.video_mode.currentData()
+        whole = len(windows) == 1 and mode == "all"
+        stuck: list = []
+        published: list = []
+        for i, window in enumerate(windows):
+            path = self._part_output_path(window, whole_novel=whole)
+            label = "Toàn bộ" if whole else f"Phần {i + 1}"
+            if needs_attention(path):
+                stuck.append((label, path))
+            elif is_published(path):
+                published.append((label, path))
+        return stuck, published
+
+    def _reset_all_upload_states(self) -> None:
+        """Bulk-clear upload records, with the two risk levels chosen separately.
+
+        A failed batch strands every part at once — clicking through 30 rows is the chore
+        that sends people to delete sidecar files by hand. But "dở dang" and "đã tải lên"
+        must not share a button: the first is nearly always safe, the second means we
+        believe the video is live and clearing it invites a duplicate. So each is its own
+        opt-in checkbox, and the dangerous one starts unticked.
+        """
+        from noveltrans.youtube_upload import clear_upload_state, has_remote_draft
+
+        stuck, published = self._upload_state_groups()
+        if not stuck and not published:
+            QMessageBox.information(
+                self,
+                "Đặt lại trạng thái tải lên",
+                "Không có phần nào ở trạng thái “dở dang” hay “đã tải lên”.",
+            )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Đặt lại trạng thái tải lên")
+        layout = QVBoxLayout(dialog)
+
+        stuck_check = QCheckBox(f"Đặt lại {len(stuck)} phần “dở dang”")
+        stuck_check.setChecked(bool(stuck))
+        stuck_check.setEnabled(bool(stuck))
+        layout.addWidget(stuck_check)
+        if stuck:
+            with_draft = [label for label, path in stuck if has_remote_draft(path)]
+            note = QLabel(
+                f"    ⚠️ {len(with_draft)} phần đã kịp tạo video trên kênh "
+                f"({', '.join(with_draft)}) — kiểm tra và xoá trên YouTube trước."
+                if with_draft
+                else "    Không phần nào kịp tạo video trên kênh — đặt lại là an toàn."
+            )
+            note.setProperty("muted", True)
+            note.setWordWrap(True)
+            layout.addWidget(note)
+
+        published_check = QCheckBox(f"Bỏ đánh dấu {len(published)} phần “đã tải lên”")
+        published_check.setChecked(False)  # dangerous: never pre-ticked
+        published_check.setEnabled(bool(published))
+        layout.addWidget(published_check)
+        if published:
+            warn = QLabel(
+                "    ⚠️ Chỉ dùng khi các video này KHÔNG thực sự có trên kênh (ví dụ lần "
+                "tải trước bị dừng giữa chừng). Nếu video vẫn còn và bạn tải lại, kênh "
+                "sẽ có HAI bản."
+            )
+            warn.setProperty("muted", True)
+            warn.setWordWrap(True)
+            layout.addWidget(warn)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.setMinimumWidth(480)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        chosen = (stuck if stuck_check.isChecked() else []) + (
+            published if published_check.isChecked() else []
+        )
+        if not chosen:
+            return
+        for _label, path in chosen:
+            clear_upload_state(path)
+        self._refresh_video_list()
+        self.status_label.setText(f"Đã đặt lại {len(chosen)} phần — có thể tải lên lại.")
+
+    def _launch_upload(self, rows: list) -> None:
+        if self._upload_worker is not None and self._upload_worker.isRunning():
+            QMessageBox.information(self, "Tải lên YouTube", "Đang có phiên tải lên chạy.")
+            return
+
+        from noveltrans.youtube_upload import YouTubeUploadError, schedule_times
+
+        scheduling = self.upload_visibility.currentData() == "schedule"
+        times = (
+            schedule_times(
+                self.upload_start.dateTime().toPython(), len(rows), self.upload_spacing.value()
+            )
+            if scheduling
+            else [None] * len(rows)
+        )
+
+        try:
+            requests = [
+                self._upload_request(w, label, pn, wn, publish_at=when)
+                for (w, label, pn, wn), when in zip(rows, times)
+            ]
+            for request in requests:  # surface a bad input before opening a browser
+                request.validate()
+        except YouTubeUploadError as exc:
+            QMessageBox.warning(self, "Tải lên YouTube", str(exc))
+            return
+
+        names = ", ".join(r.label for r in requests[:5])
+        more = f" (+{len(requests) - 5})" if len(requests) > 5 else ""
+        when_text = (
+            f"\nHẹn giờ: {times[0]:%d/%m %H:%M}"
+            + (f" → {times[-1]:%d/%m %H:%M}" if len(times) > 1 else "")
+            if scheduling
+            else f"\nChế độ: {self.upload_visibility.currentText()}"
+        )
+        # An upload is public and effectively irreversible once it publishes, so it gets
+        # a confirmation the render step doesn't need.
+        confirm = QMessageBox.question(
+            self,
+            "Tải lên YouTube",
+            f"Sẽ tải {len(requests)} phần lên kênh đã đăng nhập:\n{names}{more}{when_text}\n\n"
+            "Một cửa sổ Chrome sẽ mở ra và tự thao tác — đừng dùng nó khi đang chạy. Tiếp tục?",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        self._upload_worker = YouTubeUploadWorker(requests, self)
+        self._upload_worker.progress.connect(self._on_upload_progress)
+        self._upload_worker.part_done.connect(self._on_upload_part_done)
+        self._upload_worker.finished_ok.connect(self._on_upload_finished)
+        self._upload_worker.failed.connect(self._on_upload_failed)
+        self._upload_worker.needs_login.connect(self._on_upload_needs_login)
+        track_worker(self._upload_worker)  # don't let the Mac sleep mid-upload
+
+        self.upload_button.setEnabled(False)
+        # Rendering would overwrite the very files being uploaded — keep them apart.
+        self.video_button.setEnabled(False)
+        self.redo_all_button.setEnabled(False)
+        self.upload_cancel_button.setEnabled(True)
+        self.progress.setMaximum(len(requests))
+        self.progress.setValue(0)
+        self.status_label.setText("⬆️ Bắt đầu tải lên YouTube…")
+        self._upload_worker.start()
+
+    def _on_upload_progress(self, done: int, total: int, message: str) -> None:
+        self.progress.setMaximum(max(total, 1))
+        self.progress.setValue(done)
+        if message:
+            self.status_label.setText(f"⬆️ ({done}/{total}) {message}")
+
+    def _on_upload_part_done(self, index: int, url: str, error: str) -> None:
+        # Refresh as each part lands so the "Đã tải lên" column tracks reality during a
+        # long run, not only at the end.
+        self._refresh_video_list()
+
+    def _reset_upload_ui(self) -> None:
+        self.upload_button.setEnabled(True)
+        self.video_button.setEnabled(True)
+        self.redo_all_button.setEnabled(True)
+        self.upload_cancel_button.setEnabled(False)
+        self._refresh_video_list()
+
+    def _on_upload_finished(self, uploaded: int, errors: int) -> None:
+        self._reset_upload_ui()
+        if uploaded and not errors:
+            self.status_label.setText(f"✅ Đã tải {uploaded} phần lên YouTube.")
+        elif uploaded:
+            self.status_label.setText(
+                f"⚠️ Đã tải {uploaded} phần, {errors} phần lỗi — xem cột “Đã tải lên”."
+            )
+        else:
+            self.status_label.setText("Không tải lên được phần nào.")
+
+    def _on_upload_failed(self, message: str) -> None:
+        self._reset_upload_ui()
+        self.status_label.setText("")
+        QMessageBox.warning(self, "Tải lên YouTube thất bại", message)
+
+    def _on_upload_needs_login(self, message: str) -> None:
+        self._reset_upload_ui()
+        self.status_label.setText("")
+        QMessageBox.information(
+            self,
+            "Cần đăng nhập YouTube",
+            message + "\n\nVào Settings → “Đăng nhập YouTube”, rồi thử lại.",
+        )
+
+    def _cancel_upload(self) -> None:
+        if self._upload_worker is not None and self._upload_worker.isRunning():
+            self._upload_worker.cancel()
+            self.status_label.setText("Đang dừng tải lên (chờ bước hiện tại kết thúc)…")
 
     # --------------------------------------------------------------- helpers
 

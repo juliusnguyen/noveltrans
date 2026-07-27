@@ -133,3 +133,115 @@ class TestSettingsDialog:
         dialog.tts_workers_spin.setValue(3)
         dialog.accept()
         assert config.tts_workers == 3
+
+
+class TestLibraryFolderChange:
+    """Switching “Thư mục thư viện” must take effect immediately, not on next launch."""
+
+    def _config(self, tmp_path, library_dir):
+        from PySide6.QtCore import QSettings
+
+        config = AppConfig()
+        config._s = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+        config.library_dir = library_dir
+        return config
+
+    def _library_with(self, root, title):
+        from noveltrans.models import ChapterRef, NovelMeta
+        from noveltrans.storage import NovelProject
+
+        root.mkdir(parents=True, exist_ok=True)
+        meta = NovelMeta(url=f"https://example.com/{title}", site="example", title=title)
+        refs = [ChapterRef(index=0, title="第1章", url="https://example.com/1")]
+        NovelProject.create(root, meta, refs).close()
+        return root
+
+    def _titles(self, ws):
+        picker = ws.scrape_tab.picker
+        return [picker.itemText(i) for i in range(picker.count())]
+
+    def _window(self, tmp_path, monkeypatch, library_dir):
+        monkeypatch.setattr(mw, "AppState", lambda: AppState(state_dir=tmp_path))
+        return mw.MainWindow(self._config(tmp_path, library_dir))
+
+    def _settings_that_switches_to(self, monkeypatch, window, new_dir):
+        """Stand in for the dialog: accepting it is what writes the new library path."""
+
+        class _FakeDialog:
+            def __init__(self, config, parent=None):
+                self.config = config
+
+            def exec(self):
+                self.config.library_dir = new_dir
+
+        monkeypatch.setattr(mw, "SettingsDialog", _FakeDialog)
+
+    def test_new_library_is_listed_without_restarting(self, qapp, tmp_path, monkeypatch):
+        old = self._library_with(tmp_path / "old", "Truyện Cũ")
+        new = self._library_with(tmp_path / "new", "Truyện Mới")
+        window = self._window(tmp_path, monkeypatch, old)
+        try:
+            ws = window.workspaces.widget(0)
+            assert self._titles(ws) == ["Truyện Cũ"]
+            self._settings_that_switches_to(monkeypatch, window, new)
+            window._open_settings()
+            assert self._titles(ws) == ["Truyện Mới"]
+        finally:
+            window.close()
+
+    def test_every_workspace_is_relisted(self, qapp, tmp_path, monkeypatch):
+        old = self._library_with(tmp_path / "old", "Truyện Cũ")
+        new = self._library_with(tmp_path / "new", "Truyện Mới")
+        window = self._window(tmp_path, monkeypatch, old)
+        try:
+            ws2 = window._add_workspace()
+            self._settings_that_switches_to(monkeypatch, window, new)
+            window._open_settings()
+            for index in range(window.workspaces.count()):
+                assert self._titles(window.workspaces.widget(index)) == ["Truyện Mới"]
+            assert ws2 is window.workspaces.widget(1)
+        finally:
+            window.close()
+
+    def test_all_tabs_are_relisted_not_just_the_first(self, qapp, tmp_path, monkeypatch):
+        old = self._library_with(tmp_path / "old", "Truyện Cũ")
+        new = self._library_with(tmp_path / "new", "Truyện Mới")
+        window = self._window(tmp_path, monkeypatch, old)
+        try:
+            ws = window.workspaces.widget(0)
+            self._settings_that_switches_to(monkeypatch, window, new)
+            window._open_settings()
+            for tab in (ws.scrape_tab, ws.translate_tab, ws.export_tab,
+                        ws.audio_tab, ws.video_tab):
+                titles = [tab.picker.itemText(i) for i in range(tab.picker.count())]
+                assert titles == ["Truyện Mới"]
+        finally:
+            window.close()
+
+    def test_a_folder_that_does_not_exist_yet_is_created_not_crashed_on(
+        self, qapp, tmp_path, monkeypatch
+    ):
+        """The path can be typed by hand, and listing a missing folder would raise."""
+        old = self._library_with(tmp_path / "old", "Truyện Cũ")
+        fresh = tmp_path / "brand-new"
+        window = self._window(tmp_path, monkeypatch, old)
+        try:
+            self._settings_that_switches_to(monkeypatch, window, fresh)
+            window._open_settings()
+            assert fresh.is_dir()
+            assert self._titles(window.workspaces.widget(0)) == []
+        finally:
+            window.close()
+
+    def test_unchanged_library_does_not_relist(self, qapp, tmp_path, monkeypatch):
+        """Only react to an actual change — Cancel and unrelated edits must be no-ops."""
+        old = self._library_with(tmp_path / "old", "Truyện Cũ")
+        window = self._window(tmp_path, monkeypatch, old)
+        try:
+            self._settings_that_switches_to(monkeypatch, window, old)
+            reloaded = []
+            monkeypatch.setattr(window, "_reload_library", lambda: reloaded.append(True))
+            window._open_settings()
+            assert reloaded == []
+        finally:
+            window.close()
