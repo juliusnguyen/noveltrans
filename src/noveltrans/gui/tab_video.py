@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFileDialog,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -36,6 +37,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -103,7 +105,13 @@ class VideoTab(QWidget):
         self.progress = QProgressBar()
         self.progress.setFormat("%v / %m video")
 
-        layout = QVBoxLayout(self)
+        # Six group boxes is more than a laptop window is tall. Without somewhere to
+        # overflow to, Qt's only move is squeezing widgets below their sizeHint — and the
+        # parts table, owning the sole stretch, collapsed first and hardest (down to one
+        # clipped row on a 75-part project) before the fixed boxes started getting sliced
+        # through too. The scroll area gives the overflow a destination.
+        content = QWidget()
+        layout = QVBoxLayout(content)
         layout.addLayout(top_row)
         layout.addLayout(self._build_engine_row())  # one AI engine for tags + image prompt
         layout.addWidget(self._build_video_box())
@@ -112,8 +120,25 @@ class VideoTab(QWidget):
         layout.addWidget(self._build_thumbnail_box())
         layout.addWidget(self._build_image_prompt_box())
         layout.addWidget(self._build_tags_box())
-        layout.addWidget(self.progress)
-        layout.addWidget(self.status_label)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidget(content)
+        # The content fills the viewport when there's room and grows past it when there
+        # isn't — which is what turns "clipped" into "scrollable".
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)  # no second border inside the tab
+        # AsNeeded, never Off: Off would clip silently if some content turned out wider
+        # than the viewport, which is the exact failure this change exists to end.
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(self.scroll, stretch=1)
+        # Pinned outside the scroll: a render or an upload batch runs for minutes to hours,
+        # and progress you have to go looking for is progress you don't see — least of all
+        # while you're scrolled down reading the parts table.
+        outer.addWidget(self.progress)
+        outer.addWidget(self.status_label)
 
     # ---------------------------------------------------------------- boxes
 
@@ -269,6 +294,11 @@ class VideoTab(QWidget):
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
         self.video_list.setColumnWidth(6, 420)
         self.video_list.verticalHeader().setDefaultSectionSize(34)
+        # ~6 rows + header. Without a floor the table is the first thing Qt squeezes —
+        # it owns the only stretch in the tab — and on a short window it collapsed to a
+        # single clipped row. It keeps its own scrollbar rather than growing to fit all
+        # 75 parts, so a wheel gesture over the table never fights the page's scroll.
+        self.video_list.setMinimumHeight(240)
 
         # the "Đã tải lên" tick is a control, not just a status — see _on_upload_toggled
         self.video_list.itemChanged.connect(self._on_upload_toggled)

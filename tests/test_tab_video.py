@@ -1909,3 +1909,108 @@ class TestDisplayTitleUi:
         assert built["thumb_title_align"] == "right"
         tab._video_worker = None
         tab.shutdown()
+
+
+class TestVideoTabScrolling:
+    """Feature 037 — the tab scrolls, and the parts table stops collapsing.
+
+    Reported against a 75-part project on a laptop window: the table was squeezed to a
+    single vertically-clipped row and the boxes below it were sliced through, because six
+    group boxes are taller than the window and there was nowhere for the overflow to go.
+    """
+
+    def _tab(self, tmp_path, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        for i in range(5):
+            project.save_audio(i, f"exports/audio/{i}.mp3", "V", 60.0)
+        path = project.path
+        project.close()
+
+        tab = VideoTab(_config(tmp_path))
+        tab.voice_combo.addItem("V", "V")
+        tab.voice_combo.setCurrentIndex(tab.voice_combo.findData("V"))
+        tab._on_project_selected(str(path))
+        return tab
+
+    def _laid_out(self, qapp, tab, width, height):
+        tab.resize(width, height)
+        tab.show()
+        qapp.processEvents()
+        return tab
+
+    def test_the_tab_content_lives_in_a_resizable_scroll_area(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        from PySide6.QtWidgets import QScrollArea
+
+        tab = self._tab(tmp_path, library_dir, sample_meta, sample_refs)
+        assert isinstance(tab.scroll, QScrollArea)
+        # widgetResizable is the whole trick: the content fills the viewport when there is
+        # room and grows past it when there isn't.
+        assert tab.scroll.widgetResizable()
+        assert tab.scroll.widget().isAncestorOf(tab.video_list)
+        tab.shutdown()
+
+    def test_progress_and_status_stay_out_of_the_scroll_area(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """A render or upload batch runs for minutes to hours. Feedback you have to scroll
+        to find is feedback you don't see — least of all while reading the parts table."""
+        tab = self._tab(tmp_path, library_dir, sample_meta, sample_refs)
+        content = tab.scroll.widget()
+        assert not content.isAncestorOf(tab.progress)
+        assert not content.isAncestorOf(tab.status_label)
+        assert tab.isAncestorOf(tab.progress)
+        tab.shutdown()
+
+    def test_the_parts_table_survives_a_short_window(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """**The regression.** It used to collapse to one clipped row here."""
+        tab = self._laid_out(
+            qapp, self._tab(tmp_path, library_dir, sample_meta, sample_refs), 1400, 420
+        )
+        row_h = tab.video_list.verticalHeader().defaultSectionSize()
+        assert tab.video_list.height() >= 240
+        assert tab.video_list.height() // row_h >= 5  # several rows, not one sliced one
+        tab.hide()
+        tab.shutdown()
+
+    def test_a_short_window_has_something_to_scroll_to(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """The content keeps its natural height instead of being squeezed into the
+        viewport — which is what makes the boxes below the table reachable at all."""
+        tab = self._laid_out(
+            qapp, self._tab(tmp_path, library_dir, sample_meta, sample_refs), 1400, 420
+        )
+        assert tab.scroll.widget().height() > tab.scroll.viewport().height()
+        assert tab.scroll.verticalScrollBar().maximum() > 0
+        tab.hide()
+        tab.shutdown()
+
+    def test_a_tall_window_still_grows_the_table(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """The minimum is a floor, not a fixed size: spare vertical space still goes to
+        the table via its stretch, so a big screen gets a big table."""
+        tab = self._laid_out(
+            qapp, self._tab(tmp_path, library_dir, sample_meta, sample_refs), 1400, 1600
+        )
+        assert tab.video_list.height() > 240
+        tab.hide()
+        tab.shutdown()
+
+    def test_the_horizontal_policy_is_as_needed_never_off(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """Off would clip silently if content turned out wider than the viewport — the
+        exact failure this change exists to end."""
+        from PySide6.QtCore import Qt
+
+        tab = self._tab(tmp_path, library_dir, sample_meta, sample_refs)
+        assert (
+            tab.scroll.horizontalScrollBarPolicy()
+            == Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        tab.shutdown()
