@@ -843,3 +843,584 @@ class TestStateFileIsJsonWeCanReadBack:
         write_upload_state(part, status=STATE_PUBLISHED, title="Ta Có Một Thân Bị Động Kỹ - Phần 1")
         data = json.loads(upload_state_path(part).read_text(encoding="utf-8"))
         assert data["title"] == "Ta Có Một Thân Bị Động Kỹ - Phần 1"
+
+
+# ----------------------------------------------- 034: thumbnail update flow
+#
+# The same discipline as the upload tests above: no network, no Playwright process, and
+# every fake raises Playwright's own TimeoutError so `_first_present` behaves as it does
+# live. What is under test is the pair of gates that make this flow honest — Studio must
+# prove it took the image, and prove it saved it — because the flow's ONLY output is the
+# thumbnail, so a silently skipped step would report success for nothing.
+
+
+@pytest.fixture
+def cover(part: Path) -> Path:
+    """The `<stem>.jpg` sidecar the cover editor writes beside every rendered part."""
+    jpg = part.parent / (part.stem + ".jpg")
+    jpg.write_bytes(b"\xff\xd8\xff" + b"jpeg-ish" * 64)
+    return jpg
+
+
+class TestUploadedVideoId:
+    """Eligibility for a thumbnail push: does the record name a video we can navigate to?"""
+
+    def test_no_record_has_no_id(self, part):
+        from noveltrans.youtube_upload import uploaded_video_id
+
+        assert uploaded_video_id(part) == ""
+
+    @pytest.mark.parametrize("status", [STATE_DRAFT, STATE_COMMITTED, STATE_PUBLISHED])
+    def test_every_state_that_names_a_video_is_eligible(self, part, status):
+        """Deliberately status-blind, unlike `is_uploadable`. A scheduled or private video
+        still has an editable thumbnail, and replacing one cannot duplicate anything —
+        so the double-publish paranoia has nothing to protect here."""
+        from noveltrans.youtube_upload import uploaded_video_id
+
+        write_upload_state(part, status=status, video_id="dQw4w9WgXcQ")
+        assert uploaded_video_id(part) == "dQw4w9WgXcQ"
+
+    def test_hand_marked_part_is_not_eligible(self, part):
+        """`mark_uploaded_by_hand` records no id and never had one. Pushing a cover at a
+        video we cannot identify is the one thing this must never do."""
+        from noveltrans.youtube_upload import mark_uploaded_by_hand, uploaded_video_id
+
+        mark_uploaded_by_hand(part)
+        assert uploaded_video_id(part) == ""
+
+
+class TestThumbnailIsCurrent:
+    """Advisory only — it must fail toward "stale" so the safe answer is always
+    "offer to push it"."""
+
+    def test_cover_regenerated_after_the_push_reads_stale(self, part, cover):
+        import os
+
+        from noveltrans.youtube_upload import _now_iso, thumbnail_is_current
+
+        write_upload_state(part, thumbnail_updated_at=_now_iso())
+        future = cover.stat().st_mtime + 600
+        os.utime(cover, (future, future))
+        assert thumbnail_is_current(part, cover) is False
+
+    def test_push_after_the_cover_reads_current(self, part, cover):
+        import os
+
+        from noveltrans.youtube_upload import _now_iso, thumbnail_is_current
+
+        past = cover.stat().st_mtime - 600
+        os.utime(cover, (past, past))
+        write_upload_state(part, thumbnail_updated_at=_now_iso())
+        assert thumbnail_is_current(part, cover) is True
+
+    def test_no_record_reads_stale(self, part, cover):
+        from noveltrans.youtube_upload import thumbnail_is_current
+
+        assert thumbnail_is_current(part, cover) is False
+
+    def test_unparseable_timestamp_reads_stale(self, part, cover):
+        from noveltrans.youtube_upload import thumbnail_is_current
+
+        write_upload_state(part, thumbnail_updated_at="hôm qua")
+        assert thumbnail_is_current(part, cover) is False
+
+
+class TestThumbnailRequestValidation:
+    def test_accepts_a_good_request(self, part, cover):
+        from noveltrans.youtube_upload import ThumbnailRequest
+
+        ThumbnailRequest(video=part, thumbnail=cover).validate()
+
+    def test_rejects_a_missing_image(self, part, tmp_path):
+        from noveltrans.youtube_upload import ThumbnailRequest
+
+        with pytest.raises(YouTubeUploadError, match="Không tìm thấy ảnh bìa"):
+            ThumbnailRequest(video=part, thumbnail=tmp_path / "nope.jpg").validate()
+
+    def test_rejects_an_empty_image(self, part):
+        from noveltrans.youtube_upload import ThumbnailRequest
+
+        empty = part.parent / (part.stem + ".jpg")
+        empty.write_bytes(b"")
+        with pytest.raises(YouTubeUploadError, match="rỗng"):
+            ThumbnailRequest(video=part, thumbnail=empty).validate()
+
+    def test_rejects_an_image_over_youtubes_two_megabytes(self, part, cover):
+        """Local and free to check, so a file YouTube would refuse never costs a browser."""
+        from noveltrans.youtube_upload import _MAX_THUMBNAIL_BYTES, ThumbnailRequest
+
+        cover.write_bytes(b"x" * (_MAX_THUMBNAIL_BYTES + 1))
+        with pytest.raises(YouTubeUploadError, match="2 MB"):
+            ThumbnailRequest(video=part, thumbnail=cover).validate()
+
+    def test_rejects_an_unsupported_format(self, part):
+        from noveltrans.youtube_upload import ThumbnailRequest
+
+        webp = part.parent / (part.stem + ".webp")
+        webp.write_bytes(b"RIFFwebp")
+        with pytest.raises(YouTubeUploadError, match="định dạng"):
+            ThumbnailRequest(video=part, thumbnail=webp).validate()
+
+    def test_does_not_require_the_mp4_to_still_exist(self, part, cover):
+        """The deliberate divergence from `UploadRequest`: the video is already on
+        YouTube, so someone who deleted the local render to reclaim disk must still be
+        able to push a new cover."""
+        from noveltrans.youtube_upload import ThumbnailRequest
+
+        part.unlink()
+        ThumbnailRequest(video=part, thumbnail=cover).validate()
+
+
+class _FakeEditPage:
+    """Studio's video edit page.
+
+    Models the one signal this whole flow rests on: `#save` is DISABLED on arrival,
+    becomes enabled when a change lands, and goes back to disabled once the save
+    commits. That swing is what tells "the image went in" from "the input silently
+    no-oped", and "it saved" from "it didn't".
+    """
+
+    def __init__(
+        self,
+        *,
+        video_id="dQw4w9WgXcQ",
+        lands_on=None,
+        inputs=(),
+        editor=True,
+        accepts=True,
+        commits=True,
+        toast="",
+        save_present=True,
+    ):
+        self.video_id = video_id
+        self.lands_on = lands_on
+        self.url = ""
+        self.inputs = set(inputs)
+        self.editor = editor
+        self.accepts = accepts  # does the file enable Save?
+        self.commits = commits  # does clicking Save disable it again?
+        self.toast = toast
+        self.save_present = save_present
+        self.save_enabled = False  # nothing to save yet
+        self.sent: list = []
+        self.tried: list = []
+        self.clicked: list = []
+        self.goto_urls: list = []
+        self.waits: list = []
+
+    def goto(self, url, wait_until=None):
+        self.goto_urls.append(url)
+        self.url = self.lands_on if self.lands_on is not None else url
+
+    def wait_for_load_state(self, state=None, timeout=None):
+        pass
+
+    def wait_for_timeout(self, ms):
+        pass
+
+    def locator(self, selector):
+        from noveltrans.youtube_upload import _EDIT_PAGE_SEL, _SAVE_SEL, _TOAST_SEL
+
+        page = self
+
+        class _Loc:
+            @property
+            def first(self):
+                return self
+
+            def wait_for(self, state=None, timeout=None):
+                from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+                page.tried.append(selector)
+                page.waits.append((selector, state))
+                if selector == _EDIT_PAGE_SEL:
+                    ok = page.editor
+                elif selector == _SAVE_SEL:
+                    ok = page.save_present
+                else:
+                    ok = selector in page.inputs
+                if not ok:
+                    raise PlaywrightTimeoutError(f"{selector} not {state}")
+
+            def set_input_files(self, path):
+                if selector not in page.inputs:
+                    raise RuntimeError(f"not a file input: {selector}")
+                page.sent.append((selector, path))
+                if page.accepts:
+                    page.save_enabled = True
+
+            def get_attribute(self, name, timeout=None):
+                if selector == _SAVE_SEL and name == "disabled":
+                    return None if page.save_enabled else "true"
+                return None
+
+            def inner_text(self, timeout=None):
+                return page.toast if selector == _TOAST_SEL else ""
+
+            def click(self):
+                page.clicked.append(selector)
+                if selector == _SAVE_SEL and page.commits:
+                    page.save_enabled = False
+
+            def is_visible(self, timeout=None):
+                return False  # no text-matched fallback on this fake
+
+        return _Loc()
+
+
+class TestOpenEditPage:
+    def test_navigates_to_the_video_edit_url(self):
+        from noveltrans.youtube_upload import _open_edit_page
+
+        page = _FakeEditPage()
+        _open_edit_page(page, "dQw4w9WgXcQ")
+        assert "/video/dQw4w9WgXcQ/edit" in page.goto_urls[0]
+
+    def test_logged_out_raises_needs_login(self):
+        from noveltrans.youtube_upload import _open_edit_page
+
+        page = _FakeEditPage(lands_on="https://accounts.google.com/signin")
+        with pytest.raises(YouTubeUploadError) as excinfo:
+            _open_edit_page(page, "dQw4w9WgXcQ")
+        assert excinfo.value.needs_login is True
+
+    def test_being_bounced_away_from_the_video_names_it(self):
+        """Deleted video, or the profile is on a different channel now — either way the
+        user needs the id and the link, not a generic timeout."""
+        from noveltrans.youtube_upload import _open_edit_page
+
+        page = _FakeEditPage(lands_on="https://studio.youtube.com/channel/UC123/videos")
+        with pytest.raises(YouTubeUploadError, match="dQw4w9WgXcQ"):
+            _open_edit_page(page, "dQw4w9WgXcQ")
+
+    def test_missing_editor_is_a_named_failure(self):
+        from noveltrans.youtube_upload import _open_edit_page
+
+        page = _FakeEditPage(editor=False)
+        with pytest.raises(YouTubeUploadError, match="giao diện"):
+            _open_edit_page(page, "dQw4w9WgXcQ")
+
+    def test_waits_for_attached_never_visible(self):
+        """The zero-size `ytcp-*` wrapper trait that hung two live runs of the upload
+        flow applies to every Studio container, this page included."""
+        from noveltrans.youtube_upload import _EDIT_PAGE_SEL, _open_edit_page
+
+        page = _FakeEditPage()
+        _open_edit_page(page, "dQw4w9WgXcQ")
+        states = [state for sel, state in page.waits if sel == _EDIT_PAGE_SEL]
+        assert states and "visible" not in states
+
+
+class TestSendThumbnail:
+    def test_uses_the_first_selector_that_works(self, cover):
+        from noveltrans.youtube_upload import _EDIT_THUMBNAIL_INPUT_SELS, _send_thumbnail
+
+        page = _FakeEditPage(inputs={_EDIT_THUMBNAIL_INPUT_SELS[0]})
+        _send_thumbnail(page, cover, video_id="dQw4w9WgXcQ")
+        assert page.sent == [(_EDIT_THUMBNAIL_INPUT_SELS[0], str(cover))]
+
+    def test_falls_through_to_the_widest_selector(self, cover):
+        from noveltrans.youtube_upload import _EDIT_THUMBNAIL_INPUT_SELS, _send_thumbnail
+
+        widest = _EDIT_THUMBNAIL_INPUT_SELS[-1]
+        page = _FakeEditPage(inputs={widest})
+        _send_thumbnail(page, cover, video_id="dQw4w9WgXcQ")
+        assert page.sent == [(widest, str(cover))]
+        # the narrow ones were tried first, as the ordering intends
+        assert page.tried[:2] == list(_EDIT_THUMBNAIL_INPUT_SELS[:2])
+
+    def test_a_missing_input_is_a_hard_error_not_a_skip(self, cover):
+        """The headline behaviour of this feature.
+
+        `_set_details` swallows exactly this case and reports "kênh chưa được phép đặt
+        ảnh bìa", because there the thumbnail is one field of an upload that must still
+        finish. Here it IS the job: continuing would report success while the channel
+        still shows the old cover.
+        """
+        from noveltrans.youtube_upload import _send_thumbnail
+
+        page = _FakeEditPage(inputs=set())
+        page.expect_file_chooser = None  # no fallback available on this fake
+        with pytest.raises(YouTubeUploadError, match="YouTube Studio"):
+            _send_thumbnail(page, cover, video_id="dQw4w9WgXcQ")
+        assert page.sent == []
+
+    def test_an_input_that_silently_no_ops_raises_here(self, cover):
+        """Setting a wrong element is a no-op. Without the Save-enabled gate the run
+        would sail on and report a successful save of nothing."""
+        from noveltrans.youtube_upload import _EDIT_THUMBNAIL_INPUT_SELS, _send_thumbnail
+
+        page = _FakeEditPage(inputs={_EDIT_THUMBNAIL_INPUT_SELS[0]}, accepts=False)
+        page.expect_file_chooser = None
+        with pytest.raises(YouTubeUploadError):
+            _send_thumbnail(page, cover, video_id="dQw4w9WgXcQ")
+        assert page.clicked == []  # never reached the save
+
+    def test_a_studio_rejection_reaches_the_user_verbatim(self, cover):
+        from noveltrans.youtube_upload import _EDIT_THUMBNAIL_INPUT_SELS, _send_thumbnail
+
+        page = _FakeEditPage(
+            inputs={_EDIT_THUMBNAIL_INPUT_SELS[0]}, accepts=False, toast="Ảnh quá lớn"
+        )
+        page.expect_file_chooser = None
+        with pytest.raises(YouTubeUploadError, match="Ảnh quá lớn"):
+            _send_thumbnail(page, cover, video_id="dQw4w9WgXcQ")
+
+
+class TestSaveConfirmation:
+    """Mirrors `TestFinishConfirmation`, and guards the same bug: never confirm on a
+    state that was already true before the click."""
+
+    def test_save_going_back_to_disabled_confirms(self):
+        from noveltrans.youtube_upload import _SAVE_SEL, _save_edits
+
+        page = _FakeEditPage()
+        page.save_enabled = True  # as `_thumbnail_accepted` left it
+        _save_edits(page, video_id="dQw4w9WgXcQ")
+        assert page.clicked == [_SAVE_SEL]
+
+    def test_a_saved_toast_confirms(self):
+        """Some Studio builds leave Save enabled; the toast is the independent fallback."""
+        from noveltrans.youtube_upload import _save_edits
+
+        page = _FakeEditPage(commits=False, toast="Đã lưu thay đổi")
+        page.save_enabled = True
+        _save_edits(page, video_id="dQw4w9WgXcQ")
+
+    def test_a_never_confirming_save_raises_with_the_link(self):
+        from noveltrans.youtube_upload import _save_edits
+
+        page = _FakeEditPage(commits=False)
+        page.save_enabled = True
+        with pytest.raises(YouTubeUploadError, match="không xác nhận"):
+            _save_edits(page, video_id="dQw4w9WgXcQ")
+
+    def test_an_error_toast_short_circuits_into_the_error(self):
+        from noveltrans.youtube_upload import _save_edits
+
+        page = _FakeEditPage(commits=False, toast="Không thể lưu ảnh bìa")
+        page.save_enabled = True
+        with pytest.raises(YouTubeUploadError, match="Không thể lưu ảnh bìa"):
+            _save_edits(page, video_id="dQw4w9WgXcQ")
+
+    def test_an_unclickable_save_says_the_cover_did_not_change(self):
+        from noveltrans.youtube_upload import _save_edits
+
+        page = _FakeEditPage(save_present=False)
+        with pytest.raises(YouTubeUploadError, match="chưa được đổi"):
+            _save_edits(page, video_id="dQw4w9WgXcQ")
+
+    def test_disabled_save_alone_is_not_proof_the_image_landed(self):
+        """`#save` is disabled on arrival, so "disabled" means nothing on its own. The
+        gate that gives it meaning is `_thumbnail_accepted` seeing it ENABLED first —
+        exactly the always-true check that made `_finish` report every publish a success."""
+        from noveltrans.youtube_upload import _thumbnail_accepted
+
+        page = _FakeEditPage()  # save_enabled False, never touched
+        assert _thumbnail_accepted(page, timeout_ms=2_000) is False
+
+
+class TestUpdateThumbnailOneGuards:
+    """`page=None` throughout: any locator access would raise AttributeError instead of
+    the error we assert on, which proves nothing was touched."""
+
+    def test_a_part_with_no_video_on_youtube_raises_before_the_page(self, part, cover):
+        from noveltrans.youtube_upload import ThumbnailRequest, update_thumbnail_one
+
+        with pytest.raises(YouTubeUploadError, match="chưa có video"):
+            update_thumbnail_one(None, ThumbnailRequest(video=part, thumbnail=cover))
+
+    def test_a_hand_marked_part_raises(self, part, cover):
+        from noveltrans.youtube_upload import (
+            ThumbnailRequest,
+            mark_uploaded_by_hand,
+            update_thumbnail_one,
+        )
+
+        mark_uploaded_by_hand(part)
+        with pytest.raises(YouTubeUploadError, match="chưa có video"):
+            update_thumbnail_one(None, ThumbnailRequest(video=part, thumbnail=cover))
+
+    def test_a_bad_image_raises_before_the_page(self, part, tmp_path):
+        from noveltrans.youtube_upload import ThumbnailRequest, update_thumbnail_one
+
+        write_upload_state(part, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
+        with pytest.raises(YouTubeUploadError):
+            update_thumbnail_one(
+                None, ThumbnailRequest(video=part, thumbnail=tmp_path / "nope.jpg")
+            )
+
+
+class TestUpdateThumbnailRecord:
+    def _page(self):
+        from noveltrans.youtube_upload import _EDIT_THUMBNAIL_INPUT_SELS
+
+        return _FakeEditPage(inputs={_EDIT_THUMBNAIL_INPUT_SELS[0]})
+
+    def test_records_when_the_cover_was_pushed_and_which_file(self, part, cover):
+        from noveltrans.youtube_upload import ThumbnailRequest, update_thumbnail_one
+
+        write_upload_state(part, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
+        result = update_thumbnail_one(
+            self._page(), ThumbnailRequest(video=part, thumbnail=cover)
+        )
+        state = read_upload_state(part)
+        assert result.video_id == "dQw4w9WgXcQ"
+        assert state["thumbnail_file"] == cover.name
+        assert state["thumbnail_updated_at"]
+
+    def test_never_moves_the_publication_state_machine(self, part, cover):
+        """A thumbnail push cannot change whether a video is published, so writing a
+        status here would be a lie the rest of the app would then act on."""
+        from noveltrans.youtube_upload import ThumbnailRequest, update_thumbnail_one
+
+        write_upload_state(
+            part,
+            status=STATE_PUBLISHED,
+            video_id="dQw4w9WgXcQ",
+            published_at="2026-07-01T20:00:00+07:00",
+        )
+        update_thumbnail_one(self._page(), ThumbnailRequest(video=part, thumbnail=cover))
+        state = read_upload_state(part)
+        assert state["status"] == STATE_PUBLISHED
+        assert state["video_id"] == "dQw4w9WgXcQ"
+        assert state["published_at"] == "2026-07-01T20:00:00+07:00"
+
+    def test_a_failed_save_writes_nothing(self, part, cover):
+        from noveltrans.youtube_upload import (
+            _EDIT_THUMBNAIL_INPUT_SELS,
+            ThumbnailRequest,
+            update_thumbnail_one,
+        )
+
+        write_upload_state(part, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
+        page = _FakeEditPage(inputs={_EDIT_THUMBNAIL_INPUT_SELS[0]}, commits=False)
+        with pytest.raises(YouTubeUploadError):
+            update_thumbnail_one(page, ThumbnailRequest(video=part, thumbnail=cover))
+        assert "thumbnail_updated_at" not in read_upload_state(part)
+
+    def test_cancelling_before_the_save_writes_nothing(self, part, cover):
+        from noveltrans.youtube_upload import (
+            ThumbnailRequest,
+            UploadCancelled,
+            update_thumbnail_one,
+        )
+
+        write_upload_state(part, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
+        calls = {"n": 0}
+
+        def should_cancel():
+            calls["n"] += 1
+            return calls["n"] > 1  # true only after the image has gone in
+
+        with pytest.raises(UploadCancelled):
+            update_thumbnail_one(
+                self._page(),
+                ThumbnailRequest(video=part, thumbnail=cover),
+                should_cancel=should_cancel,
+            )
+        assert "thumbnail_updated_at" not in read_upload_state(part)
+
+
+class TestUpdateThumbnailBatch:
+    """One browser for the whole run, and one failure must not cost the others."""
+
+    def _patch(self, monkeypatch, behaviour):
+        import noveltrans.youtube_upload as mod
+
+        page = _FakeEditPage()
+        monkeypatch.setattr(mod, "_require_playwright", lambda: object())
+        launches = []
+
+        def fake_launch(_sync, *, headless):
+            launches.append(headless)
+            return object(), _FakeContext(page)
+
+        monkeypatch.setattr(mod, "_launch_context", fake_launch)
+        monkeypatch.setattr(mod, "_close", lambda *a: None)
+        seen = []
+
+        def fake_one(_page, request, **kw):
+            seen.append(request.label)
+            return behaviour(request)
+
+        monkeypatch.setattr(mod, "update_thumbnail_one", fake_one)
+        return launches, seen
+
+    def _requests(self, part, cover, n=3):
+        from noveltrans.youtube_upload import ThumbnailRequest
+
+        return [
+            ThumbnailRequest(
+                video=part, thumbnail=cover, video_id="dQw4w9WgXcQ", label=f"Phần {i + 1}"
+            )
+            for i in range(n)
+        ]
+
+    def test_one_browser_for_the_whole_run(self, monkeypatch, part, cover):
+        from noveltrans.youtube_upload import ThumbnailResult, update_thumbnail_batch
+
+        launches, seen = self._patch(
+            monkeypatch, lambda r: ThumbnailResult("dQw4w9WgXcQ", "", "now")
+        )
+        update_thumbnail_batch(self._requests(part, cover))
+        assert launches == [False]  # headed, exactly once
+        assert seen == ["Phần 1", "Phần 2", "Phần 3"]
+
+    def test_a_failing_part_does_not_abort_the_rest(self, monkeypatch, part, cover):
+        from noveltrans.youtube_upload import ThumbnailResult, update_thumbnail_batch
+
+        def behaviour(request):
+            if request.label == "Phần 2":
+                raise YouTubeUploadError("hỏng")
+            return ThumbnailResult("dQw4w9WgXcQ", "", "now")
+
+        _launches, seen = self._patch(monkeypatch, behaviour)
+        done: list = []
+        update_thumbnail_batch(
+            self._requests(part, cover), on_part_done=lambda i, r, e: done.append((i, e))
+        )
+        assert seen == ["Phần 1", "Phần 2", "Phần 3"]
+        assert done[1] == (1, "hỏng")
+
+    def test_needs_login_aborts_the_whole_run(self, monkeypatch, part, cover):
+        """Every remaining part would fail identically, so continuing is only noise."""
+        from noveltrans.youtube_upload import update_thumbnail_batch
+
+        def behaviour(request):
+            raise YouTubeUploadError("chưa đăng nhập", needs_login=True)
+
+        _launches, seen = self._patch(monkeypatch, behaviour)
+        with pytest.raises(YouTubeUploadError):
+            update_thumbnail_batch(self._requests(part, cover))
+        assert seen == ["Phần 1"]
+
+    def test_validates_every_request_before_opening_a_browser(self, monkeypatch, part, tmp_path):
+        from noveltrans.youtube_upload import ThumbnailRequest, update_thumbnail_batch
+
+        launches, _seen = self._patch(monkeypatch, lambda r: None)
+        with pytest.raises(YouTubeUploadError):
+            update_thumbnail_batch(
+                [ThumbnailRequest(video=part, thumbnail=tmp_path / "nope.jpg")]
+            )
+        assert launches == []
+
+    def test_a_dirty_editor_is_discarded_between_parts(self, monkeypatch, part, cover):
+        """A part that failed after its image went in leaves Studio's "bỏ thay đổi?"
+        guard up, which would block navigation for every part after it."""
+        import noveltrans.youtube_upload as mod
+        from noveltrans.youtube_upload import ThumbnailResult, update_thumbnail_batch
+
+        self._patch(monkeypatch, lambda r: ThumbnailResult("dQw4w9WgXcQ", "", "now"))
+        dismissed: list = []
+        monkeypatch.setattr(mod, "_dismiss_unsaved_changes", lambda p: dismissed.append(1))
+        update_thumbnail_batch(self._requests(part, cover))
+        assert len(dismissed) == 2  # between each pair, not before the first
+
+
+class _FakeContext:
+    """Just enough browser context for `update_thumbnail_batch` to get at its page."""
+
+    def __init__(self, page):
+        self.pages = [page]
+        page.set_default_timeout = lambda ms: None

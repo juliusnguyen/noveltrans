@@ -19,6 +19,11 @@ Design choices (see changes/033-VIDEO-UPLOAD-AUTOMATION):
     notice a login-upload-quit cycle repeated per video, and the launch itself costs
     seconds.
 
+`update_thumbnail_batch` (feature 034) is the one flow that does *not* upload: it drives
+Studio's standalone **video edit page** to replace the cover of a video that is already
+on the channel, for when the cover is re-cut after publishing. It is also the one flow
+where a missing thumbnail input is fatal rather than a shrug — see `_send_thumbnail`.
+
 **Never double-publish.** A part's upload state is a sidecar next to its `.mp4`
 (`<name>.upload.json`), written *before* the file is handed to Studio and updated as
 soon as the draft's video id is known. Anything already `published` is skipped. See
@@ -154,6 +159,51 @@ _TRANSFER_DONE_RE = re.compile(
 )
 _PERCENT_RE = re.compile(r"(\d+)\s*%")
 
+# -- video edit page (feature 034: replace the thumbnail of a published video) --
+#
+# A different Studio surface from the upload dialog: the standalone edit page, chosen
+# because it has an explicit save affordance. `#save` is disabled while there is nothing
+# to save, which makes it a language-independent TWO-WAY signal — it going *enabled*
+# proves Studio took the image, it going *disabled* proves the save landed. The
+# thumbnail control inside the upload dialog has no save of its own; it only commits
+# when the whole dialog does, which no longer exists once the video is published.
+#
+# Like the upload selectors above, NONE of these have been verified against a live
+# channel. They are written so that drift stops the run and names the step, never so
+# that it quietly reports success: this flow's only output is the thumbnail, so a
+# skipped step would be a lie.
+_EDIT_URL = "https://studio.youtube.com/video/{video_id}/edit?hl=vi"
+# The metadata editor mounting is how we know the id resolved to a real video on this
+# channel — a deleted or foreign id bounces to the video list instead.
+_EDIT_PAGE_SEL = "ytcp-video-metadata-editor, #metadata-container, ytcp-uploads-details"
+# Same component the upload dialog renders (see `_THUMBNAIL_INPUT_SEL`), widest net
+# last — the first live run of 033 stalled because only narrow `ytcp-*` forms were tried.
+_EDIT_THUMBNAIL_INPUT_SELS = (
+    "ytcp-thumbnails-compact-editor input[type='file']",
+    "ytcp-video-thumbnail-editor input[type='file']",
+    "#file-loader",
+    "ytcp-video-metadata-editor input[type='file']",
+)
+_EDIT_THUMBNAIL_BUTTON_SEL = (
+    "#still-picker-upload-button, ytcp-thumbnails-compact-editor #upload-button"
+)
+_EDIT_THUMBNAIL_TEXTS = ("Tải file lên", "Tải tệp lên", "Upload file", "Upload thumbnail")
+_SAVE_SEL = "#save, ytcp-button#save, ytcp-button#save-button"
+_SAVE_TEXTS = ("Lưu", "Save")
+# Studio's post-save toast. Secondary confirmation only: the primary one is `#save`
+# going back to disabled, which needs no text matching at all.
+_TOAST_SEL = "ytcp-toast, tp-yt-paper-toast, ytcp-snackbar, #notification-text"
+_SAVED_RE = re.compile(r"đã lưu|lưu thay đổi|saved|changes saved", re.IGNORECASE)
+_SAVE_ERROR_RE = re.compile(
+    r"không thể|thất bại|lỗi|quá lớn|không hợp lệ|error|failed|too large|invalid",
+    re.IGNORECASE,
+)
+# Navigating away with an unsaved change puts up Studio's own confirmation. In a batch
+# that lands between parts, so it must be cleared or one failed part blocks every
+# remaining one behind a modal nobody sees.
+_DISCARD_DIALOG_SEL = "ytcp-confirmation-dialog, tp-yt-paper-dialog#dialog"
+_DISCARD_TEXTS = ("Loại bỏ", "Bỏ thay đổi", "Discard", "Discard changes")
+
 # -- timings ------------------------------------------------------------------
 # Studio is slow and network-bound; these are deliberately generous. A part-video is
 # often > 1 GB, so the *upload* wait is measured in tens of minutes, not seconds.
@@ -171,6 +221,14 @@ _MIN_SCHEDULE_LEAD = timedelta(minutes=15)
 _BETWEEN_PARTS_MS = 20_000
 # Grace period before tearing the browser down at the end of a run.
 _SETTLE_BEFORE_CLOSE_MS = 5_000
+
+# thumbnail update (034). Much cheaper than an upload — a page load, not a transfer.
+_EDIT_PAGE_WAIT_MS = 45_000  # the edit page to mount
+_THUMB_ACCEPT_MS = 20_000  # Studio to register the new image (save becomes enabled)
+_SAVE_CONFIRM_MS = 60_000  # the save to land (a 2 MB image + Studio round-trip)
+_BETWEEN_THUMBNAILS_MS = 8_000  # human pacing, shorter than `_BETWEEN_PARTS_MS`
+_MAX_THUMBNAIL_BYTES = 2 * 1024 * 1024  # YouTube's hard limit
+_THUMBNAIL_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".bmp"}
 
 
 class YouTubeUploadError(Exception):
@@ -249,6 +307,53 @@ class UploadResult:
     visibility: str
     publish_at: datetime | None = None
     skipped: bool = False  # already published; nothing was sent this run
+
+
+@dataclass
+class ThumbnailRequest:
+    """One part's thumbnail replacement: an already-uploaded video + the new image.
+
+    `video` is only the identity key for the `<name>.upload.json` record — unlike
+    `UploadRequest`, the .mp4 itself need not still exist. The video lives on YouTube
+    now, and someone who deleted the local render to reclaim disk should still be able
+    to push a new cover.
+    """
+
+    video: Path
+    thumbnail: Path
+    video_id: str = ""  # "" → resolved from the record in `update_thumbnail_one`
+    label: str = ""  # human name for progress lines, e.g. "Phần 3"
+
+    def validate(self) -> None:
+        """Reject a request that can't succeed, before any browser is launched.
+
+        Every check here is local and free, so a file YouTube would refuse costs zero
+        seconds of Chrome — the same discipline as `UploadRequest.validate()`.
+        """
+        thumbnail = Path(self.thumbnail)
+        name = self.label or Path(self.video).stem
+        if not thumbnail.is_file():
+            raise YouTubeUploadError(f"Không tìm thấy ảnh bìa: {thumbnail}")
+        size = thumbnail.stat().st_size
+        if not size:
+            raise YouTubeUploadError(f"{name}: ảnh bìa rỗng — hãy tạo lại ảnh bìa.")
+        if size > _MAX_THUMBNAIL_BYTES:
+            raise YouTubeUploadError(
+                f"{name}: ảnh bìa nặng {size / 1024 / 1024:.1f} MB, YouTube chỉ nhận "
+                "tối đa 2 MB."
+            )
+        if thumbnail.suffix.lower() not in _THUMBNAIL_SUFFIXES:
+            raise YouTubeUploadError(
+                f"{name}: YouTube không nhận định dạng “{thumbnail.suffix}”. "
+                "Dùng .jpg, .png, .gif hoặc .bmp."
+            )
+
+
+@dataclass
+class ThumbnailResult:
+    video_id: str
+    url: str
+    updated_at: str
 
 
 # -- schedule arithmetic (pure, tested) ---------------------------------------
@@ -445,6 +550,41 @@ def has_remote_draft(video: Path) -> bool:
     """
     state = read_upload_state(video)
     return bool(state.get("video_id")) and state.get("status") != STATE_PUBLISHED
+
+
+def uploaded_video_id(video: Path) -> str:
+    """The YouTube video id recorded for this part, or "" if there isn't one.
+
+    Eligibility for a thumbnail update, and deliberately status-blind where
+    `is_uploadable` is paranoid: `draft`, `committed` and `published` all name a video
+    that exists on the channel and whose thumbnail is editable. Replacing a thumbnail
+    cannot duplicate anything, so the rule that protects against double-publishing has
+    nothing to protect here.
+
+    A `marked_by_hand` record has no id and never had one, so it is excluded for free —
+    which is the point: we must never push a cover at a video we can't identify.
+    """
+    return str(read_upload_state(video).get("video_id") or "")
+
+
+def thumbnail_is_current(video: Path, thumbnail: Path) -> bool:
+    """True if the recorded thumbnail push is at least as new as the image on disk.
+
+    Advisory only — it feeds the confirmation dialog's "these N are already up to date"
+    line, and must never be used to skip work silently. Anything unreadable or
+    unparseable reads as *stale*, so the safe answer is always "offer to push it".
+    """
+    updated = read_upload_state(video).get("thumbnail_updated_at")
+    if not updated:
+        return False
+    try:
+        pushed_at = datetime.fromisoformat(str(updated))
+        made_at = datetime.fromtimestamp(Path(thumbnail).stat().st_mtime)
+    except (ValueError, OSError):
+        return False
+    if pushed_at.tzinfo is not None:  # `_now_iso` is tz-aware; st_mtime is naive local
+        pushed_at = pushed_at.astimezone().replace(tzinfo=None)
+    return pushed_at >= made_at
 
 
 def is_uploadable(video: Path) -> bool:
@@ -1096,6 +1236,199 @@ def _finish(page, *, video_id: str) -> None:
     )
 
 
+# -- the Studio edit page: replacing a published video's thumbnail ------------
+
+
+def _open_edit_page(page, video_id: str, *, timeout_ms: int = _EDIT_PAGE_WAIT_MS):
+    """Navigate to a video's edit page and confirm the metadata editor mounted.
+
+    Three distinct failures get three distinct messages, because their fixes differ:
+    not logged in (the one-time sign-in), Studio bouncing us away from the video (it
+    was deleted, or the profile is on a different channel now), and the editor never
+    mounting (DOM drift).
+    """
+    page.goto(_EDIT_URL.format(video_id=video_id), wait_until="domcontentloaded")
+    try:
+        page.wait_for_load_state("networkidle", timeout=5_000)
+    except Exception:
+        pass  # Studio keeps long-poll connections open; networkidle often never fires
+
+    if _LOGGED_OUT_URL_RE.search(page.url or ""):
+        raise YouTubeUploadError(
+            "Profile YouTube chưa đăng nhập. Vào Settings → “Đăng nhập YouTube” để "
+            "đăng nhập kênh một lần.",
+            needs_login=True,
+            video_id=video_id,
+        )
+    if video_id not in (page.url or ""):
+        raise YouTubeUploadError(
+            f"Không mở được trang chỉnh sửa video {video_id} "
+            f"(https://youtu.be/{video_id}). Video có thể đã bị xoá, thuộc kênh khác, "
+            "hoặc phiên đăng nhập đã đổi kênh.",
+            video_id=video_id,
+        )
+    # `attached`, never `visible` — the same zero-size `ytcp-*` wrapper trait that hung
+    # the first live runs of the upload flow applies to every Studio container.
+    editor = _first_present(page, _EDIT_PAGE_SEL, timeout_ms=timeout_ms, state="attached")
+    if editor is None:
+        raise YouTubeUploadError(
+            "Trang chỉnh sửa video của YouTube Studio không mở ra (giao diện có thể đã "
+            "thay đổi). Hãy đổi ảnh bìa thủ công lần này và báo lỗi để cập nhật selector.",
+            video_id=video_id,
+        )
+    return editor
+
+
+def _toast_text(page) -> str:
+    """Whatever Studio's toast says right now, or "". Never raises."""
+    try:
+        return (page.locator(_TOAST_SEL).first.inner_text(timeout=1_000) or "").strip()
+    except Exception:
+        return ""
+
+
+def _save_button_disabled(page) -> bool:
+    """True when Studio's Save button is disabled — i.e. there is nothing left to save."""
+    locator = _first_present(page, _SAVE_SEL, timeout_ms=2_000, state="attached")
+    if locator is None:
+        return False
+    try:
+        return locator.get_attribute("disabled") is not None
+    except Exception:
+        return False
+
+
+def _thumbnail_accepted(page, *, timeout_ms: int = _THUMB_ACCEPT_MS) -> bool:
+    """True once Save has become enabled — Studio's own "there is an unsaved change" bit.
+
+    The counterpart to `_file_accepted`, and it exists for the same reason:
+    `set_input_files` against a selector that matched the wrong element is a silent
+    no-op, and without this check the run would sail on and report a successful save
+    of nothing.
+    """
+    waited = 0
+    while waited < timeout_ms:
+        text = _toast_text(page)
+        if text and _SAVE_ERROR_RE.search(text):
+            return False  # Studio rejected the image; the caller quotes the toast
+        if _first_present(page, _SAVE_SEL, timeout_ms=1_000, state="attached") is not None:
+            if not _save_button_disabled(page):
+                return True
+        page.wait_for_timeout(1_000)
+        waited += 2_000
+    return False
+
+
+def _send_thumbnail(page, image: Path, *, video_id: str) -> None:
+    """Hand the image to the edit page's thumbnail editor, then prove Studio took it.
+
+    Two strategies, the same ladder as `_send_file` and for the same reason — this is
+    the step with no alternative. Set the input directly first (works while it's
+    hidden); click Studio's own upload button inside `expect_file_chooser` second.
+
+    **Unlike `_set_details`, a missing input is fatal here.** There the thumbnail is one
+    field of an upload that must still finish, so a channel without thumbnail privileges
+    should still get its video up. Here it *is* the job: continuing would report
+    "đã cập nhật ảnh bìa" while the channel still shows the old cover.
+    """
+    for selector in _EDIT_THUMBNAIL_INPUT_SELS:
+        locator = page.locator(selector).first
+        try:
+            locator.wait_for(state="attached", timeout=5_000)
+            locator.set_input_files(str(image))
+        except Exception:
+            continue
+        if _thumbnail_accepted(page):
+            return
+
+    try:
+        with page.expect_file_chooser(timeout=_STEP_WAIT_MS) as chooser_info:
+            if not _click_any(
+                page, _EDIT_THUMBNAIL_BUTTON_SEL, _EDIT_THUMBNAIL_TEXTS, timeout_ms=10_000
+            ):
+                raise YouTubeUploadError(
+                    "Không tìm thấy chỗ tải ảnh bìa trên trang chỉnh sửa video. Kênh có "
+                    "thể chưa được phép đặt ảnh bìa tuỳ chỉnh (cần xác minh số điện "
+                    "thoại), hoặc giao diện Studio đã thay đổi.",
+                    video_id=video_id,
+                )
+        chooser_info.value.set_files(str(image))
+    except YouTubeUploadError:
+        raise
+    except Exception as exc:
+        # Quote Studio's own message when it has one: a rejection ("Ảnh quá lớn") names
+        # the real problem, while the generic text sends the user hunting for a selector
+        # bug that isn't there.
+        said = _toast_text(page)
+        raise YouTubeUploadError(
+            "Không đưa được ảnh bìa vào YouTube Studio"
+            + (f" — Studio báo: “{said}”." if said else " — giao diện có thể đã thay đổi.")
+            + " Hãy đổi ảnh bìa thủ công lần này và báo lỗi để cập nhật selector.",
+            video_id=video_id,
+        ) from exc
+
+    if not _thumbnail_accepted(page):
+        said = _toast_text(page)
+        raise YouTubeUploadError(
+            "Đã chọn ảnh bìa nhưng YouTube Studio không ghi nhận thay đổi (nút “Lưu” "
+            "vẫn tắt)."
+            + (f" Studio báo: “{said}”." if said else "")
+            + " Ảnh có thể sai định dạng, hoặc kênh chưa được phép đặt ảnh bìa tuỳ chỉnh.",
+            video_id=video_id,
+        )
+
+
+def _save_edits(page, *, video_id: str) -> None:
+    """Click Lưu / Save and require Studio to confirm it. Raises otherwise.
+
+    Two accepted proofs, in order of trustworthiness: Save going back to *disabled*
+    (Polymer's own "no unsaved changes" state), or a toast matching `_SAVED_RE`.
+
+    Mirrors `_finish` — and its bug. Never confirm on a state that was already true
+    before the click: `#save` is disabled on arrival, so "disabled" means nothing on its
+    own. It only counts because `_thumbnail_accepted` already saw it enabled.
+    """
+    if not _click_any(page, _SAVE_SEL, _SAVE_TEXTS):
+        raise YouTubeUploadError(
+            "Không bấm được nút “Lưu” trên trang chỉnh sửa video (giao diện có thể đã "
+            "thay đổi). Ảnh bìa chưa được đổi.",
+            video_id=video_id,
+        )
+    waited = 0
+    while waited < _SAVE_CONFIRM_MS:
+        text = _toast_text(page)
+        if text and _SAVE_ERROR_RE.search(text):
+            raise YouTubeUploadError(
+                f"YouTube Studio báo lỗi khi lưu ảnh bìa: “{text}”.", video_id=video_id
+            )
+        if text and _SAVED_RE.search(text):
+            return
+        if _save_button_disabled(page):
+            return
+        page.wait_for_timeout(1_000)
+        waited += 1_000
+    raise YouTubeUploadError(
+        "Đã bấm “Lưu” nhưng YouTube Studio không xác nhận đã lưu ảnh bìa. "
+        f"Kiểm tra video trên kênh: https://youtu.be/{video_id}",
+        video_id=video_id,
+    )
+
+
+def _dismiss_unsaved_changes(page) -> None:
+    """Clear Studio's "bỏ thay đổi?" guard so the next part can navigate. Never raises.
+
+    Only appears when a part failed *after* its image went in. Without this, one failed
+    part in a batch blocks every remaining part behind a modal nobody can see.
+    """
+    try:
+        if _first_present(page, _DISCARD_DIALOG_SEL, timeout_ms=2_000, state="attached") is None:
+            return
+        _click_by_text(page, _DISCARD_TEXTS, timeout_ms=5_000)
+        page.wait_for_timeout(_SETTLE_MS)
+    except Exception:
+        pass
+
+
 # -- public entry points ------------------------------------------------------
 
 
@@ -1271,6 +1604,121 @@ def upload_batch(
             page.wait_for_timeout(_SETTLE_BEFORE_CLOSE_MS)
         except Exception:
             pass
+    finally:
+        _close(context, playwright)
+    return results
+
+
+def update_thumbnail_one(
+    page,
+    request: ThumbnailRequest,
+    *,
+    on_progress=None,
+    should_cancel=None,
+) -> ThumbnailResult:
+    """Replace one already-uploaded video's thumbnail, on an already-open page.
+
+    Split from the batch for the same two reasons `upload_one` is: a batch reuses one
+    browser, and the flow has to be drivable from a test with a fake page.
+
+    Nothing is written to the record until Studio confirms the save, so a failure leaves
+    the sidecar exactly as it was. There is no half-state to reason about here — which
+    is what makes this action so much cheaper than an upload, and why it needs none of
+    the write-before-the-irreversible-click machinery around publishing.
+    """
+    request.validate()
+    video = Path(request.video)
+    video_id = request.video_id or uploaded_video_id(video)
+    if not video_id:
+        raise YouTubeUploadError(
+            f"{request.label or video.stem}: chưa có video trên YouTube cho phần này "
+            "(hoặc phần này chỉ được đánh dấu thủ công), nên không biết đổi ảnh bìa của "
+            "video nào."
+        )
+
+    _check_cancel(should_cancel)
+    _report(on_progress, "Mở trang chỉnh sửa video…")
+    _open_edit_page(page, video_id)
+
+    _report(on_progress, "Gửi ảnh bìa mới…")
+    _send_thumbnail(page, Path(request.thumbnail), video_id=video_id)
+
+    # Last cancellation point. Past the save click there is nothing to abort, and
+    # stopping between "YouTube took it" and "we recorded it" costs one redundant
+    # re-push — cheap, unlike the publish fence in `upload_one`.
+    _check_cancel(should_cancel, video_id=video_id)
+    _report(on_progress, "Lưu thay đổi…")
+    _save_edits(page, video_id=video_id)
+
+    updated_at = _now_iso()
+    # Merge-only, and deliberately narrow: `status`, `video_id` and `published_at` are
+    # untouched. A thumbnail push cannot move the publication state machine, so writing
+    # one here would be a lie the rest of the app would then act on.
+    write_upload_state(
+        video,
+        thumbnail_updated_at=updated_at,
+        thumbnail_file=Path(request.thumbnail).name,
+    )
+    return ThumbnailResult(
+        video_id=video_id, url=f"https://youtu.be/{video_id}", updated_at=updated_at
+    )
+
+
+def update_thumbnail_batch(
+    requests,
+    *,
+    headless: bool = False,
+    on_progress=None,
+    on_part_done=None,
+    should_cancel=None,
+) -> list:
+    """Update every request's thumbnail through ONE browser session. Returns the results.
+
+    Same contract as `upload_batch`: headed by default (Google challenges this profile
+    hard, and a headless session invites a mid-run re-challenge), `on_part_done(index,
+    result, error)` per part, and a failing part does NOT abort the run — except
+    `needs_login`, where every remaining part would fail identically.
+
+    Between parts it clears any leftover "bỏ thay đổi?" guard and paces itself. The
+    pacing is shorter than an upload's because the work per part is a page load rather
+    than a multi-GB transfer, but it is still there: this is a second automated Studio
+    surface on the same profile.
+    """
+    requests = list(requests)
+    for request in requests:  # fail fast, before the browser costs anything
+        request.validate()
+
+    sync_playwright = _require_playwright()
+    playwright, context = _launch_context(sync_playwright, headless=headless)
+    results: list = []
+    try:
+        page = context.pages[0] if context.pages else context.new_page()
+        page.set_default_timeout(_STEP_WAIT_MS)
+        for index, request in enumerate(requests):
+            label = request.label or Path(request.video).stem
+            _check_cancel(should_cancel)
+            if index:
+                _dismiss_unsaved_changes(page)
+                page.wait_for_timeout(_BETWEEN_THUMBNAILS_MS)
+            try:
+                result = update_thumbnail_one(
+                    page,
+                    request,
+                    on_progress=lambda msg, lbl=label: _report(on_progress, f"{lbl}: {msg}"),
+                    should_cancel=should_cancel,
+                )
+            except UploadCancelled:
+                raise
+            except YouTubeUploadError as exc:
+                results.append(None)
+                if on_part_done is not None:
+                    on_part_done(index, None, str(exc))
+                if exc.needs_login:
+                    raise  # every remaining part would fail the same way
+                continue
+            results.append(result)
+            if on_part_done is not None:
+                on_part_done(index, result, "")
     finally:
         _close(context, playwright)
     return results

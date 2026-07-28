@@ -1492,3 +1492,71 @@ class YouTubeUploadWorker(QThread):
             self.failed.emit(repr(exc))
         else:
             self.finished_ok.emit(done - errors, errors)
+
+
+class YouTubeThumbnailWorker(QThread):
+    """Replace the thumbnails of already-uploaded parts, in one browser session.
+
+    A sibling of YouTubeUploadWorker down to the signal shapes, so the Video tab drives
+    it with the wiring it already has. The requests are built on the GUI thread (they
+    only read sidecar files) and handed over whole; this worker never touches a
+    NovelProject.
+    """
+
+    progress = Signal(int, int, str)  # parts done, total parts, status line
+    part_done = Signal(int, str, str)  # index, video url ("" on failure), error
+    finished_ok = Signal(int, int)  # updated count, failed count
+    failed = Signal(str)  # the whole run could not start
+    needs_login = Signal(str)  # profile has no valid Google session
+
+    def __init__(self, requests: list, parent=None):
+        super().__init__(parent)
+        self.requests = list(requests)
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        from noveltrans.youtube_upload import (
+            UploadCancelled,
+            YouTubeUploadError,
+            update_thumbnail_batch,
+        )
+
+        total = len(self.requests)
+        done = 0
+        errors = 0
+
+        def on_part_done(index: int, result, error: str) -> None:
+            nonlocal done, errors
+            done += 1
+            if error:
+                errors += 1
+            self.part_done.emit(index, getattr(result, "url", "") or "", error)
+            label = self.requests[index].label or f"phần {index + 1}"
+            self.progress.emit(done, total, f"{label}: {'lỗi' if error else 'xong'}")
+
+        try:
+            update_thumbnail_batch(
+                self.requests,
+                on_progress=lambda msg: self.progress.emit(done, total, msg),
+                on_part_done=on_part_done,
+                should_cancel=lambda: self._cancelled,
+            )
+        except UploadCancelled:
+            # Nothing half-done can be left behind here: a part is either saved or
+            # untouched. So this is NOT the upload worker's "a stray draft is on your
+            # channel" — say plainly that the parts already done keep their new cover.
+            self.failed.emit(
+                f"Đã dừng cập nhật ảnh bìa. {done} phần đã đổi vẫn giữ ảnh bìa mới."
+            )
+        except YouTubeUploadError as exc:
+            if exc.needs_login:
+                self.needs_login.emit(str(exc))
+            else:
+                self.failed.emit(str(exc))
+        except Exception as exc:  # keep unexpected automation errors on-screen
+            self.failed.emit(repr(exc))
+        else:
+            self.finished_ok.emit(done - errors, errors)
