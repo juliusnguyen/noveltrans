@@ -365,7 +365,7 @@ class TagsWorker(QThread):
                 return
             meta = project.meta
             prompt = build_tags_prompt(
-                vn_title=meta.translated_title or meta.title,
+                vn_title=meta.display_name(),
                 original_title=meta.title,
                 author=meta.translated_author or meta.author,
                 vn_description=meta.translated_description,
@@ -840,6 +840,8 @@ class MergeWorker(QThread):
                 self.failed.emit("Không có chương nào có audio giọng này trong phạm vi đã chọn.")
                 return
             project.audio_dir.mkdir(parents=True, exist_ok=True)
+            # NOT display_name(): the slug keys <stem>.mp4 and its sidecars, so an
+            # editable title must never move them. See NovelMeta.display_name().
             slug = slugify(project.meta.translated_title or project.meta.title)
             ext = "m4b" if self.fmt == "m4b" else "mp3"
             total = len(windows)
@@ -913,6 +915,10 @@ class VideoWorker(QThread):
         thumb_font_key: str = "",  # font registry key for the thumbnail text; "" → font_key
         thumb_title_pos: tuple[float, float] | None = None,  # cover title (x, y) fractions
         thumb_part_pos: tuple[float, float] | None = None,  # cover "PHẦN N" (x, y) fractions
+        # cover text-size multipliers; None → the renderer's 1.0 (the original layout)
+        thumb_title_scale: float | None = None,
+        thumb_part_scale: float | None = None,
+        thumb_tagline_scale: float | None = None,
         bg_color: str = "",  # background hex "#rrggbb"; "" → the default pastel gradient
         skip_existing: bool = False,  # skip parts whose .mp4 already exists (batch "continue")
         credit: str = "",  # "Tạo bởi: …" line; "" → the default (Fox Novel)
@@ -939,6 +945,9 @@ class VideoWorker(QThread):
         self.thumb_font_key = thumb_font_key
         self.thumb_title_pos = thumb_title_pos
         self.thumb_part_pos = thumb_part_pos
+        self.thumb_title_scale = thumb_title_scale
+        self.thumb_part_scale = thumb_part_scale
+        self.thumb_tagline_scale = thumb_tagline_scale
         self.bg_color = bg_color
         self.skip_existing = skip_existing
         self.credit = credit
@@ -988,8 +997,10 @@ class VideoWorker(QThread):
                 self.failed.emit("Không có chương nào có audio giọng này trong phạm vi đã chọn.")
                 return
             project.video_dir.mkdir(parents=True, exist_ok=True)
+            # NOT display_name(): the slug keys <stem>.mp4 and its sidecars, so an
+            # editable title must never move them. See NovelMeta.display_name().
             slug = slugify(project.meta.translated_title or project.meta.title)
-            novel_title = project.meta.translated_title or project.meta.title
+            novel_title = project.meta.display_name()
             total = len(windows)
             written = 0
             with font_dir_context() as font_dir:
@@ -1056,7 +1067,11 @@ class VideoWorker(QThread):
         A thumbnail failure is swallowed (a bad base image must not discard an otherwise
         good video); the text sidecars are cheap and always written.
         """
-        from noveltrans.tts.thumbnail import DEFAULT_PART_POS, DEFAULT_TITLE_POS
+        from noveltrans.tts.thumbnail import (
+            DEFAULT_PART_POS,
+            DEFAULT_TEXT_SCALE,
+            DEFAULT_TITLE_POS,
+        )
 
         def sidecar(ext: str) -> Path:
             return out_path.parent / (out_path.stem + ext)
@@ -1091,6 +1106,9 @@ class VideoWorker(QThread):
                 width=1280, height=720,
                 title_pos=self.thumb_title_pos or DEFAULT_TITLE_POS,
                 part_pos=self.thumb_part_pos or DEFAULT_PART_POS,
+                title_scale=self.thumb_title_scale or DEFAULT_TEXT_SCALE,
+                part_scale=self.thumb_part_scale or DEFAULT_TEXT_SCALE,
+                tagline_scale=self.thumb_tagline_scale or DEFAULT_TEXT_SCALE,
             )
         except Exception:  # noqa: BLE001 — never fail a good render over a thumbnail
             pass

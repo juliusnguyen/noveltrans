@@ -117,6 +117,35 @@ def _font(font_path: Path | str, size: int) -> ImageFont.FreeTypeFont:
 DEFAULT_TITLE_POS = (0.035, 0.0625)
 DEFAULT_PART_POS = (0.5, 0.66)
 
+# Text sizes are MULTIPLIERS on the fractions below, not absolute sizes, so 1.0 reproduces
+# the original fixed layout pixel-for-pixel and no existing project re-renders differently.
+# The bounds keep the result a thumbnail: much under 0.5 is unreadable at YouTube's grid
+# size, much over 2.0 wraps the title past the bottom of the frame.
+DEFAULT_TEXT_SCALE = 1.0
+MIN_TEXT_SCALE = 0.5
+MAX_TEXT_SCALE = 2.0
+
+# Base sizes, as fractions of the frame height. Stroke widths and glow radii are derived
+# from the resulting pixel size (below), so scaling the text scales its outline for free.
+_TITLE_FRACTION = 0.11
+_PART_FRACTION = 0.15
+_TAGLINE_FRACTION = 0.055
+
+
+def _scaled_px(height: int, fraction: float, scale: float) -> int:
+    """One text's pixel size: `height * fraction`, scaled and clamped.
+
+    The 8 px floor is not decoration — Pillow raises on a zero-size font, and a caller
+    handing us a 0 (or a `None` coerced to one) should get an ugly thumbnail, not a
+    traceback in the middle of a 30-part render.
+    """
+    try:
+        scale = float(scale)
+    except (TypeError, ValueError):
+        scale = DEFAULT_TEXT_SCALE
+    scale = max(MIN_TEXT_SCALE, min(MAX_TEXT_SCALE, scale))
+    return max(8, round(height * fraction * scale))
+
 
 def compose_thumbnail(
     base_image_path: Path | str,
@@ -129,13 +158,19 @@ def compose_thumbnail(
     height: int = 720,
     title_pos: tuple[float, float] = DEFAULT_TITLE_POS,
     part_pos: tuple[float, float] = DEFAULT_PART_POS,
+    title_scale: float = DEFAULT_TEXT_SCALE,
+    part_scale: float = DEFAULT_TEXT_SCALE,
+    tagline_scale: float = DEFAULT_TEXT_SCALE,
 ) -> Image.Image:
     """Compose the thumbnail and return it as an RGB `Image` (no disk write).
 
     Separated from `render_thumbnail` so the editor can render live previews straight to a
     pixmap without touching disk. `title_pos` places the title block's top-left; `part_pos`
     places the "PHẦN N" block's top-centre — both as (x, y) fractions of (width, height).
-    An unreadable/empty base image still yields a valid thumbnail (a neutral dark backdrop).
+
+    The three `*_scale` arguments multiply each text's default size; `1.0` everywhere is
+    the original layout exactly. An unreadable/empty base image still yields a valid
+    thumbnail (a neutral dark backdrop).
     """
     W, H = width, height
 
@@ -154,7 +189,7 @@ def compose_thumbnail(
 
     # -- the wrapped novel title (anchored top-left at title_pos) -------------
     title_x = round(W * title_pos[0])
-    title_px = round(H * 0.11)
+    title_px = _scaled_px(H, _TITLE_FRACTION, title_scale)
     title_font = _font(font_path, title_px)
     title_stroke = max(2, round(title_px * 0.06))
     # wrap within whatever width remains to the right of the anchor, capped at the original
@@ -173,7 +208,7 @@ def compose_thumbnail(
 
     # -- PHẦN {N} + tagline (anchored top-centre at part_pos) ----------------
     part_cx = round(W * part_pos[0])
-    part_px = round(H * 0.15)
+    part_px = _scaled_px(H, _PART_FRACTION, part_scale)
     part_font = _font(font_path, part_px)
     part_stroke = max(3, round(part_px * 0.06))
     part_text = f"PHẦN {part_num}"
@@ -187,10 +222,12 @@ def compose_thumbnail(
 
     tagline = (tagline or "").strip()
     if tagline:
-        tag_px = round(H * 0.055)
+        tag_px = _scaled_px(H, _TAGLINE_FRACTION, tagline_scale)
         tag_font = _font(font_path, tag_px)
         tag_stroke = max(2, round(tag_px * 0.08))
-        # keep the tagline on one line: shrink until it fits the width budget
+        # Keep the tagline on one line: shrink until it fits the width budget. This still
+        # applies when the user has picked a size — a chosen size is a request, and "the
+        # text I typed is cut off" is a worse outcome than "it came out a bit smaller".
         while tag_px > 12 and tag_font.getlength(tagline) > W - margin * 2:
             tag_px -= 2
             tag_font = _font(font_path, tag_px)
@@ -218,12 +255,15 @@ def render_thumbnail(
     height: int = 720,
     title_pos: tuple[float, float] = DEFAULT_TITLE_POS,
     part_pos: tuple[float, float] = DEFAULT_PART_POS,
+    title_scale: float = DEFAULT_TEXT_SCALE,
+    part_scale: float = DEFAULT_TEXT_SCALE,
+    tagline_scale: float = DEFAULT_TEXT_SCALE,
 ) -> Path:
     """Render a `width`×`height` thumbnail to `out_path` and return it.
 
     An unreadable/empty base image still yields a valid thumbnail (a neutral dark
     backdrop) so a bad photo never fails a render. Saved as JPEG unless `out_path` ends
-    `.png`. See `compose_thumbnail` for the `title_pos` / `part_pos` placement.
+    `.png`. See `compose_thumbnail` for the placement and `*_scale` arguments.
     """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -231,6 +271,7 @@ def render_thumbnail(
         base_image_path,
         vn_title=vn_title, part_num=part_num, tagline=tagline, font_path=font_path,
         width=width, height=height, title_pos=title_pos, part_pos=part_pos,
+        title_scale=title_scale, part_scale=part_scale, tagline_scale=tagline_scale,
     )
     if out_path.suffix.lower() == ".png":
         img.save(out_path)

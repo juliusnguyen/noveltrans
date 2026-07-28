@@ -452,6 +452,55 @@ class AppConfig:
         self._s.setValue("video_thumbnail_part_x", _clamp(float(value[0]), 0.0, 1.0))
         self._s.setValue("video_thumbnail_part_y", _clamp(float(value[1]), 0.0, 1.0))
 
+    def _text_scale(self, key: str) -> float:
+        """One thumbnail text-size multiplier, clamped to the renderer's own bounds.
+
+        Clamped on read as well as write so a hand-edited settings file — or one written
+        by a future build with wider bounds — can't produce an unreadable cover.
+        """
+        from noveltrans.tts.thumbnail import (
+            DEFAULT_TEXT_SCALE,
+            MAX_TEXT_SCALE,
+            MIN_TEXT_SCALE,
+        )
+
+        raw = self._s.value(key, DEFAULT_TEXT_SCALE, type=float)
+        return _clamp(raw, MIN_TEXT_SCALE, MAX_TEXT_SCALE)
+
+    def _set_text_scale(self, key: str, value: float) -> None:
+        from noveltrans.tts.thumbnail import MAX_TEXT_SCALE, MIN_TEXT_SCALE
+
+        self._s.setValue(key, _clamp(float(value), MIN_TEXT_SCALE, MAX_TEXT_SCALE))
+
+    @property
+    def video_thumbnail_title_scale(self) -> float:
+        """Size multiplier for the novel title on the cover. 1.0 = the original layout."""
+        return self._text_scale("video_thumbnail_title_scale")
+
+    @video_thumbnail_title_scale.setter
+    def video_thumbnail_title_scale(self, value: float) -> None:
+        self._set_text_scale("video_thumbnail_title_scale", value)
+
+    @property
+    def video_thumbnail_part_scale(self) -> float:
+        """Size multiplier for the "PHẦN N" text on the cover. 1.0 = the original layout."""
+        return self._text_scale("video_thumbnail_part_scale")
+
+    @video_thumbnail_part_scale.setter
+    def video_thumbnail_part_scale(self, value: float) -> None:
+        self._set_text_scale("video_thumbnail_part_scale", value)
+
+    @property
+    def video_thumbnail_tagline_scale(self) -> float:
+        """Size multiplier for the tagline on the cover. 1.0 = the original layout.
+
+        The renderer still shrinks the tagline further if it would overflow one line."""
+        return self._text_scale("video_thumbnail_tagline_scale")
+
+    @video_thumbnail_tagline_scale.setter
+    def video_thumbnail_tagline_scale(self, value: float) -> None:
+        self._set_text_scale("video_thumbnail_tagline_scale", value)
+
     @property
     def keep_awake_enabled(self) -> bool:
         """Keep the Mac awake while a download/translate/TTS/merge/video job is running."""

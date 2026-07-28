@@ -25,6 +25,32 @@ class NovelMeta:
     tags: str = ""
     # AI image-generation prompt for the thumbnail base image, generated on demand
     thumbnail_prompt: str = ""
+    # User override for how the title appears on video output — the point is dropping a
+    # source tag like "[ĐM/EDIT] " without editing the scraped metadata. See display_name().
+    display_title: str = ""
+
+    def display_name(self) -> str:
+        """The novel title as it should appear on a video, thumbnail and description.
+
+        Falls back through the user's override → the translated title → the original, so
+        an empty override means "whatever we'd have shown anyway".
+
+        **Not for filenames.** The video slug stays keyed to the translated/original title
+        (`slugify(meta.translated_title or meta.title)`): it decides
+        `video_dir/<stem>/<stem>.mp4` and every sidecar beside it, including
+        `<stem>.upload.json`. Deriving it from this would move all of them the moment
+        someone edits the display title — rendered parts would read as "chưa tạo", and the
+        upload records from feature 034 would point at files that no longer exist.
+
+        Each candidate is stripped *before* the fallback, not after: a box containing
+        only spaces is "I didn't set one", and stripping last would let it win the chain
+        and blank the title on every video and cover.
+        """
+        for candidate in (self.display_title, self.translated_title, self.title):
+            text = (candidate or "").strip()
+            if text:
+                return text
+        return ""
 
     def to_dict(self) -> dict:
         return asdict(self)

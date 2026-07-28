@@ -93,6 +93,9 @@ class ThumbnailEditorDialog(QDialog):
         # editable state, seeded from the saved config
         self.title_pos = list(config.video_thumbnail_title_pos)
         self.part_pos = list(config.video_thumbnail_part_pos)
+        self.title_scale = config.video_thumbnail_title_scale
+        self.part_scale = config.video_thumbnail_part_scale
+        self.tagline_scale = config.video_thumbnail_tagline_scale
         self.font_key = config.video_thumbnail_font
         self._active = "title"  # which block a drag moves
 
@@ -154,8 +157,32 @@ class ThumbnailEditorDialog(QDialog):
         sy.addWidget(QLabel("Dọc:  "))
         sy.addWidget(self.slider_y)
 
-        reset = QPushButton("Đặt lại vị trí")
-        reset.setToolTip("Trả tiêu đề và PHẦN N về vị trí mặc định.")
+        # size sliders — one per text, because a title that fits and a "PHẦN N" that
+        # reads at YouTube's grid size are different problems.
+        self.size_title = self._make_size_slider()
+        self.size_part = self._make_size_slider()
+        self.size_tagline = self._make_size_slider()
+        self.size_title_label = QLabel()
+        self.size_part_label = QLabel()
+        self.size_tagline_label = QLabel()
+        self.size_title.valueChanged.connect(lambda v: self._on_size("title", v))
+        self.size_part.valueChanged.connect(lambda v: self._on_size("part", v))
+        self.size_tagline.valueChanged.connect(lambda v: self._on_size("tagline", v))
+        size_rows = []
+        for text, slider, readout in (
+            ("Cỡ tiêu đề:", self.size_title, self.size_title_label),
+            (f"Cỡ PHẦN {self.part_num}:", self.size_part, self.size_part_label),
+            ("Cỡ tagline:", self.size_tagline, self.size_tagline_label),
+        ):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(text))
+            row.addWidget(slider)
+            readout.setMinimumWidth(48)
+            row.addWidget(readout)
+            size_rows.append(row)
+
+        reset = QPushButton("Đặt lại")
+        reset.setToolTip("Trả vị trí và cỡ chữ về mặc định.")
         reset.clicked.connect(self._reset_positions)
 
         save = QPushButton("Lưu")
@@ -180,6 +207,8 @@ class ThumbnailEditorDialog(QDialog):
         controls.addLayout(font_row)
         controls.addLayout(sx)
         controls.addLayout(sy)
+        for row in size_rows:
+            controls.addLayout(row)
 
         layout = QVBoxLayout(self)
         layout.addWidget(self.preview, alignment=Qt.AlignmentFlag.AlignCenter)
@@ -192,6 +221,19 @@ class ThumbnailEditorDialog(QDialog):
     def _make_slider() -> QSlider:
         s = QSlider(Qt.Orientation.Horizontal)
         s.setRange(0, 1000)  # 0.0..1.0 in thousandths, for smooth placement
+        return s
+
+    @staticmethod
+    def _make_size_slider() -> QSlider:
+        """A text-size multiplier slider, in whole percent.
+
+        The range is the renderer's own clamp, so the slider cannot ask for a size
+        `compose_thumbnail` would refuse — what you drag to is what gets rendered.
+        """
+        from noveltrans.tts.thumbnail import MAX_TEXT_SCALE, MIN_TEXT_SCALE
+
+        s = QSlider(Qt.Orientation.Horizontal)
+        s.setRange(round(MIN_TEXT_SCALE * 100), round(MAX_TEXT_SCALE * 100))
         return s
 
     # -------------------------------------------------------------- state
@@ -210,10 +252,32 @@ class ThumbnailEditorDialog(QDialog):
             slider.blockSignals(True)
             slider.setValue(round(frac * 1000))
             slider.blockSignals(False)
+        for slider, scale in (
+            (self.size_title, self.title_scale),
+            (self.size_part, self.part_scale),
+            (self.size_tagline, self.tagline_scale),
+        ):
+            slider.blockSignals(True)
+            slider.setValue(round(scale * 100))
+            slider.blockSignals(False)
+        self._sync_size_readouts()
 
     def _on_slider(self, axis: int, value: int) -> None:
         self._active_pos()[axis] = value / 1000.0
         self._schedule_render()
+
+    def _on_size(self, which: str, value: int) -> None:
+        setattr(self, f"{which}_scale", value / 100.0)
+        self._sync_size_readouts()
+        self._schedule_render()
+
+    def _sync_size_readouts(self) -> None:
+        for scale, label in (
+            (self.title_scale, self.size_title_label),
+            (self.part_scale, self.size_part_label),
+            (self.tagline_scale, self.size_tagline_label),
+        ):
+            label.setText(f"{round(scale * 100)}%")
 
     def _on_preview_dragged(self, x: float, y: float) -> None:
         pos = self._active_pos()
@@ -226,10 +290,22 @@ class ThumbnailEditorDialog(QDialog):
         self._schedule_render()
 
     def _reset_positions(self) -> None:
-        from noveltrans.tts.thumbnail import DEFAULT_PART_POS, DEFAULT_TITLE_POS
+        """Back to the original layout: default positions AND default sizes.
+
+        One button for both, because "đặt lại" that left the text twice its normal size
+        would read as broken.
+        """
+        from noveltrans.tts.thumbnail import (
+            DEFAULT_PART_POS,
+            DEFAULT_TEXT_SCALE,
+            DEFAULT_TITLE_POS,
+        )
 
         self.title_pos = list(DEFAULT_TITLE_POS)
         self.part_pos = list(DEFAULT_PART_POS)
+        self.title_scale = DEFAULT_TEXT_SCALE
+        self.part_scale = DEFAULT_TEXT_SCALE
+        self.tagline_scale = DEFAULT_TEXT_SCALE
         self._sync_controls_from_state()
         self._render_preview()
 
@@ -252,6 +328,8 @@ class ThumbnailEditorDialog(QDialog):
                     font_path=font_dir / video_font(self.font_key)["file"],
                     width=_PREVIEW_W, height=_PREVIEW_H,
                     title_pos=tuple(self.title_pos), part_pos=tuple(self.part_pos),
+                    title_scale=self.title_scale, part_scale=self.part_scale,
+                    tagline_scale=self.tagline_scale,
                 )
             self.preview.setPixmap(_pil_to_pixmap(img))
         except Exception:  # noqa: BLE001 — a bad base image must not crash the editor
@@ -263,6 +341,9 @@ class ThumbnailEditorDialog(QDialog):
         self.config.video_thumbnail_title_pos = tuple(self.title_pos)
         self.config.video_thumbnail_part_pos = tuple(self.part_pos)
         self.config.video_thumbnail_font = self.font_key
+        self.config.video_thumbnail_title_scale = self.title_scale
+        self.config.video_thumbnail_part_scale = self.part_scale
+        self.config.video_thumbnail_tagline_scale = self.tagline_scale
 
     def _save(self) -> None:
         self._save_to_config()
