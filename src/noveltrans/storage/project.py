@@ -473,6 +473,21 @@ class NovelProject:
             json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
+    def save_display_title(self, title: str) -> None:
+        """Persist the title override used on video output into meta.json.
+
+        Deliberately does NOT touch `translated_title`: that one still keys the video
+        filename slug, and moving it would strand every rendered part and upload record.
+        """
+        title = (title or "").strip()
+        self.meta.display_title = title
+        meta_path = self.path / META_FILE
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+        data.update(display_title=title)
+        meta_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
     def clear_translations(self) -> None:
         """Drop all translations so the novel can be re-translated from scratch."""
         with self._db:

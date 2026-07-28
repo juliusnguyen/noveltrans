@@ -463,3 +463,74 @@ class TestLibrary:
         with pytest.raises(ValueError):
             library.delete_project(project.path)
         assert project.path.exists()
+
+
+class TestDisplayTitle:
+    """Feature 035 — the title override used on video output.
+
+    The whole point of the field is stripping a source tag like `[ĐM/EDIT] ` from what
+    the viewer sees, without touching the scraped metadata underneath.
+    """
+
+    def test_falls_back_through_override_then_translated_then_original(self):
+        from noveltrans.models import NovelMeta
+
+        meta = NovelMeta(url="u", site="s", title="原标题")
+        assert meta.display_name() == "原标题"
+        meta.translated_title = "[ĐM/EDIT] CHÀO MỪNG ĐẾN VỚI PHÒNG LIVESTREAM ÁC MỘNG"
+        assert meta.display_name().startswith("[ĐM/EDIT]")
+        meta.display_title = "CHÀO MỪNG ĐẾN VỚI PHÒNG LIVESTREAM ÁC MỘNG"
+        assert meta.display_name() == "CHÀO MỪNG ĐẾN VỚI PHÒNG LIVESTREAM ÁC MỘNG"
+
+    def test_a_blank_override_falls_through_rather_than_blanking_the_title(self):
+        from noveltrans.models import NovelMeta
+
+        meta = NovelMeta(url="u", site="s", title="原标题", translated_title="Tên đã dịch")
+        meta.display_title = "   "
+        assert meta.display_name() == "Tên đã dịch"
+
+    def test_an_old_meta_json_without_the_key_still_loads(self):
+        """`from_dict` filters unknown keys, so a project written before 035 opens fine
+        and reads as "no override"."""
+        from noveltrans.models import NovelMeta
+
+        meta = NovelMeta.from_dict(
+            {"url": "u", "site": "s", "title": "原标题", "translated_title": "Tên đã dịch"}
+        )
+        assert meta.display_title == ""
+        assert meta.display_name() == "Tên đã dịch"
+
+    def test_save_display_title_persists_and_leaves_the_slug_source_alone(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        """**The invariant this feature turns on.**
+
+        `slugify(translated_title or title)` decides `video_dir/<stem>/<stem>.mp4` and
+        every sidecar beside it, including the `<stem>.upload.json` that feature 034 uses
+        to know what is already on YouTube. If editing the display title moved that,
+        rendered parts would read as "chưa tạo" and the app would offer to re-upload
+        videos already live on the channel.
+        """
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_meta_translation("[ĐM/EDIT] Tên Truyện", "mô tả", "vi")
+        before = slugify(project.meta.translated_title or project.meta.title)
+
+        project.save_display_title("Tên Truyện")
+        after = slugify(project.meta.translated_title or project.meta.title)
+        assert after == before
+        assert project.meta.translated_title == "[ĐM/EDIT] Tên Truyện"
+        assert project.meta.display_name() == "Tên Truyện"
+
+        path = project.path
+        project.close()
+        assert NovelProject.open(path).meta.display_title == "Tên Truyện"
+
+    def test_saving_an_empty_override_clears_it(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_display_title("Tên Truyện")
+        project.save_display_title("")
+        path = project.path
+        project.close()
+        assert NovelProject.open(path).meta.display_title == ""

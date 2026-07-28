@@ -471,6 +471,9 @@ class VideoTab(QWidget):
         from noveltrans.storage.project import slugify
         from noveltrans.tts.video import video_part_name
 
+        # NOT display_name(): the slug decides <stem>.mp4 and every sidecar beside it
+        # (including <stem>.upload.json), so keying it to an editable title would
+        # strand every rendered part and orphan its upload record.
         slug = slugify(self.project.meta.translated_title or self.project.meta.title)
         name = video_part_name(
             slug, window.first_num, window.last_num, whole_novel=whole_novel
@@ -489,7 +492,7 @@ class VideoTab(QWidget):
     def _part_title(self, part_num) -> str:
         from noveltrans.tts.video import build_upload_title
 
-        novel_title = self.project.meta.translated_title or self.project.meta.title
+        novel_title = self.project.meta.display_name()
         return build_upload_title(novel_title, part_num)
 
     @staticmethod
@@ -886,7 +889,7 @@ class VideoTab(QWidget):
     def _part_metadata(self, window, part_num, whole_novel) -> tuple[str, str, str]:
         """(title, description, tags) for a part — from the rendered sidecars if they exist,
         otherwise computed so the text is available even before the video is made."""
-        novel_title = self.project.meta.translated_title or self.project.meta.title
+        novel_title = self.project.meta.display_name()
         title_p = self._part_sidecar(window, whole_novel, ".title.txt")
         desc_p = self._part_sidecar(window, whole_novel, ".txt")
         tags_p = self._part_sidecar(window, whole_novel, ".tags.txt")
@@ -1018,7 +1021,7 @@ class VideoTab(QWidget):
         from noveltrans.tts.thumbnail import render_thumbnail
         from noveltrans.tts.video import video_font
 
-        novel_title = self.project.meta.translated_title or self.project.meta.title
+        novel_title = self.project.meta.display_name()
         font_file = video_font(self.config.video_thumbnail_font)["file"]
         render_thumbnail(
             base,
@@ -1030,6 +1033,9 @@ class VideoTab(QWidget):
             width=1280, height=720,
             title_pos=self.config.video_thumbnail_title_pos,
             part_pos=self.config.video_thumbnail_part_pos,
+            title_scale=self.config.video_thumbnail_title_scale,
+            part_scale=self.config.video_thumbnail_part_scale,
+            tagline_scale=self.config.video_thumbnail_tagline_scale,
         )
 
     def _regen_part_thumbnail(self, window, part_num, whole_novel) -> bool:
@@ -1113,7 +1119,7 @@ class VideoTab(QWidget):
         from noveltrans.gui.thumbnail_editor import ThumbnailEditorDialog
 
         base = self.thumb_image_edit.text().strip() or self.video_image_edit.text().strip()
-        novel_title = self.project.meta.translated_title or self.project.meta.title
+        novel_title = self.project.meta.display_name()
         dialog = ThumbnailEditorDialog(
             self.config,
             base_image=base,
@@ -1157,6 +1163,16 @@ class VideoTab(QWidget):
             lambda: setattr(self.config, "video_thumbnail_font", self.thumb_font.currentData())
         )
 
+        # Per-NOVEL, unlike everything else in this box: it lives in meta.json, because
+        # "bỏ [ĐM/EDIT]" is true of this novel and nonsense for the next one.
+        self.display_title_edit = QLineEdit()
+        self.display_title_edit.setToolTip(
+            "Tên truyện dùng trên ảnh bìa, tiêu đề video và mô tả — ví dụ bỏ tiền tố "
+            "“[ĐM/EDIT] ”. Để trống = dùng tên đã dịch. Không đổi tên file video đã tạo, "
+            "và không đổi được tiêu đề video đã đăng lên YouTube."
+        )
+        self.display_title_edit.editingFinished.connect(self._save_display_title)
+
         self.tagline_edit = QLineEdit(self.config.video_tagline)
         self.tagline_edit.setPlaceholderText("Câu tagline dưới 'PHẦN N' (tuỳ chọn)…")
         self.tagline_edit.editingFinished.connect(
@@ -1188,6 +1204,10 @@ class VideoTab(QWidget):
         )
         self.thumb_regen_button.clicked.connect(self._regen_all_thumbnails)
 
+        title_row = QHBoxLayout()
+        title_row.addWidget(QLabel("Tên hiển thị:"))
+        title_row.addWidget(self.display_title_edit, stretch=1)
+
         row = QHBoxLayout()
         row.addWidget(QLabel("Ảnh bìa:"))
         row.addWidget(self.thumb_image_edit, stretch=1)
@@ -1205,6 +1225,7 @@ class VideoTab(QWidget):
         action_row.addWidget(self.thumb_regen_button)
 
         inner = QVBoxLayout()
+        inner.addLayout(title_row)
         inner.addLayout(row)
         inner.addLayout(action_row)
         box = QGroupBox("Ảnh bìa (thumbnail) & metadata")
@@ -1408,12 +1429,43 @@ class VideoTab(QWidget):
             self.video_range_from.setValue(1)
             self.tags_edit.setPlainText(self.project.meta.tags)
             self.image_prompt_edit.setPlainText(self.project.meta.thumbnail_prompt)
+            self._sync_display_title()
             self._update_status_line()
         else:
             self.tags_edit.setPlainText("")
             self.image_prompt_edit.setPlainText("")
+            self.display_title_edit.clear()
+            self.display_title_edit.setPlaceholderText("")
             self.status_label.setText("")
         self._refresh_video_list()
+
+    def _sync_display_title(self) -> None:
+        """Show the override, with the current fallback as the placeholder.
+
+        The placeholder is what makes an empty box read as "dùng tên đã dịch" rather than
+        "there is no title" — the box is empty in the common case, and an empty box with
+        no hint invites people to paste the title in just to see something there.
+        """
+        meta = self.project.meta
+        self.display_title_edit.setText(meta.display_title)
+        self.display_title_edit.setPlaceholderText(
+            meta.translated_title or meta.title or "Tên truyện"
+        )
+
+    def _save_display_title(self) -> None:
+        """Persist the title override and re-render the parts table's titles."""
+        if self.project is None:
+            return
+        wanted = self.display_title_edit.text().strip()
+        if wanted == self.project.meta.display_title:
+            return
+        self.project.save_display_title(wanted)
+        self._sync_display_title()
+        self._refresh_video_list()  # the "Tiêu đề" column is built from display_name()
+        self.status_label.setText(
+            f"Tên hiển thị: “{self.project.meta.display_name()}”. Bấm “Tạo lại tất cả "
+            "ảnh bìa” để áp dụng lên ảnh bìa đã tạo."
+        )
 
     def _update_status_line(self) -> None:
         if self.project is None:
@@ -1498,7 +1550,7 @@ class VideoTab(QWidget):
 
         meta = self.project.meta
         prompt = build_thumbnail_image_prompt(
-            vn_title=meta.translated_title or meta.title,
+            vn_title=meta.display_name(),
             original_title=meta.title,
             vn_description=meta.translated_description,
             tagline=self.tagline_edit.text().strip(),
@@ -1547,7 +1599,7 @@ class VideoTab(QWidget):
         family = video_font(self.video_font.currentData())["family"]
         novel_title = "Tên truyện"
         if self.project is not None:
-            novel_title = self.project.meta.translated_title or self.project.meta.title
+            novel_title = self.project.meta.display_name()
 
         self.video_preview_button.setEnabled(False)
         self.status_label.setText("🖼️ Đang tạo ảnh xem trước…")
@@ -1843,6 +1895,9 @@ class VideoTab(QWidget):
             thumb_font_key=self.config.video_thumbnail_font,
             thumb_title_pos=self.config.video_thumbnail_title_pos,
             thumb_part_pos=self.config.video_thumbnail_part_pos,
+            thumb_title_scale=self.config.video_thumbnail_title_scale,
+            thumb_part_scale=self.config.video_thumbnail_part_scale,
+            thumb_tagline_scale=self.config.video_thumbnail_tagline_scale,
             bg_color=self.bg_color, skip_existing=skip_existing,
             credit=self.credit_edit.text().strip() or "Fox Novel",
             tagline=self.tagline_edit.text().strip(),
@@ -1936,7 +1991,7 @@ class VideoTab(QWidget):
 
         video = self._part_output_path(window, whole_novel=whole_novel)
         thumbnail = self._part_sidecar(window, whole_novel, ".jpg")
-        novel_title = self.project.meta.translated_title or self.project.meta.title
+        novel_title = self.project.meta.display_name()
         return UploadRequest(
             video=video,
             title=self._read_sidecar(window, whole_novel, ".title.txt")

@@ -98,3 +98,104 @@ class TestComposeThumbnail:
         default = self._compose()
         moved = self._compose(title_pos=(0.4, 0.5))
         assert default.tobytes() != moved.tobytes()
+
+
+class TestTextScales:
+    """Feature 035 — the three size multipliers.
+
+    The load-bearing test here is the first one: `1.0` must reproduce the old fixed
+    layout byte-for-byte. Feature 034 shipped a button that pushes covers onto videos
+    already published on the channel, so a silent layout shift would propagate to a live
+    channel the next time someone clicks it.
+    """
+
+    def _compose(self, **overrides):
+        from noveltrans.tts.thumbnail import compose_thumbnail
+
+        with font_dir_context() as d:
+            kwargs = dict(
+                vn_title="Chào mừng đến với phòng livestream ác mộng",
+                part_num=1,
+                tagline="Một câu tagline",
+                font_path=d / video_font("noto_sans")["file"],
+                width=320, height=180,
+            )
+            kwargs.update(overrides)
+            return compose_thumbnail("/no/such/file.png", **kwargs)
+
+    def test_scale_one_is_byte_identical_to_the_old_layout(self):
+        from noveltrans.tts.thumbnail import DEFAULT_TEXT_SCALE
+
+        assert DEFAULT_TEXT_SCALE == 1.0
+        plain = self._compose()
+        explicit = self._compose(title_scale=1.0, part_scale=1.0, tagline_scale=1.0)
+        assert plain.tobytes() == explicit.tobytes()
+
+    def test_each_scale_changes_the_pixels_independently(self):
+        base = self._compose().tobytes()
+        assert self._compose(title_scale=1.6).tobytes() != base
+        assert self._compose(part_scale=1.6).tobytes() != base
+        assert self._compose(tagline_scale=1.6).tobytes() != base
+
+    def test_a_bigger_title_wraps_onto_more_lines(self):
+        """The size is doing real work, not just being stored."""
+        from noveltrans.tts.thumbnail import _TITLE_FRACTION, _scaled_px, _wrap_title
+
+        title = "Chào mừng đến với phòng livestream ác mộng"
+        small = _wrap_title(title, _load_font(_scaled_px(720, _TITLE_FRACTION, 0.6)), 700)
+        large = _wrap_title(title, _load_font(_scaled_px(720, _TITLE_FRACTION, 1.8)), 700)
+        assert len(large) > len(small)
+
+    def test_scales_clamp_to_the_documented_bounds(self):
+        from noveltrans.tts.thumbnail import (
+            MAX_TEXT_SCALE,
+            MIN_TEXT_SCALE,
+            _TITLE_FRACTION,
+            _scaled_px,
+        )
+
+        assert _scaled_px(720, _TITLE_FRACTION, 99) == _scaled_px(
+            720, _TITLE_FRACTION, MAX_TEXT_SCALE
+        )
+        assert _scaled_px(720, _TITLE_FRACTION, 0.01) == _scaled_px(
+            720, _TITLE_FRACTION, MIN_TEXT_SCALE
+        )
+
+    def test_a_junk_scale_renders_instead_of_raising(self):
+        """Pillow raises on a zero-size font; a 30-part render must not die on one."""
+        from noveltrans.tts.thumbnail import _TITLE_FRACTION, _scaled_px
+
+        assert _scaled_px(720, _TITLE_FRACTION, 0) >= 8
+        assert _scaled_px(720, _TITLE_FRACTION, -5) >= 8
+        assert _scaled_px(720, _TITLE_FRACTION, None) >= 8
+        assert _scaled_px(720, _TITLE_FRACTION, "big") >= 8
+        assert self._compose(title_scale=0, part_scale=None).size == (320, 180)
+
+    def test_a_tiny_frame_still_gets_a_legible_floor(self):
+        from noveltrans.tts.thumbnail import _TAGLINE_FRACTION, _scaled_px
+
+        assert _scaled_px(60, _TAGLINE_FRACTION, 0.5) == 8
+
+    def test_an_overlong_tagline_still_shrinks_to_fit(self):
+        """A chosen size is a request; cutting the user's text off is worse than
+        rendering it a little smaller than the slider says."""
+        long_tag = "Một câu tagline rất dài " * 6
+        img = self._compose(tagline=long_tag, tagline_scale=2.0)
+        assert img.size == (320, 180)  # rendered, not overflowed into an error
+
+
+class TestRenderThumbnailScales:
+    def test_render_accepts_and_applies_the_scales(self, tmp_path):
+        outs = []
+        for scale in (1.0, 1.8):
+            out = tmp_path / f"t{scale}.jpg"
+            with font_dir_context() as d:
+                render_thumbnail(
+                    tmp_path / "missing.png", out,
+                    vn_title="Chào mừng đến với phòng livestream ác mộng",
+                    part_num=1, tagline="tagline",
+                    font_path=d / video_font("noto_sans")["file"],
+                    width=320, height=180, title_scale=scale,
+                )
+            outs.append(out.read_bytes())
+        assert outs[0] != outs[1]

@@ -1659,3 +1659,202 @@ class TestThumbnailUpdateUi:
         assert [r.label for r in tab._thumbnail_worker.requests] == ["Phần 2"]
         tab._thumbnail_worker = None
         tab.shutdown()
+
+
+class TestDisplayTitleUi:
+    """Feature 035 — the "Tên hiển thị" override, end to end through the Video tab."""
+
+    def _project(self, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        for i in range(5):
+            project.save_audio(i, f"exports/audio/{i}.mp3", "V", 60.0)
+        project.save_meta_translation(
+            "[ĐM/EDIT] CHÀO MỪNG ĐẾN VỚI PHÒNG LIVESTREAM ÁC MỘNG", "mô tả", "vi"
+        )
+        path = project.path
+        project.close()
+        return path
+
+    def _tab(self, tmp_path, path):
+        tab = VideoTab(_config(tmp_path))
+        tab.voice_combo.addItem("V", "V")
+        tab.voice_combo.setCurrentIndex(tab.voice_combo.findData("V"))
+        tab.video_mode.setCurrentIndex(tab.video_mode.findData("batch"))
+        tab.video_batch_size.setValue(2)
+        tab._on_project_selected(str(path))
+        return tab
+
+    def test_empty_box_shows_the_current_title_as_a_placeholder(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """An empty box has to read as "dùng tên đã dịch", not "there is no title"."""
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        assert tab.display_title_edit.text() == ""
+        assert "[ĐM/EDIT]" in tab.display_title_edit.placeholderText()
+        tab.shutdown()
+
+    def test_setting_it_changes_the_video_title_and_the_parts_table(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        tab.display_title_edit.setText("CHÀO MỪNG ĐẾN VỚI PHÒNG LIVESTREAM ÁC MỘNG")
+        tab._save_display_title()
+
+        assert tab.project.meta.display_name() == (
+            "CHÀO MỪNG ĐẾN VỚI PHÒNG LIVESTREAM ÁC MỘNG"
+        )
+        # the video title ("... - Phần N") and the table's Tiêu đề column both follow
+        assert tab._part_title(1) == (
+            "CHÀO MỪNG ĐẾN VỚI PHÒNG LIVESTREAM ÁC MỘNG - Phần 1"
+        )
+        assert "[ĐM/EDIT]" not in tab.video_list.item(0, 3).text()
+        tab.shutdown()
+
+    def test_the_slug_and_therefore_every_rendered_part_stays_put(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """**The invariant this feature turns on.**
+
+        Rendering a part, then editing the display title, must not move the .mp4 or its
+        sidecars. If it did, the part would read as "chưa tạo" and its `.upload.json`
+        from feature 034 would orphan — the app would offer to re-upload a video already
+        live on the channel.
+        """
+        from noveltrans.youtube_upload import STATE_PUBLISHED, uploaded_video_id, write_upload_state
+
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        window = tab._windows_for_current_selection()[0]
+        out = tab._part_output_path(window, whole_novel=False)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"fake mp4")
+        write_upload_state(out, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
+
+        tab.display_title_edit.setText("CHÀO MỪNG ĐẾN VỚI PHÒNG LIVESTREAM ÁC MỘNG")
+        tab._save_display_title()
+
+        after = tab._part_output_path(
+            tab._windows_for_current_selection()[0], whole_novel=False
+        )
+        assert after == out and after.is_file()
+        assert uploaded_video_id(after) == "dQw4w9WgXcQ"  # the record still points at it
+        assert tab.video_list.item(0, 4).text() == "✅ Đã tạo"
+        tab.shutdown()
+
+    def test_a_whitespace_only_entry_does_not_blank_the_title(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        tab.display_title_edit.setText("   ")
+        tab._save_display_title()
+        assert tab.project.meta.display_name().startswith("[ĐM/EDIT]")
+        tab.shutdown()
+
+    def test_clearing_it_falls_back_to_the_translated_title(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        tab.display_title_edit.setText("Tên ngắn")
+        tab._save_display_title()
+        tab.display_title_edit.setText("")
+        tab._save_display_title()
+        assert tab.project.meta.display_name().startswith("[ĐM/EDIT]")
+        tab.shutdown()
+
+    def test_the_status_line_says_covers_need_regenerating(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """Editing the title doesn't redraw covers already on disk — say so, or it looks
+        like nothing happened."""
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        tab.display_title_edit.setText("Tên ngắn")
+        tab._save_display_title()
+        assert "Tạo lại tất cả ảnh bìa" in tab.status_label.text()
+        tab.shutdown()
+
+    def test_the_thumbnail_is_rendered_with_the_override(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from noveltrans.tts.video import font_dir_context
+
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        tab.display_title_edit.setText("Tên ngắn")
+        tab._save_display_title()
+
+        seen = {}
+        monkeypatch.setattr(
+            "noveltrans.tts.thumbnail.render_thumbnail",
+            lambda *a, **k: seen.update(k) or a[1],
+        )
+        window = tab._windows_for_current_selection()[0]
+        with font_dir_context() as font_dir:
+            tab._render_thumbnail_now(
+                window, 1, False, base="/no/such.png", font_dir=font_dir
+            )
+        assert seen["vn_title"] == "Tên ngắn"
+        tab.shutdown()
+
+    def test_render_passes_the_configured_text_scales(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from noveltrans.tts.video import font_dir_context
+
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        tab.config.video_thumbnail_title_scale = 1.5
+        tab.config.video_thumbnail_part_scale = 0.8
+        tab.config.video_thumbnail_tagline_scale = 1.2
+
+        seen = {}
+        monkeypatch.setattr(
+            "noveltrans.tts.thumbnail.render_thumbnail",
+            lambda *a, **k: seen.update(k) or a[1],
+        )
+        window = tab._windows_for_current_selection()[0]
+        with font_dir_context() as font_dir:
+            tab._render_thumbnail_now(
+                window, 1, False, base="/no/such.png", font_dir=font_dir
+            )
+        assert seen["title_scale"] == 1.5
+        assert seen["part_scale"] == 0.8
+        assert seen["tagline_scale"] == 1.2
+        tab.shutdown()
+
+    def test_the_render_worker_is_given_the_title_and_scales(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        """The video render is the *other* path that writes a cover — it must carry the
+        same settings, or a full render would silently undo an editor change."""
+        from noveltrans.gui import tab_video as tab_module
+
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        tab.config.video_thumbnail_title_scale = 1.5
+        tab.config.video_thumbnail_part_scale = 0.8
+        tab.config.video_thumbnail_tagline_scale = 1.2
+        tab.video_image_edit.setText(str(tmp_path / "bg.png"))
+        (tmp_path / "bg.png").write_bytes(b"x")
+
+        built = {}
+
+        class _FakeWorker:
+            def __init__(self, *a, **kw):
+                built.update(kw)
+                self.progress = self.file_done = self.finished_ok = self.failed = _Sig()
+
+            def start(self):
+                pass
+
+            def isRunning(self):
+                return False
+
+        class _Sig:
+            def connect(self, *_a):
+                pass
+
+        monkeypatch.setattr(tab_module, "VideoWorker", _FakeWorker)
+        monkeypatch.setattr(tab_module, "track_worker", lambda *_a: None)
+        tab._launch_video()
+
+        assert built["thumb_title_scale"] == 1.5
+        assert built["thumb_part_scale"] == 0.8
+        assert built["thumb_tagline_scale"] == 1.2
+        tab._video_worker = None
+        tab.shutdown()
