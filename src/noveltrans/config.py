@@ -502,6 +502,29 @@ class AppConfig:
         self._set_text_scale("video_thumbnail_tagline_scale", value)
 
     @property
+    def video_thumbnail_title_align(self) -> str:
+        """Which edge the cover title's lines are flush against: "left" or "right".
+
+        Validated on read as well as write — an unrecognised stored value reads as the
+        default rather than reaching the renderer, so a hand-edited settings file can't
+        produce a cover nobody asked for.
+        """
+        from noveltrans.tts.thumbnail import DEFAULT_TITLE_ALIGN, TITLE_ALIGNS
+
+        value = str(self._s.value("video_thumbnail_title_align", DEFAULT_TITLE_ALIGN))
+        return value if value in TITLE_ALIGNS else DEFAULT_TITLE_ALIGN
+
+    @video_thumbnail_title_align.setter
+    def video_thumbnail_title_align(self, value: str) -> None:
+        from noveltrans.tts.thumbnail import DEFAULT_TITLE_ALIGN, TITLE_ALIGNS
+
+        value = str(value or "").strip().lower()
+        self._s.setValue(
+            "video_thumbnail_title_align",
+            value if value in TITLE_ALIGNS else DEFAULT_TITLE_ALIGN,
+        )
+
+    @property
     def keep_awake_enabled(self) -> bool:
         """Keep the Mac awake while a download/translate/TTS/merge/video job is running."""
         return self._s.value("keep_awake_enabled", True, type=bool)

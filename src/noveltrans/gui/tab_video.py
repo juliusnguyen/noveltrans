@@ -1036,6 +1036,7 @@ class VideoTab(QWidget):
             title_scale=self.config.video_thumbnail_title_scale,
             part_scale=self.config.video_thumbnail_part_scale,
             tagline_scale=self.config.video_thumbnail_tagline_scale,
+            title_align=self.config.video_thumbnail_title_align,
         )
 
     def _regen_part_thumbnail(self, window, part_num, whole_novel) -> bool:
@@ -1898,6 +1899,7 @@ class VideoTab(QWidget):
             thumb_title_scale=self.config.video_thumbnail_title_scale,
             thumb_part_scale=self.config.video_thumbnail_part_scale,
             thumb_tagline_scale=self.config.video_thumbnail_tagline_scale,
+            thumb_title_align=self.config.video_thumbnail_title_align,
             bg_color=self.bg_color, skip_existing=skip_existing,
             credit=self.credit_edit.text().strip() or "Fox Novel",
             tagline=self.tagline_edit.text().strip(),

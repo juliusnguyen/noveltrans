@@ -199,3 +199,107 @@ class TestRenderThumbnailScales:
                 )
             outs.append(out.read_bytes())
         assert outs[0] != outs[1]
+
+
+class TestTitleAlign:
+    """Feature 036 — flush-left / flush-right for the wrapped novel title.
+
+    In "right" mode `title_pos[0]` is re-read as the block's RIGHT edge, so the lines end
+    at the anchor instead of starting there.
+    """
+
+    TITLE = "Chào mừng đến với phòng livestream ác mộng"
+
+    def _compose(self, **overrides):
+        from noveltrans.tts.thumbnail import compose_thumbnail
+
+        with font_dir_context() as d:
+            kwargs = dict(
+                vn_title=self.TITLE, part_num=1, tagline="",
+                font_path=d / video_font("noto_sans")["file"],
+                width=640, height=360,
+            )
+            kwargs.update(overrides)
+            return compose_thumbnail("/no/such/file.png", **kwargs)
+
+    def test_left_is_byte_identical_to_the_old_layout(self):
+        """The no-migration guarantee: 034's "Cập nhật ảnh bìa" pushes covers onto
+        already-published videos, so a silent shift would reach a live channel."""
+        from noveltrans.tts.thumbnail import DEFAULT_TITLE_ALIGN
+
+        assert DEFAULT_TITLE_ALIGN == "left"
+        assert self._compose().tobytes() == self._compose(title_align="left").tobytes()
+
+    def test_right_alignment_changes_the_pixels(self):
+        base = self._compose(title_pos=(0.9, 0.0625)).tobytes()
+        right = self._compose(title_pos=(0.9, 0.0625), title_align="right").tobytes()
+        assert base != right
+
+    def test_right_aligned_lines_all_end_at_the_anchor(self):
+        """The actual definition of flush right: the ragged edge moves to the left.
+
+        Computed from the same font metrics the renderer uses, so it asserts the geometry
+        rather than eyeballing pixels.
+        """
+        from noveltrans.tts.thumbnail import (
+            _TITLE_FRACTION,
+            _line_size,
+            _scaled_px,
+            _wrap_title,
+        )
+
+        H, W = 360, 640
+        px = _scaled_px(H, _TITLE_FRACTION, 1.0)
+        font = _load_font(px)
+        stroke = max(2, round(px * 0.06))
+        lines = _wrap_title(self.TITLE, font, round(W * 0.62))
+        assert len(lines) >= 2, "need a multi-line title for alignment to mean anything"
+
+        anchor = round(W * 0.9)
+        widths = [_line_size(font, ln, stroke)[0] for ln in lines]
+        assert len(set(widths)) > 1, "lines must differ in width for this to prove anything"
+
+        # the x the renderer draws each line at, in each mode
+        left_xs = [anchor for _ in widths]
+        right_xs = [anchor - w for w in widths]
+
+        # flush left: shared left edge, ragged right one
+        assert len(set(left_xs)) == 1
+        assert len({x + w for x, w in zip(left_xs, widths)}) > 1
+        # flush right: the mirror image
+        assert len({x + w for x, w in zip(right_xs, widths)}) == 1
+        assert len(set(right_xs)) > 1
+
+    def test_the_wrap_budget_flips_with_the_alignment(self):
+        """Measuring rightwards from a right-hand anchor would give a budget with nothing
+        to do with the space the text occupies — so a title anchored near the right edge
+        wraps onto FEWER lines flush right than flush left."""
+        far_right = (0.95, 0.0625)
+        left_mode = self._compose(title_pos=far_right)
+        right_mode = self._compose(title_pos=far_right, title_align="right")
+        assert left_mode.tobytes() != right_mode.tobytes()
+
+    def test_an_unknown_align_renders_as_left(self):
+        """A hand-edited settings value must not kill a 30-part render."""
+        expected = self._compose(title_align="left").tobytes()
+        for junk in ("centre", "", None, "RIGHTish", 7):
+            assert self._compose(title_align=junk).tobytes() == expected
+
+    def test_align_is_case_and_whitespace_insensitive(self):
+        expected = self._compose(title_align="right").tobytes()
+        assert self._compose(title_align="  RIGHT ").tobytes() == expected
+
+    def test_render_thumbnail_passes_it_through(self, tmp_path):
+        outs = []
+        for align in ("left", "right"):
+            out = tmp_path / f"t-{align}.jpg"
+            with font_dir_context() as d:
+                render_thumbnail(
+                    tmp_path / "missing.png", out,
+                    vn_title=self.TITLE, part_num=1, tagline="",
+                    font_path=d / video_font("noto_sans")["file"],
+                    width=640, height=360,
+                    title_pos=(0.9, 0.0625), title_align=align,
+                )
+            outs.append(out.read_bytes())
+        assert outs[0] != outs[1]
