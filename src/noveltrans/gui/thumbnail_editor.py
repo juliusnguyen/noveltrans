@@ -96,6 +96,7 @@ class ThumbnailEditorDialog(QDialog):
         self.title_scale = config.video_thumbnail_title_scale
         self.part_scale = config.video_thumbnail_part_scale
         self.tagline_scale = config.video_thumbnail_tagline_scale
+        self.title_align = config.video_thumbnail_title_align
         self.font_key = config.video_thumbnail_font
         self._active = "title"  # which block a drag moves
 
@@ -181,6 +182,20 @@ class ThumbnailEditorDialog(QDialog):
             row.addWidget(readout)
             size_rows.append(row)
 
+        # Which edge the title's lines are flush against. Only the title has this: it is
+        # the one text that wraps onto several lines.
+        self.align_left = QRadioButton("Trái")
+        self.align_right = QRadioButton("Phải")
+        align_group = QButtonGroup(self)
+        align_group.addButton(self.align_left)
+        align_group.addButton(self.align_right)
+        self.align_right.toggled.connect(self._on_align_changed)
+        align_row = QHBoxLayout()
+        align_row.addWidget(QLabel("Canh tiêu đề:"))
+        align_row.addWidget(self.align_left)
+        align_row.addWidget(self.align_right)
+        align_row.addStretch()
+
         reset = QPushButton("Đặt lại")
         reset.setToolTip("Trả vị trí và cỡ chữ về mặc định.")
         reset.clicked.connect(self._reset_positions)
@@ -209,6 +224,7 @@ class ThumbnailEditorDialog(QDialog):
         controls.addLayout(sy)
         for row in size_rows:
             controls.addLayout(row)
+        controls.addLayout(align_row)
 
         layout = QVBoxLayout(self)
         layout.addWidget(self.preview, alignment=Qt.AlignmentFlag.AlignCenter)
@@ -261,9 +277,32 @@ class ThumbnailEditorDialog(QDialog):
             slider.setValue(round(scale * 100))
             slider.blockSignals(False)
         self._sync_size_readouts()
+        button = self.align_right if self.title_align == "right" else self.align_left
+        if not button.isChecked():
+            button.blockSignals(True)
+            button.setChecked(True)
+            button.blockSignals(False)
 
     def _on_slider(self, axis: int, value: int) -> None:
         self._active_pos()[axis] = value / 1000.0
+        self._schedule_render()
+
+    def _on_align_changed(self, _checked: bool = False) -> None:
+        """Flip the title's flush edge, mirroring the anchor so the block lands where
+        the user expects.
+
+        The mirror is the whole reason this isn't a one-liner. `title_pos[0]` means the
+        block's LEFT edge when flush left and its RIGHT edge when flush right, so a
+        project sitting at the default 0.035 would, on switching to "phải", put its right
+        edge 3.5% from the left — the title crushed into nothing. Mirroring lands it
+        symmetrically on the other side, and flipping back returns it exactly where it was.
+        """
+        wanted = "right" if self.align_right.isChecked() else "left"
+        if wanted == self.title_align:
+            return
+        self.title_align = wanted
+        self.title_pos[0] = round(1.0 - self.title_pos[0], 4)
+        self._sync_controls_from_state()
         self._schedule_render()
 
     def _on_size(self, which: str, value: int) -> None:
@@ -298,9 +337,11 @@ class ThumbnailEditorDialog(QDialog):
         from noveltrans.tts.thumbnail import (
             DEFAULT_PART_POS,
             DEFAULT_TEXT_SCALE,
+            DEFAULT_TITLE_ALIGN,
             DEFAULT_TITLE_POS,
         )
 
+        self.title_align = DEFAULT_TITLE_ALIGN
         self.title_pos = list(DEFAULT_TITLE_POS)
         self.part_pos = list(DEFAULT_PART_POS)
         self.title_scale = DEFAULT_TEXT_SCALE
@@ -330,6 +371,7 @@ class ThumbnailEditorDialog(QDialog):
                     title_pos=tuple(self.title_pos), part_pos=tuple(self.part_pos),
                     title_scale=self.title_scale, part_scale=self.part_scale,
                     tagline_scale=self.tagline_scale,
+                    title_align=self.title_align,
                 )
             self.preview.setPixmap(_pil_to_pixmap(img))
         except Exception:  # noqa: BLE001 — a bad base image must not crash the editor
@@ -344,6 +386,7 @@ class ThumbnailEditorDialog(QDialog):
         self.config.video_thumbnail_title_scale = self.title_scale
         self.config.video_thumbnail_part_scale = self.part_scale
         self.config.video_thumbnail_tagline_scale = self.tagline_scale
+        self.config.video_thumbnail_title_align = self.title_align
 
     def _save(self) -> None:
         self._save_to_config()

@@ -173,3 +173,80 @@ class TestThumbnailEditorSizeSliders:
         assert dialog.title_scale == DEFAULT_TEXT_SCALE
         assert dialog.size_title.value() == round(DEFAULT_TEXT_SCALE * 100)
         assert tuple(dialog.title_pos) == DEFAULT_TITLE_POS
+
+
+class TestTitleAlignConfig:
+    """Feature 036 — the title's flush edge."""
+
+    def test_default_is_left(self, tmp_path):
+        from noveltrans.tts.thumbnail import DEFAULT_TITLE_ALIGN
+
+        assert _config(tmp_path).video_thumbnail_title_align == DEFAULT_TITLE_ALIGN
+
+    def test_round_trips(self, tmp_path):
+        config = _config(tmp_path)
+        config.video_thumbnail_title_align = "right"
+        assert config.video_thumbnail_title_align == "right"
+
+    def test_an_unknown_value_is_rejected_on_write_and_on_read(self, tmp_path):
+        """Validated both ways, so a hand-edited settings file can't reach the renderer."""
+        config = _config(tmp_path)
+        config.video_thumbnail_title_align = "centre"
+        assert config.video_thumbnail_title_align == "left"
+        config._s.setValue("video_thumbnail_title_align", "sideways")
+        assert config.video_thumbnail_title_align == "left"
+
+    def test_case_and_whitespace_are_normalised_on_write(self, tmp_path):
+        config = _config(tmp_path)
+        config.video_thumbnail_title_align = "  RIGHT "
+        assert config.video_thumbnail_title_align == "right"
+
+
+class TestThumbnailEditorAlign:
+    def _dialog(self, tmp_path, **kw):
+        config = _config(tmp_path)
+        return ThumbnailEditorDialog(
+            config, base_image="", novel_title="Tụ Bảo Tiên Bồn", part_num=1, **kw
+        )
+
+    def test_radio_seeds_from_config(self, qapp, tmp_path):
+        config = _config(tmp_path)
+        config.video_thumbnail_title_align = "right"
+        dialog = ThumbnailEditorDialog(
+            config, base_image="", novel_title="X", part_num=1
+        )
+        assert dialog.align_right.isChecked()
+        assert not dialog.align_left.isChecked()
+
+    def test_flipping_to_right_mirrors_the_anchor(self, qapp, tmp_path):
+        """Without the mirror, a project at the default 0.035 would put its RIGHT edge
+        3.5% from the left — the title crushed into nothing."""
+        dialog = self._dialog(tmp_path)
+        dialog.title_pos = [0.035, 0.0625]
+        dialog.align_right.setChecked(True)
+        assert dialog.title_align == "right"
+        assert dialog.title_pos[0] == 0.965
+
+    def test_flipping_back_returns_exactly_where_it_was(self, qapp, tmp_path):
+        dialog = self._dialog(tmp_path)
+        dialog.title_pos = [0.2, 0.0625]
+        dialog.align_right.setChecked(True)
+        dialog.align_left.setChecked(True)
+        assert dialog.title_align == "left"
+        assert dialog.title_pos[0] == 0.2
+
+    def test_save_persists_the_alignment(self, qapp, tmp_path):
+        dialog = self._dialog(tmp_path)
+        dialog.align_right.setChecked(True)
+        dialog._save_to_config()
+        assert dialog.config.video_thumbnail_title_align == "right"
+
+    def test_reset_restores_left(self, qapp, tmp_path):
+        from noveltrans.tts.thumbnail import DEFAULT_TITLE_ALIGN, DEFAULT_TITLE_POS
+
+        dialog = self._dialog(tmp_path)
+        dialog.align_right.setChecked(True)
+        dialog._reset_positions()
+        assert dialog.title_align == DEFAULT_TITLE_ALIGN
+        assert dialog.align_left.isChecked()
+        assert tuple(dialog.title_pos) == DEFAULT_TITLE_POS

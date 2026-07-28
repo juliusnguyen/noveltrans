@@ -125,6 +125,14 @@ DEFAULT_TEXT_SCALE = 1.0
 MIN_TEXT_SCALE = 0.5
 MAX_TEXT_SCALE = 2.0
 
+# Which edge the wrapped title's lines are flush against. In "right" mode `title_pos[0]`
+# is read as the block's RIGHT edge rather than its left — that is what makes the setting
+# useful (the title sits against the right of the frame) and what makes dragging honest
+# (you drag the edge the text is flush to). Only the title has this: it is the one text
+# that wraps onto several lines, so the only one where alignment is visible.
+TITLE_ALIGNS = ("left", "right")
+DEFAULT_TITLE_ALIGN = "left"
+
 # Base sizes, as fractions of the frame height. Stroke widths and glow radii are derived
 # from the resulting pixel size (below), so scaling the text scales its outline for free.
 _TITLE_FRACTION = 0.11
@@ -161,6 +169,7 @@ def compose_thumbnail(
     title_scale: float = DEFAULT_TEXT_SCALE,
     part_scale: float = DEFAULT_TEXT_SCALE,
     tagline_scale: float = DEFAULT_TEXT_SCALE,
+    title_align: str = DEFAULT_TITLE_ALIGN,
 ) -> Image.Image:
     """Compose the thumbnail and return it as an RGB `Image` (no disk write).
 
@@ -169,8 +178,10 @@ def compose_thumbnail(
     places the "PHẦN N" block's top-centre — both as (x, y) fractions of (width, height).
 
     The three `*_scale` arguments multiply each text's default size; `1.0` everywhere is
-    the original layout exactly. An unreadable/empty base image still yields a valid
-    thumbnail (a neutral dark backdrop).
+    the original layout exactly. `title_align` is "left" (the default, and the original
+    layout) or "right", which re-reads `title_pos[0]` as the block's right edge.
+    An unreadable/empty base image still yields a valid thumbnail (a neutral dark
+    backdrop).
     """
     W, H = width, height
 
@@ -187,23 +198,32 @@ def compose_thumbnail(
 
     margin = round(W * 0.035)
 
-    # -- the wrapped novel title (anchored top-left at title_pos) -------------
+    # -- the wrapped novel title (anchored at title_pos; which edge depends on
+    #    title_align — top-left when flush left, top-RIGHT when flush right) ---
     title_x = round(W * title_pos[0])
     title_px = _scaled_px(H, _TITLE_FRACTION, title_scale)
     title_font = _font(font_path, title_px)
     title_stroke = max(2, round(title_px * 0.06))
-    # wrap within whatever width remains to the right of the anchor, capped at the original
-    # 62% budget so the title never runs under the photo's subject on the far right
-    max_text_w = max(round(W * 0.2), min(round(W * 0.62), W - title_x - margin))
+    # Anything we don't recognise renders flush left rather than raising: a hand-edited
+    # settings file must not kill a 30-part render halfway through.
+    flush_right = str(title_align or "").strip().lower() == "right"
+    # Wrap within whatever room remains between the anchor and the far margin — leftwards
+    # when flush right, rightwards otherwise — capped at the original 62% budget so the
+    # title never runs under the photo's subject.
+    room = (title_x - margin) if flush_right else (W - title_x - margin)
+    max_text_w = max(round(W * 0.2), min(round(W * 0.62), room))
     lines = _wrap_title(vn_title, title_font, max_text_w)
     y = round(H * title_pos[1])
     line_gap = round(title_px * 0.18)
     for line in lines:
+        line_w, line_h = _line_size(title_font, line, title_stroke)
+        # Same measure the PHẦN N block uses to centre itself, so the two agree about
+        # where a line's edges are.
+        x = title_x - line_w if flush_right else title_x
         _draw_glow_line(
-            bg, (title_x, y), line, title_font,
+            bg, (x, y), line, title_font,
             stroke_width=title_stroke, glow_radius=max(4, round(title_px * 0.18)),
         )
-        _, line_h = _line_size(title_font, line, title_stroke)
         y += line_h + line_gap
 
     # -- PHẦN {N} + tagline (anchored top-centre at part_pos) ----------------
@@ -258,6 +278,7 @@ def render_thumbnail(
     title_scale: float = DEFAULT_TEXT_SCALE,
     part_scale: float = DEFAULT_TEXT_SCALE,
     tagline_scale: float = DEFAULT_TEXT_SCALE,
+    title_align: str = DEFAULT_TITLE_ALIGN,
 ) -> Path:
     """Render a `width`×`height` thumbnail to `out_path` and return it.
 
@@ -272,6 +293,7 @@ def render_thumbnail(
         vn_title=vn_title, part_num=part_num, tagline=tagline, font_path=font_path,
         width=width, height=height, title_pos=title_pos, part_pos=part_pos,
         title_scale=title_scale, part_scale=part_scale, tagline_scale=tagline_scale,
+        title_align=title_align,
     )
     if out_path.suffix.lower() == ".png":
         img.save(out_path)

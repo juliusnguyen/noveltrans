@@ -919,6 +919,7 @@ class VideoWorker(QThread):
         thumb_title_scale: float | None = None,
         thumb_part_scale: float | None = None,
         thumb_tagline_scale: float | None = None,
+        thumb_title_align: str = "",  # cover title flush edge; "" → the renderer's "left"
         bg_color: str = "",  # background hex "#rrggbb"; "" → the default pastel gradient
         skip_existing: bool = False,  # skip parts whose .mp4 already exists (batch "continue")
         credit: str = "",  # "Tạo bởi: …" line; "" → the default (Fox Novel)
@@ -948,6 +949,7 @@ class VideoWorker(QThread):
         self.thumb_title_scale = thumb_title_scale
         self.thumb_part_scale = thumb_part_scale
         self.thumb_tagline_scale = thumb_tagline_scale
+        self.thumb_title_align = thumb_title_align
         self.bg_color = bg_color
         self.skip_existing = skip_existing
         self.credit = credit
@@ -1070,6 +1072,7 @@ class VideoWorker(QThread):
         from noveltrans.tts.thumbnail import (
             DEFAULT_PART_POS,
             DEFAULT_TEXT_SCALE,
+            DEFAULT_TITLE_ALIGN,
             DEFAULT_TITLE_POS,
         )
 
@@ -1109,6 +1112,7 @@ class VideoWorker(QThread):
                 title_scale=self.thumb_title_scale or DEFAULT_TEXT_SCALE,
                 part_scale=self.thumb_part_scale or DEFAULT_TEXT_SCALE,
                 tagline_scale=self.thumb_tagline_scale or DEFAULT_TEXT_SCALE,
+                title_align=self.thumb_title_align or DEFAULT_TITLE_ALIGN,
             )
         except Exception:  # noqa: BLE001 — never fail a good render over a thumbnail
             pass

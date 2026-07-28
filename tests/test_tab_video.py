@@ -1858,3 +1858,54 @@ class TestDisplayTitleUi:
         assert built["thumb_tagline_scale"] == 1.2
         tab._video_worker = None
         tab.shutdown()
+
+    def test_both_cover_paths_carry_the_title_alignment(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        """Feature 036. Both writers must carry it, or a full video render would silently
+        undo an alignment set in the cover editor."""
+        from noveltrans.gui import tab_video as tab_module
+        from noveltrans.tts.video import font_dir_context
+
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        tab.config.video_thumbnail_title_align = "right"
+
+        # path 1: the cover-only render
+        seen = {}
+        monkeypatch.setattr(
+            "noveltrans.tts.thumbnail.render_thumbnail",
+            lambda *a, **k: seen.update(k) or a[1],
+        )
+        window = tab._windows_for_current_selection()[0]
+        with font_dir_context() as font_dir:
+            tab._render_thumbnail_now(
+                window, 1, False, base="/no/such.png", font_dir=font_dir
+            )
+        assert seen["title_align"] == "right"
+
+        # path 2: the full video render
+        tab.video_image_edit.setText(str(tmp_path / "bg.png"))
+        (tmp_path / "bg.png").write_bytes(b"x")
+        built = {}
+
+        class _Sig:
+            def connect(self, *_a):
+                pass
+
+        class _FakeWorker:
+            def __init__(self, *a, **kw):
+                built.update(kw)
+                self.progress = self.file_done = self.finished_ok = self.failed = _Sig()
+
+            def start(self):
+                pass
+
+            def isRunning(self):
+                return False
+
+        monkeypatch.setattr(tab_module, "VideoWorker", _FakeWorker)
+        monkeypatch.setattr(tab_module, "track_worker", lambda *_a: None)
+        tab._launch_video()
+        assert built["thumb_title_align"] == "right"
+        tab._video_worker = None
+        tab.shutdown()
