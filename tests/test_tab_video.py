@@ -1242,3 +1242,420 @@ class TestWorkspaceRegistration:
         assert not hasattr(ws.audio_tab, "video_button")
         assert hasattr(ws.video_tab, "video_button")
         ws.shutdown()
+
+
+class TestThumbnailUpdateUi:
+    """The two "cập nhật ảnh bìa" buttons: eligibility, interlocks, and the confirm.
+
+    Same helpers as `TestYouTubeUploadUi`, plus a cover writer — the whole feature is
+    about a part having BOTH a video on the channel and a .jpg on disk.
+    """
+
+    def _project_with_audio(self, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)  # 5 chapters
+        for i in range(5):
+            project.save_audio(i, f"exports/audio/{i}.mp3", "V", 60.0)
+        path = project.path
+        project.close()
+        return path
+
+    def _tab_on_project(self, tmp_path, path):
+        tab = VideoTab(_config(tmp_path))
+        tab.voice_combo.addItem("V", "V")
+        tab.voice_combo.setCurrentIndex(tab.voice_combo.findData("V"))
+        tab.video_mode.setCurrentIndex(tab.video_mode.findData("batch"))
+        tab.video_batch_size.setValue(2)
+        tab._on_project_selected(str(path))
+        return tab
+
+    def _render_part(self, tab, index):
+        window = tab._windows_for_current_selection()[index]
+        out = tab._part_output_path(window, whole_novel=False)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"fake mp4")
+        return window, out
+
+    def _cover(self, tab, index):
+        """Write the .jpg sidecar the cover editor would produce for this part."""
+        window = tab._windows_for_current_selection()[index]
+        jpg = tab._part_sidecar(window, False, ".jpg")
+        jpg.parent.mkdir(parents=True, exist_ok=True)
+        jpg.write_bytes(b"\xff\xd8\xff" + b"jpeg-ish" * 64)
+        return jpg
+
+    def _publish(self, out, video_id="dQw4w9WgXcQ"):
+        from noveltrans.youtube_upload import STATE_PUBLISHED, write_upload_state
+
+        write_upload_state(out, status=STATE_PUBLISHED, video_id=video_id)
+
+    def _cover_button(self, tab, row=0):
+        """The row's "Cập nhật bìa" — appended last, after Tạo/Chi tiết/Ảnh bìa/Tải lên."""
+        from PySide6.QtWidgets import QPushButton
+
+        return tab.video_list.cellWidget(row, 6).findChildren(QPushButton)[4]
+
+    def test_row_button_is_last_so_existing_positions_do_not_shift(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        self._render_part(tab, 0)
+        tab._refresh_video_list()
+        assert self._cover_button(tab).text() == "Cập nhật bìa"
+        tab.shutdown()
+
+    def test_row_button_needs_a_video_on_youtube(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        self._render_part(tab, 0)
+        self._cover(tab, 0)
+        tab._refresh_video_list()
+        button = self._cover_button(tab)
+        assert not button.isEnabled()
+        assert "chưa có video" in button.toolTip()
+        tab.shutdown()
+
+    def test_row_button_needs_a_cover_on_disk(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        _, out = self._render_part(tab, 0)
+        self._publish(out)
+        tab._refresh_video_list()
+        button = self._cover_button(tab)
+        assert not button.isEnabled()
+        assert "Chưa có ảnh bìa" in button.toolTip()
+        tab.shutdown()
+
+    def test_row_button_enabled_when_both_are_there(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        _, out = self._render_part(tab, 0)
+        self._cover(tab, 0)
+        self._publish(out)
+        tab._refresh_video_list()
+        assert self._cover_button(tab).isEnabled()
+        tab.shutdown()
+
+    def test_row_button_enabled_for_a_scheduled_draft_not_only_published(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """The eligibility decision, pinned at the UI level: a scheduled or private video
+        still has an editable thumbnail, and a push can't duplicate anything."""
+        from noveltrans.youtube_upload import STATE_DRAFT, write_upload_state
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        _, out = self._render_part(tab, 0)
+        self._cover(tab, 0)
+        write_upload_state(out, status=STATE_DRAFT, video_id="dQw4w9WgXcQ")
+        tab._refresh_video_list()
+        assert self._cover_button(tab).isEnabled()
+        tab.shutdown()
+
+    def test_rows_skip_parts_with_no_video_or_no_cover(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        from noveltrans.youtube_upload import mark_uploaded_by_hand
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        _, out0 = self._render_part(tab, 0)
+        self._cover(tab, 0)
+        self._publish(out0)
+        _, out1 = self._render_part(tab, 1)  # hand-marked: no video id to aim at
+        self._cover(tab, 1)
+        mark_uploaded_by_hand(out1)
+        assert [label for _w, label, _wn in tab._thumbnail_update_rows()] == ["Phần 1"]
+        tab.shutdown()
+
+    def test_rows_include_a_part_whose_mp4_was_deleted(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """The video lives on YouTube now; a cleaned-up local render must not block the push."""
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        _, out = self._render_part(tab, 0)
+        self._cover(tab, 0)
+        self._publish(out)
+        out.unlink()
+        assert [label for _w, label, _wn in tab._thumbnail_update_rows()] == ["Phần 1"]
+        tab.shutdown()
+
+    def test_request_points_at_the_jpg_sidecar_and_the_recorded_id(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """Pins "the source is the sidecar" — there is no file picker in this flow."""
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        window, out = self._render_part(tab, 0)
+        jpg = self._cover(tab, 0)
+        self._publish(out)
+        request = tab._thumbnail_request(window, "Phần 1", False)
+        assert request.thumbnail == jpg
+        assert request.video_id == "dQw4w9WgXcQ"
+        tab.shutdown()
+
+    def test_nothing_eligible_starts_no_worker(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from PySide6.QtWidgets import QMessageBox
+
+        shown = []
+        monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: shown.append(a))
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        self._render_part(tab, 0)
+        tab._start_thumbnail_update()
+        assert shown and tab._thumbnail_worker is None
+        tab.shutdown()
+
+    def _drive(self, tab, monkeypatch, answer=True):
+        """Run `_start_thumbnail_update` to `worker.start()` with the real `track_worker`."""
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.gui import keep_awake
+        from noveltrans.gui.workers import YouTubeThumbnailWorker
+
+        class _DummyManager:
+            def acquire(self):
+                pass
+
+            def release(self):
+                pass
+
+        monkeypatch.setattr(keep_awake, "_manager", _DummyManager())
+        asked = []
+
+        def question(_self, title, text, *a, **k):
+            asked.append(text)
+            return (
+                QMessageBox.StandardButton.Yes if answer else QMessageBox.StandardButton.No
+            )
+
+        monkeypatch.setattr(QMessageBox, "question", question)
+        started = []
+        monkeypatch.setattr(
+            YouTubeThumbnailWorker, "start", lambda self: started.append(self)
+        )
+        tab._start_thumbnail_update()
+        return started, asked
+
+    def test_launch_builds_and_starts_a_worker(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        """The `_launch_upload` regression test's twin: `track_worker` itself is the real
+        one here, so its call signature is exercised — that is the bug 033 shipped."""
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        for i in range(2):
+            _, out = self._render_part(tab, i)
+            self._cover(tab, i)
+            self._publish(out, video_id=f"vid{i}xxxxxxx")
+
+        started, _asked = self._drive(tab, monkeypatch)
+        assert len(started) == 1
+        assert [r.label for r in tab._thumbnail_worker.requests] == ["Phần 1", "Phần 2"]
+        # a render would rewrite the very .jpg being pushed; an upload shares the profile
+        assert not tab.thumbnail_update_button.isEnabled()
+        assert not tab.upload_button.isEnabled()
+        assert not tab.video_button.isEnabled()
+        assert not tab.redo_all_button.isEnabled()
+        assert not tab.thumb_regen_button.isEnabled()
+        assert tab.upload_cancel_button.isEnabled()
+        tab._thumbnail_worker = None  # never really started; don't let shutdown() wait
+        tab.shutdown()
+
+    def test_confirm_warns_when_a_target_is_live_on_the_channel(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        _, out = self._render_part(tab, 0)
+        self._cover(tab, 0)
+        self._publish(out)
+        _started, asked = self._drive(tab, monkeypatch)
+        assert asked and "đang hiển thị trên kênh" in asked[0]
+        tab._thumbnail_worker = None
+        tab.shutdown()
+
+    def test_declining_the_confirm_starts_nothing(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        _, out = self._render_part(tab, 0)
+        self._cover(tab, 0)
+        self._publish(out)
+        started, _asked = self._drive(tab, monkeypatch, answer=False)
+        assert started == [] and tab._thumbnail_worker is None
+        tab.shutdown()
+
+    def test_finished_handler_restores_every_button(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        for b in (
+            tab.thumbnail_update_button, tab.upload_button, tab.video_button,
+            tab.redo_all_button, tab.thumb_regen_button,
+        ):
+            b.setEnabled(False)
+        tab._on_thumbnail_finished(2, 0)
+        assert tab.thumbnail_update_button.isEnabled()
+        assert tab.upload_button.isEnabled()
+        assert tab.video_button.isEnabled()
+        assert tab.redo_all_button.isEnabled()
+        assert tab.thumb_regen_button.isEnabled()
+        assert not tab.upload_cancel_button.isEnabled()
+        tab.shutdown()
+
+    def test_an_upload_run_locks_out_the_thumbnail_button(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        """Both runs open the same persistent profile, so they can never overlap."""
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.gui import keep_awake
+        from noveltrans.gui.workers import YouTubeUploadWorker
+
+        class _DummyManager:
+            def acquire(self):
+                pass
+
+            def release(self):
+                pass
+
+        monkeypatch.setattr(keep_awake, "_manager", _DummyManager())
+        monkeypatch.setattr(
+            QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes
+        )
+        monkeypatch.setattr(YouTubeUploadWorker, "start", lambda self: None)
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        self._render_part(tab, 0)
+        tab._start_upload()
+        assert not tab.thumbnail_update_button.isEnabled()
+        tab._upload_worker = None
+        tab.shutdown()
+
+    def test_cancel_button_stops_the_thumbnail_worker(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+
+        class _Fake:
+            def __init__(self):
+                self.cancelled = False
+
+            def isRunning(self):
+                return True
+
+            def cancel(self):
+                self.cancelled = True
+
+        worker = _Fake()
+        tab._thumbnail_worker = worker
+        tab._cancel_upload()
+        assert worker.cancelled is True
+        tab._thumbnail_worker = None
+        tab.shutdown()
+
+    def test_upload_cell_tooltip_reports_the_last_cover_push(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """The only place a push leaves a visible trace — without it "did that do
+        anything?" has no answer."""
+        from noveltrans.youtube_upload import write_upload_state
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        _, out = self._render_part(tab, 0)
+        self._publish(out)
+        write_upload_state(out, thumbnail_updated_at="2026-07-28T10:00:00+07:00")
+        tab._refresh_video_list()
+        assert "2026-07-28" in tab.video_list.item(0, 5).toolTip()
+        tab.shutdown()
+
+    def test_regen_all_points_at_the_push_button_when_parts_are_live(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        """Re-rendering a cover changes nothing on YouTube — the same trap
+        `_redo_all_videos` warns about, and the discovery path for the new button."""
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        _, out = self._render_part(tab, 0)
+        self._cover(tab, 0)
+        self._publish(out)
+        monkeypatch.setattr(tab, "_thumbnail_base_image", lambda: "base.png")
+        monkeypatch.setattr(tab, "_render_thumbnail_now", lambda *a, **k: None)
+        tab._regen_all_thumbnails()
+        assert "Cập nhật ảnh bìa" in tab.status_label.text()
+        tab.shutdown()
+
+    def test_regen_all_stays_quiet_when_nothing_is_on_youtube(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        self._render_part(tab, 0)
+        monkeypatch.setattr(tab, "_thumbnail_base_image", lambda: "base.png")
+        monkeypatch.setattr(tab, "_render_thumbnail_now", lambda *a, **k: None)
+        tab._regen_all_thumbnails()
+        assert "Cập nhật ảnh bìa" not in tab.status_label.text()
+        tab.shutdown()
+
+    def test_shutdown_accounts_for_the_thumbnail_worker(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        tab.shutdown()  # no worker: must not raise
+
+    def test_clicking_the_row_button_starts_a_run_for_that_part(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        """Regression: the row path first looked its part up in `_thumbnail_update_rows()`,
+        which re-plans the windows on every call — so the fresh objects never matched the
+        one the row had captured and the button always reported "chưa có video"."""
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.gui import keep_awake
+        from noveltrans.gui.workers import YouTubeThumbnailWorker
+
+        class _DummyManager:
+            def acquire(self):
+                pass
+
+            def release(self):
+                pass
+
+        monkeypatch.setattr(keep_awake, "_manager", _DummyManager())
+        monkeypatch.setattr(
+            QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes
+        )
+        started = []
+        monkeypatch.setattr(
+            YouTubeThumbnailWorker, "start", lambda self: started.append(self)
+        )
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        for i in range(2):
+            _, out = self._render_part(tab, i)
+            self._cover(tab, i)
+            self._publish(out, video_id=f"vid{i}xxxxxxx")
+        tab._refresh_video_list()
+
+        self._cover_button(tab, row=1).click()
+        assert len(started) == 1
+        assert [r.label for r in tab._thumbnail_worker.requests] == ["Phần 2"]
+        tab._thumbnail_worker = None
+        tab.shutdown()

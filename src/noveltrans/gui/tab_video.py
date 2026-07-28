@@ -52,6 +52,7 @@ from noveltrans.gui.workers import (
     TtsVoicesWorker,
     VideoPreviewWorker,
     VideoWorker,
+    YouTubeThumbnailWorker,
     YouTubeUploadWorker,
 )
 from noveltrans.storage import NovelProject
@@ -68,6 +69,7 @@ class VideoTab(QWidget):
         self.project: NovelProject | None = None
         self._video_worker: VideoWorker | None = None
         self._upload_worker: YouTubeUploadWorker | None = None
+        self._thumbnail_worker: YouTubeThumbnailWorker | None = None
         self._preview_worker: VideoPreviewWorker | None = None
         self._voices_worker: TtsVoicesWorker | None = None
         self._tags_worker: TagsWorker | None = None
@@ -263,9 +265,9 @@ class VideoTab(QWidget):
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)  # đã tải lên
         # ResizeToContents ignores cell *widgets*, so the action column must be sized
-        # explicitly or the four buttons get crushed unreadably narrow.
+        # explicitly or the five buttons get crushed unreadably narrow.
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
-        self.video_list.setColumnWidth(6, 320)
+        self.video_list.setColumnWidth(6, 420)
         self.video_list.verticalHeader().setDefaultSectionSize(34)
 
         # the "Đã tải lên" tick is a control, not just a status — see _on_upload_toggled
@@ -352,6 +354,15 @@ class VideoTab(QWidget):
             "ghi nhầm là đã tải lên, để có thể tải lên lại."
         )
         self.upload_reset_button.clicked.connect(self._reset_all_upload_states)
+        # Lives here rather than in the thumbnail box: it opens the browser and shares
+        # the one Chrome profile with the upload run, so it belongs with the other
+        # YouTube actions and under the same "Dừng".
+        self.thumbnail_update_button = QPushButton("🖼️ Cập nhật ảnh bìa")
+        self.thumbnail_update_button.setToolTip(
+            "Đẩy ảnh bìa mới lên MỌI phần đã có video trên YouTube trong phạm vi đang "
+            "chọn — dùng sau khi “Tạo lại tất cả ảnh bìa”. Không tải lại video."
+        )
+        self.thumbnail_update_button.clicked.connect(self._start_thumbnail_update)
         self.upload_cancel_button = QPushButton("Dừng")
         self.upload_cancel_button.setEnabled(False)
         self.upload_cancel_button.clicked.connect(self._cancel_upload)
@@ -360,6 +371,7 @@ class VideoTab(QWidget):
         action_row.addWidget(QLabel("Danh sách phát:"))
         action_row.addWidget(self.upload_playlist, stretch=1)
         action_row.addWidget(self.upload_reset_button)
+        action_row.addWidget(self.thumbnail_update_button)
         action_row.addWidget(self.upload_button)
         action_row.addWidget(self.upload_cancel_button)
 
@@ -370,7 +382,8 @@ class VideoTab(QWidget):
         hint = QLabel(
             "Một cửa sổ Chrome riêng sẽ mở ra và tự điền form YouTube Studio — đừng "
             "bấm vào nó khi đang chạy. Cần “Đăng nhập YouTube” trong Settings một lần "
-            "trước đó. Phần nào đã tải lên sẽ được bỏ qua."
+            "trước đó. Phần nào đã tải lên sẽ được bỏ qua. “Cập nhật ảnh bìa” chỉ đổi "
+            "ảnh bìa của video đã đăng — không tải lại video."
         )
         hint.setProperty("muted", True)
         hint.setWordWrap(True)
@@ -669,6 +682,13 @@ class VideoTab(QWidget):
             item = QTableWidgetItem("Chưa tải")
             item.setToolTip("Tick nếu bạn đã tự tải phần này lên YouTube.")
 
+        # A thumbnail push leaves no other trace, so this tooltip is the only place
+        # "did that actually do anything?" gets an answer. Not part of the column text:
+        # it's a detail about the upload, not a state of its own.
+        pushed = (state.get("thumbnail_updated_at") or "")[:10]
+        if pushed:
+            item.setToolTip(item.toolTip() + f"\nẢnh bìa cập nhật: {pushed}")
+
         item.setFlags(
             (item.flags() | Qt.ItemFlag.ItemIsUserCheckable) & ~Qt.ItemFlag.ItemIsEditable
         )
@@ -804,8 +824,36 @@ class VideoTab(QWidget):
             upload.clicked.connect(
                 lambda _=False, w=window, pn=part_num, wn=whole_novel: self._upload_one(w, pn, wn)
             )
+
+        # Push the current cover onto the video that is already on the channel. Appended
+        # last so the existing button positions don't shift.
+        from noveltrans.youtube_upload import uploaded_video_id
+
+        jpg = self._part_sidecar(window, whole_novel, ".jpg")
+        video_id = uploaded_video_id(path)
+        cover = QPushButton("Cập nhật bìa")
+        cover.setEnabled(bool(video_id) and jpg.is_file())
+        # Two distinct disabled tooltips, because the two blockers have different fixes —
+        # a dead control with no explanation is what the "Đã tải lên" column exists to avoid.
+        if not video_id:
+            cover.setToolTip("Phần này chưa có video trên YouTube — tải lên trước đã.")
+        elif not jpg.is_file():
+            cover.setToolTip(
+                "Chưa có ảnh bìa cho phần này — bấm “Tạo lại tất cả ảnh bìa” trước."
+            )
+        else:
+            cover.setToolTip(
+                "Thay ảnh bìa của video đã đăng trên YouTube bằng ảnh bìa mới nhất "
+                f"({jpg.name}). Không tải lại video."
+            )
+        cover.clicked.connect(
+            lambda _=False, w=window, pn=part_num, wn=whole_novel: self._update_thumbnail_one(
+                w, pn, wn
+            )
+        )
+
         # compact padding + a sensible min width so the labels never truncate
-        for b, min_w in ((make, 58), (detail, 66), (thumb, 66), (upload, 66)):
+        for b, min_w in ((make, 58), (detail, 66), (thumb, 66), (upload, 66), (cover, 92)):
             b.setStyleSheet("padding: 3px 8px;")
             b.setMinimumWidth(min_w)
             row.addWidget(b)
@@ -1023,6 +1071,9 @@ class VideoTab(QWidget):
         mode = self.video_mode.currentData()
         total = len(windows)
         done = 0
+        # Counted before the loop: `processEvents()` below can repopulate the voice combo
+        # mid-run, and the answer we want is about the selection we are re-rendering.
+        live = len(self._thumbnail_update_rows())
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             with font_dir_context() as font_dir:
@@ -1040,7 +1091,17 @@ class VideoTab(QWidget):
                         pass
         finally:
             QApplication.restoreOverrideCursor()
-        self.status_label.setText(f"✅ Đã tạo lại {done}/{total} ảnh bìa.")
+        # Re-rendering a cover changes nothing on YouTube — the same trap `_redo_all_videos`
+        # warns about, and the discovery path for the button that fixes it.
+        self.status_label.setText(
+            f"✅ Đã tạo lại {done}/{total} ảnh bìa."
+            + (
+                f" ⚠️ {live} phần đã có video trên YouTube — bấm “🖼️ Cập nhật ảnh bìa” "
+                "để đẩy bìa mới lên."
+                if live
+                else ""
+            )
+        )
         self._refresh_video_list()
 
     def _open_thumbnail_editor(self) -> None:
@@ -1766,9 +1827,10 @@ class VideoTab(QWidget):
 
         self.video_button.setEnabled(False)
         self.redo_all_button.setEnabled(False)
-        # An upload reads the .mp4 files this worker is about to overwrite, so the two
-        # can't run together.
+        # An upload reads the .mp4 files this worker is about to overwrite, and a
+        # thumbnail push reads the .jpg it also rewrites — neither can run alongside.
         self.upload_button.setEnabled(False)
+        self.thumbnail_update_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.progress.setMaximum(1)
         self.progress.setValue(0)
@@ -1807,6 +1869,7 @@ class VideoTab(QWidget):
         self.video_button.setEnabled(True)
         self.redo_all_button.setEnabled(True)
         self.upload_button.setEnabled(True)
+        self.thumbnail_update_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
 
     def _on_video_finished(self, count: int) -> None:
@@ -2115,6 +2178,8 @@ class VideoTab(QWidget):
         # Rendering would overwrite the very files being uploaded — keep them apart.
         self.video_button.setEnabled(False)
         self.redo_all_button.setEnabled(False)
+        # One Chrome profile, one session: the two browser runs can never overlap.
+        self.thumbnail_update_button.setEnabled(False)
         self.upload_cancel_button.setEnabled(True)
         self.progress.setMaximum(len(requests))
         self.progress.setValue(0)
@@ -2136,6 +2201,7 @@ class VideoTab(QWidget):
         self.upload_button.setEnabled(True)
         self.video_button.setEnabled(True)
         self.redo_all_button.setEnabled(True)
+        self.thumbnail_update_button.setEnabled(True)
         self.upload_cancel_button.setEnabled(False)
         self._refresh_video_list()
 
@@ -2165,9 +2231,211 @@ class VideoTab(QWidget):
         )
 
     def _cancel_upload(self) -> None:
+        """Stop whichever browser run is live.
+
+        One button for both, because only one can ever be running: they share the single
+        persistent `.youtube-profile`, and Chromium refuses a second instance on one
+        user-data-dir. A second "Dừng" would be a second control for one piece of state.
+        """
         if self._upload_worker is not None and self._upload_worker.isRunning():
             self._upload_worker.cancel()
             self.status_label.setText("Đang dừng tải lên (chờ bước hiện tại kết thúc)…")
+        elif self._thumbnail_worker is not None and self._thumbnail_worker.isRunning():
+            self._thumbnail_worker.cancel()
+            self.status_label.setText("Đang dừng cập nhật ảnh bìa…")
+
+    # ------------------------------------------- cập nhật ảnh bìa trên YouTube
+
+    def _thumbnail_update_rows(self) -> list:
+        """Parts with a video on the channel AND a cover to push, as (window, label, whole).
+
+        Eligibility is `uploaded_video_id()`, deliberately not `is_published()`: a
+        scheduled or private video still has an editable thumbnail, and replacing one
+        cannot duplicate anything — so the paranoia that guards `_pending_upload_rows`
+        has nothing to protect here. Parts marked uploaded by hand carry no video id and
+        drop out on their own, which is right: we don't know which video they mean.
+        """
+        if self.project is None:
+            return []
+        from noveltrans.youtube_upload import uploaded_video_id
+
+        windows = self._windows_for_current_selection()
+        mode = self.video_mode.currentData()
+        total = len(windows)
+        rows = []
+        for i, window in enumerate(windows):
+            whole_novel = total == 1 and mode == "all"
+            path = self._part_output_path(window, whole_novel=whole_novel)
+            if not uploaded_video_id(path):
+                continue
+            if not self._part_sidecar(window, whole_novel, ".jpg").is_file():
+                continue
+            label = "Toàn bộ" if whole_novel else f"Phần {i + 1}"
+            rows.append((window, label, whole_novel))
+        return rows
+
+    def _thumbnail_request(self, window, label, whole_novel):
+        """One `ThumbnailRequest` from the .jpg sidecar beside the part's .mp4."""
+        from noveltrans.youtube_upload import ThumbnailRequest, uploaded_video_id
+
+        video = self._part_output_path(window, whole_novel=whole_novel)
+        return ThumbnailRequest(
+            video=video,
+            thumbnail=self._part_sidecar(window, whole_novel, ".jpg"),
+            video_id=uploaded_video_id(video),
+            label=label,
+        )
+
+    def _start_thumbnail_update(self) -> None:
+        """Push the current cover onto every already-uploaded part in the selection.
+
+        The batch case is the real one: "Tạo lại tất cả ảnh bìa" and the cover editor's
+        "áp dụng cho mọi phần" both rewrite every part's .jpg at once, so one font change
+        leaves every published part wearing the old cover simultaneously.
+        """
+        if self.project is None:
+            QMessageBox.information(self, "Cập nhật ảnh bìa", "Chọn truyện trước.")
+            return
+        rows = self._thumbnail_update_rows()
+        if not rows:
+            QMessageBox.information(
+                self,
+                "Cập nhật ảnh bìa",
+                "Không có phần nào để cập nhật ảnh bìa (chưa tải lên YouTube, hoặc "
+                "chưa có ảnh bìa).",
+            )
+            return
+        self._launch_thumbnail_update(rows)
+
+    def _update_thumbnail_one(self, window, part_num, whole_novel) -> None:
+        """Push one part's cover — the per-row path.
+
+        Built straight from the row's own window, like `_upload_one`, rather than by
+        looking the part up in `_thumbnail_update_rows()`: that method re-plans the
+        windows from scratch on every call, so the fresh objects would never match the
+        one this row captured.
+        """
+        label = "Toàn bộ" if whole_novel else f"Phần {part_num}"
+        self._launch_thumbnail_update([(window, label, whole_novel)])
+
+    def _launch_thumbnail_update(self, rows: list) -> None:
+        from noveltrans.youtube_upload import (
+            YouTubeUploadError,
+            is_published,
+            thumbnail_is_current,
+        )
+
+        if self._thumbnail_worker is not None and self._thumbnail_worker.isRunning():
+            QMessageBox.information(
+                self, "Cập nhật ảnh bìa", "Đang có phiên cập nhật ảnh bìa chạy."
+            )
+            return
+        if self._upload_worker is not None and self._upload_worker.isRunning():
+            QMessageBox.information(
+                self, "Cập nhật ảnh bìa", "Đang có phiên tải lên chạy — chờ xong đã."
+            )
+            return
+
+        try:
+            requests = [self._thumbnail_request(w, label, wn) for (w, label, wn) in rows]
+            for request in requests:  # surface a bad image before opening a browser
+                request.validate()
+        except YouTubeUploadError as exc:
+            QMessageBox.warning(self, "Cập nhật ảnh bìa", str(exc))
+            return
+
+        names = ", ".join(r.label for r in requests[:5])
+        more = f" (+{len(requests) - 5})" if len(requests) > 5 else ""
+        public = sum(1 for r in requests if is_published(r.video))
+        fresh = sum(1 for r in requests if thumbnail_is_current(r.video, r.thumbnail))
+        # It touches videos the public may already see, so it confirms — but the tone is
+        # informational, not the two-copies klaxon of `_reset_upload_state`: pushing a
+        # thumbnail is idempotent and re-doable by pushing the old image back.
+        warn = (
+            f"\n\n⚠️ {public} phần đang hiển thị trên kênh — người xem sẽ thấy ảnh bìa "
+            "mới (YouTube có thể mất vài phút để cập nhật)."
+            if public
+            else ""
+        )
+        already = f"\n{fresh} phần đã dùng đúng ảnh bìa này rồi (sẽ đẩy lại)." if fresh else ""
+        confirm = QMessageBox.question(
+            self,
+            "Cập nhật ảnh bìa",
+            f"Sẽ đổi ảnh bìa của {len(requests)} video đã đăng trên kênh:\n"
+            f"{names}{more}{already}{warn}\n\n"
+            "Một cửa sổ Chrome sẽ mở ra và tự thao tác — đừng dùng nó khi đang chạy. "
+            "Tiếp tục?",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        self._thumbnail_worker = YouTubeThumbnailWorker(requests, self)
+        self._thumbnail_worker.progress.connect(self._on_thumbnail_progress)
+        self._thumbnail_worker.part_done.connect(self._on_thumbnail_part_done)
+        self._thumbnail_worker.finished_ok.connect(self._on_thumbnail_finished)
+        self._thumbnail_worker.failed.connect(self._on_thumbnail_failed)
+        self._thumbnail_worker.needs_login.connect(self._on_thumbnail_needs_login)
+        track_worker(self._thumbnail_worker)  # don't let the Mac sleep mid-run
+
+        self.thumbnail_update_button.setEnabled(False)
+        # One browser profile between them, and a render would rewrite the very .jpg
+        # being pushed — all three have to stay apart.
+        self.upload_button.setEnabled(False)
+        self.video_button.setEnabled(False)
+        self.redo_all_button.setEnabled(False)
+        self.thumb_regen_button.setEnabled(False)
+        self.upload_cancel_button.setEnabled(True)
+        self.progress.setMaximum(len(requests))
+        self.progress.setValue(0)
+        self.status_label.setText("🖼️ Bắt đầu cập nhật ảnh bìa…")
+        self._thumbnail_worker.start()
+
+    def _on_thumbnail_progress(self, done: int, total: int, message: str) -> None:
+        self.progress.setMaximum(max(total, 1))
+        self.progress.setValue(done)
+        if message:
+            self.status_label.setText(f"🖼️ ({done}/{total}) {message}")
+
+    def _on_thumbnail_part_done(self, index: int, url: str, error: str) -> None:
+        # Refresh as each part lands so the tooltip tracks reality during a long run.
+        self._refresh_video_list()
+
+    def _reset_thumbnail_ui(self) -> None:
+        self.thumbnail_update_button.setEnabled(True)
+        self.upload_button.setEnabled(True)
+        self.video_button.setEnabled(True)
+        self.redo_all_button.setEnabled(True)
+        self.thumb_regen_button.setEnabled(True)
+        self.upload_cancel_button.setEnabled(False)
+        self._refresh_video_list()
+
+    def _on_thumbnail_finished(self, updated: int, errors: int) -> None:
+        self._reset_thumbnail_ui()
+        if updated and not errors:
+            self.status_label.setText(
+                f"✅ Đã đổi ảnh bìa {updated} video. YouTube có thể mất vài phút mới "
+                "hiện ảnh mới."
+            )
+        elif updated:
+            self.status_label.setText(
+                f"⚠️ Đã đổi ảnh bìa {updated} video, {errors} phần lỗi."
+            )
+        else:
+            self.status_label.setText("Không đổi được ảnh bìa phần nào.")
+
+    def _on_thumbnail_failed(self, message: str) -> None:
+        self._reset_thumbnail_ui()
+        self.status_label.setText("")
+        QMessageBox.warning(self, "Cập nhật ảnh bìa thất bại", message)
+
+    def _on_thumbnail_needs_login(self, message: str) -> None:
+        self._reset_thumbnail_ui()
+        self.status_label.setText("")
+        QMessageBox.information(
+            self,
+            "Cần đăng nhập YouTube",
+            message + "\n\nVào Settings → “Đăng nhập YouTube”, rồi thử lại.",
+        )
 
     # --------------------------------------------------------------- helpers
 
@@ -2193,6 +2461,9 @@ class VideoTab(QWidget):
         if self._video_worker is not None and self._video_worker.isRunning():
             self._video_worker.cancel()
             self._video_worker.wait(120_000)
+        if self._thumbnail_worker is not None and self._thumbnail_worker.isRunning():
+            self._thumbnail_worker.cancel()
+            self._thumbnail_worker.wait(60_000)
         if self._preview_worker is not None and self._preview_worker.isRunning():
             self._preview_worker.wait(60_000)
         if self._tags_worker is not None and self._tags_worker.isRunning():
