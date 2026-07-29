@@ -137,3 +137,91 @@ class TestDownstreamChunkingSurvives:
         assert not any("中" in c or "😀" in c for c in chunks)  # specials gone
         # sentence enders survived, so splitting still sees sentence boundaries
         assert any(c.endswith(("!", "?", "…", ".", "”")) for c in chunks)
+
+
+class TestPunctuationOnlyLinesBecomeSilence:
+    """Feature 038 — a line with nothing speakable on it is a *beat*, not a sound.
+
+    Reported: a `“…”` line rendered by Ngọc Linh came out as a weird noise. It reached the
+    engine because every character in it is in the keep-set, `split_sentences` gave it its
+    own chunk, and feature 028's `merge_short_chunks` glued that 3-char chunk onto the
+    neighbouring sentence for the voice to pronounce.
+    """
+
+    # the excerpt exactly as reported
+    REPORTED = (
+        "“Tên bây giờ khó nghe quá.”\n\n"
+        "“…”\n\n"
+        "Một vấn đề hoàn toàn không nên xuất hiện trong trường hợp này."
+    )
+
+    def test_the_reported_ellipsis_line_is_gone(self):
+        out = clean_for_tts(self.REPORTED)
+        assert "…" not in out
+        assert out == (
+            "“Tên bây giờ khó nghe quá.”\n\n"
+            "Một vấn đề hoàn toàn không nên xuất hiện trong trường hợp này."
+        )
+
+    def test_an_ellipsis_inside_a_sentence_is_untouched(self):
+        """**The anti-regression.** Mid-sentence ellipsis is prosody, not silence —
+        turning it into a pause would be a worse bug than the one being fixed."""
+        text = "Anh ta ngập ngừng… rồi im lặng."
+        assert clean_for_tts(text) == text
+
+    def test_a_sentence_ending_in_an_ellipsis_survives(self):
+        text = "Hắn không nói gì cả…"
+        assert clean_for_tts(text) == text
+
+    def test_silent_beats_of_every_common_shape_are_dropped(self):
+        """The shapes these novels actually use for a wordless reply."""
+        for beat in ("“…”", "……", '"..."', "“?”", "“!”", "- - -", "***", "( )", "?!"):
+            out = clean_for_tts(f"Trước.\n\n{beat}\n\nSau.")
+            assert out == "Trước.\n\nSau.", f"{beat!r} survived as {out!r}"
+
+    def test_a_digit_only_line_is_speech_and_stays(self):
+        """Digits are pronounceable — a bare chapter number must still be read."""
+        assert clean_for_tts("Trước.\n\n1\n\nSau.") == "Trước.\n\n1\n\nSau."
+
+    def test_a_single_letter_line_stays(self):
+        assert clean_for_tts("Trước.\n\nA\n\nSau.") == "Trước.\n\nA\n\nSau."
+
+    def test_a_line_emptied_by_extra_remove_is_dropped_too(self):
+        """Ordering: the check runs after `extra_remove`, so a line that setting empties
+        is caught as well."""
+        assert clean_for_tts("Trước.\n\n(A)\n\nSau.", "A") == "Trước.\n\nSau."
+
+    def test_a_chapter_of_nothing_but_beats_cleans_to_empty(self):
+        """Feeds the existing "Chương không có nội dung để đọc." guard rather than
+        handing the engine a page of punctuation."""
+        assert clean_for_tts("“…”\n\n“?”\n\n***") == ""
+
+    def test_dropping_a_beat_leaves_a_paragraph_break_not_a_join(self):
+        """The break is what `synthesize_chapter` renders as real silence, so the beat
+        the author wrote survives *as* silence."""
+        out = clean_for_tts("Trước.\n\n“…”\n\nSau.")
+        assert "\n\n" in out
+        assert "Trước. Sau." not in out
+
+    def test_the_beat_no_longer_reaches_the_engine(self):
+        """End to end through the real chunker, including 028's merge step — which is what
+        actually handed the ellipsis to the voice."""
+        from noveltrans.tts.base import merge_short_chunks
+
+        chunks = merge_short_chunks(
+            split_sentences(clean_for_tts(self.REPORTED), 400), 30, 400
+        )
+        assert not any("…" in c for c in chunks)
+
+    def test_a_beat_between_normal_length_paragraphs_still_yields_a_pause(self):
+        """With paragraphs above 028's 30-char merge floor the gap survives as a real
+        pause — two chunks, so `synthesize_chapter` puts silence between them."""
+        from noveltrans.tts.base import merge_short_chunks
+
+        src = (
+            "“Tên bây giờ khó nghe quá, ta đã nói với ngươi bao nhiêu lần rồi hả?”\n\n"
+            "“…”\n\n"
+            "Một vấn đề hoàn toàn không nên xuất hiện trong trường hợp này, hắn nghĩ."
+        )
+        chunks = merge_short_chunks(split_sentences(clean_for_tts(src), 400), 30, 400)
+        assert len(chunks) == 2
