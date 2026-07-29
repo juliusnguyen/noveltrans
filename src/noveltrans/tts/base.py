@@ -108,6 +108,7 @@ class TtsEngine(ABC):
         clean_extra_remove: str = "",
         gap_seconds: float | None = None,
         volume: float = 1.0,
+        cues_out: list | None = None,
     ) -> float:
         """Synthesize title + body into one WAV. Returns audio duration (s).
 
@@ -120,8 +121,16 @@ class TtsEngine(ABC):
         `paragraph_gap_seconds` default). `volume` is a linear gain on the rendered
         audio, hard-clipped to [-1, 1] so gains > 1.0 can't wrap around into noise.
 
+        `cues_out`, when given, is filled with one `subtitles.Cue` per chunk — the exact
+        timings of what was spoken, which exist only inside this loop and cannot be
+        recovered afterwards. An out-parameter rather than a changed return type because
+        three callers depend on the `float`, and two of them are previews that would only
+        unpack a value to discard it. **These timings are pre-speed**: a caller that
+        post-processes with `apply_tempo` must rescale them (`subtitles.scale_cues`).
+
         Raises TtsError("đã dừng") if `cancelled()` turns true between chunks.
         """
+        from noveltrans.tts.subtitles import Cue
         import numpy as np
 
         text = f"{title}\n\n{body}" if title else body
@@ -135,13 +144,26 @@ class TtsEngine(ABC):
         gap_len = self.paragraph_gap_seconds if gap_seconds is None else gap_seconds
         gap = np.zeros(int(self.sample_rate * gap_len), dtype=np.float32)
         pieces: list = []
+        # Counted in SAMPLES, not by summing float durations: the offsets have to be the
+        # ones the concatenation actually produces, and float seconds accumulate error.
+        offset = 0
         for chunk in chunks:
             if cancelled is not None and cancelled():
                 raise TtsError("Đã dừng theo yêu cầu.")
             samples = np.asarray(self.synthesize(chunk), dtype=np.float32).reshape(-1)
             if pieces and gap.size:
                 pieces.append(gap)
+                offset += gap.size
             pieces.append(samples)
+            if cues_out is not None:
+                cues_out.append(
+                    Cue(
+                        offset / self.sample_rate,
+                        (offset + samples.size) / self.sample_rate,
+                        chunk,
+                    )
+                )
+            offset += samples.size
         audio = np.concatenate(pieces)
         if volume != 1.0:
             audio = np.clip(audio * volume, -1.0, 1.0).astype(np.float32)

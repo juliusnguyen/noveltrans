@@ -801,3 +801,136 @@ class TestRealRender:
         assert "codec_type=video" in probe.stdout
         assert "codec_type=audio" in probe.stdout
         assert Path(out).stat().st_size > 1000
+
+
+class TestBurnedNarrationSubtitles:
+    """Feature 041 — the optional narration layer burned into the video.
+
+    The title block (Novel/Chapter styles) is the player-skin identity and must be
+    completely unaffected when the option is off.
+    """
+
+    def _segments(self, tmp_path, n=2, seconds=60.0):
+        from noveltrans.tts.video import MergeSegment
+
+        out = []
+        for i in range(n):
+            p = tmp_path / f"{i:04d}.mp3"
+            p.write_bytes(b"audio")
+            out.append(MergeSegment(p, seconds, f"Chương {i + 1}"))
+        return out
+
+    def _cue(self, start, end, text):
+        from noveltrans.tts.subtitles import Cue
+
+        return Cue(start, end, text)
+
+    def test_no_narration_is_byte_identical_to_before(self, tmp_path):
+        """The no-surprise guarantee: the option cannot change a video nobody asked to
+        change."""
+        from noveltrans.tts.video import build_ass_subtitles
+
+        segs = self._segments(tmp_path)
+        assert build_ass_subtitles(segs, "Tên") == build_ass_subtitles(
+            segs, "Tên", narration=None
+        )
+
+    def test_an_empty_narration_list_adds_nothing(self, tmp_path):
+        from noveltrans.tts.video import build_ass_subtitles
+
+        segs = self._segments(tmp_path)
+        assert build_ass_subtitles(segs, "Tên", narration=[]) == build_ass_subtitles(
+            segs, "Tên"
+        )
+
+    def test_each_cue_becomes_a_sub_event_at_its_own_time(self, tmp_path):
+        from noveltrans.tts.video import build_ass_subtitles
+
+        ass = build_ass_subtitles(
+            self._segments(tmp_path),
+            "Tên",
+            narration=[self._cue(1.5, 3.0, "Hắn bước tới.")],
+        )
+        assert "Sub,,0,0,0,,Hắn bước tới." in ass
+        assert "0:00:01.50,0:00:03.00,Sub" in ass
+
+    def test_the_title_events_survive_alongside_the_narration(self, tmp_path):
+        """Both layers coexist — narration is added, nothing is replaced."""
+        from noveltrans.tts.video import build_ass_subtitles
+
+        ass = build_ass_subtitles(
+            self._segments(tmp_path), "Tên", narration=[self._cue(0, 1, "Lời đọc")]
+        )
+        assert ",Novel,," in ass and ",Chapter,," in ass and ",Sub,," in ass
+
+    def test_cue_text_is_escaped_like_every_other_event(self, tmp_path):
+        """Braces open an ASS override block and a newline ends the event — narration is
+        arbitrary novel text, so it is exactly as dangerous as a chapter title."""
+        from noveltrans.tts.video import build_ass_subtitles
+
+        ass = build_ass_subtitles(
+            self._segments(tmp_path),
+            "Tên",
+            narration=[self._cue(0, 1, "A {\\b1} B\nC")],
+        )
+        assert "Sub,,0,0,0,,A (\\b1) B\\NC" in ass
+
+    def test_an_empty_cue_produces_no_event(self, tmp_path):
+        """A chunk can clean down to nothing — feature 038's punctuation-only lines."""
+        from noveltrans.tts.video import build_ass_subtitles
+
+        ass = build_ass_subtitles(
+            self._segments(tmp_path), "Tên", narration=[self._cue(0, 1, "   ")]
+        )
+        assert ",Sub,," not in ass
+
+    def test_the_sub_style_sits_at_the_bottom_centre(self, tmp_path):
+        from noveltrans.tts.video import build_ass_subtitles
+
+        ass = build_ass_subtitles(self._segments(tmp_path), "Tên", narration=[])
+        style = next(ln for ln in ass.splitlines() if ln.startswith("Style: Sub,"))
+        # ASS style fields: ..., BorderStyle, Outline, Shadow, Alignment, L, R, V, Enc
+        assert style.split(",")[18] == "2"  # 2 = bottom-centre
+
+    def test_the_narration_clears_the_progress_track_at_any_resolution(self):
+        """Asserted against PlayerLayout rather than a 1080p number, so a future layout
+        change surfaces here instead of on a rendered video."""
+        from noveltrans.tts.player_skin import PlayerLayout
+        from noveltrans.tts.video import sub_font_px, sub_margin_v
+
+        for w, h in ((1920, 1080), (1280, 720)):
+            lay = PlayerLayout.of(w, h)
+            top_of_three_lines = h - sub_margin_v(h) - 3 * sub_font_px(h)
+            assert top_of_three_lines > lay.track_y, f"{w}x{h} collides with the track"
+
+    def test_the_narration_does_not_reach_up_into_the_photo(self):
+        from noveltrans.tts.player_skin import PlayerLayout
+        from noveltrans.tts.video import sub_font_px, sub_margin_v
+
+        lay = PlayerLayout.of(1920, 1080)
+        top_of_three_lines = 1080 - sub_margin_v(1080) - 3 * sub_font_px(1080)
+        assert top_of_three_lines > lay.photo_y + lay.photo_h
+
+
+class TestBurnedSubtitlesShareTheSidecarTimings:
+    """One definition of where a chapter starts, so a burned line can never disagree with
+    the .srt line."""
+
+    def test_part_cues_and_part_srt_agree(self, tmp_path):
+        from noveltrans.tts.subtitles import Cue, part_cues, part_srt, write_cues
+        from noveltrans.tts.video import MergeSegment
+
+        segs = []
+        for i in range(2):
+            p = tmp_path / f"{i:04d}.mp3"
+            p.write_bytes(b"audio")
+            write_cues(p, [Cue(0, 5, f"Câu {i}")], seconds=60.0)
+            segs.append(MergeSegment(p, 60.0, f"Chương {i}"))
+
+        cues, covered, total = part_cues(segs)
+        srt, srt_covered, srt_total = part_srt(segs)
+        assert (covered, total) == (srt_covered, srt_total) == (2, 2)
+        assert len(cues) == srt.count("-->")
+        # the second chapter's cue is offset by the first chapter's duration in both
+        assert cues[1].start == 60.0
+        assert "00:01:00,000" in srt

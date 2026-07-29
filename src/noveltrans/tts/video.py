@@ -35,6 +35,7 @@ from pathlib import Path
 
 from noveltrans.errors import TtsError
 from noveltrans.tts.convert import ffmpeg_available  # noqa: F401 (re-exported for callers)
+from noveltrans.tts.subtitles import part_cues, part_srt
 from noveltrans.tts.player_skin import (
     PlayerLayout,
     build_knob,
@@ -189,6 +190,14 @@ _ASS_STYLES = (
     "0,0,0,0,100,100,0,0,1,{ow},1,8,{mL},{mR},{nmargin},1\n"
     "Style: Chapter,{font},{csize},{cpri},&H000000FF,{ocol},&H30000000,"
     "1,0,0,0,100,100,0,0,1,{ow},1,8,{mL},{mR},{cmargin},1\n"
+    # Narration (feature 041, optional). Alignment 2 = bottom-centre, the only region of
+    # the frame that is empty at every resolution: the photo ends at 65.8% of the height
+    # and the progress track sits at 72%, so growing upward from a 6% bottom margin gives
+    # ~3 lines of clearance. Always white with a heavy outline and a shadow — unlike the
+    # title block it cannot adapt to the backdrop, because it spans the full width and
+    # crosses whatever the user's gradient happens to be doing.
+    "Style: Sub,{font},{ssize},&H00FFFFFF,&H000000FF,&H00101010,&H80000000,"
+    "0,0,0,0,100,100,0,0,1,{sow},2,2,{smL},{smR},{smargin},1\n"
 )
 
 # Below this backdrop luminance (0..255) the titles flip to light-on-dark.
@@ -242,6 +251,20 @@ _ASS_EVENTS_HEADER = (
 _TRAILING_BACKSLASH = re.compile(r"\\+$")
 
 
+def sub_font_px(height: int) -> int:
+    """Burned-narration font size — ~4.2% of the frame height (45 px at 1080p).
+
+    The conventional subtitle proportion. Kept as a function so the tests can assert the
+    layout clears the progress track at any resolution rather than pinning a 1080p number.
+    """
+    return max(12, round(height * 0.042))
+
+
+def sub_margin_v(height: int) -> int:
+    """Distance from the bottom of the frame to the narration block."""
+    return round(height * 0.06)
+
+
 def _escape_ass(text: str) -> str:
     """Make arbitrary title text safe inside an ASS Dialogue Text field.
 
@@ -262,6 +285,7 @@ def build_ass_subtitles(
     height: int = 1080,
     font_name: str = FONT_NAME,
     bg_color: tuple[int, int, int] | None = None,
+    narration=None,
 ) -> str:
     """An ASS document: the novel title for the whole video + one event per chapter.
 
@@ -272,6 +296,11 @@ def build_ass_subtitles(
     block in the right column (`PlayerLayout` fixes the placement): the novel title is the
     muted album line above, the chapter title the bold track line below it. The title colours
     follow `bg_color` — light-on-dark over a dark chosen background, dark-on-light otherwise.
+
+    `narration`, when given, is a list of `subtitles.Cue` already in PART time (see
+    `subtitles.part_cues`); each becomes a bottom-centre event in the `Sub` style. Passing
+    `None` — the default — produces byte-identical output to before feature 041, so the
+    burned-in option cannot change a video nobody asked to change.
     """
     lay = PlayerLayout.of(width, height)
     palette = _text_palette(bg_color)
@@ -284,6 +313,9 @@ def build_ass_subtitles(
             nmargin=lay.novel_margin_v, cmargin=lay.chapter_margin_v,
             npri=palette["npri"], cpri=palette["cpri"],
             ocol=palette["ocol"], ow=palette["ow"],
+            ssize=sub_font_px(height), sow=max(2, round(height * 0.0035)),
+            smL=round(width * 0.08), smR=round(width * 0.08),
+            smargin=sub_margin_v(height),
         ),
         "\n",
         _ASS_EVENTS_HEADER,
@@ -299,6 +331,14 @@ def build_ass_subtitles(
             f"{{\\fad(400,400)}}{_escape_ass(seg.title)}\n"
         )
         start = end
+
+    for cue in narration or []:
+        text = _escape_ass((cue.text or "").strip())
+        if not text:
+            continue  # a chunk can clean down to nothing — see feature 038
+        out.append(
+            f"Dialogue: 0,{_ass_time(cue.start)},{_ass_time(cue.end)},Sub,,0,0,0,,{text}\n"
+        )
     return "".join(out)
 
 
@@ -592,6 +632,7 @@ def render_video(
     spin_vinyl: bool = True,
     font_name: str = FONT_NAME,
     bg_color: tuple[int, int, int] | None = None,
+    burn_subtitles: bool = False,
     cancelled: Callable[[], bool] | None = None,
 ) -> Path:
     """Render `segments` into an MP4 at `out_path`; also write the YouTube description.
@@ -628,8 +669,12 @@ def render_video(
     deadline = time.monotonic() + max(3600, int(total) * 6)
 
     try:
+        # Shared with the .srt sidecar below, deliberately: one definition of where each
+        # chapter starts, so a burned line can never disagree with the sidecar line.
+        narration = part_cues(segments)[0] if burn_subtitles else None
         subs_file.write_text(
             build_ass_subtitles(segments, novel_title, width=width, height=height,
+                                narration=narration,
                                 font_name=font_name, bg_color=bg_color),
             encoding="utf-8",
         )
@@ -659,6 +704,14 @@ def render_video(
              "-c:a", "copy", "-shortest", str(out_path)],
             err_file, cancelled, deadline, "tạo video",
         )
+
+        # Companion subtitle track, timed from the TTS run itself (feature 040). Written
+        # only when some chapter in this part actually has cues: an empty .srt beside a
+        # video is worse than none, because it looks like subtitles that failed rather
+        # than audio recorded before cues existed.
+        srt, _covered, _total = part_srt(segments)
+        if srt.strip():
+            out_path.with_suffix(".srt").write_text(srt, encoding="utf-8")
 
         # Companion YouTube description with clickable chapter timestamps.
         out_path.with_suffix(".txt").write_text(

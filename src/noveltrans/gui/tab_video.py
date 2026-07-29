@@ -55,6 +55,7 @@ from noveltrans.gui.workers import (
     VideoPreviewWorker,
     PlaylistFetchWorker,
     PlaylistSyncWorker,
+    SubtitleWorker,
     VideoWorker,
     YouTubeThumbnailWorker,
     YouTubeUploadWorker,
@@ -76,6 +77,7 @@ class VideoTab(QWidget):
         self._thumbnail_worker: YouTubeThumbnailWorker | None = None
         self._playlist_worker: PlaylistSyncWorker | None = None
         self._playlist_fetch_worker: PlaylistFetchWorker | None = None
+        self._subtitle_worker: SubtitleWorker | None = None
         self._preview_worker: VideoPreviewWorker | None = None
         self._voices_worker: TtsVoicesWorker | None = None
         self._tags_worker: TagsWorker | None = None
@@ -213,6 +215,17 @@ class VideoTab(QWidget):
 
         self.video_preview_button = QPushButton("Xem trước")
         self.video_preview_button.clicked.connect(self._start_preview)
+        self.burn_subs_check = QCheckBox("Chèn phụ đề")
+        self.burn_subs_check.setChecked(self.config.video_burn_subtitles)
+        self.burn_subs_check.setToolTip(
+            "Vẽ lời đọc thành phụ đề CỐ ĐỊNH ở đáy video (không tắt được). File .srt vẫn "
+            "được tạo dù bật hay tắt.\n\nTăng ~25% dung lượng file, và muốn sửa thì phải "
+            "tạo lại video. Chỉ áp dụng cho phần có audio tạo sau bản 040."
+        )
+        self.burn_subs_check.toggled.connect(
+            lambda on: setattr(self.config, "video_burn_subtitles", on)
+        )
+
         self.video_button = QPushButton("Tạo video")
         self.video_button.setProperty("primary", True)
         self.video_button.clicked.connect(self._start_video)
@@ -229,6 +242,15 @@ class VideoTab(QWidget):
             for b in (self.video_button, self.redo_all_button, self.video_preview_button):
                 b.setEnabled(False)
                 b.setToolTip("Cần ffmpeg để tạo video (brew install ffmpeg).")
+        self.subtitle_button = QPushButton("Tạo phụ đề (.srt)")
+        self.subtitle_button.setToolTip(
+            "Ghi file .srt cho mọi phần trong phạm vi đang chọn — KHÔNG tạo lại video.\n\n"
+            "Với audio tạo trước đây (chưa có mốc thời gian), ứng dụng sẽ dò các khoảng "
+            "lặng trong file audio để khôi phục mốc. Chương nào không khớp sẽ được bỏ qua "
+            "thay vì đoán."
+        )
+        self.subtitle_button.clicked.connect(self._start_subtitles)
+
         self.open_video_dir_button = QPushButton("Mở thư mục video")
         self.open_video_dir_button.clicked.connect(self._open_video_dir)
 
@@ -247,6 +269,7 @@ class VideoTab(QWidget):
         row.addWidget(QLabel("Màu nền:"))
         row.addWidget(self.bg_color_button)
         row.addWidget(self.bg_reset_button)
+        row.addWidget(self.burn_subs_check)
 
         row2 = QHBoxLayout()
         row2.addWidget(QLabel("Ảnh nền:"))
@@ -256,6 +279,7 @@ class VideoTab(QWidget):
         row2.addWidget(self.video_button)
         row2.addWidget(self.redo_all_button)
         row2.addWidget(self.cancel_button)
+        row2.addWidget(self.subtitle_button)
         row2.addWidget(self.open_video_dir_button)
 
         inner = QVBoxLayout()
@@ -1955,6 +1979,7 @@ class VideoTab(QWidget):
             thumb_part_scale=self.config.video_thumbnail_part_scale,
             thumb_tagline_scale=self.config.video_thumbnail_tagline_scale,
             thumb_title_align=self.config.video_thumbnail_title_align,
+            burn_subtitles=self.burn_subs_check.isChecked(),
             bg_color=self.bg_color, skip_existing=skip_existing,
             credit=self.credit_edit.text().strip() or "Fox Novel",
             tagline=self.tagline_edit.text().strip(),
@@ -1984,13 +2009,41 @@ class VideoTab(QWidget):
         self.thumbnail_update_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
 
+    def _subtitle_coverage(self) -> tuple[int, int]:
+        """(parts with an .srt, parts rendered) in the current selection.
+
+        Audio voiced before feature 040 carries no timing cues, so those parts render
+        without subtitles. Saying so is the whole point: silence would read as a broken
+        feature rather than as "that audio predates it".
+        """
+        if self.project is None:
+            return 0, 0
+        windows = self._windows_for_current_selection()
+        mode = self.video_mode.currentData()
+        whole = len(windows) == 1 and mode == "all"
+        rendered = [
+            self._part_output_path(w, whole_novel=whole)
+            for w in windows
+            if self._part_output_path(w, whole_novel=whole).is_file()
+        ]
+        return sum(1 for p in rendered if p.with_suffix(".srt").is_file()), len(rendered)
+
     def _on_video_finished(self, count: int) -> None:
         self._reset_video_ui()
         self._refresh_video_list()  # update the created/not-created statuses
         if count:
+            subs, total = self._subtitle_coverage()
+            note = (
+                ""
+                if subs == total
+                else (
+                    f" ⚠️ Phụ đề: {subs}/{total} phần — audio tạo trước đây chưa có mốc "
+                    "thời gian, hãy tạo lại audio nếu muốn phụ đề đầy đủ."
+                )
+            )
             self.status_label.setText(
-                f"✅ Đã tạo {count} video (kèm tiêu đề, mô tả, ảnh bìa, tags) — "
-                "bấm “Mở thư mục video”."
+                f"✅ Đã tạo {count} video (kèm tiêu đề, mô tả, ảnh bìa, tags, phụ đề .srt) — "
+                "bấm “Mở thư mục video”." + note
             )
         else:
             self.status_label.setText("Đã dừng tạo video.")
@@ -2358,6 +2411,72 @@ class VideoTab(QWidget):
         elif self._playlist_worker is not None and self._playlist_worker.isRunning():
             self._playlist_worker.cancel()
             self.status_label.setText("Đang dừng sắp xếp danh sách phát…")
+
+    # ------------------------------------------------------------- phụ đề .srt
+
+    def _start_subtitles(self) -> None:
+        """Write each part's .srt, recovering missing cues from the audio first.
+
+        No ffmpeg render: the sidecar needs only the segment list and the cues, and going
+        through `render_video` for one would cost ~26 minutes and ~250 MB per part to
+        produce a 40 KB text file.
+        """
+        if self.project is None:
+            QMessageBox.information(self, "Tạo phụ đề", "Chọn truyện trước.")
+            return
+        if self._subtitle_worker is not None and self._subtitle_worker.isRunning():
+            return
+        voice = self.voice_combo.currentData() or self.voice_combo.currentText().strip()
+        mode = self.video_mode.currentData()
+
+        self._subtitle_worker = SubtitleWorker(
+            self.project.path,
+            voice,
+            mode,
+            start=self.video_range_from.value() if mode == "range" else None,
+            end=self.video_range_to.value() if mode == "range" else None,
+            batch=self.video_batch_size.value() if mode == "batch" else None,
+            use_translation=self.config.tts_use_translation,
+            clean_text=self.config.tts_clean_text,
+            clean_extra_remove=self.config.tts_clean_extra_remove,
+            gap_seconds=self.config.tts_gap,
+            speed=self.config.tts_speed,
+            parent=self,
+        )
+        self._subtitle_worker.progress.connect(self._on_subtitle_progress)
+        self._subtitle_worker.finished_ok.connect(self._on_subtitles_finished)
+        self._subtitle_worker.failed.connect(self._on_subtitles_failed)
+        track_worker(self._subtitle_worker)
+
+        self.subtitle_button.setEnabled(False)
+        self.progress.setValue(0)
+        self.status_label.setText("💬 Đang tạo phụ đề…")
+        self._subtitle_worker.start()
+
+    def _on_subtitle_progress(self, done: int, total: int, message: str) -> None:
+        self.progress.setMaximum(max(total, 1))
+        self.progress.setValue(done)
+        if message:
+            self.status_label.setText(f"💬 ({done}/{total}) {message}")
+
+    def _on_subtitles_finished(self, written: int, backfilled: int, skipped: int) -> None:
+        self.subtitle_button.setEnabled(True)
+        parts = [f"✅ Đã ghi {written} file .srt"]
+        if backfilled:
+            parts.append(f"khôi phục mốc thời gian cho {backfilled} chương")
+        if skipped:
+            # Named, not hidden: a skipped part means the audio's silence pattern didn't
+            # match the text, and guessing would have been worse than saying so.
+            parts.append(
+                f"⚠️ {skipped} phần chưa có phụ đề (không dò được mốc — tạo lại audio "
+                "nếu cần)"
+            )
+        self.status_label.setText(" — ".join(parts) + ".")
+
+    def _on_subtitles_failed(self, message: str) -> None:
+        self.subtitle_button.setEnabled(True)
+        self.status_label.setText("")
+        QMessageBox.warning(self, "Tạo phụ đề thất bại", message)
 
     # -------------------------------------------------- danh sách phát YouTube
 
@@ -2741,6 +2860,9 @@ class VideoTab(QWidget):
             self._playlist_worker.wait(60_000)
         if self._playlist_fetch_worker is not None and self._playlist_fetch_worker.isRunning():
             self._playlist_fetch_worker.wait(60_000)
+        if self._subtitle_worker is not None and self._subtitle_worker.isRunning():
+            self._subtitle_worker.cancel()
+            self._subtitle_worker.wait(60_000)
         if self._preview_worker is not None and self._preview_worker.isRunning():
             self._preview_worker.wait(60_000)
         if self._tags_worker is not None and self._tags_worker.isRunning():

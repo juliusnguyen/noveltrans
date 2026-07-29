@@ -847,3 +847,148 @@ class TestVieneuLive:
         )
         assert (tmp_path / "live.wav").stat().st_size > 10_000
         assert seconds > 0.5
+
+
+class TestSynthesizeChapterCues:
+    """Feature 040 — the cue timings captured while the chapter audio is built.
+
+    FakeTtsEngine is 1 sample per character at 1000 Hz, so every offset below is exact
+    arithmetic rather than an approximation.
+    """
+
+    # FakeTtsEngine has max_chunk_chars == min_chunk_chars == 30, so paragraphs must be
+    # long enough that `merge_short_chunks` cannot fuse two without exceeding the max.
+    # Short ones collapse into a SINGLE chunk, which makes every pairwise assertion below
+    # vacuously true — the first draft of these tests did exactly that.
+    P1 = "Cau mot rat dai va day du."
+    P2 = "Cau hai cung dai nhu vay."
+    P3 = "Cau ba dai khong kem gi."
+    BODY = f"{P1}\n\n{P2}\n\n{P3}"
+
+    def _run(self, tmp_path, body=None, **kw):
+        engine = FakeTtsEngine()
+        cues: list = []
+        out = tmp_path / "audio" / "0001-test.wav"
+        seconds = engine.synthesize_chapter(
+            "", body if body is not None else self.BODY, out, cues_out=cues, **kw
+        )
+        return engine, cues, seconds
+
+    def test_the_fixture_really_produces_several_chunks(self, tmp_path):
+        """Guards every other test in this class: with one chunk the pairwise assertions
+        below would pass without checking anything."""
+        engine, cues, _ = self._run(tmp_path)
+        assert len(engine.chunks) >= 3
+        assert len(cues) == len(engine.chunks)
+
+    def test_one_cue_per_chunk_with_the_chunk_text(self, tmp_path):
+        engine, cues, _ = self._run(tmp_path)
+        assert [c.text for c in cues] == engine.chunks
+
+    def test_the_first_cue_starts_at_zero(self, tmp_path):
+        _e, cues, _ = self._run(tmp_path)
+        assert cues[0].start == 0.0
+
+    def test_each_cue_length_matches_the_audio_synthesised_for_it(self, tmp_path):
+        """1 sample per char at 1000 Hz, so a chunk of N characters is exactly N ms."""
+        engine, cues, _ = self._run(tmp_path)
+        for cue, chunk in zip(cues, engine.chunks):
+            assert cue.end - cue.start == pytest.approx(len(chunk) / 1000.0)
+
+    def test_consecutive_cues_are_separated_by_exactly_the_gap(self, tmp_path):
+        """The gap is real silence in the audio, so it must be real silence between cues —
+        a cue that runs into the next one subtitles the wrong words."""
+        _e, cues, _ = self._run(tmp_path)
+        gap = FakeTtsEngine.paragraph_gap_seconds
+        for prev, nxt in zip(cues, cues[1:]):
+            assert nxt.start - prev.end == pytest.approx(gap)
+
+    def test_the_last_cue_ends_exactly_at_the_reported_duration(self, tmp_path):
+        """The end-to-end property: the cues describe the whole of the audio that was
+        written, with nothing left over and nothing overrunning."""
+        _e, cues, seconds = self._run(tmp_path)
+        assert cues[-1].end == pytest.approx(seconds)
+
+    def test_a_custom_gap_is_reflected_in_the_cue_spacing(self, tmp_path):
+        _e, cues, _ = self._run(tmp_path, gap_seconds=0.5)
+        assert cues[1].start - cues[0].end == pytest.approx(0.5)
+
+    def test_no_gap_makes_cues_contiguous(self, tmp_path):
+        _e, cues, _ = self._run(tmp_path, gap_seconds=0.0)
+        assert cues[1].start == pytest.approx(cues[0].end)
+
+    def test_omitting_cues_out_changes_nothing(self, tmp_path):
+        """The out-parameter exists so the two preview callers stay untouched."""
+        engine = FakeTtsEngine()
+        out = tmp_path / "audio" / "a.wav"
+        seconds = engine.synthesize_chapter("", self.BODY, out)
+        _e2, _cues, with_cues = self._run(tmp_path)
+        assert seconds == with_cues
+
+    def test_cues_survive_a_speed_rescale(self, tmp_path):
+        """What `AudioWorker._write_cues` does: cues come out pre-speed, and the rescale
+        must leave the last one landing on the post-speed duration."""
+        from noveltrans.tts.subtitles import scale_cues
+
+        _e, cues, raw = self._run(tmp_path)
+        speed = 1.25
+        final = raw / speed
+        scaled = scale_cues(cues, final / raw)
+        assert scaled[0].start == 0.0
+        assert scaled[-1].end == pytest.approx(final)
+
+
+class TestBothSynthesisPathsWriteCues:
+    """Regression: 040 wired cue capture into `_run_sequential` only.
+
+    `AudioWorker` picks `_run_parallel` whenever `workers > 1`, and that path calls
+    `_synth_one` — a *second* `synthesize_chapter` call site that was never wired. With
+    the default of 3 workers in the user's settings, no chapter ever produced a cue file,
+    and the failure was invisible because the video simply rendered without an `.srt`.
+
+    Testing `_write_cues` in isolation (which 040 did) proves the helper works, not that
+    anything calls it. These tests assert the wiring.
+    """
+
+    def _source_of(self, func):
+        import inspect
+
+        return inspect.getsource(func)
+
+    def test_the_sequential_path_requests_cues(self):
+        from noveltrans.gui.workers import AudioWorker
+
+        src = self._source_of(AudioWorker._run_sequential)
+        assert "cues_out=" in src
+        assert "_write_cues(" in src
+
+    def test_the_parallel_path_requests_cues(self):
+        """The one that was missing."""
+        from noveltrans.gui.workers import AudioWorker
+
+        src = self._source_of(AudioWorker._synth_one)
+        assert "cues_out=" in src
+        assert "_write_cues(" in src
+
+    def test_every_synthesize_chapter_call_site_passes_cues_out(self):
+        """A structural guard: a third synthesis path added later must wire cues too, or
+        this fails. Previews are excluded by name — they render nothing to keep."""
+        import inspect
+
+        from noveltrans.gui import workers
+
+        src = inspect.getsource(workers)
+        calls = src.count("engine.synthesize_chapter(")
+        wired = src.count("cues_out=cues")
+        assert calls == wired, (
+            f"{calls} synthesis call sites but only {wired} capture cues — "
+            "a path that doesn't write cues renders videos with no subtitles, silently."
+        )
+
+    def test_both_paths_drop_stale_cues_when_audio_is_replaced(self):
+        import inspect
+
+        from noveltrans.gui import workers
+
+        assert inspect.getsource(workers.AudioWorker._run_sequential).count("_drop_cues") == 1
+        assert inspect.getsource(workers.AudioWorker._run_parallel).count("_drop_cues") == 1

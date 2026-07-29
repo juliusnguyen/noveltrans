@@ -2230,3 +2230,233 @@ class TestPlaylistPickerUi:
         assert worker.cancelled is True
         tab._playlist_worker = None
         tab.shutdown()
+
+
+class TestSubtitleCoverageUi:
+    """Feature 040 — the render's report about which parts got an .srt."""
+
+    def _tab(self, tmp_path, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        for i in range(5):
+            project.save_audio(i, f"exports/audio/{i}.mp3", "V", 60.0)
+        path = project.path
+        project.close()
+        tab = VideoTab(_config(tmp_path))
+        tab.voice_combo.addItem("V", "V")
+        tab.voice_combo.setCurrentIndex(tab.voice_combo.findData("V"))
+        tab.video_mode.setCurrentIndex(tab.video_mode.findData("batch"))
+        tab.video_batch_size.setValue(2)
+        tab._on_project_selected(str(path))
+        return tab
+
+    def _render(self, tab, index, *, with_srt):
+        window = tab._windows_for_current_selection()[index]
+        out = tab._part_output_path(window, whole_novel=False)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"fake mp4")
+        if with_srt:
+            out.with_suffix(".srt").write_text("1\n00:00:00,000 --> 00:00:01,000\nx\n")
+        return out
+
+    def test_full_coverage_reports_no_warning(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._tab(tmp_path, library_dir, sample_meta, sample_refs)
+        self._render(tab, 0, with_srt=True)
+        assert tab._subtitle_coverage() == (1, 1)
+        tab._on_video_finished(1)
+        assert "Phụ đề:" not in tab.status_label.text()
+        assert "phụ đề .srt" in tab.status_label.text()
+        tab.shutdown()
+
+    def test_partial_coverage_says_the_audio_predates_the_feature(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """Silence here would read as a broken feature rather than as old audio."""
+        tab = self._tab(tmp_path, library_dir, sample_meta, sample_refs)
+        self._render(tab, 0, with_srt=True)
+        self._render(tab, 1, with_srt=False)
+        assert tab._subtitle_coverage() == (1, 2)
+        tab._on_video_finished(2)
+        text = tab.status_label.text()
+        assert "Phụ đề: 1/2" in text
+        assert "tạo lại audio" in text
+        tab.shutdown()
+
+    def test_unrendered_parts_are_not_counted_against_coverage(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """Only parts that actually produced a video can be expected to have an .srt."""
+        tab = self._tab(tmp_path, library_dir, sample_meta, sample_refs)
+        self._render(tab, 0, with_srt=True)  # parts 2 and 3 never rendered
+        assert tab._subtitle_coverage() == (1, 1)
+        tab.shutdown()
+
+
+class TestBurnSubtitlesOption:
+    """Feature 041 — the "Chèn phụ đề" checkbox."""
+
+    def _tab(self, tmp_path, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        for i in range(5):
+            project.save_audio(i, f"exports/audio/{i}.mp3", "V", 60.0)
+        path = project.path
+        project.close()
+        tab = VideoTab(_config(tmp_path))
+        tab.voice_combo.addItem("V", "V")
+        tab.voice_combo.setCurrentIndex(tab.voice_combo.findData("V"))
+        tab.video_mode.setCurrentIndex(tab.video_mode.findData("batch"))
+        tab.video_batch_size.setValue(2)
+        tab._on_project_selected(str(path))
+        return tab
+
+    def test_it_is_off_by_default(self, qapp, tmp_path, library_dir, sample_meta, sample_refs):
+        """It changes what every future render looks like, and the current look is what
+        users have already published."""
+        tab = self._tab(tmp_path, library_dir, sample_meta, sample_refs)
+        assert not tab.burn_subs_check.isChecked()
+        assert not tab.config.video_burn_subtitles
+        tab.shutdown()
+
+    def test_ticking_it_persists_to_config(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._tab(tmp_path, library_dir, sample_meta, sample_refs)
+        tab.burn_subs_check.setChecked(True)
+        assert tab.config.video_burn_subtitles is True
+        tab.shutdown()
+
+    def test_the_saved_setting_seeds_the_checkbox(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._tab(tmp_path, library_dir, sample_meta, sample_refs)
+        tab.config.video_burn_subtitles = True
+        tab2 = VideoTab(tab.config)
+        assert tab2.burn_subs_check.isChecked()
+        tab.shutdown()
+        tab2.shutdown()
+
+    def test_the_flag_reaches_the_render_worker(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from noveltrans.gui import tab_video as tab_module
+
+        tab = self._tab(tmp_path, library_dir, sample_meta, sample_refs)
+        tab.burn_subs_check.setChecked(True)
+        tab.video_image_edit.setText(str(tmp_path / "bg.png"))
+        (tmp_path / "bg.png").write_bytes(b"x")
+
+        built = {}
+
+        class _Sig:
+            def connect(self, *_a):
+                pass
+
+        class _FakeWorker:
+            def __init__(self, *a, **kw):
+                built.update(kw)
+                self.progress = self.file_done = self.finished_ok = self.failed = _Sig()
+
+            def start(self):
+                pass
+
+            def isRunning(self):
+                return False
+
+        monkeypatch.setattr(tab_module, "VideoWorker", _FakeWorker)
+        monkeypatch.setattr(tab_module, "track_worker", lambda *_a: None)
+        tab._launch_video()
+        assert built["burn_subtitles"] is True
+        tab._video_worker = None
+        tab.shutdown()
+
+
+class TestSubtitleWorker:
+    """Feature 042 — writing .srt without a render, and where the file lands.
+
+    The worker owns the risky parts: planning the same windows the render would, and
+    building the same output path. A sidecar written here and one written by a render must
+    be the same file in the same place.
+    """
+
+    def _project(self, library_dir, sample_meta, sample_refs, tmp_path):
+        from noveltrans.tts.subtitles import Cue, write_cues
+
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_meta_translation("Tên Truyện", "mô tả", "vi")
+        audio_dir = project.path / "exports" / "audio"
+        audio_dir.mkdir(parents=True, exist_ok=True)
+        for i in range(5):
+            wav = audio_dir / f"{i:04d}.wav"
+            wav.write_bytes(b"RIFF" + b"\0" * 64)
+            project.save_audio(i, str(wav.relative_to(project.path)), "V", 60.0)
+            write_cues(wav, [Cue(0, 5, f"Câu chương {i + 1}")], seconds=60.0)
+        path = project.path
+        project.close()
+        return path
+
+    def _run(self, path, **kw):
+        from noveltrans.gui.workers import SubtitleWorker
+
+        worker = SubtitleWorker(path, "V", "batch", batch=2, **kw)
+        got = {}
+        worker.finished_ok.connect(lambda w, b, s: got.update(written=w, backfilled=b, skipped=s))
+        worker.failed.connect(lambda m: got.update(error=m))
+        worker.run()  # synchronous: this is the logic, not the threading
+        return got
+
+    def test_it_writes_one_srt_per_part_without_rendering(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        path = self._project(library_dir, sample_meta, sample_refs, tmp_path)
+        got = self._run(path)
+        assert "error" not in got, got.get("error")
+        assert got["written"] == 3  # 5 chapters, batch of 2 -> 3 parts
+        srts = sorted((path / "exports" / "video").rglob("*.srt"))
+        assert len(srts) == 3
+        assert not list((path / "exports" / "video").rglob("*.mp4"))  # nothing rendered
+
+    def test_the_srt_lands_beside_where_the_mp4_would_go(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """Same folder and stem as the render's output, or the pair would never meet."""
+        from pathlib import Path
+
+        from noveltrans.storage.project import slugify
+        from noveltrans.tts.video import video_part_name
+
+        path = self._project(library_dir, sample_meta, sample_refs, tmp_path)
+        self._run(path)
+        name = video_part_name(slugify("Tên Truyện"), 1, 2, whole_novel=False)
+        expected = path / "exports" / "video" / Path(name).stem / (Path(name).stem + ".srt")
+        assert expected.is_file()
+
+    def test_the_written_srt_has_the_chapter_offsets(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        path = self._project(library_dir, sample_meta, sample_refs, tmp_path)
+        self._run(path)
+        srt = sorted((path / "exports" / "video").rglob("*.srt"))[0].read_text(encoding="utf-8")
+        assert "Câu chương 1" in srt and "Câu chương 2" in srt
+        assert srt.count("-->") == 2  # one cue per chapter in the part
+
+    def test_a_project_with_no_audio_for_the_voice_reports_it(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        path = self._project(library_dir, sample_meta, sample_refs, tmp_path)
+        from noveltrans.gui.workers import SubtitleWorker
+
+        worker = SubtitleWorker(path, "GiọngKhác", "batch", batch=2)
+        got = {}
+        worker.failed.connect(lambda m: got.update(error=m))
+        worker.run()
+        assert "Không có chương nào" in got.get("error", "")
+
+    def test_chapters_that_already_have_cues_are_not_backfilled(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """Backfill runs ffmpeg per chapter; re-running the button must not redo work that
+        real synthesis already did — and must never overwrite real cues with recovered ones."""
+        path = self._project(library_dir, sample_meta, sample_refs, tmp_path)
+        got = self._run(path)
+        assert got["backfilled"] == 0
