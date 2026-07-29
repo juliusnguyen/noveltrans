@@ -502,6 +502,19 @@ class AppConfig:
         self._set_text_scale("video_thumbnail_tagline_scale", value)
 
     @property
+    def video_burn_subtitles(self) -> bool:
+        """Burn the narration subtitles into the video as well as writing the .srt.
+
+        Off by default: it changes what every future render looks like, and the existing
+        look is what users have already published.
+        """
+        return self._s.value("video_burn_subtitles", False, type=bool)
+
+    @video_burn_subtitles.setter
+    def video_burn_subtitles(self, value: bool) -> None:
+        self._s.setValue("video_burn_subtitles", bool(value))
+
+    @property
     def video_thumbnail_title_align(self) -> str:
         """Which edge the cover title's lines are flush against: "left" or "right".
 

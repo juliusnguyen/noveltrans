@@ -541,6 +541,27 @@ class AudioWorker(QThread):
         apply_tempo(out_path, self.speed)
         return seconds / self.speed
 
+    def _write_cues(self, audio_path, cues, raw_seconds: float, seconds: float) -> None:
+        """Persist this chapter's subtitle cues beside its final audio file.
+
+        The rescale is the whole reason this lives in the worker: cues come out of the
+        engine in PRE-speed time, and `_apply_speed` has just stretched the audio with
+        `apply_tempo`. Deriving the factor from the two durations rather than from
+        `self.speed` means it stays correct when `_apply_speed` silently no-ops (no
+        ffmpeg), which is exactly when a hard-coded `1 / speed` would desync everything.
+
+        Best-effort: a subtitle sidecar must never cost someone their rendered audio.
+        """
+        if not cues:
+            return
+        from noveltrans.tts.subtitles import scale_cues, write_cues
+
+        try:
+            factor = (seconds / raw_seconds) if raw_seconds > 0 else 1.0
+            write_cues(audio_path, scale_cues(cues, factor), seconds=seconds)
+        except Exception:  # noqa: BLE001 — never fail a good render over subtitles
+            pass
+
     def run(self) -> None:
         from noveltrans.errors import TtsError
         from noveltrans.tts import get_tts_engine
@@ -617,7 +638,8 @@ class AudioWorker(QThread):
             name = f"{chapter.index + 1:04d}-{slugify(title)}-{slugify(self.voice)}.wav"
             out_path = project.audio_dir / name
             try:
-                seconds = engine.synthesize_chapter(
+                cues: list = []
+                raw_seconds = engine.synthesize_chapter(
                     title,
                     text,
                     out_path,
@@ -626,8 +648,9 @@ class AudioWorker(QThread):
                     clean_extra_remove=self.clean_extra_remove,
                     gap_seconds=self.gap_seconds,
                     volume=self.volume,
+                    cues_out=cues,
                 )
-                seconds = self._apply_speed(out_path, seconds)
+                seconds = self._apply_speed(out_path, raw_seconds)
                 if self.out_format == "mp3":
                     from noveltrans.tts.convert import convert_to_mp3
 
@@ -636,6 +659,8 @@ class AudioWorker(QThread):
                 if chapter.audio_path and chapter.audio_path != rel_path:
                     # re-voiced with another format — drop the stale old file
                     (project.path / chapter.audio_path).unlink(missing_ok=True)
+                    _drop_cues(project.path / chapter.audio_path)
+                self._write_cues(out_path, cues, raw_seconds, seconds)
                 project.save_audio(chapter.index, rel_path, self.voice, seconds, source)
                 self.chapter_done.emit(chapter.index)
             except TtsError as exc:
@@ -690,7 +715,8 @@ class AudioWorker(QThread):
         name = f"{chapter.index + 1:04d}-{slugify(title)}-{slugify(self.voice)}.wav"
         out_path = audio_dir / name
         try:
-            seconds = engine.synthesize_chapter(
+            cues: list = []
+            raw_seconds = engine.synthesize_chapter(
                 title,
                 text,
                 out_path,
@@ -699,12 +725,17 @@ class AudioWorker(QThread):
                 clean_extra_remove=self.clean_extra_remove,
                 gap_seconds=self.gap_seconds,
                 volume=self.volume,
+                cues_out=cues,
             )
-            seconds = self._apply_speed(out_path, seconds)
+            seconds = self._apply_speed(out_path, raw_seconds)
             if self.out_format == "mp3":
                 from noveltrans.tts.convert import convert_to_mp3
 
                 out_path = convert_to_mp3(out_path)
+            # Written here on the pool thread, not handed back through _AudioResult: each
+            # chapter owns a distinct path, so there is nothing to serialise, and the
+            # orchestrator has no business carrying subtitle data it never reads.
+            self._write_cues(out_path, cues, raw_seconds, seconds)
             rel_path = str(out_path.relative_to(project_path))
             return _AudioResult(
                 chapter.index, title, "ok", rel_path, seconds, chapter.audio_path or ""
@@ -764,6 +795,7 @@ class AudioWorker(QThread):
                         if result.prev_audio_path and result.prev_audio_path != result.rel_path:
                             # re-voiced with another format — drop the stale old file
                             (project.path / result.prev_audio_path).unlink(missing_ok=True)
+                            _drop_cues(project.path / result.prev_audio_path)
                         project.save_audio(
                             result.index, result.rel_path, self.voice, result.seconds, source
                         )
@@ -920,6 +952,7 @@ class VideoWorker(QThread):
         thumb_part_scale: float | None = None,
         thumb_tagline_scale: float | None = None,
         thumb_title_align: str = "",  # cover title flush edge; "" → the renderer's "left"
+        burn_subtitles: bool = False,  # also burn the narration into the video
         bg_color: str = "",  # background hex "#rrggbb"; "" → the default pastel gradient
         skip_existing: bool = False,  # skip parts whose .mp4 already exists (batch "continue")
         credit: str = "",  # "Tạo bởi: …" line; "" → the default (Fox Novel)
@@ -950,6 +983,7 @@ class VideoWorker(QThread):
         self.thumb_part_scale = thumb_part_scale
         self.thumb_tagline_scale = thumb_tagline_scale
         self.thumb_title_align = thumb_title_align
+        self.burn_subtitles = burn_subtitles
         self.bg_color = bg_color
         self.skip_existing = skip_existing
         self.credit = credit
@@ -1038,7 +1072,8 @@ class VideoWorker(QThread):
                             segments, self.image_path, out_path, font_dir, novel_title,
                             width=self.width, height=self.height, fps=self.fps,
                             spin_vinyl=self.spin_vinyl, font_name=self.font or FONT_NAME,
-                            bg_color=bg_rgb, cancelled=lambda: self._cancelled,
+                            bg_color=bg_rgb, burn_subtitles=self.burn_subtitles,
+                            cancelled=lambda: self._cancelled,
                         )
                         self._write_metadata(
                             project, out_path, novel_title, segments, part_num, font_dir,
@@ -1116,6 +1151,156 @@ class VideoWorker(QThread):
             )
         except Exception:  # noqa: BLE001 — never fail a good render over a thumbnail
             pass
+
+
+class SubtitleWorker(QThread):
+    """Write each part's `.srt`, backfilling missing cues from the audio first.
+
+    Two jobs, one button, because on their own neither is what the user wants: writing
+    sidecars is instant but produces nothing for audio voiced before feature 040, and
+    backfilling produces cues nobody has asked to be turned into a file.
+
+    Deliberately does NOT re-render video. The `.srt` needs only the segment list and the
+    cues; going through `render_video` to get one would cost ~26 minutes and ~250 MB per
+    part to produce a 40 KB text file.
+    """
+
+    progress = Signal(int, int, str)  # parts done, total parts, status line
+    finished_ok = Signal(int, int, int)  # srt files written, chapters backfilled, skipped
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        project_path: Path,
+        voice: str,
+        mode: str,
+        *,
+        start=None,
+        end=None,
+        batch=None,
+        use_translation: bool = True,
+        clean_text: bool = True,
+        clean_extra_remove: str = "",
+        gap_seconds: float = 0.4,
+        speed: float = 1.0,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.project_path = Path(project_path)
+        self.voice = voice
+        self.mode = mode
+        self.start_num = start
+        self.end_num = end
+        self.batch_size = batch
+        self.use_translation = use_translation
+        self.clean_text = clean_text
+        self.clean_extra_remove = clean_extra_remove
+        self.gap_seconds = gap_seconds
+        self.speed = speed
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def _backfill(self, project, chapter) -> bool:
+        """Recover one chapter's cues from its audio. False if it couldn't be trusted."""
+        from noveltrans.tts.subtitles import backfill_cues, read_cues, write_cues
+        from noveltrans.tts.vieneu import VieneuEngine
+
+        audio = self.project_path / chapter.audio_path
+        if not audio.is_file() or read_cues(audio)[0]:
+            return False  # nothing to do, or already has real cues from synthesis
+        title, text = (
+            (chapter.translated_title or chapter.title, chapter.translated)
+            if self.use_translation
+            else (chapter.title, chapter.content)
+        )
+        cues = backfill_cues(
+            audio, title, text,
+            duration=chapter.audio_seconds,
+            gap_seconds=self.gap_seconds,
+            speed=self.speed,
+            clean=self.clean_text,
+            extra_remove=self.clean_extra_remove,
+            max_chars=VieneuEngine.max_chunk_chars,
+            min_chars=VieneuEngine.min_chunk_chars,
+        )
+        if cues is None:
+            return False
+        write_cues(audio, cues, seconds=chapter.audio_seconds)
+        return True
+
+    def run(self) -> None:
+        from noveltrans.storage.project import slugify
+        from noveltrans.tts.merge import (
+            MergeSegment,
+            chapter_marker_title,
+            plan_merge_windows,
+        )
+        from noveltrans.tts.subtitles import part_srt
+        from noveltrans.tts.video import (
+            _with_real_durations,
+            video_part_name,
+        )
+
+        project = NovelProject.open(self.project_path)
+        try:
+            windows = plan_merge_windows(
+                project.chapters(), self.voice, self.mode,
+                start=self.start_num, end=self.end_num, batch=self.batch_size,
+            )
+            if not windows:
+                self.failed.emit("Không có chương nào có audio giọng này trong phạm vi đã chọn.")
+                return
+            # Same slug rule as the render: NOT display_name(). See NovelMeta.display_name().
+            slug = slugify(project.meta.translated_title or project.meta.title)
+            total = len(windows)
+            written = backfilled = skipped = 0
+
+            for i, window in enumerate(windows):
+                if self._cancelled:
+                    break
+                label = "Toàn bộ" if (total == 1 and self.mode == "all") else f"Phần {i + 1}"
+                self.progress.emit(i, total, f"{label}: dò mốc thời gian…")
+                for chapter in window.chapters:
+                    if self._cancelled:
+                        break
+                    if self._backfill(project, chapter):
+                        backfilled += 1
+
+                segments = [
+                    MergeSegment(
+                        path=self.project_path / c.audio_path,
+                        seconds=c.audio_seconds,
+                        title=chapter_marker_title(c),
+                    )
+                    for c in window.chapters
+                    if (self.project_path / c.audio_path).is_file()
+                ]
+                if not segments:
+                    continue
+                # Real durations, exactly as render_video does — so a sidecar written here
+                # and one written by a render are the same file.
+                segments = _with_real_durations(segments)
+                srt, covered, _n = part_srt(segments)
+                whole_novel = total == 1 and self.mode == "all"
+                name = video_part_name(
+                    slug, window.first_num, window.last_num, whole_novel=whole_novel
+                )
+                out = project.video_dir / Path(name).stem / Path(name).with_suffix(".srt").name
+                if not srt.strip():
+                    skipped += 1
+                    continue
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_text(srt, encoding="utf-8")
+                written += 1
+                self.progress.emit(i + 1, total, f"{label}: {covered} chương có phụ đề")
+        except Exception as exc:  # noqa: BLE001 — keep automation errors on-screen
+            self.failed.emit(repr(exc))
+            return
+        finally:
+            project.close()
+        self.finished_ok.emit(written, backfilled, skipped)
 
 
 class VideoPreviewWorker(QThread):
@@ -1441,6 +1626,20 @@ class YouTubeLoginWorker(QThread):
             self.failed.emit(repr(exc))
         else:
             self.done.emit(channel_id, name)
+
+
+def _drop_cues(audio_path) -> None:
+    """Delete a chapter's cue sidecar. Used when its audio file is replaced.
+
+    Stale cues are worse than none: they describe a take that no longer exists, and the
+    subtitles would confidently be wrong rather than absent.
+    """
+    from noveltrans.tts.subtitles import cues_path
+
+    try:
+        cues_path(audio_path).unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 class YouTubeUploadWorker(QThread):
