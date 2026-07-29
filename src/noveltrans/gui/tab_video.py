@@ -53,6 +53,8 @@ from noveltrans.gui.workers import (
     TagsWorker,
     TtsVoicesWorker,
     VideoPreviewWorker,
+    PlaylistFetchWorker,
+    PlaylistSyncWorker,
     VideoWorker,
     YouTubeThumbnailWorker,
     YouTubeUploadWorker,
@@ -72,6 +74,8 @@ class VideoTab(QWidget):
         self._video_worker: VideoWorker | None = None
         self._upload_worker: YouTubeUploadWorker | None = None
         self._thumbnail_worker: YouTubeThumbnailWorker | None = None
+        self._playlist_worker: PlaylistSyncWorker | None = None
+        self._playlist_fetch_worker: PlaylistFetchWorker | None = None
         self._preview_worker: VideoPreviewWorker | None = None
         self._voices_worker: TtsVoicesWorker | None = None
         self._tags_worker: TagsWorker | None = None
@@ -365,8 +369,13 @@ class VideoTab(QWidget):
         sched_row.addWidget(self.upload_spacing)
         sched_row.addStretch(1)
 
-        self.upload_playlist = QLineEdit()
-        self.upload_playlist.setPlaceholderText(
+        # Editable, deliberately: the list is an aid, not a gate. A name that isn't on
+        # the channel yet can still be typed and gets created on upload, exactly as before
+        # — so nothing that worked stops working, and nobody has to fetch before uploading.
+        self.upload_playlist = QComboBox()
+        self.upload_playlist.setEditable(True)
+        self.upload_playlist.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.upload_playlist.lineEdit().setPlaceholderText(
             "Tên danh sách phát (để trống = không thêm vào playlist)"
         )
         self.upload_playlist.setToolTip(
@@ -393,6 +402,20 @@ class VideoTab(QWidget):
             "chọn — dùng sau khi “Tạo lại tất cả ảnh bìa”. Không tải lại video."
         )
         self.thumbnail_update_button.clicked.connect(self._start_thumbnail_update)
+        self.playlist_fetch_button = QPushButton("Tải danh sách…")
+        self.playlist_fetch_button.setToolTip(
+            "Đọc các danh sách phát đang có trên kênh đã đăng nhập và đưa vào ô bên trái. "
+            "Sẽ mở một cửa sổ Chrome trong vài giây."
+        )
+        self.playlist_fetch_button.clicked.connect(self._fetch_playlists)
+
+        self.playlist_sync_button = QPushButton("Thêm vào danh sách phát")
+        self.playlist_sync_button.setToolTip(
+            "XOÁ HẾT danh sách phát đang chọn rồi thêm lại mọi phần đã tải lên theo đúng "
+            "thứ tự. Dùng khi thứ tự trong danh sách phát bị sai."
+        )
+        self.playlist_sync_button.clicked.connect(self._start_playlist_sync)
+
         self.upload_cancel_button = QPushButton("Dừng")
         self.upload_cancel_button.setEnabled(False)
         self.upload_cancel_button.clicked.connect(self._cancel_upload)
@@ -400,6 +423,8 @@ class VideoTab(QWidget):
         action_row = QHBoxLayout()
         action_row.addWidget(QLabel("Danh sách phát:"))
         action_row.addWidget(self.upload_playlist, stretch=1)
+        action_row.addWidget(self.playlist_fetch_button)
+        action_row.addWidget(self.playlist_sync_button)
         action_row.addWidget(self.upload_reset_button)
         action_row.addWidget(self.thumbnail_update_button)
         action_row.addWidget(self.upload_button)
@@ -2033,7 +2058,7 @@ class VideoTab(QWidget):
             tags=self._read_sidecar(window, whole_novel, ".tags.txt")
             or (self.project.meta.tags or ""),
             thumbnail=thumbnail if thumbnail.is_file() else None,
-            playlist=self.upload_playlist.text().strip(),
+            playlist=self.upload_playlist.currentText().strip(),
             visibility=self.upload_visibility.currentData(),
             publish_at=publish_at,
             label=label,
@@ -2330,6 +2355,166 @@ class VideoTab(QWidget):
         elif self._thumbnail_worker is not None and self._thumbnail_worker.isRunning():
             self._thumbnail_worker.cancel()
             self.status_label.setText("Đang dừng cập nhật ảnh bìa…")
+        elif self._playlist_worker is not None and self._playlist_worker.isRunning():
+            self._playlist_worker.cancel()
+            self.status_label.setText("Đang dừng sắp xếp danh sách phát…")
+
+    # -------------------------------------------------- danh sách phát YouTube
+
+    def _fetch_playlists(self) -> None:
+        """Read the channel's playlists into the combo, keeping whatever was typed."""
+        if self._playlist_fetch_worker is not None and self._playlist_fetch_worker.isRunning():
+            return
+        self.playlist_fetch_button.setEnabled(False)
+        self.status_label.setText("Đang đọc danh sách phát trên kênh…")
+        self._playlist_fetch_worker = PlaylistFetchWorker(self)
+        self._playlist_fetch_worker.fetched.connect(self._on_playlists_fetched)
+        self._playlist_fetch_worker.failed.connect(self._on_playlists_failed)
+        self._playlist_fetch_worker.needs_login.connect(self._on_upload_needs_login)
+        self._playlist_fetch_worker.finished.connect(
+            lambda: self.playlist_fetch_button.setEnabled(True)
+        )
+        self._playlist_fetch_worker.start()
+
+    def _on_playlists_fetched(self, titles: list) -> None:
+        """Repopulate the combo without losing what the user had typed.
+
+        Losing a half-typed name to a background fetch would be its own small betrayal,
+        and the combo is editable precisely so an unlisted name stays usable.
+        """
+        typed = self.upload_playlist.currentText()
+        self.upload_playlist.clear()
+        self.upload_playlist.addItems(list(titles))
+        self.upload_playlist.setCurrentText(typed)
+        self.status_label.setText(
+            f"Đã đọc {len(titles)} danh sách phát trên kênh."
+            if titles
+            else "Kênh chưa có danh sách phát nào — gõ tên mới để tạo khi tải lên."
+        )
+
+    def _on_playlists_failed(self, message: str) -> None:
+        self.status_label.setText("")
+        QMessageBox.warning(self, "Không đọc được danh sách phát", message)
+
+    def _playlist_sync_rows(self) -> list:
+        """Parts with a video on the channel, in part order — same rule as 034's push."""
+        if self.project is None:
+            return []
+        from noveltrans.youtube_upload import uploaded_video_id
+
+        windows = self._windows_for_current_selection()
+        mode = self.video_mode.currentData()
+        total = len(windows)
+        rows = []
+        for i, window in enumerate(windows):
+            whole_novel = total == 1 and mode == "all"
+            path = self._part_output_path(window, whole_novel=whole_novel)
+            if not uploaded_video_id(path):
+                continue
+            rows.append((path, "Toàn bộ" if whole_novel else f"Phần {i + 1}"))
+        return rows
+
+    def _start_playlist_sync(self) -> None:
+        """Empty the chosen playlist, then re-add every uploaded part in order."""
+        from noveltrans.youtube_upload import PlaylistSyncRequest, YouTubeUploadError
+
+        if self.project is None:
+            QMessageBox.information(self, "Danh sách phát", "Chọn truyện trước.")
+            return
+        for worker in (self._playlist_worker, self._upload_worker, self._thumbnail_worker):
+            if worker is not None and worker.isRunning():
+                QMessageBox.information(
+                    self, "Danh sách phát", "Đang có phiên trình duyệt khác chạy."
+                )
+                return
+
+        playlist = self.upload_playlist.currentText().strip()
+        if not playlist:
+            QMessageBox.information(
+                self, "Danh sách phát", "Chọn hoặc gõ tên danh sách phát trước."
+            )
+            return
+        rows = self._playlist_sync_rows()
+        if not rows:
+            QMessageBox.information(
+                self, "Danh sách phát", "Chưa có phần nào đã tải lên YouTube."
+            )
+            return
+
+        requests = [
+            PlaylistSyncRequest(video=path, label=label) for path, label in rows
+        ]
+        try:
+            for request in requests:
+                request.validate()
+        except YouTubeUploadError as exc:
+            QMessageBox.warning(self, "Danh sách phát", str(exc))
+            return
+
+        names = ", ".join(r.label for r in requests[:5])
+        more = f" (+{len(requests) - 5})" if len(requests) > 5 else ""
+        # This EMPTIES something viewers may be watching. The trade-off was accepted when
+        # the feature was chosen; the dialog still has to state it, because agreeing to it
+        # once is not the same as remembering it at the moment of clicking.
+        confirm = QMessageBox.question(
+            self,
+            "Thêm vào danh sách phát",
+            f"⚠️ Sẽ XOÁ HẾT video đang có trong danh sách phát “{playlist}”, rồi thêm lại "
+            f"{len(requests)} phần theo đúng thứ tự:\n{names}{more}\n\n"
+            "Mọi thứ tự sắp xếp thủ công sẽ mất, và danh sách phát sẽ trống trong lúc "
+            "chạy — người xem có thể thấy điều đó.\n\n"
+            "Một cửa sổ Chrome sẽ mở ra và tự thao tác. Tiếp tục?",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        self._playlist_worker = PlaylistSyncWorker(playlist, requests, self)
+        self._playlist_worker.progress.connect(self._on_playlist_progress)
+        self._playlist_worker.finished_ok.connect(self._on_playlist_finished)
+        self._playlist_worker.failed.connect(self._on_playlist_failed)
+        self._playlist_worker.needs_login.connect(self._on_playlist_needs_login)
+        track_worker(self._playlist_worker)
+
+        self.playlist_sync_button.setEnabled(False)
+        self.playlist_fetch_button.setEnabled(False)
+        self.upload_button.setEnabled(False)
+        self.thumbnail_update_button.setEnabled(False)
+        self.video_button.setEnabled(False)
+        self.redo_all_button.setEnabled(False)
+        self.upload_cancel_button.setEnabled(True)
+        self.progress.setMaximum(len(requests))
+        self.progress.setValue(0)
+        self.status_label.setText("▶️ Bắt đầu sắp xếp danh sách phát…")
+        self._playlist_worker.start()
+
+    def _on_playlist_progress(self, done: int, total: int, message: str) -> None:
+        self.progress.setMaximum(max(total, 1))
+        self.progress.setValue(done)
+        if message:
+            self.status_label.setText(f"▶️ ({done}/{total}) {message}")
+
+    def _reset_playlist_ui(self) -> None:
+        self.playlist_sync_button.setEnabled(True)
+        self.playlist_fetch_button.setEnabled(True)
+        self.upload_button.setEnabled(True)
+        self.thumbnail_update_button.setEnabled(True)
+        self.video_button.setEnabled(True)
+        self.redo_all_button.setEnabled(True)
+        self.upload_cancel_button.setEnabled(False)
+
+    def _on_playlist_finished(self, removed: int, added: int, errors: int) -> None:
+        self._reset_playlist_ui()
+        note = f"✅ Danh sách phát: gỡ {removed}, thêm lại {added} phần theo thứ tự."
+        self.status_label.setText(note if not errors else f"{note} {errors} phần lỗi.")
+
+    def _on_playlist_failed(self, message: str) -> None:
+        self._reset_playlist_ui()
+        self.status_label.setText("")
+        QMessageBox.warning(self, "Danh sách phát thất bại", message)
+
+    def _on_playlist_needs_login(self, message: str) -> None:
+        self._reset_playlist_ui()
+        self._on_upload_needs_login(message)
 
     # ------------------------------------------- cập nhật ảnh bìa trên YouTube
 
@@ -2551,6 +2736,11 @@ class VideoTab(QWidget):
         if self._thumbnail_worker is not None and self._thumbnail_worker.isRunning():
             self._thumbnail_worker.cancel()
             self._thumbnail_worker.wait(60_000)
+        if self._playlist_worker is not None and self._playlist_worker.isRunning():
+            self._playlist_worker.cancel()
+            self._playlist_worker.wait(60_000)
+        if self._playlist_fetch_worker is not None and self._playlist_fetch_worker.isRunning():
+            self._playlist_fetch_worker.wait(60_000)
         if self._preview_worker is not None and self._preview_worker.isRunning():
             self._preview_worker.wait(60_000)
         if self._tags_worker is not None and self._tags_worker.isRunning():

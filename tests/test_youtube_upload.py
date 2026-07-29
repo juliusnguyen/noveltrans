@@ -1424,3 +1424,593 @@ class _FakeContext:
     def __init__(self, page):
         self.pages = [page]
         page.set_default_timeout = lambda ms: None
+
+
+# ------------------------------------------------ 039: playlists (read + sync)
+#
+# The clear phase REMOVES things from a playlist viewers may be watching, so the tests
+# that matter most here are the ones proving it can't run past a failure into the add
+# phase, and that what was in the playlist is captured before anything is destroyed.
+
+
+class _FakePlaylistPage:
+    """Studio's playlist page: a list of entries, each removable via a row menu.
+
+    `stuck` models the failure this feature is designed around — a removal that silently
+    no-ops, e.g. because the menu selector drifted.
+    """
+
+    def __init__(self, *, entries=(), stuck=False, playlists=()):
+        self.entries = list(entries)
+        self.stuck = stuck
+        self.playlists = list(playlists)
+        self.url = "https://studio.youtube.com/channel/UC123/playlists"
+        self.clicked: list = []
+        self.removed = 0
+
+    def goto(self, url, wait_until=None):
+        self.url = url
+
+    def wait_for_timeout(self, ms):
+        pass
+
+    def wait_for_load_state(self, state=None, timeout=None):
+        pass
+
+    def set_default_timeout(self, ms):
+        pass
+
+    @property
+    def keyboard(self):
+        page = self
+
+        class _Kb:
+            def press(self, key):
+                page.clicked.append(f"key:{key}")
+
+        return _Kb()
+
+    def locator(self, selector):
+        from noveltrans.youtube_upload import (
+            _PLAYLIST_ENTRY_SEL,
+            _PLAYLIST_REMOVE_TEXTS,
+        )
+
+        page = self
+        is_entry = selector == _PLAYLIST_ENTRY_SEL
+        is_remove = any(t in selector for t in _PLAYLIST_REMOVE_TEXTS)
+
+        class _Loc:
+            def __init__(self, index=0):
+                self._index = index
+
+            @property
+            def first(self):
+                # keeps this locator's row index, as `row.locator(x).first` does live
+                return self
+
+            def nth(self, i):
+                return _Loc(i)
+
+            def count(self):
+                return len(page.entries) if is_entry else 0
+
+            def wait_for(self, state=None, timeout=None):
+                return None
+
+            def inner_text(self, timeout=None):
+                if is_entry and self._index < len(page.entries):
+                    return page.entries[self._index]
+                return ""
+
+            def is_visible(self, timeout=None):
+                return is_remove
+
+            def click(self, timeout=None):
+                page.clicked.append(selector)
+                # Clicking "Xoá khỏi danh sách phát" is the one click that mutates the
+                # playlist. `stuck` models the drifted-selector case: the click lands, the
+                # entry stays — which is exactly what the runaway guard exists to catch.
+                if is_remove and not page.stuck and page.entries:
+                    page.entries.pop(0)
+                    page.removed += 1
+
+            def locator(self, sub):
+                return _Loc(self._index)
+
+        return _Loc()
+
+
+class TestClearPlaylistSafety:
+    def test_captures_what_was_in_it_before_removing_anything(self):
+        """Clearing is destructive and per-row. If it fails halfway, this list is the only
+        thing that turns "your playlist is broken" into something actionable."""
+        from noveltrans.youtube_upload import _playlist_entries
+
+        page = _FakePlaylistPage(entries=["Phần 1", "Phần 2", "Phần 3"])
+        assert _playlist_entries(page) == ["Phần 1", "Phần 2", "Phần 3"]
+
+    def test_a_removal_that_never_reduces_the_count_raises_instead_of_looping(self):
+        """A drifted menu selector must stop the run, not hammer Studio until someone
+        kills the browser."""
+        from noveltrans.youtube_upload import _clear_playlist
+
+        page = _FakePlaylistPage(entries=["Phần 1", "Phần 2"], stuck=True)
+        with pytest.raises(YouTubeUploadError, match="Không gỡ được"):
+            _clear_playlist(page)
+
+    def test_the_error_says_how_many_are_left(self):
+        from noveltrans.youtube_upload import _clear_playlist
+
+        page = _FakePlaylistPage(entries=["Phần 1", "Phần 2"], stuck=True)
+        with pytest.raises(YouTubeUploadError, match="còn 2"):
+            _clear_playlist(page)
+
+    def test_it_removes_every_entry_and_reports_the_count(self):
+        """The success path of the loop: it re-reads the first row each time, because the
+        DOM re-renders after every removal and held row handles go stale."""
+        from noveltrans.youtube_upload import _clear_playlist
+
+        page = _FakePlaylistPage(entries=["Phần 1", "Phần 2", "Phần 3"])
+        assert _clear_playlist(page) == 3
+        assert page.entries == []
+
+    def test_progress_is_reported_per_removal(self):
+        from noveltrans.youtube_upload import _clear_playlist
+
+        page = _FakePlaylistPage(entries=["a", "b"])
+        seen: list = []
+        _clear_playlist(page, on_progress=seen.append)
+        assert len(seen) == 2
+
+    def test_cancelling_stops_the_clear_partway(self):
+        from noveltrans.youtube_upload import UploadCancelled, _clear_playlist
+
+        page = _FakePlaylistPage(entries=["a", "b", "c"])
+        calls = {"n": 0}
+
+        def should_cancel():
+            calls["n"] += 1
+            return calls["n"] > 2
+
+        with pytest.raises(UploadCancelled):
+            _clear_playlist(page, should_cancel=should_cancel)
+        assert page.entries, "stopped before emptying it"
+
+    def test_an_empty_playlist_clears_to_zero_without_touching_anything(self):
+        from noveltrans.youtube_upload import _clear_playlist
+
+        page = _FakePlaylistPage(entries=[])
+        assert _clear_playlist(page) == 0
+        assert page.clicked == []
+
+    def test_emptiness_is_read_from_the_dom_not_assumed(self):
+        from noveltrans.youtube_upload import _playlist_is_empty
+
+        assert _playlist_is_empty(_FakePlaylistPage(entries=[])) is True
+        assert _playlist_is_empty(_FakePlaylistPage(entries=["Phần 1"])) is False
+
+
+class TestPlaylistSyncRequest:
+    def test_a_part_never_uploaded_is_rejected(self, part):
+        from noveltrans.youtube_upload import PlaylistSyncRequest
+
+        with pytest.raises(YouTubeUploadError, match="chưa có video"):
+            PlaylistSyncRequest(video=part, label="Phần 1").validate()
+
+    def test_a_part_with_a_video_id_resolves(self, part):
+        from noveltrans.youtube_upload import PlaylistSyncRequest
+
+        write_upload_state(part, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
+        request = PlaylistSyncRequest(video=part, label="Phần 1")
+        request.validate()
+        assert request.resolve() == "dQw4w9WgXcQ"
+
+
+class TestSyncPlaylistBatch:
+    """The phase ordering is the whole safety story: clear → verify → add, never overlap."""
+
+    def _patch(self, monkeypatch, *, cleared=2, empty_after=True):
+        import noveltrans.youtube_upload as mod
+
+        monkeypatch.setattr(mod, "_require_playwright", lambda: object())
+        page = _FakePlaylistPage()
+        monkeypatch.setattr(
+            mod, "_launch_context", lambda _s, *, headless: (object(), _FakeContext(page))
+        )
+        monkeypatch.setattr(mod, "_close", lambda *a: None)
+        monkeypatch.setattr(mod, "_open_playlist_page", lambda p, name: None)
+        monkeypatch.setattr(mod, "_playlist_entries", lambda p: ["cũ 1", "cũ 2"])
+        monkeypatch.setattr(mod, "_clear_playlist", lambda p, **kw: cleared)
+        monkeypatch.setattr(mod, "_playlist_is_empty", lambda p: empty_after)
+        added: list = []
+        monkeypatch.setattr(
+            mod, "_add_to_playlist", lambda p, vid, name: added.append(vid)
+        )
+        return added
+
+    def _requests(self, part, n=3):
+        from noveltrans.youtube_upload import PlaylistSyncRequest
+
+        write_upload_state(part, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
+        return [
+            PlaylistSyncRequest(video=part, video_id=f"vid{i}xxxxxxx", label=f"Phần {i + 1}")
+            for i in range(n)
+        ]
+
+    def test_videos_are_added_in_request_order(self, monkeypatch, part):
+        from noveltrans.youtube_upload import sync_playlist_batch
+
+        added = self._patch(monkeypatch)
+        result = sync_playlist_batch("Truyện A", self._requests(part))
+        assert added == ["vid0xxxxxxx", "vid1xxxxxxx", "vid2xxxxxxx"]
+        assert result["added"] == ["Phần 1", "Phần 2", "Phần 3"]
+
+    def test_a_clear_that_does_not_verify_empty_never_reaches_the_add_phase(
+        self, monkeypatch, part
+    ):
+        """**The load-bearing test.** A half-cleared playlist that then gets a partial
+        re-add is worse than either end state and impossible to reason about after."""
+        from noveltrans.youtube_upload import sync_playlist_batch
+
+        added = self._patch(monkeypatch, empty_after=False)
+        with pytest.raises(YouTubeUploadError, match="chưa trống"):
+            sync_playlist_batch("Truyện A", self._requests(part))
+        assert added == []
+
+    def test_the_failure_reports_what_was_in_the_playlist(self, monkeypatch, part):
+        from noveltrans.youtube_upload import sync_playlist_batch
+
+        self._patch(monkeypatch, cleared=1, empty_after=False)
+        with pytest.raises(YouTubeUploadError, match="1/2"):
+            sync_playlist_batch("Truyện A", self._requests(part))
+
+    def test_the_previous_contents_come_back_in_the_result(self, monkeypatch, part):
+        from noveltrans.youtube_upload import sync_playlist_batch
+
+        self._patch(monkeypatch)
+        result = sync_playlist_batch("Truyện A", self._requests(part))
+        assert result["had"] == ["cũ 1", "cũ 2"]
+        assert result["removed"] == 2
+
+    def test_an_empty_playlist_name_is_refused_before_the_browser_opens(
+        self, monkeypatch, part
+    ):
+        import noveltrans.youtube_upload as mod
+        from noveltrans.youtube_upload import sync_playlist_batch
+
+        launched = []
+        monkeypatch.setattr(mod, "_require_playwright", lambda: launched.append(1))
+        with pytest.raises(YouTubeUploadError, match="Chưa chọn danh sách phát"):
+            sync_playlist_batch("  ", self._requests(part))
+        assert launched == []
+
+    def test_a_part_with_no_video_is_refused_before_the_browser_opens(
+        self, monkeypatch, part
+    ):
+        import noveltrans.youtube_upload as mod
+        from noveltrans.youtube_upload import PlaylistSyncRequest, sync_playlist_batch
+
+        launched = []
+        monkeypatch.setattr(mod, "_require_playwright", lambda: launched.append(1))
+        with pytest.raises(YouTubeUploadError, match="chưa có video"):
+            sync_playlist_batch("A", [PlaylistSyncRequest(video=part, label="Phần 1")])
+        assert launched == []
+
+
+class _FakeNavPage:
+    """A browser whose pages either mount, show Studio's error page, or are gone.
+
+    `behaviour` maps a URL substring to one of "ok" / "error" / "missing" / "closed",
+    so a test can say "the first two URL shapes fail, the third works" — which is exactly
+    the situation that broke the live run.
+    """
+
+    def __init__(self, behaviour, *, url=""):
+        self.behaviour = dict(behaviour)
+        self.url = url
+        self.visited: list = []
+
+    def _mode(self) -> str:
+        for key, mode in self.behaviour.items():
+            if key in (self.url or ""):
+                return mode
+        return "missing"
+
+    def goto(self, url, wait_until=None):
+        self.visited.append(url)
+        self.url = url
+        mode = self._mode()
+        if mode == "closed":
+            raise RuntimeError("Target page, context or browser has been closed")
+        if mode == "missing":
+            raise RuntimeError("net::ERR_ABORTED")
+
+    def wait_for_load_state(self, state=None, timeout=None):
+        pass
+
+    def wait_for_timeout(self, ms):
+        pass
+
+    def locator(self, selector):
+        page = self
+
+        class _Loc:
+            @property
+            def first(self):
+                return self
+
+            def is_visible(self, timeout=None):
+                # the error-text probe is the only is_visible caller in this path
+                return page._mode() == "error"
+
+        return _Loc()
+
+
+class TestPlaylistsPageNavigation:
+    """Regression: the first guessed URL (`/channel/<id>/playlists`) renders Studio's
+    "Oops, something went wrong" page — a *successful* navigation with a normal DOM, so
+    it burned the whole 45s wait and then blamed the selectors."""
+
+    def test_it_falls_through_an_error_page_to_a_url_that_works(self):
+        from noveltrans.youtube_upload import _goto_playlists_page
+
+        page = _FakeNavPage({"/content/playlists": "error", "/videos/playlists": "ok"})
+        landed = _goto_playlists_page(page, "UC123")
+        assert "/videos/playlists" in landed
+        assert len(page.visited) == 2  # the bad one was rejected, not waited out
+
+    def test_the_studio_error_page_is_recognised_not_waited_out(self):
+        from noveltrans.youtube_upload import _page_shows_studio_error
+
+        assert _page_shows_studio_error(_FakeNavPage({"x": "error"}, url="x")) is True
+        assert _page_shows_studio_error(_FakeNavPage({"x": "ok"}, url="x")) is False
+
+    def test_every_candidate_failing_names_them_all(self):
+        """The error has to be actionable: which URLs were tried, and the fact that typing
+        a name by hand still works."""
+        from noveltrans.youtube_upload import _goto_playlists_page
+
+        page = _FakeNavPage({})  # nothing matches -> "missing" everywhere
+        with pytest.raises(YouTubeUploadError) as excinfo:
+            _goto_playlists_page(page, "UC123")
+        message = str(excinfo.value)
+        assert "studio.youtube.com" in message
+        assert "youtube.com/feed/playlists" in message
+        assert "bằng tay" in message
+
+    def test_it_tries_youtube_com_when_every_studio_shape_fails(self):
+        """youtube.com proper is a different, far more stable surface — the point of
+        having it last is that it isn't subject to Studio's reshuffles."""
+        from noveltrans.youtube_upload import _goto_playlists_page
+
+        page = _FakeNavPage({"studio.youtube.com": "error", "feed/playlists": "ok"})
+        assert "feed/playlists" in _goto_playlists_page(page, "UC123")
+
+    def test_a_logged_out_bounce_raises_needs_login(self):
+        from noveltrans.youtube_upload import _goto_playlists_page
+
+        page = _FakeNavPage({"accounts.google.com": "missing"})
+        page.goto = lambda url, wait_until=None: setattr(
+            page, "url", "https://accounts.google.com/signin"
+        )
+        with pytest.raises(YouTubeUploadError) as excinfo:
+            _goto_playlists_page(page, "UC123")
+        assert excinfo.value.needs_login is True
+
+    def test_closing_the_window_reads_as_one_sentence(self):
+        """Regression: this surfaced live as a raw
+        TargetClosedError('Locator.wait_for: Target page, context or browser has been
+        closed'). Closing a window is a normal thing for a person to do."""
+        from noveltrans.youtube_upload import _goto_playlists_page
+
+        page = _FakeNavPage({"": "closed"})
+        with pytest.raises(YouTubeUploadError, match="đã bị đóng"):
+            _goto_playlists_page(page, "UC123")
+
+    def test_browser_gone_recognises_playwright_and_message_forms(self):
+        from noveltrans.youtube_upload import _browser_gone
+
+        class TargetClosedError(Exception):
+            pass
+
+        assert _browser_gone(TargetClosedError("boom")) is True
+        assert _browser_gone(RuntimeError("... has been closed")) is True
+        assert _browser_gone(RuntimeError("something else")) is False
+
+
+class TestPlaylistExtractionIsWideNet:
+    """Regression from the second live run.
+
+    `/content/playlists` — the CORRECT url, confirmed against the channel — loaded fine,
+    but the code gated on a `ytcp-playlist-section` container that does not exist and
+    walked away from a working page, then reported all four URLs as failures. The gate was
+    the bug, not the URL.
+    """
+
+    class _Page:
+        """A page that loaded fine and has rows under a tag we didn't predict."""
+
+        def __init__(self, *, rows=(), row_tag="ytcp-unknown-row", links=(), tags=None):
+            self.rows = list(rows)
+            self.row_tag = row_tag
+            # links are (href, text) — the href is the grouping key, as it is live: a row
+            # points at the same playlist from its thumbnail, its title and its count.
+            self.links = [
+                x if isinstance(x, tuple) else (f"/playlist/PL{i:010d}/videos", x)
+                for i, x in enumerate(links)
+            ]
+            self.tags = tags or ["ytcp-unknown-row×3", "ytcp-app×1"]
+            self.url = "https://studio.youtube.com/channel/UC1/content/playlists"
+
+        def goto(self, url, wait_until=None):
+            self.url = url
+
+        def wait_for_load_state(self, state=None, timeout=None):
+            pass
+
+        def wait_for_timeout(self, ms):
+            pass
+
+        def evaluate(self, script):
+            return self.tags
+
+        def locator(self, selector):
+            page = self
+            from noveltrans.youtube_upload import _PLAYLIST_LINK_SEL
+
+            if selector == page.row_tag:
+                items = page.rows
+            elif selector == _PLAYLIST_LINK_SEL:
+                items = page.links
+            else:
+                items = []
+
+            class _Loc:
+                def __init__(self, i=0):
+                    self._i = i
+
+                @property
+                def first(self):
+                    return self
+
+                def nth(self, i):
+                    return _Loc(i)
+
+                def count(self):
+                    return len(items)
+
+                def inner_text(self, timeout=None):
+                    if self._i >= len(items):
+                        return ""
+                    item = items[self._i]
+                    return item[1] if isinstance(item, tuple) else item
+
+                def get_attribute(self, name, timeout=None):
+                    if self._i >= len(items):
+                        return None
+                    item = items[self._i]
+                    return item[0] if isinstance(item, tuple) and name == "href" else None
+
+                def is_visible(self, timeout=None):
+                    return False
+
+                def locator(self, sub):
+                    return _Loc(self._i)
+
+            return _Loc()
+
+    def test_a_page_with_an_unknown_row_tag_still_yields_titles_via_links(self):
+        """The anchor fallback is the point: an href is structural and survives the
+        component renames that break tag- and id-based selectors."""
+        from noveltrans.youtube_upload import _extract_playlist_titles
+
+        page = self._Page(links=["Truyện A", "Truyện B"])
+        assert _extract_playlist_titles(page) == ["Truyện A", "Truyện B"]
+
+    def test_a_known_row_tag_is_preferred_over_the_link_fallback(self):
+        from noveltrans.youtube_upload import _extract_playlist_titles
+
+        page = self._Page(rows=["Từ hàng"], row_tag="ytcp-playlist-row", links=["Từ link"])
+        assert _extract_playlist_titles(page) == ["Từ hàng"]
+
+    def test_navigation_no_longer_requires_a_container_element(self):
+        """The whole regression in one assertion: a page that loaded and isn't the error
+        page is accepted, whatever components it happens to be built from."""
+        from noveltrans.youtube_upload import _goto_playlists_page
+
+        page = self._Page()
+        landed = _goto_playlists_page(page, "UC1")
+        assert "/content/playlists" in landed
+
+    def test_duplicate_titles_collapse(self):
+        from noveltrans.youtube_upload import _extract_playlist_titles
+
+        page = self._Page(links=["Truyện A", "Truyện A", "Truyện B"])
+        assert _extract_playlist_titles(page) == ["Truyện A", "Truyện B"]
+
+    def test_an_unreadable_page_reports_the_components_it_found(self):
+        """"Giao diện có thể đã thay đổi" is useless on its own. Naming the components is
+        the difference between a bug report and a fix."""
+        from noveltrans.youtube_upload import _dom_inventory
+
+        page = self._Page(tags=["ytcp-mystery-row×7", "ytcp-app×1"])
+        assert "ytcp-mystery-row×7" in _dom_inventory(page)
+
+    def test_the_inventory_never_raises_on_a_hostile_page(self):
+        from noveltrans.youtube_upload import _dom_inventory
+
+        class _Broken:
+            def evaluate(self, script):
+                raise RuntimeError("nope")
+
+        assert "không đọc được" in _dom_inventory(_Broken())
+
+
+class TestPlaylistTitlesAreNamesNotCounts:
+    """Regression from live run 3: the picker offered "No videos / 75 videos / 31 videos /
+    10 episodes" — every row's video-count cell, read as if it were the playlist name."""
+
+    def test_the_count_cell_never_wins_over_the_name(self):
+        from noveltrans.youtube_upload import _best_title
+
+        assert _best_title(["75 videos", "Truyện Ma", "Công khai"]) == "Truyện Ma"
+        assert _best_title(["No videos", "Chào Mừng Đến Với Phòng Livestream"]) == (
+            "Chào Mừng Đến Với Phòng Livestream"
+        )
+
+    def test_every_metadata_shape_seen_live_is_refused(self):
+        from noveltrans.youtube_upload import _is_playlist_metadata
+
+        for junk in (
+            "No videos", "75 videos", "31 videos", "10 episodes",  # the reported dropdown
+            "Không có video", "12 video", "5 tập",
+            "Công khai", "Riêng tư", "Unlisted",
+            "2026-07-29", "  ", "Xem tất cả",
+        ):
+            assert _is_playlist_metadata(junk), junk
+
+    def test_a_real_title_is_never_mistaken_for_metadata(self):
+        from noveltrans.youtube_upload import _is_playlist_metadata
+
+        for title in (
+            "Chào Mừng Đến Với Phòng Livestream Ác Mộng",
+            "Truyện Ma",
+            "10 Năm Cô Đơn",  # starts with a number but isn't a count
+            "Tập Truyện Ngắn",
+        ):
+            assert not _is_playlist_metadata(title), title
+
+    def test_links_are_grouped_by_playlist_so_the_name_wins(self):
+        """The row's thumbnail, title and count all link to the same playlist. Grouping by
+        the id in the href is what says which strings belong together — reading each
+        anchor independently is exactly how the counts got in."""
+        from noveltrans.youtube_upload import _titles_by_playlist_link
+
+        page = TestPlaylistExtractionIsWideNet._Page(
+            links=[
+                ("/playlist/PLaaaaaaaaaa/videos", ""),          # thumbnail link, no text
+                ("/playlist/PLaaaaaaaaaa/videos", "Truyện Ma"),  # the title
+                ("/playlist/PLaaaaaaaaaa/videos", "75 videos"),  # the count
+                ("/playlist/PLbbbbbbbbbb/videos", "10 episodes"),
+                ("/playlist/PLbbbbbbbbbb/videos", "Truyện Kinh Dị"),
+            ]
+        )
+        assert _titles_by_playlist_link(page) == ["Truyện Ma", "Truyện Kinh Dị"]
+
+    def test_a_playlist_with_only_metadata_text_is_dropped_not_named_after_its_count(self):
+        """Better to omit a playlist than to list "No videos" as one."""
+        from noveltrans.youtube_upload import _titles_by_playlist_link
+
+        page = TestPlaylistExtractionIsWideNet._Page(
+            links=[("/playlist/PLaaaaaaaaaa/videos", "No videos")]
+        )
+        assert _titles_by_playlist_link(page) == []
+
+    def test_row_extraction_also_skips_the_count_line(self):
+        from noveltrans.youtube_upload import _extract_playlist_titles
+
+        page = TestPlaylistExtractionIsWideNet._Page(
+            rows=["75 videos\nTruyện Ma\nCông khai"], row_tag="ytcp-playlist-row"
+        )
+        assert _extract_playlist_titles(page) == ["Truyện Ma"]

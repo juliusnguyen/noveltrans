@@ -1516,6 +1516,99 @@ class YouTubeUploadWorker(QThread):
             self.finished_ok.emit(done - errors, errors)
 
 
+class PlaylistFetchWorker(QThread):
+    """Read the logged-in channel's playlist titles, off the GUI thread.
+
+    Its own worker rather than a blocking call because it opens a real browser on the
+    shared profile — seconds at best, and a login prompt at worst.
+    """
+
+    fetched = Signal(list)  # playlist titles, in Studio's own order
+    failed = Signal(str)
+    needs_login = Signal(str)
+
+    def run(self) -> None:
+        from noveltrans.youtube_upload import YouTubeUploadError, fetch_playlists
+
+        try:
+            self.fetched.emit(fetch_playlists())
+        except YouTubeUploadError as exc:
+            if exc.needs_login:
+                self.needs_login.emit(str(exc))
+            else:
+                self.failed.emit(str(exc))
+        except Exception as exc:  # keep unexpected automation errors on-screen
+            self.failed.emit(repr(exc))
+
+
+class PlaylistSyncWorker(QThread):
+    """Empty a playlist, then add every part's video to it in order.
+
+    Signal shape copied from YouTubeThumbnailWorker so the Video tab drives all three
+    browser runs with one set of handlers and one cancel button.
+    """
+
+    progress = Signal(int, int, str)  # parts done, total parts, status line
+    part_done = Signal(int, str, str)  # index, label ("" on failure), error
+    finished_ok = Signal(int, int, int)  # removed, added, failed
+    failed = Signal(str)
+    needs_login = Signal(str)
+
+    def __init__(self, playlist: str, requests: list, parent=None):
+        super().__init__(parent)
+        self.playlist = playlist
+        self.requests = list(requests)
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        from noveltrans.youtube_upload import (
+            UploadCancelled,
+            YouTubeUploadError,
+            sync_playlist_batch,
+        )
+
+        total = len(self.requests)
+        done = 0
+        errors = 0
+
+        def on_part_done(index: int, label, error: str) -> None:
+            nonlocal done, errors
+            done += 1
+            if error:
+                errors += 1
+            self.part_done.emit(index, label or "", error)
+            name = self.requests[index].label or f"phần {index + 1}"
+            self.progress.emit(done, total, f"{name}: {'lỗi' if error else 'xong'}")
+
+        try:
+            result = sync_playlist_batch(
+                self.playlist,
+                self.requests,
+                on_progress=lambda msg: self.progress.emit(done, total, msg),
+                on_part_done=on_part_done,
+                should_cancel=lambda: self._cancelled,
+            )
+        except UploadCancelled:
+            # Cancelling here CAN leave a half-filled playlist — the clear already ran.
+            # Say so plainly rather than letting the user assume nothing happened.
+            self.failed.emit(
+                f"Đã dừng. Danh sách phát “{self.playlist}” đã bị xoá trước đó và mới "
+                f"thêm lại {done} phần — kiểm tra trên YouTube."
+            )
+        except YouTubeUploadError as exc:
+            if exc.needs_login:
+                self.needs_login.emit(str(exc))
+            else:
+                self.failed.emit(str(exc))
+        except Exception as exc:
+            self.failed.emit(repr(exc))
+        else:
+            self.finished_ok.emit(result["removed"], len(result["added"]), errors)
+
+
 class YouTubeThumbnailWorker(QThread):
     """Replace the thumbnails of already-uploaded parts, in one browser session.
 

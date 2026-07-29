@@ -586,7 +586,7 @@ class TestYouTubeUploadUi:
         (out.parent / (out.stem + ".title.txt")).write_text("Tiêu đề riêng", encoding="utf-8")
         (out.parent / (out.stem + ".tags.txt")).write_text("a, b, c", encoding="utf-8")
         (out.parent / (out.stem + ".jpg")).write_bytes(b"jpeg")
-        tab.upload_playlist.setText("Danh sách của tôi")
+        tab.upload_playlist.setCurrentText("Danh sách của tôi")  # editable combo since 039
 
         request = tab._upload_request(window, "Phần 1", 1, False, publish_at=None)
         assert request.title == "Tiêu đề riêng"
@@ -2013,4 +2013,220 @@ class TestVideoTabScrolling:
             tab.scroll.horizontalScrollBarPolicy()
             == Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
+        tab.shutdown()
+
+
+class TestPlaylistPickerUi:
+    """Feature 039 — the playlist combo, the fetch, and the ordered add-all."""
+
+    def _project(self, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        for i in range(5):
+            project.save_audio(i, f"exports/audio/{i}.mp3", "V", 60.0)
+        path = project.path
+        project.close()
+        return path
+
+    def _tab(self, tmp_path, path):
+        tab = VideoTab(_config(tmp_path))
+        tab.voice_combo.addItem("V", "V")
+        tab.voice_combo.setCurrentIndex(tab.voice_combo.findData("V"))
+        tab.video_mode.setCurrentIndex(tab.video_mode.findData("batch"))
+        tab.video_batch_size.setValue(2)
+        tab._on_project_selected(str(path))
+        return tab
+
+    def _uploaded_part(self, tab, index, video_id):
+        from noveltrans.youtube_upload import STATE_PUBLISHED, write_upload_state
+
+        window = tab._windows_for_current_selection()[index]
+        out = tab._part_output_path(window, whole_novel=False)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"fake mp4")
+        write_upload_state(out, status=STATE_PUBLISHED, video_id=video_id)
+        return out
+
+    def test_the_picker_is_editable_so_a_new_name_still_works(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """The list is an aid, not a gate — a name that isn't on the channel yet must
+        still reach the upload, exactly as it did before this feature."""
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        assert tab.upload_playlist.isEditable()
+        self._uploaded_part(tab, 0, "vid0xxxxxxx")
+        tab.upload_playlist.setCurrentText("Danh sách chưa tồn tại")
+        w = tab._windows_for_current_selection()[0]
+        request = tab._upload_request(w, "Phần 1", 1, False, publish_at=None)
+        assert request.playlist == "Danh sách chưa tồn tại"
+        tab.shutdown()
+
+    def test_fetching_repopulates_without_losing_what_was_typed(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """Losing a half-typed name to a background fetch would be its own small
+        betrayal, and the combo is editable precisely so an unlisted name stays usable."""
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        tab.upload_playlist.setCurrentText("Đang gõ dở")
+        tab._on_playlists_fetched(["Truyện A", "Truyện B"])
+        assert tab.upload_playlist.currentText() == "Đang gõ dở"
+        assert [
+            tab.upload_playlist.itemText(i) for i in range(tab.upload_playlist.count())
+        ] == ["Truyện A", "Truyện B"]
+        tab.shutdown()
+
+    def test_an_empty_channel_says_so_instead_of_looking_broken(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        tab._on_playlists_fetched([])
+        assert "chưa có danh sách phát" in tab.status_label.text().lower()
+        tab.shutdown()
+
+    def test_sync_rows_are_uploaded_parts_in_order(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        self._uploaded_part(tab, 0, "vid0xxxxxxx")
+        self._uploaded_part(tab, 2, "vid2xxxxxxx")  # part 2 not uploaded
+        assert [label for _p, label in tab._playlist_sync_rows()] == ["Phần 1", "Phần 3"]
+        tab.shutdown()
+
+    def test_sync_without_a_playlist_name_starts_nothing(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from PySide6.QtWidgets import QMessageBox
+
+        shown: list = []
+        monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: shown.append(a))
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        self._uploaded_part(tab, 0, "vid0xxxxxxx")
+        tab.upload_playlist.setCurrentText("")
+        tab._start_playlist_sync()
+        assert shown and tab._playlist_worker is None
+        tab.shutdown()
+
+    def test_sync_with_nothing_uploaded_starts_nothing(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from PySide6.QtWidgets import QMessageBox
+
+        shown: list = []
+        monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: shown.append(a))
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        tab.upload_playlist.setCurrentText("Truyện A")
+        tab._start_playlist_sync()
+        assert shown and tab._playlist_worker is None
+        tab.shutdown()
+
+    def _drive(self, tab, monkeypatch, answer=True):
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.gui import keep_awake
+        from noveltrans.gui.workers import PlaylistSyncWorker
+
+        class _DummyManager:
+            def acquire(self):
+                pass
+
+            def release(self):
+                pass
+
+        monkeypatch.setattr(keep_awake, "_manager", _DummyManager())
+        asked: list = []
+
+        def question(_self, title, text, *a, **k):
+            asked.append(text)
+            return (
+                QMessageBox.StandardButton.Yes if answer else QMessageBox.StandardButton.No
+            )
+
+        monkeypatch.setattr(QMessageBox, "question", question)
+        started: list = []
+        monkeypatch.setattr(PlaylistSyncWorker, "start", lambda self: started.append(self))
+        tab._start_playlist_sync()
+        return started, asked
+
+    def test_the_confirm_states_that_it_empties_the_playlist(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        """It empties something viewers may be watching. Agreeing to that once when the
+        feature was designed is not the same as remembering it at the moment of clicking."""
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        self._uploaded_part(tab, 0, "vid0xxxxxxx")
+        tab.upload_playlist.setCurrentText("Truyện A")
+        _started, asked = self._drive(tab, monkeypatch)
+        assert asked
+        assert "XOÁ HẾT" in asked[0]
+        assert "Truyện A" in asked[0]
+        tab._playlist_worker = None
+        tab.shutdown()
+
+    def test_declining_the_confirm_starts_nothing(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        self._uploaded_part(tab, 0, "vid0xxxxxxx")
+        tab.upload_playlist.setCurrentText("Truyện A")
+        started, _asked = self._drive(tab, monkeypatch, answer=False)
+        assert started == [] and tab._playlist_worker is None
+        tab.shutdown()
+
+    def test_launching_builds_a_worker_and_locks_the_other_browser_runs_out(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        """`track_worker` is the real one here, so its call signature is exercised — the
+        bug 033 shipped."""
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        for i in range(2):
+            self._uploaded_part(tab, i, f"vid{i}xxxxxxx")
+        tab.upload_playlist.setCurrentText("Truyện A")
+        started, _asked = self._drive(tab, monkeypatch)
+
+        assert len(started) == 1
+        assert [r.label for r in tab._playlist_worker.requests] == ["Phần 1", "Phần 2"]
+        assert tab._playlist_worker.playlist == "Truyện A"
+        assert not tab.upload_button.isEnabled()
+        assert not tab.thumbnail_update_button.isEnabled()
+        assert not tab.video_button.isEnabled()
+        assert not tab.playlist_sync_button.isEnabled()
+        assert tab.upload_cancel_button.isEnabled()
+        tab._playlist_worker = None
+        tab.shutdown()
+
+    def test_the_finish_handler_restores_every_button(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        for b in (
+            tab.playlist_sync_button, tab.playlist_fetch_button, tab.upload_button,
+            tab.thumbnail_update_button, tab.video_button, tab.redo_all_button,
+        ):
+            b.setEnabled(False)
+        tab._on_playlist_finished(3, 3, 0)
+        assert tab.playlist_sync_button.isEnabled()
+        assert tab.upload_button.isEnabled()
+        assert not tab.upload_cancel_button.isEnabled()
+        assert "gỡ 3" in tab.status_label.text()
+        tab.shutdown()
+
+    def test_the_cancel_button_stops_the_playlist_worker(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+
+        class _Fake:
+            def __init__(self):
+                self.cancelled = False
+
+            def isRunning(self):
+                return True
+
+            def cancel(self):
+                self.cancelled = True
+
+        worker = _Fake()
+        tab._playlist_worker = worker
+        tab._cancel_upload()
+        assert worker.cancelled is True
+        tab._playlist_worker = None
         tab.shutdown()

@@ -230,6 +230,85 @@ _BETWEEN_THUMBNAILS_MS = 8_000  # human pacing, shorter than `_BETWEEN_PARTS_MS`
 _MAX_THUMBNAIL_BYTES = 2 * 1024 * 1024  # YouTube's hard limit
 _THUMBNAIL_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".bmp"}
 
+# -- the channel's playlists (039) --------------------------------------------
+#
+# Unverified against a live channel, same as every selector block since 033. The stakes
+# are higher here than anywhere else in this module: `_clear_playlist` REMOVES things, so
+# a drifted selector can empty a playlist viewers are watching. That is why the clear is
+# gated behind a verify-empty check and can never fall through into the add phase.
+# Studio moves its content sub-pages between URL shapes, and a wrong one does NOT 404 —
+# it renders "Oops, something went wrong", which looks exactly like a page that is merely
+# slow to mount. So we try the known shapes in order and let the DOM decide which worked,
+# rather than betting the feature on one guessed path.
+# (`/channel/<id>/playlists` was the first guess and returns the error page.)
+_PLAYLISTS_URLS = (
+    # CONFIRMED against a live channel (2026-07-29): this is the one Studio uses.
+    "https://studio.youtube.com/channel/{channel_id}/content/playlists",
+    "https://studio.youtube.com/channel/{channel_id}/videos/playlists",
+    "https://studio.youtube.com/channel/{channel_id}/playlists",
+    # youtube.com proper, not Studio: a different, more stable surface, kept as a last
+    # resort precisely because it is not subject to Studio's reshuffles.
+    "https://www.youtube.com/feed/playlists",
+)
+# Rows are found with a WIDE net and the page is never gated on a container element.
+# That gate is what broke the first live run: `/content/playlists` loaded correctly, no
+# `ytcp-playlist-section` existed to match, and the code walked away from a working page.
+# Gate on what is actually known — the URL loaded and is not the error page — and let
+# extraction be the step that can fail, with the DOM attached when it does.
+_PLAYLIST_ROW_SELS = (
+    "ytcp-playlist-row",
+    "ytcp-video-row",
+    "#playlists-table ytcp-table-row",
+    "ytcp-table-row",
+    "ytd-grid-playlist-renderer",
+    "ytd-playlist-renderer",
+    "yt-lockup-view-model",
+)
+# Studio links each row at the playlist it opens; youtube.com uses ?list=. Anchors are the
+# most structural handle on this page — they survive component renames that ids don't.
+_PLAYLIST_LINK_SEL = "a[href*='/playlist/'], a[href*='list=']"
+_STUDIO_ERROR_TEXTS = ("Oops, something went wrong", "Rất tiếc, đã xảy ra sự cố")
+_PLAYLIST_TITLE_SEL = "#playlist-title, #title, .playlist-title, #video-title"
+
+# One playlist's own page: its entries, and the per-row menu that removes one.
+_PLAYLIST_OPEN_URL = "https://studio.youtube.com/playlist/{playlist_id}/videos?hl=vi"
+_PLAYLIST_ENTRY_SEL = "ytcp-video-row, #video-list ytcp-table-row"
+_PLAYLIST_ENTRY_TITLE_SEL = "#video-title, #title"
+_PLAYLIST_ROW_MENU_SEL = "#menu-button, ytcp-button#menu-button, #overflow-menu-button"
+_PLAYLIST_REMOVE_TEXTS = (
+    "Xóa khỏi danh sách phát", "Xoá khỏi danh sách phát", "Remove from playlist",
+)
+_PLAYLIST_ID_RE = re.compile(r"(?:playlist/|list=)([A-Za-z0-9_-]{10,})")
+
+# Every row on the playlists page carries several strings, and only one of them is the
+# title. Live run 3 picked the video-count cell and offered "No videos / 75 videos /
+# 31 videos / 10 episodes" as playlist names. These are the shapes to refuse: counts,
+# visibility labels, dates and bare numbers, in both languages Studio may render.
+_PLAYLIST_METADATA_RES = (
+    re.compile(r"^\d+\s*(videos?|episodes?|video|tập|bài|mục)$", re.IGNORECASE),
+    re.compile(r"^(no|không có)\s*(videos?|video)$", re.IGNORECASE),
+    re.compile(r"^(công khai|riêng tư|không công khai|public|private|unlisted)$", re.I),
+    re.compile(r"^[\d\s./:-]+$"),  # bare numbers and dates
+    re.compile(r"^(danh sách phát|playlists?|xem tất cả|view all)$", re.IGNORECASE),
+)
+
+
+def _is_playlist_metadata(text: str) -> bool:
+    """True for a row string that is decoration rather than the playlist's name."""
+    text = (text or "").strip()
+    return not text or any(r.match(text) for r in _PLAYLIST_METADATA_RES)
+
+_PLAYLIST_PAGE_WAIT_MS = 45_000
+# Studio keeps long-poll connections open, so networkidle rarely fires; this is a
+# short settle after navigation, not a load gate.
+_SETTLE_AFTER_NAV_MS = 4_000
+_CLEAR_ROW_WAIT_MS = 10_000
+# A long playlist is a lot of menu interactions; keep them human-paced but not glacial.
+_BETWEEN_PLAYLIST_OPS_MS = 1_500
+# A runaway guard: if removing a row never reduces the count, stop rather than loop until
+# the browser is killed. Generous enough for any real serialised novel.
+_MAX_PLAYLIST_ENTRIES = 500
+
 
 class YouTubeUploadError(Exception):
     """An upload could not be completed.
@@ -1427,6 +1506,466 @@ def _dismiss_unsaved_changes(page) -> None:
         page.wait_for_timeout(_SETTLE_MS)
     except Exception:
         pass
+
+
+# -- the channel's playlists: reading, clearing, filling (039) ----------------
+
+
+@dataclass
+class PlaylistSyncRequest:
+    """One part to place in a playlist. `video` is the key to its `.upload.json`."""
+
+    video: Path
+    video_id: str = ""  # "" → resolved from the record
+    label: str = ""
+
+    def resolve(self) -> str:
+        self.video_id = self.video_id or uploaded_video_id(Path(self.video))
+        return self.video_id
+
+    def validate(self) -> None:
+        if not self.resolve():
+            raise YouTubeUploadError(
+                f"{self.label or Path(self.video).stem}: chưa có video trên YouTube nên "
+                "không thêm vào danh sách phát được."
+            )
+
+
+def _page_shows_studio_error(page) -> bool:
+    """True if Studio rendered its generic "Oops, something went wrong" page.
+
+    Worth its own check because that page is a *successful* navigation with a normal DOM —
+    indistinguishable from a slow-mounting one unless you read the text. Without this, a
+    wrong URL burns the full page-wait and then reports "giao diện có thể đã thay đổi",
+    sending the reader after a selector bug that isn't there.
+    """
+    for text in _STUDIO_ERROR_TEXTS:
+        try:
+            if page.locator(f'body:has-text("{text}")').first.is_visible(timeout=1_500):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _browser_gone(exc: Exception) -> bool:
+    """True if this exception means the browser/page went away — usually the user closed it."""
+    return "TargetClosedError" in type(exc).__name__ or "has been closed" in str(exc)
+
+
+def _goto_playlists_page(page, channel_id: str) -> str:
+    """Navigate to a page listing the channel's playlists. Returns the URL that worked.
+
+    Tries each known URL shape and lets the DOM decide, because a wrong Studio path
+    renders an error page rather than failing the navigation. Cheap: a wrong candidate is
+    rejected in a second or two by the error-text check, not by the 45s page wait.
+    """
+    tried: list[str] = []
+    for template in _PLAYLISTS_URLS:
+        url = template.format(channel_id=channel_id)
+        tried.append(url)
+        try:
+            page.goto(url, wait_until="domcontentloaded")
+        except Exception as exc:
+            if _browser_gone(exc):
+                raise YouTubeUploadError(
+                    "Cửa sổ trình duyệt đã bị đóng trước khi đọc xong danh sách phát."
+                ) from exc
+            continue
+        if _LOGGED_OUT_URL_RE.search(page.url or ""):
+            raise YouTubeUploadError(
+                "Profile YouTube chưa đăng nhập. Vào Settings → “Đăng nhập YouTube”.",
+                needs_login=True,
+            )
+        if _page_shows_studio_error(page):
+            continue  # wrong shape for this Studio build; try the next
+        # No container check. Studio renders this page from components whose names we do
+        # not reliably know, and requiring one is what made the first live run walk away
+        # from a URL that had loaded perfectly. "It loaded and it isn't the error page" is
+        # the strongest claim the DOM actually supports here.
+        try:
+            page.wait_for_load_state("networkidle", timeout=_SETTLE_AFTER_NAV_MS)
+        except Exception:
+            pass
+        return page.url or url
+    raise YouTubeUploadError(
+        "Không mở được trang danh sách phát trên YouTube. Đã thử:\n  "
+        + "\n  ".join(tried)
+        + "\n\nBạn vẫn có thể gõ tên danh sách phát bằng tay — ô này cho phép nhập tự do."
+    )
+
+
+def _dom_inventory(page, limit: int = 25) -> str:
+    """The distinct custom-element tags on the page, most common first.
+
+    Attached to extraction failures so the next report *names the components* instead of
+    saying "giao diện có thể đã thay đổi". Studio's element names are the one thing this
+    module cannot know in advance and the one thing it always needs when something drifts.
+    """
+    try:
+        tags = page.evaluate(
+            """() => {
+                const counts = {};
+                for (const el of document.querySelectorAll('*')) {
+                    const t = el.tagName.toLowerCase();
+                    if (t.includes('-')) counts[t] = (counts[t] || 0) + 1;
+                }
+                return Object.entries(counts)
+                    .sort((a, b) => b[1] - a[1])
+                    .map(([t, n]) => `${t}×${n}`);
+            }"""
+        )
+    except Exception:
+        return "(không đọc được cấu trúc trang)"
+    return ", ".join(list(tags)[:limit]) or "(trang không có component nào)"
+
+
+def _row_titles(page, row_sel: str, title_sel: str) -> list[str]:
+    """The visible title of every row matching `row_sel`. Never raises."""
+    titles: list[str] = []
+    try:
+        rows = page.locator(row_sel)
+        for i in range(min(rows.count(), _MAX_PLAYLIST_ENTRIES)):
+            row = rows.nth(i)
+            try:
+                text = (row.locator(title_sel).first.inner_text(timeout=2_000) or "").strip()
+            except Exception:
+                text = ""
+            if not text:
+                try:
+                    text = (row.inner_text(timeout=2_000) or "").strip().splitlines()[0]
+                except Exception:
+                    text = ""
+            if text:
+                titles.append(text)
+    except Exception:
+        return titles
+    return titles
+
+
+def _best_title(texts) -> str:
+    """The likeliest playlist name among the strings found in one row.
+
+    Longest non-metadata string wins. A title is the substantive text in a row; the other
+    cells are counts, a visibility label and a date, all of which are short and all of
+    which `_is_playlist_metadata` already refuses. Length is the tie-breaker that stops a
+    stray one-word cell from beating a real name.
+    """
+    candidates = [t.strip() for t in texts if not _is_playlist_metadata(t)]
+    return max(candidates, key=len) if candidates else ""
+
+
+def _titles_by_playlist_link(page) -> list[str]:
+    """Titles read via the anchors on the page, grouped by the playlist each points at.
+
+    Grouping by the id in the `href` is what makes this reliable: a row links to the same
+    playlist from its thumbnail, its title and its video count, so the id says which
+    strings belong together and `_best_title` picks the name out of them. Live run 3 read
+    each anchor independently and offered the count cells as playlist names.
+    """
+    groups: dict[str, list[str]] = {}
+    order: list[str] = []
+    try:
+        links = page.locator(_PLAYLIST_LINK_SEL)
+        count = min(links.count(), _MAX_PLAYLIST_ENTRIES)
+    except Exception:
+        return []
+    for i in range(count):
+        link = links.nth(i)
+        try:
+            href = link.get_attribute("href") or ""
+            text = (link.inner_text(timeout=2_000) or "").strip()
+        except Exception:
+            continue
+        match = _PLAYLIST_ID_RE.search(href)
+        if not match:
+            continue
+        key = match.group(1)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].extend(text.splitlines())
+    titles = [_best_title(groups[k]) for k in order]
+    return list(dict.fromkeys(t for t in titles if t))
+
+
+def _extract_playlist_titles(page) -> list[str]:
+    """Playlist titles off whatever this page turned out to be. [] -> nothing recognised.
+
+    Each row shape is tried first, then the anchor pass. Both feed every string in a row
+    through `_best_title` rather than trusting position: taking the row's first line is
+    what produced a dropdown of "No videos / 75 videos / 31 videos".
+    """
+    for row_sel in _PLAYLIST_ROW_SELS:
+        try:
+            rows = page.locator(row_sel)
+            count = min(rows.count(), _MAX_PLAYLIST_ENTRIES)
+        except Exception:
+            continue
+        titles = []
+        for i in range(count):
+            try:
+                text = rows.nth(i).inner_text(timeout=2_000) or ""
+            except Exception:
+                continue
+            best = _best_title(text.splitlines())
+            if best:
+                titles.append(best)
+        if titles:
+            return list(dict.fromkeys(titles))
+    return _titles_by_playlist_link(page)
+
+
+def fetch_playlists(*, headless: bool = False) -> list[str]:
+    """Every playlist title on the logged-in channel, in Studio's own order.
+
+    Titles rather than ids, because the upload picker searches by title — a title is the
+    one identifier the rest of this flow can actually act on. Duplicates collapse: if a
+    channel really has two playlists of the same name, neither this nor the picker it
+    feeds can tell them apart, and pretending otherwise would be worse than saying so.
+    """
+    sync_playwright = _require_playwright()
+    playwright, context = _launch_context(sync_playwright, headless=headless)
+    try:
+        page = context.pages[0] if context.pages else context.new_page()
+        page.set_default_timeout(_STEP_WAIT_MS)
+        page.goto(_STUDIO_HOME, wait_until="domcontentloaded")
+        if _LOGGED_OUT_URL_RE.search(page.url or ""):
+            raise YouTubeUploadError(
+                "Profile YouTube chưa đăng nhập. Vào Settings → “Đăng nhập YouTube”.",
+                needs_login=True,
+            )
+        channel_id, _name = _current_channel(page)
+        if not channel_id:
+            raise YouTubeUploadError(
+                "Không xác định được kênh đang đăng nhập — thử “Đăng nhập YouTube” lại."
+            )
+        landed = _goto_playlists_page(page, channel_id)
+        titles = _extract_playlist_titles(page)
+        if not titles:
+            raise YouTubeUploadError(
+                f"Mở được trang danh sách phát ({landed}) nhưng không đọc được tên danh "
+                "sách phát nào — giao diện YouTube đã đổi tên component.\n\n"
+                f"Component trên trang: {_dom_inventory(page)}\n\n"
+                "Gửi dòng trên để cập nhật selector. Trong lúc đó bạn vẫn gõ tên danh "
+                "sách phát bằng tay được."
+            )
+        return titles
+    except YouTubeUploadError:
+        raise
+    except Exception as exc:
+        # Closing the window mid-run is a normal thing for a person to do; it should read
+        # as one sentence, not a Playwright traceback.
+        if _browser_gone(exc):
+            raise YouTubeUploadError(
+                "Cửa sổ trình duyệt đã bị đóng trước khi đọc xong danh sách phát."
+            ) from exc
+        raise
+    finally:
+        _close(context, playwright)
+
+
+def _open_playlist_page(page, playlist: str) -> None:
+    """Navigate to `playlist`'s own page, found by title on the channel's playlist list."""
+    page.goto(_STUDIO_HOME, wait_until="domcontentloaded")
+    if _LOGGED_OUT_URL_RE.search(page.url or ""):
+        raise YouTubeUploadError(
+            "Profile YouTube chưa đăng nhập. Vào Settings → “Đăng nhập YouTube”.",
+            needs_login=True,
+        )
+    channel_id, _name = _current_channel(page)
+    _goto_playlists_page(page, channel_id)
+    # Exact title match only, and the same wide net the reader uses. A substring match
+    # here would open "Phần 1" for "Phần 10" — and the next thing this code does is empty
+    # whatever it opened, so an approximate match is not a cosmetic bug.
+    for row_sel in (*_PLAYLIST_ROW_SELS, _PLAYLIST_LINK_SEL):
+        try:
+            rows = page.locator(row_sel)
+            count = min(rows.count(), _MAX_PLAYLIST_ENTRIES)
+        except Exception:
+            continue
+        for i in range(count):
+            row = rows.nth(i)
+            try:
+                title = (row.inner_text(timeout=2_000) or "").strip().splitlines()
+            except Exception:
+                continue
+            if title and title[0].strip() == playlist:
+                row.click()
+                page.wait_for_timeout(_SETTLE_MS)
+                return
+    raise YouTubeUploadError(
+        f"Không tìm thấy danh sách phát “{playlist}” trên kênh.\n\n"
+        f"Component trên trang: {_dom_inventory(page)}\n\n"
+        "Bấm “Tải danh sách…” để xem danh sách hiện có, hoặc tạo nó trên YouTube trước."
+    )
+
+
+def _playlist_entries(page) -> list[str]:
+    """Titles currently in the open playlist.
+
+    Captured BEFORE clearing. Clearing is destructive and per-row, so if it fails halfway
+    this list is the only thing that turns "your playlist is broken" into something the
+    user can act on — and it is the one thing that cannot be recovered afterwards.
+    """
+    return _row_titles(page, _PLAYLIST_ENTRY_SEL, _PLAYLIST_ENTRY_TITLE_SEL)
+
+
+def _remove_first_entry(page) -> bool:
+    """Remove the playlist's first entry. False if there was nothing to remove."""
+    rows = page.locator(_PLAYLIST_ENTRY_SEL)
+    try:
+        if rows.count() == 0:
+            return False
+    except Exception:
+        return False
+    row = rows.first
+    try:
+        row.locator(_PLAYLIST_ROW_MENU_SEL).first.click(timeout=_CLEAR_ROW_WAIT_MS)
+    except Exception:
+        return False
+    page.wait_for_timeout(_SETTLE_MS)
+    if not _click_by_text(page, _PLAYLIST_REMOVE_TEXTS, timeout_ms=_CLEAR_ROW_WAIT_MS):
+        page.keyboard.press("Escape")  # leave no menu covering the next row
+        return False
+    page.wait_for_timeout(_BETWEEN_PLAYLIST_OPS_MS)
+    return True
+
+
+def _clear_playlist(page, *, on_progress=None, should_cancel=None) -> int:
+    """Remove every entry from the open playlist. Returns how many went.
+
+    Loops on "remove the first row" rather than iterating a snapshot: the DOM re-renders
+    after each removal, so held row handles go stale. The count guard is a runaway stop —
+    if a removal silently no-ops, the count stops falling and we raise instead of
+    hammering Studio until someone kills the browser.
+    """
+    def _count() -> int:
+        try:
+            return page.locator(_PLAYLIST_ENTRY_SEL).count()
+        except Exception:
+            return 0
+
+    removed = 0
+    stalled = 0
+    while removed < _MAX_PLAYLIST_ENTRIES:
+        _check_cancel(should_cancel)
+        before = _count()
+        if not before:
+            return removed
+        _remove_first_entry(page)
+        after = _count()
+        # The COUNT is the only thing trusted here, never the click's return value. A menu
+        # item can be found and clicked and still not remove anything — and treating that
+        # as progress resets the stall counter, which turns this guard from "give up after
+        # 3" into "hammer Studio 500 times". Measured: that is exactly what happened.
+        if after < before:
+            removed += before - after
+            stalled = 0
+            _report(on_progress, f"Đã gỡ {removed} video khỏi danh sách phát…")
+        else:
+            stalled += 1
+        if stalled >= 3:
+            raise YouTubeUploadError(
+                f"Không gỡ được video khỏi danh sách phát (đã gỡ {removed}, còn {after}). "
+                "Giao diện Studio có thể đã thay đổi — kiểm tra danh sách phát trên kênh."
+            )
+    raise YouTubeUploadError(
+        f"Danh sách phát có quá {_MAX_PLAYLIST_ENTRIES} video — dừng để an toàn."
+    )
+
+
+def _playlist_is_empty(page) -> bool:
+    try:
+        return page.locator(_PLAYLIST_ENTRY_SEL).count() == 0
+    except Exception:
+        return False
+
+
+def _add_to_playlist(page, video_id: str, playlist: str) -> None:
+    """Add one already-uploaded video to `playlist` via its edit page.
+
+    The same surface 034 uses to replace a thumbnail — proven navigation and save
+    confirmation — driving the picker DOM `_set_playlist` already knows.
+    """
+    _open_edit_page(page, video_id)
+    _set_playlist(page, playlist)
+    page.wait_for_timeout(_SETTLE_MS)
+    _save_edits(page, video_id=video_id)
+
+
+def sync_playlist_batch(
+    playlist: str,
+    requests,
+    *,
+    headless: bool = False,
+    on_progress=None,
+    on_part_done=None,
+    should_cancel=None,
+) -> dict:
+    """Empty `playlist`, then add every request's video in order. ONE browser session.
+
+    Phased deliberately, and the phases do not overlap: the clear must finish AND verify
+    empty before a single video is added. A half-cleared playlist that then receives a
+    partial re-add is worse than either end state and impossible to reason about
+    afterwards — so a clear that doesn't verify raises, and nothing is added.
+
+    Returns `{"had": [...titles...], "removed": n, "added": [...labels...]}` so the caller
+    can tell the user what was in there, which matters most when something went wrong.
+    """
+    requests = list(requests)
+    playlist = (playlist or "").strip()
+    if not playlist:
+        raise YouTubeUploadError("Chưa chọn danh sách phát.")
+    if not requests:
+        raise YouTubeUploadError("Không có phần nào đã tải lên để thêm vào danh sách phát.")
+    for request in requests:  # fail fast, before the browser costs anything
+        request.validate()
+
+    sync_playwright = _require_playwright()
+    playwright, context = _launch_context(sync_playwright, headless=headless)
+    had: list[str] = []
+    removed = 0
+    added: list[str] = []
+    try:
+        page = context.pages[0] if context.pages else context.new_page()
+        page.set_default_timeout(_STEP_WAIT_MS)
+
+        _report(on_progress, f"Mở danh sách phát “{playlist}”…")
+        _open_playlist_page(page, playlist)
+        had = _playlist_entries(page)
+
+        _report(on_progress, f"Xoá {len(had)} video khỏi danh sách phát…")
+        removed = _clear_playlist(page, on_progress=on_progress, should_cancel=should_cancel)
+        if not _playlist_is_empty(page):
+            raise YouTubeUploadError(
+                f"Danh sách phát “{playlist}” chưa trống sau khi xoá (đã gỡ {removed}/"
+                f"{len(had)}). Dừng lại — không thêm video vào một danh sách dở dang. "
+                "Kiểm tra trên YouTube rồi thử lại."
+            )
+
+        for index, request in enumerate(requests):
+            _check_cancel(should_cancel)
+            label = request.label or Path(request.video).stem
+            if index:
+                page.wait_for_timeout(_BETWEEN_PLAYLIST_OPS_MS)
+            _report(on_progress, f"{label}: thêm vào danh sách phát…")
+            try:
+                _add_to_playlist(page, request.resolve(), playlist)
+            except UploadCancelled:
+                raise
+            except YouTubeUploadError as exc:
+                if on_part_done is not None:
+                    on_part_done(index, None, str(exc))
+                if exc.needs_login:
+                    raise
+                continue
+            added.append(label)
+            if on_part_done is not None:
+                on_part_done(index, label, "")
+    finally:
+        _close(context, playwright)
+    return {"had": had, "removed": removed, "added": added}
 
 
 # -- public entry points ------------------------------------------------------
