@@ -48,6 +48,26 @@ _MULTISPACE_RE = re.compile(r"[^\S\n]+")  # runs of non-newline whitespace
 _SPACE_AROUND_NL_RE = re.compile(r" *\n *")
 _BLANK_RUN_RE = re.compile(r"\n{3,}")
 
+# Any letter or digit — i.e. anything an engine could actually pronounce.
+_SPEAKABLE_RE = re.compile(r"[^\W\d_]|\d")
+
+
+def _has_speech(line: str) -> bool:
+    """True if a line has anything to say; False for pure punctuation.
+
+    A line that is only punctuation — `“…”`, `……`, `“?”`, `- - -` — is a *beat*. Vietnamese
+    web novels lean on it constantly for a silent reply in dialogue. Handed to the engine
+    it comes out as a noise instead: `split_sentences` gives such a paragraph its own
+    chunk, feature 028's `merge_short_chunks` glues that 3-character chunk onto the
+    neighbouring sentence (it is far below `min_chunk_chars`), and the voice dutifully
+    tries to pronounce it.
+
+    Digits count as speech, so a bare chapter-number line still gets read. By the time
+    this runs the keep-set has already reduced letters to Latin script, so no script
+    logic is needed here.
+    """
+    return _SPEAKABLE_RE.search(line) is not None
+
 
 def _keep(ch: str) -> bool:
     """True for a character that belongs in spoken Vietnamese text."""
@@ -107,6 +127,16 @@ def clean_for_tts(text: str, extra_remove: str = "") -> str:
     if drop:
         # Match visible-symbol removal above: → space, then let the tidy collapse it.
         cleaned = "".join(" " if ch in drop else ch for ch in cleaned)
+
+    # Blank out lines with nothing to say, keeping their newlines so the blank-run collapse
+    # below turns the hole into an ordinary paragraph break — which `synthesize_chapter`
+    # already renders as `paragraph_gap_seconds` of real silence. The beat the author wrote
+    # survives *as* silence, which is what they meant by it.
+    #
+    # Whole lines only: an ellipsis INSIDE a sentence ("Anh ta ngập ngừng… rồi im lặng.")
+    # is prosody and must keep working. Runs after `extra_remove`, because that can empty a
+    # line too — stripping "()" turns a "(…)" line into punctuation-only.
+    cleaned = "\n".join(line if _has_speech(line) else "" for line in cleaned.split("\n"))
 
     cleaned = _MULTISPACE_RE.sub(" ", cleaned)
     cleaned = _SPACE_AROUND_NL_RE.sub("\n", cleaned)  # trim spaces hugging newlines
