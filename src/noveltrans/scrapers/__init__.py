@@ -27,6 +27,7 @@ def _import_adapters() -> None:
         ixdzs,
         medoctruyen,
         shuba69,
+        tieuthuyetmang,
         webtruyendich,
         xbanxia,
     )

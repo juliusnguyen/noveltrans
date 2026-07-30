@@ -27,7 +27,12 @@ from noveltrans.config import AppConfig
 from noveltrans.discord_unlock import valid_channel_url
 from noveltrans.gui.keep_awake import track_worker
 from noveltrans.gui.notify import clear_dock_badge, request_attention, set_dock_badge
-from noveltrans.gui.widgets import ChapterTableModel, ProjectPicker, enable_cell_copy
+from noveltrans.gui.widgets import (
+    CellEditorDelegate,
+    ChapterTableModel,
+    ProjectPicker,
+    enable_cell_copy,
+)
 from noveltrans.gui.workers import DownloadWorker, ScanWorker, UnlockWorker
 from noveltrans.storage import NovelProject
 
@@ -115,8 +120,15 @@ class ScrapeTab(QWidget):
 
         # --- chapter table
         self.model = ChapterTableModel(self)
+        # Renaming lives here rather than in the Dịch tab: this is where the chapter list
+        # arrives, and a wrong name is easiest to fix before anything is built on it.
+        self.model.set_title_editable(True)
+        self.model.title_edited.connect(self._on_title_edited)
         self.table = QTableView()
         self.table.setModel(self.model)
+        # Without this the styled QLineEdit editor is taller than the row and the title
+        # is clipped mid-glyph while you type.
+        self.table.setItemDelegate(CellEditorDelegate(self.table))
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
@@ -227,7 +239,7 @@ class ScrapeTab(QWidget):
             url,
             self.config.library_dir,
             self.config.request_delay,
-            cookies=self.config.medoctruyen_cookies,
+            cookies=self.config.cookies_for_url(url),
         )
         self._scan_worker.progress.connect(self.status_label.setText)
         self._scan_worker.scanned.connect(self._on_scanned)
@@ -264,6 +276,16 @@ class ScrapeTab(QWidget):
         if chapter is None:
             return
         running = self._download_worker is not None and self._download_worker.isRunning()
+        menu.addSeparator()
+        rename = menu.addAction("Sửa tên chương")
+        rename.triggered.connect(
+            lambda: self.table.edit(self.model.index(index.row(), self.model.TITLE_COLUMN))
+        )
+        if chapter.title_custom:
+            # Only offered once there is something to undo, and it says what it will do:
+            # "reset" on a title nobody changed reads like it might erase something.
+            restore = menu.addAction("Lấy lại tên gốc từ trang web")
+            restore.triggered.connect(lambda: self._reset_title(chapter.index))
         menu.addSeparator()
         from_here = menu.addAction(f"Tải từ chương {chapter.index + 1}")
         from_here.setEnabled(not running)
@@ -324,7 +346,7 @@ class ScrapeTab(QWidget):
         self._download_worker = DownloadWorker(
             self.project.path,
             self.config.request_delay,
-            cookies=self.config.medoctruyen_cookies,
+            cookies=self.config.cookies_for_url(self.project.meta.url),
             start_index=self._dl_start,
             end_index=self._dl_end,
             force=self._dl_force,
@@ -507,6 +529,26 @@ class ScrapeTab(QWidget):
         if self.project is not None and not busy:
             self._show_meta(self.project.reload_meta())
         super().showEvent(event)
+
+    def _on_title_edited(self, idx: int, title: str) -> None:
+        if self.project is None:
+            return
+        self.project.edit_title(idx, title)
+        # Re-read the row so the "tên bạn đặt" tooltip reflects what is on disk rather
+        # than what the model assumed it wrote.
+        chapter = self.project.chapter(idx)
+        if chapter is not None:
+            self.model.update_chapter(chapter)
+
+    def _reset_title(self, idx: int) -> None:
+        """Undo a rename: put the site's own title back, now."""
+        if self.project is None:
+            return
+        self.project.reset_title(idx)
+        chapter = self.project.chapter(idx)
+        if chapter is not None:
+            self.model.update_chapter(chapter)
+            self.status_label.setText(f"Chương {idx + 1}: đã lấy lại tên gốc.")
 
     def _reload_table(self) -> None:
         if self.project is not None:

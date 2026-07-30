@@ -56,7 +56,11 @@ CREATE TABLE IF NOT EXISTS chapters (
   audio_voice      TEXT NOT NULL DEFAULT '',
   audio_source     TEXT NOT NULL DEFAULT 'translated',
   audio_seconds    REAL NOT NULL DEFAULT 0,
-  audio_error      TEXT NOT NULL DEFAULT ''
+  audio_error      TEXT NOT NULL DEFAULT '',
+  -- 1 once the user has renamed this chapter by hand, so a re-scan leaves it alone
+  title_custom     INTEGER NOT NULL DEFAULT 0,
+  -- the site's own title, kept so a rename can be undone; refreshed by every scan
+  title_source     TEXT NOT NULL DEFAULT ''
 );
 """
 
@@ -93,6 +97,8 @@ def _row_to_chapter(row: sqlite3.Row) -> Chapter:
         audio_source=row["audio_source"],
         audio_seconds=row["audio_seconds"],
         audio_error=row["audio_error"],
+        title_custom=bool(row["title_custom"]),
+        title_source=row["title_source"],
     )
 
 
@@ -120,6 +126,9 @@ class NovelProject:
             "audio_source": "TEXT NOT NULL DEFAULT 'translated'",
             "audio_seconds": "REAL NOT NULL DEFAULT 0",
             "audio_error": "TEXT NOT NULL DEFAULT ''",
+            # existing titles all came from a scan, so none of them is a manual rename
+            "title_custom": "INTEGER NOT NULL DEFAULT 0",
+            "title_source": "TEXT NOT NULL DEFAULT ''",
         }
         with self._db:
             for name, ddl in added.items():
@@ -188,6 +197,10 @@ class NovelProject:
 
         Existing rows keep their content/translation; only titles/urls are
         updated, so re-scanning a novel to pick up new chapters is safe.
+
+        A title the user renamed by hand (`title_custom`) is left alone. Without that
+        exception every re-scan would silently undo the renaming — and a re-scan is the
+        normal way to pick up new chapters, so the work would rarely survive a day.
         """
         with self._db:
             for ref in refs:
@@ -196,7 +209,11 @@ class NovelProject:
                     INSERT INTO chapters (idx, title, url, updated_at)
                     VALUES (?, ?, ?, ?)
                     ON CONFLICT(idx) DO UPDATE SET
-                        title = excluded.title,
+                        title = CASE WHEN chapters.title_custom = 1
+                                     THEN chapters.title ELSE excluded.title END,
+                        -- kept current even under a rename, so "undo" restores the
+                        -- site's LATEST title rather than one from months ago
+                        title_source = excluded.title,
                         url = excluded.url
                     """,
                     (ref.index, ref.title, ref.url, _now()),
@@ -360,6 +377,45 @@ class NovelProject:
                 (*params, _now(), idx),
             )
 
+    def edit_title(self, idx: int, title: str) -> None:
+        """Rename one chapter by hand, and remember both that it was renamed and what it
+        was called before.
+
+        The `title_custom` flag is the whole point: the chapter title is what the export,
+        the video and the TTS narration all use, and `replace_toc` would otherwise put the
+        site's version back the next time the novel is scanned for new chapters.
+
+        `title_source` keeps the site's own title so the rename can be undone. The first
+        rename captures it; later ones must not, or the second edit would record the first
+        edit as "the original" and the way back would be gone.
+
+        Status, content and translation are untouched — renaming is not a re-download.
+        """
+        with self._db:
+            self._db.execute(
+                """
+                UPDATE chapters SET
+                    title_source = CASE WHEN title_custom = 1 THEN title_source
+                                        ELSE title END,
+                    title = ?, title_custom = 1, updated_at = ?
+                WHERE idx = ?
+                """,
+                (title, _now(), idx),
+            )
+
+    def reset_title(self, idx: int) -> None:
+        """Undo a rename: put the site's own title back and let scans update it again."""
+        with self._db:
+            self._db.execute(
+                """
+                UPDATE chapters SET
+                    title = CASE WHEN title_source != '' THEN title_source ELSE title END,
+                    title_custom = 0, updated_at = ?
+                WHERE idx = ?
+                """,
+                (_now(), idx),
+            )
+
     def edit_content(self, idx: int, text: str) -> None:
         """Manual edit of a chapter's original text.
 
@@ -449,6 +505,36 @@ class NovelProject:
             translated_title=title, translated_description=description,
             translated_author=author, translated_lang=lang,
         )
+        meta_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    def refresh_meta(self, meta: NovelMeta) -> None:
+        """Write a re-scan's scraped fields back into meta.json.
+
+        Without this a re-scan updated the chapter list and nothing else, so a project
+        created while a site adapter was buggy kept the wrong title and author **for
+        ever** — re-scanning appeared to do nothing and the only cure was deleting the
+        project. Found exactly that way on tieuthuyetmang (046).
+
+        Only the SCRAPED fields move. The translated title/description/author, the
+        generated tags and the thumbnail prompt are this app's own work, cost real time
+        and money to produce, and a scan knows nothing about them — overwriting them with
+        a fresh `NovelMeta`'s blank defaults would silently destroy them.
+        """
+        scraped = {
+            "site": meta.site,
+            "title": meta.title,
+            "author": meta.author,
+            "description": meta.description,
+            "cover_url": meta.cover_url,
+            "source_lang": meta.source_lang,
+        }
+        for field, value in scraped.items():
+            setattr(self.meta, field, value)
+        meta_path = self.path / META_FILE
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+        data.update(scraped)
         meta_path.write_text(
             json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
         )

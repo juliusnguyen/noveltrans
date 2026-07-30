@@ -25,6 +25,7 @@ from noveltrans.gui.keep_awake import track_worker
 from noveltrans.gui.widgets import (
     ChapterTableModel,
     ProjectPicker,
+    CellEditorDelegate,
     RetranslateButtonDelegate,
     enable_cell_copy,
 )
@@ -101,6 +102,9 @@ class TranslateTab(QWidget):
         enable_cell_copy(self.table)  # Ctrl+C / right-click to copy a cell (e.g. errors)
         self.table.setMouseTracking(True)  # hover state for the row buttons
         self.model.translated_title_edited.connect(self._on_translated_title_edited)
+        # Same clipping as the chapter title in Tải truyện: the styled QLineEdit
+        # editor is taller than the row unless its padding is stripped.
+        self.table.setItemDelegate(CellEditorDelegate(self.table))
         self._row_button_delegate = RetranslateButtonDelegate(self.table)
         self._row_button_delegate.clicked.connect(self._retranslate_row)
         self.table.setItemDelegateForColumn(

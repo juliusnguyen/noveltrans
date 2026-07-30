@@ -99,6 +99,10 @@ class Chapter:
     audio_source: str = "translated"  # which text the audio was voiced from
     audio_seconds: float = 0.0  # duration of the generated audio
     audio_error: str = ""
+    # True once the user renamed this chapter by hand; a re-scan then leaves the title
+    # alone instead of overwriting it with the site's again.
+    title_custom: bool = False
+    title_source: str = ""  # the site's own title, kept so a rename can be undone
 
     @property
     def is_downloaded(self) -> bool:
