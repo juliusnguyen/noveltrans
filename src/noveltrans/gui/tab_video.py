@@ -55,6 +55,7 @@ from noveltrans.gui.workers import (
     VideoPreviewWorker,
     PlaylistFetchWorker,
     PlaylistSyncWorker,
+    SubtitleUploadWorker,
     SubtitleWorker,
     VideoWorker,
     YouTubeThumbnailWorker,
@@ -78,6 +79,7 @@ class VideoTab(QWidget):
         self._playlist_worker: PlaylistSyncWorker | None = None
         self._playlist_fetch_worker: PlaylistFetchWorker | None = None
         self._subtitle_worker: SubtitleWorker | None = None
+        self._subtitle_upload_worker: SubtitleUploadWorker | None = None
         self._preview_worker: VideoPreviewWorker | None = None
         self._voices_worker: TtsVoicesWorker | None = None
         self._tags_worker: TagsWorker | None = None
@@ -440,6 +442,13 @@ class VideoTab(QWidget):
         )
         self.playlist_sync_button.clicked.connect(self._start_playlist_sync)
 
+        self.subtitle_upload_button = QPushButton("💬 Tải phụ đề lên")
+        self.subtitle_upload_button.setToolTip(
+            "Tải file .srt của những phần ĐÃ có video trên YouTube lên làm phụ đề. "
+            "Không tải lại video, không đổi ảnh bìa.\n\nCần bấm “Tạo phụ đề (.srt)” trước."
+        )
+        self.subtitle_upload_button.clicked.connect(self._start_subtitle_upload)
+
         self.upload_cancel_button = QPushButton("Dừng")
         self.upload_cancel_button.setEnabled(False)
         self.upload_cancel_button.clicked.connect(self._cancel_upload)
@@ -451,6 +460,7 @@ class VideoTab(QWidget):
         action_row.addWidget(self.playlist_sync_button)
         action_row.addWidget(self.upload_reset_button)
         action_row.addWidget(self.thumbnail_update_button)
+        action_row.addWidget(self.subtitle_upload_button)
         action_row.addWidget(self.upload_button)
         action_row.addWidget(self.upload_cancel_button)
 
@@ -2411,6 +2421,136 @@ class VideoTab(QWidget):
         elif self._playlist_worker is not None and self._playlist_worker.isRunning():
             self._playlist_worker.cancel()
             self.status_label.setText("Đang dừng sắp xếp danh sách phát…")
+        elif (
+            self._subtitle_upload_worker is not None
+            and self._subtitle_upload_worker.isRunning()
+        ):
+            self._subtitle_upload_worker.cancel()
+            self.status_label.setText("Đang dừng tải phụ đề…")
+
+    # ------------------------------------------------- tải phụ đề lên YouTube
+
+    def _subtitle_upload_rows(self) -> list:
+        """Parts with BOTH a video on the channel and an .srt on disk, in part order.
+
+        Same eligibility rule as 034's cover push — a recorded `video_id` is exactly
+        "there is a video to act on" — plus the sidecar this flow uploads.
+        """
+        if self.project is None:
+            return []
+        from noveltrans.youtube_upload import uploaded_video_id
+
+        windows = self._windows_for_current_selection()
+        mode = self.video_mode.currentData()
+        total = len(windows)
+        rows = []
+        for i, window in enumerate(windows):
+            whole_novel = total == 1 and mode == "all"
+            path = self._part_output_path(window, whole_novel=whole_novel)
+            srt = path.with_suffix(".srt")
+            if not uploaded_video_id(path) or not srt.is_file():
+                continue
+            rows.append((path, srt, "Toàn bộ" if whole_novel else f"Phần {i + 1}"))
+        return rows
+
+    def _start_subtitle_upload(self) -> None:
+        """Upload every eligible part's .srt as a YouTube subtitle track."""
+        from noveltrans.youtube_upload import SubtitleRequest, YouTubeUploadError
+
+        if self.project is None:
+            QMessageBox.information(self, "Tải phụ đề lên", "Chọn truyện trước.")
+            return
+        for worker in (
+            self._subtitle_upload_worker, self._upload_worker,
+            self._thumbnail_worker, self._playlist_worker,
+        ):
+            if worker is not None and worker.isRunning():
+                QMessageBox.information(
+                    self, "Tải phụ đề lên", "Đang có phiên trình duyệt khác chạy."
+                )
+                return
+
+        rows = self._subtitle_upload_rows()
+        if not rows:
+            QMessageBox.information(
+                self,
+                "Tải phụ đề lên",
+                "Không có phần nào đủ điều kiện — cần đã tải video lên YouTube VÀ có file "
+                ".srt (bấm “Tạo phụ đề (.srt)” trước).",
+            )
+            return
+
+        try:
+            requests = [
+                SubtitleRequest(video=path, subtitle=srt, label=label)
+                for path, srt, label in rows
+            ]
+            for request in requests:
+                request.validate()
+        except YouTubeUploadError as exc:
+            QMessageBox.warning(self, "Tải phụ đề lên", str(exc))
+            return
+
+        names = ", ".join(r.label for r in requests[:5])
+        more = f" (+{len(requests) - 5})" if len(requests) > 5 else ""
+        confirm = QMessageBox.question(
+            self,
+            "Tải phụ đề lên",
+            f"Sẽ tải phụ đề .srt lên {len(requests)} video đã đăng:\n{names}{more}\n\n"
+            "Phụ đề cũ cùng ngôn ngữ (nếu có) sẽ bị thay thế. Không đổi video, ảnh bìa "
+            "hay tiêu đề.\n\nMột cửa sổ Chrome sẽ mở ra và tự thao tác. Tiếp tục?",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        self._subtitle_upload_worker = SubtitleUploadWorker(requests, self)
+        self._subtitle_upload_worker.progress.connect(self._on_subtitle_upload_progress)
+        self._subtitle_upload_worker.finished_ok.connect(self._on_subtitle_upload_finished)
+        self._subtitle_upload_worker.failed.connect(self._on_subtitle_upload_failed)
+        self._subtitle_upload_worker.needs_login.connect(self._on_upload_needs_login)
+        track_worker(self._subtitle_upload_worker)
+
+        self.subtitle_upload_button.setEnabled(False)
+        self.upload_button.setEnabled(False)
+        self.thumbnail_update_button.setEnabled(False)
+        self.playlist_sync_button.setEnabled(False)
+        self.video_button.setEnabled(False)
+        self.upload_cancel_button.setEnabled(True)
+        self.progress.setMaximum(len(requests))
+        self.progress.setValue(0)
+        self.status_label.setText("💬 Bắt đầu tải phụ đề lên YouTube…")
+        self._subtitle_upload_worker.start()
+
+    def _on_subtitle_upload_progress(self, done: int, total: int, message: str) -> None:
+        self.progress.setMaximum(max(total, 1))
+        self.progress.setValue(done)
+        if message:
+            self.status_label.setText(f"💬 ({done}/{total}) {message}")
+
+    def _reset_subtitle_upload_ui(self) -> None:
+        self.subtitle_upload_button.setEnabled(True)
+        self.upload_button.setEnabled(True)
+        self.thumbnail_update_button.setEnabled(True)
+        self.playlist_sync_button.setEnabled(True)
+        self.video_button.setEnabled(True)
+        self.upload_cancel_button.setEnabled(False)
+        self._refresh_video_list()
+
+    def _on_subtitle_upload_finished(self, uploaded: int, errors: int) -> None:
+        self._reset_subtitle_upload_ui()
+        if uploaded and not errors:
+            self.status_label.setText(f"✅ Đã tải phụ đề lên {uploaded} video.")
+        elif uploaded:
+            self.status_label.setText(
+                f"⚠️ Đã tải phụ đề lên {uploaded} video, {errors} phần lỗi."
+            )
+        else:
+            self.status_label.setText("Không tải được phụ đề lên phần nào.")
+
+    def _on_subtitle_upload_failed(self, message: str) -> None:
+        self._reset_subtitle_upload_ui()
+        self.status_label.setText("")
+        QMessageBox.warning(self, "Tải phụ đề lên thất bại", message)
 
     # ------------------------------------------------------------- phụ đề .srt
 
@@ -2439,7 +2579,7 @@ class VideoTab(QWidget):
             use_translation=self.config.tts_use_translation,
             clean_text=self.config.tts_clean_text,
             clean_extra_remove=self.config.tts_clean_extra_remove,
-            gap_seconds=self.config.tts_gap,
+            gap_seconds=self.config.tts_gap_seconds,
             speed=self.config.tts_speed,
             parent=self,
         )
@@ -2863,6 +3003,12 @@ class VideoTab(QWidget):
         if self._subtitle_worker is not None and self._subtitle_worker.isRunning():
             self._subtitle_worker.cancel()
             self._subtitle_worker.wait(60_000)
+        if (
+            self._subtitle_upload_worker is not None
+            and self._subtitle_upload_worker.isRunning()
+        ):
+            self._subtitle_upload_worker.cancel()
+            self._subtitle_upload_worker.wait(60_000)
         if self._preview_worker is not None and self._preview_worker.isRunning():
             self._preview_worker.wait(60_000)
         if self._tags_worker is not None and self._tags_worker.isRunning():

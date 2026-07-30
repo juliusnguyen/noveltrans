@@ -2460,3 +2460,206 @@ class TestSubtitleWorker:
         path = self._project(library_dir, sample_meta, sample_refs, tmp_path)
         got = self._run(path)
         assert got["backfilled"] == 0
+
+    def test_start_subtitles_builds_a_worker_from_real_config_attributes(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        """Regression: `_start_subtitles` read `config.tts_gap`, which does not exist —
+        the property is `tts_gap_seconds`. It raised AttributeError the moment the button
+        was clicked.
+
+        042's tests drove `SubtitleWorker` directly, so the *worker* was covered and the
+        code that constructs it never ran. Same shape as 040's bug: testing the piece
+        instead of the call.
+        """
+        from noveltrans.gui import tab_video as tab_module
+        from noveltrans.gui.workers import SubtitleWorker
+
+        path = self._project(library_dir, sample_meta, sample_refs, tmp_path)
+        tab = VideoTab(_config(tmp_path))
+        tab.voice_combo.addItem("V", "V")
+        tab.voice_combo.setCurrentIndex(tab.voice_combo.findData("V"))
+        tab.video_mode.setCurrentIndex(tab.video_mode.findData("batch"))
+        tab.video_batch_size.setValue(2)
+        tab._on_project_selected(str(path))
+
+        tab.config.tts_gap_seconds = 0.55
+        tab.config.tts_speed = 1.15
+        monkeypatch.setattr(SubtitleWorker, "start", lambda self: None)
+        monkeypatch.setattr(tab_module, "track_worker", lambda *_a: None)
+
+        tab._start_subtitles()  # would have raised AttributeError
+
+        worker = tab._subtitle_worker
+        assert worker is not None
+        assert worker.gap_seconds == 0.55
+        assert worker.speed == 1.15
+        assert worker.voice == "V"
+        assert worker.batch_size == 2
+        tab._subtitle_worker = None
+        tab.shutdown()
+
+    def test_every_config_attribute_the_tab_reads_exists(self):
+        """A structural guard for the whole class of bug: any `self.config.X` in the Video
+        tab must be a real AppConfig attribute. Catches a typo at test time rather than on
+        the click that needs it."""
+        import inspect
+        import re
+
+        from noveltrans.config import AppConfig
+        from noveltrans.gui import tab_video as tab_module
+
+        used = set(re.findall(r"self\.config\.([a-z_][a-z0-9_]*)", inspect.getsource(tab_module)))
+        missing = sorted(n for n in used if not hasattr(AppConfig, n))
+        assert not missing, f"tab_video reads AppConfig attributes that don't exist: {missing}"
+
+
+class TestSubtitleUploadUi:
+    """Feature 044 — the "💬 Tải phụ đề lên" button."""
+
+    def _tab(self, tmp_path, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        for i in range(5):
+            project.save_audio(i, f"exports/audio/{i}.mp3", "V", 60.0)
+        path = project.path
+        project.close()
+        tab = VideoTab(_config(tmp_path))
+        tab.voice_combo.addItem("V", "V")
+        tab.voice_combo.setCurrentIndex(tab.voice_combo.findData("V"))
+        tab.video_mode.setCurrentIndex(tab.video_mode.findData("batch"))
+        tab.video_batch_size.setValue(2)
+        tab._on_project_selected(str(path))
+        return tab
+
+    def _part(self, tab, index, *, uploaded=True, srt=True):
+        from noveltrans.youtube_upload import STATE_PUBLISHED, write_upload_state
+
+        window = tab._windows_for_current_selection()[index]
+        out = tab._part_output_path(window, whole_novel=False)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"fake mp4")
+        if uploaded:
+            write_upload_state(out, status=STATE_PUBLISHED, video_id=f"vid{index}xxxxxxx")
+        if srt:
+            out.with_suffix(".srt").write_text("1\n00:00:00,000 --> 00:00:01,000\nx\n")
+        return out
+
+    def test_a_part_needs_both_a_video_and_an_srt(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._tab(tmp_path, library_dir, sample_meta, sample_refs)
+        self._part(tab, 0, uploaded=True, srt=True)
+        self._part(tab, 1, uploaded=True, srt=False)   # no subtitle file
+        self._part(tab, 2, uploaded=False, srt=True)   # not on YouTube
+        assert [label for _p, _s, label in tab._subtitle_upload_rows()] == ["Phần 1"]
+        tab.shutdown()
+
+    def test_nothing_eligible_starts_no_worker(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from PySide6.QtWidgets import QMessageBox
+
+        shown: list = []
+        monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: shown.append(a))
+        tab = self._tab(tmp_path, library_dir, sample_meta, sample_refs)
+        self._part(tab, 0, uploaded=True, srt=False)
+        tab._start_subtitle_upload()
+        assert shown and tab._subtitle_upload_worker is None
+        tab.shutdown()
+
+    def test_launching_builds_a_worker_and_locks_the_other_browser_runs_out(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        """`track_worker` is the real one here — the 033 signature bug, guarded."""
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.gui import keep_awake
+        from noveltrans.gui.workers import SubtitleUploadWorker
+
+        class _DummyManager:
+            def acquire(self):
+                pass
+
+            def release(self):
+                pass
+
+        monkeypatch.setattr(keep_awake, "_manager", _DummyManager())
+        monkeypatch.setattr(
+            QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes
+        )
+        started: list = []
+        monkeypatch.setattr(
+            SubtitleUploadWorker, "start", lambda self: started.append(self)
+        )
+
+        tab = self._tab(tmp_path, library_dir, sample_meta, sample_refs)
+        for i in range(2):
+            self._part(tab, i)
+        tab._start_subtitle_upload()
+
+        assert len(started) == 1
+        assert [r.label for r in tab._subtitle_upload_worker.requests] == ["Phần 1", "Phần 2"]
+        assert not tab.upload_button.isEnabled()
+        assert not tab.thumbnail_update_button.isEnabled()
+        assert not tab.playlist_sync_button.isEnabled()
+        assert not tab.subtitle_upload_button.isEnabled()
+        assert tab.upload_cancel_button.isEnabled()
+        tab._subtitle_upload_worker = None
+        tab.shutdown()
+
+    def test_declining_the_confirm_starts_nothing(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.gui.workers import SubtitleUploadWorker
+
+        monkeypatch.setattr(
+            QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.No
+        )
+        started: list = []
+        monkeypatch.setattr(
+            SubtitleUploadWorker, "start", lambda self: started.append(self)
+        )
+        tab = self._tab(tmp_path, library_dir, sample_meta, sample_refs)
+        self._part(tab, 0)
+        tab._start_subtitle_upload()
+        assert started == [] and tab._subtitle_upload_worker is None
+        tab.shutdown()
+
+    def test_the_cancel_button_stops_it(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._tab(tmp_path, library_dir, sample_meta, sample_refs)
+
+        class _Fake:
+            def __init__(self):
+                self.cancelled = False
+
+            def isRunning(self):
+                return True
+
+            def cancel(self):
+                self.cancelled = True
+
+        worker = _Fake()
+        tab._subtitle_upload_worker = worker
+        tab._cancel_upload()
+        assert worker.cancelled is True
+        tab._subtitle_upload_worker = None
+        tab.shutdown()
+
+    def test_the_finish_handler_restores_every_button(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._tab(tmp_path, library_dir, sample_meta, sample_refs)
+        for b in (
+            tab.subtitle_upload_button, tab.upload_button, tab.thumbnail_update_button,
+            tab.playlist_sync_button, tab.video_button,
+        ):
+            b.setEnabled(False)
+        tab._on_subtitle_upload_finished(2, 0)
+        assert tab.subtitle_upload_button.isEnabled()
+        assert tab.upload_button.isEnabled()
+        assert not tab.upload_cancel_button.isEnabled()
+        tab.shutdown()

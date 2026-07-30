@@ -100,3 +100,105 @@ def test_precision_dropdown_loads_and_saves(qapp, tmp_path):
     dialog.accept()
     assert config.tts_precision == "int8"
     assert SettingsDialog(config).tts_precision_combo.currentData() == "int8"
+
+
+class TestLibraryDirHistory:
+    """Feature 045 — remember previously-used library folders so they can be switched to."""
+
+    def _config(self, tmp_path):
+        from PySide6.QtCore import QSettings
+
+        from noveltrans.config import AppConfig
+
+        config = AppConfig()
+        config._s = QSettings(str(tmp_path / "s.ini"), QSettings.Format.IniFormat)
+        return config
+
+    def test_the_current_library_is_always_in_the_history(self, tmp_path):
+        """Even on a fresh install with nothing recorded — otherwise the dropdown would
+        open empty while a library is plainly in use."""
+        config = self._config(tmp_path)
+        assert str(config.library_dir) in config.library_dir_history
+
+    def test_setting_a_library_records_it(self, tmp_path):
+        config = self._config(tmp_path)
+        config.library_dir = tmp_path / "A"
+        config.library_dir = tmp_path / "B"
+        assert config.library_dir_history[:2] == [str(tmp_path / "B"), str(tmp_path / "A")]
+
+    def test_reusing_a_library_moves_it_to_the_front_without_duplicating(self, tmp_path):
+        config = self._config(tmp_path)
+        for name in ("A", "B", "A"):
+            config.library_dir = tmp_path / name
+        history = config.library_dir_history
+        assert history[0] == str(tmp_path / "A")
+        assert history.count(str(tmp_path / "A")) == 1
+
+    def test_the_history_is_capped(self, tmp_path):
+        from noveltrans.config import MAX_LIBRARY_HISTORY
+
+        config = self._config(tmp_path)
+        for i in range(MAX_LIBRARY_HISTORY + 5):
+            config.library_dir = tmp_path / f"lib{i}"
+        assert len(config.library_dir_history) == MAX_LIBRARY_HISTORY
+        assert config.library_dir_history[0] == str(tmp_path / f"lib{MAX_LIBRARY_HISTORY + 4}")
+
+    def test_an_empty_value_neither_blanks_the_library_nor_enters_the_history(self, tmp_path):
+        """An empty box on save must not strand the user with no library at all."""
+        config = self._config(tmp_path)
+        config.library_dir = tmp_path / "A"
+        config.library_dir = "   "
+        assert config.library_dir == tmp_path / "A"
+        assert "" not in config.library_dir_history
+
+    def test_a_settings_file_holding_one_entry_still_reads_as_a_list(self, tmp_path):
+        """QSettings collapses a one-item list to a bare string — read back as a string it
+        would iterate into single characters."""
+        config = self._config(tmp_path)
+        config._s.setValue("library_dir_history", "/only/one")
+        assert "/only/one" in config.library_dir_history
+        assert "/" not in config.library_dir_history  # not exploded into characters
+
+    def test_forgetting_removes_an_entry_but_never_the_active_one(self, tmp_path):
+        config = self._config(tmp_path)
+        config.library_dir = tmp_path / "A"
+        config.library_dir = tmp_path / "B"
+        config.forget_library_dir(str(tmp_path / "A"))
+        assert str(tmp_path / "A") not in config.library_dir_history
+        config.forget_library_dir(str(tmp_path / "B"))  # the active one
+        assert str(tmp_path / "B") in config.library_dir_history
+
+
+class TestLibraryDirDropdown:
+    def _dialog(self, qapp, tmp_path):
+        from PySide6.QtCore import QSettings
+
+        from noveltrans.config import AppConfig
+        from noveltrans.gui.settings_dialog import SettingsDialog
+
+        config = AppConfig()
+        config._s = QSettings(str(tmp_path / "s.ini"), QSettings.Format.IniFormat)
+        config.library_dir = tmp_path / "A"
+        config.library_dir = tmp_path / "B"
+        return SettingsDialog(config), config
+
+    def test_it_offers_the_history_with_the_current_one_selected(self, qapp, tmp_path):
+        dialog, config = self._dialog(qapp, tmp_path)
+        items = [dialog.library_edit.itemText(i) for i in range(dialog.library_edit.count())]
+        assert items[:2] == [str(tmp_path / "B"), str(tmp_path / "A")]
+        assert dialog.library_edit.currentText() == str(config.library_dir)
+
+    def test_a_path_not_in_the_list_can_still_be_typed(self, qapp, tmp_path):
+        """The list is an aid, not a gate — the same call made for the playlist picker."""
+        dialog, config = self._dialog(qapp, tmp_path)
+        assert dialog.library_edit.isEditable()
+        dialog.library_edit.setCurrentText(str(tmp_path / "brand-new"))
+        dialog.accept()
+        assert config.library_dir == tmp_path / "brand-new"
+        assert str(tmp_path / "brand-new") == config.library_dir_history[0]
+
+    def test_choosing_an_older_entry_switches_to_it(self, qapp, tmp_path):
+        dialog, config = self._dialog(qapp, tmp_path)
+        dialog.library_edit.setCurrentText(str(tmp_path / "A"))
+        dialog.accept()
+        assert config.library_dir == tmp_path / "A"

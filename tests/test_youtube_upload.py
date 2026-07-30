@@ -1740,9 +1740,15 @@ class _FakeNavPage:
             def first(self):
                 return self
 
+            @property
+            def last(self):
+                return self
+
             def is_visible(self, timeout=None):
                 # the error-text probe is the only is_visible caller in this path
-                return page._mode() == "error"
+                if any(t in selector for t in ("Oops, something went wrong", "Rất tiếc")):
+                    return page._mode() == "error"
+                return False
 
         return _Loc()
 
@@ -2014,3 +2020,899 @@ class TestPlaylistTitlesAreNamesNotCounts:
             rows=["75 videos\nTruyện Ma\nCông khai"], row_tag="ytcp-playlist-row"
         )
         assert _extract_playlist_titles(page) == ["Truyện Ma"]
+
+
+# A real cue line, not a placeholder: `_cue_probe` searches the editor for the .srt's own
+# first line, and a one-character cue is too short to search for.
+_SRT_TEXT = "1\n00:00:00,000 --> 00:00:01,000\nChương một: người khách lạ\n"
+
+
+class TestSubtitleRequestValidation:
+    """Feature 044 — uploading the .srt as a YouTube caption track."""
+
+    def test_a_part_never_uploaded_is_rejected(self, part, tmp_path):
+        from noveltrans.youtube_upload import SubtitleRequest
+
+        srt = tmp_path / "a.srt"
+        srt.write_text(_SRT_TEXT)
+        with pytest.raises(YouTubeUploadError, match="chưa có video"):
+            SubtitleRequest(video=part, subtitle=srt, label="Phần 1").validate()
+
+    def test_a_missing_srt_is_rejected(self, part, tmp_path):
+        from noveltrans.youtube_upload import SubtitleRequest
+
+        write_upload_state(part, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
+        with pytest.raises(YouTubeUploadError, match="phụ đề"):
+            SubtitleRequest(video=part, subtitle=tmp_path / "nope.srt").validate()
+
+    def test_an_empty_srt_is_rejected(self, part, tmp_path):
+        from noveltrans.youtube_upload import SubtitleRequest
+
+        write_upload_state(part, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
+        srt = tmp_path / "a.srt"
+        srt.write_text("")
+        with pytest.raises(YouTubeUploadError, match="rỗng"):
+            SubtitleRequest(video=part, subtitle=srt).validate()
+
+    def test_a_good_request_resolves_its_video_id(self, part, tmp_path):
+        from noveltrans.youtube_upload import SubtitleRequest
+
+        write_upload_state(part, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
+        srt = tmp_path / "a.srt"
+        srt.write_text(_SRT_TEXT)
+        request = SubtitleRequest(video=part, subtitle=srt)
+        request.validate()
+        assert request.resolve() == "dQw4w9WgXcQ"
+
+
+class _NativeFileWindow(RuntimeError):
+    """What a live run gets for clicking Continue outside `expect_file_chooser`.
+
+    Nothing raises this in production — the browser simply stops responding, forever, with
+    the OS file window on top of it. Raising here is how a test can see the hang at all.
+    """
+
+
+class _FakeSubtitlePage:
+    """A subtitles page: a file input appears only after N clicks, if at all.
+
+    Models the one thing the first live run proved matters: Continue opens an OS file
+    window. `native_chooser=True` makes this page behave like Studio does — clicking
+    Continue while an interception is armed yields a chooser, and clicking it unguarded
+    raises `_NativeFileWindow` where the real browser would just hang.
+    """
+
+    def __init__(self, *, clicks_to_input=1, published=True, lands_on=None,
+                 language_gate=False, gate_clears=True, native_chooser=False,
+                 cue="", editor_polls=0, caption_fields=0):
+        self.clicks_to_input = clicks_to_input
+        # The caption editor: `cue` is the text that only appears once it has loaded, after
+        # `editor_polls` polls. `caption_fields` is the structural fallback's answer.
+        self.cue = cue
+        self.editor_polls = editor_polls
+        self.caption_fields = caption_fields
+        self.published = published
+        self.lands_on = lands_on
+        # The gate seen live: a video with no language set shows "Set language" + Confirm
+        # instead of the subtitles table.
+        self.language_gate = language_gate
+        self.gate_clears = gate_clears
+        self.native_chooser = native_chooser
+        self.arming = False  # inside an expect_file_chooser block
+        self.chooser_opened = False
+        self.url = ""
+        self.clicks = 0
+        self.sent: list = []
+        self.clicked: list = []  # the selectors clicked, in order
+        self.goto_urls: list = []
+
+    def expect_file_chooser(self, timeout=None):
+        page = self
+
+        class _Expect:
+            def __enter__(self):
+                page.arming = True
+                return self
+
+            def __exit__(self, *exc):
+                page.arming = False
+                return False
+
+            @property
+            def value(self):
+                from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+                # No OS window on a page whose input already took the file — Studio moves
+                # straight on, and the expectation times out. That is a success, not a bug.
+                if not page.chooser_opened:
+                    raise PlaywrightTimeoutError("no file chooser")
+                return _Chooser(page)
+
+        class _Chooser:
+            def __init__(self, page):
+                self.page = page
+
+            def set_files(self, path):
+                self.page.sent.append(path)
+
+        return _Expect()
+
+    def goto(self, url, wait_until=None):
+        self.goto_urls.append(url)
+        self.url = self.lands_on if self.lands_on is not None else url
+
+    def wait_for_load_state(self, state=None, timeout=None):
+        pass
+
+    def wait_for_timeout(self, ms):
+        if self.editor_polls > 0:
+            self.editor_polls -= 1  # the editor finishes loading while we wait
+
+    def evaluate(self, script):
+        # `_editor_caption_fields` counts filled boxes; everything else wants labels.
+        if "let n = 0" in script:
+            return self.caption_fields
+        return ["ytcp-mystery×3"]
+
+    def locator(self, selector):
+        page = self
+        is_file = "input[type='file']" in selector
+        # `body:has-text(...)` is the Studio-error probe — this page is NOT an error page,
+        # so it must read False. Answering True there made every URL candidate look broken.
+        # Keyed off the error TEXT, not the selector shape: the probe moved from
+        # `body:has-text(...)` to `:text(...)` and a prefix check silently stopped working.
+        is_error_probe = any(
+            t in selector for t in ("Oops, something went wrong", "Rất tiếc")
+        )
+        # `:text(...)` reaches the same controls as `…:has-text(…)` — the tag-agnostic
+        # click added after the live run uses the former.
+        # `:text-is(...)` is the exact form `_choose_with_timing` prefers; it reaches the
+        # same controls as the other two.
+        texty = (
+            "has-text" in selector
+            or selector.startswith(":text(")
+            or selector.startswith(":text-is(")
+        )
+        is_confirm = texty and any(t in selector for t in ("Confirm", "Xác nhận"))
+        is_language = texty and any(
+            t in selector for t in ("Tiếng Việt", "Vietnamese", "Set language")
+        )
+        is_state = "has-text" in selector and any(
+            t in selector for t in ("Đã xuất bản", "Published")
+        )
+        is_continue = texty and any(t in selector for t in ("Continue", "Tiếp tục"))
+        is_button = texty and not is_state and not is_error_probe
+
+        class _Loc:
+            @property
+            def first(self):
+                return self
+
+            @property
+            def last(self):
+                return self
+
+            def wait_for(self, state=None, timeout=None):
+                from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+                if is_file and page.clicks >= page.clicks_to_input:
+                    return
+                raise PlaywrightTimeoutError(selector)
+
+            def is_visible(self, timeout=None):
+                if is_error_probe:
+                    return False
+                if page.cue and page.cue in selector:
+                    return page.editor_polls <= 0  # the editor is still loading
+                if is_confirm:
+                    return page.language_gate
+                if is_language:
+                    return page.language_gate  # only offered while the gate is up
+                if is_state:
+                    return page.published
+                return is_button
+
+            def inner_text(self, timeout=None):
+                # Whatever the selector asked for is what this element reads.
+                start = selector.find('("') + 2
+                return selector[start : selector.find('")', start)]
+
+            def locator(self, sub):
+                # Scoping a row and then searching inside it: the row selector narrows
+                # nothing on this page, so the inner selector is the whole question.
+                return page.locator(sub)
+
+            def click(self):
+                page.clicks += 1
+                page.clicked.append(selector)
+                if is_confirm and page.gate_clears:
+                    page.language_gate = False
+                if is_continue and page.native_chooser:
+                    if not page.arming:
+                        raise _NativeFileWindow(selector)  # a live run would hang here
+                    page.chooser_opened = True
+
+            def set_input_files(self, path):
+                page.sent.append(path)
+
+        return _Loc()
+
+
+class TestSubtitleUploadFlow:
+    def _request(self, part, tmp_path):
+        from noveltrans.youtube_upload import SubtitleRequest
+
+        write_upload_state(part, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
+        srt = tmp_path / "a.srt"
+        srt.write_text(_SRT_TEXT)
+        return SubtitleRequest(video=part, subtitle=srt, label="Phần 1")
+
+    def test_it_clicks_through_to_the_file_input_and_sends_the_srt(self, part, tmp_path):
+        from noveltrans.youtube_upload import upload_subtitle_one
+
+        page = _FakeSubtitlePage(clicks_to_input=2)
+        assert upload_subtitle_one(page, self._request(part, tmp_path)) == "dQw4w9WgXcQ"
+        assert page.sent == [str(tmp_path / "a.srt")]
+
+    def test_continue_is_never_clicked_outside_the_chooser_interception(
+        self, part, tmp_path
+    ):
+        """The first live hang, and the reason this flow exists in its current shape.
+
+        Studio's Continue opens the OS file window. Playwright can only intercept that
+        while `expect_file_chooser` is armed; unguarded, the native window sits on top of
+        the browser and the run waits for it forever — no exception, no timeout, just a
+        stopped app. The old code set an input directly and *then* clicked Continue, so a
+        page whose real picker lives behind the button hung every time.
+        """
+        from noveltrans.youtube_upload import upload_subtitle_one
+
+        page = _FakeSubtitlePage(clicks_to_input=2, native_chooser=True)
+        assert upload_subtitle_one(page, self._request(part, tmp_path)) == "dQw4w9WgXcQ"
+        assert page.sent  # and no _NativeFileWindow escaped
+
+    def test_the_file_still_lands_when_only_the_os_window_can_take_it(
+        self, part, tmp_path
+    ):
+        """No reachable input at all — the interception is then the only way in."""
+        from noveltrans.youtube_upload import upload_subtitle_one
+
+        page = _FakeSubtitlePage(clicks_to_input=99, native_chooser=True)
+        assert upload_subtitle_one(page, self._request(part, tmp_path)) == "dQw4w9WgXcQ"
+        assert page.sent == [str(tmp_path / "a.srt")]
+
+    def test_never_reaching_a_file_input_reports_the_dom(self, part, tmp_path):
+        """The 039 lesson: a failure has to name the components actually on the page, not
+        say "giao diện có thể đã thay đổi" and leave the reader guessing."""
+        from noveltrans.youtube_upload import upload_subtitle_one
+
+        page = _FakeSubtitlePage(clicks_to_input=99)
+        with pytest.raises(YouTubeUploadError, match="ytcp-mystery"):
+            upload_subtitle_one(page, self._request(part, tmp_path))
+        assert page.sent == []
+
+    def test_the_draft_is_opened_for_editing_before_publish_is_pressed(
+        self, part, tmp_path
+    ):
+        """MEASURED live: the upload only creates a draft — Studio says "Vietnamese
+        subtitles uploaded" and the track stays unpublished. Publish lives in the caption
+        editor, behind "Edit subtitles"; pressing it on the translations page pressed
+        nothing at all."""
+        from noveltrans.youtube_upload import upload_subtitle_one
+
+        page = _FakeSubtitlePage(clicks_to_input=1)
+        upload_subtitle_one(page, self._request(part, tmp_path))
+        edit = next(i for i, s in enumerate(page.clicked) if "Edit subtitles" in s)
+        # Vietnamese first in `_SUB_PUBLISH_TEXTS`, so that is the label tried first.
+        publish = next(
+            i for i, s in enumerate(page.clicked) if "Xuất bản" in s or "Publish" in s
+        )
+        assert edit < publish
+
+    def test_publish_waits_for_the_editor_to_load_the_cues(self, part, tmp_path):
+        """MEASURED live: Publish on a still-loading editor publishes an EMPTY track and
+        Studio answers "no subtitles". The click is not a no-op, so being early here costs
+        the track — it is the one step where slow beats eager."""
+        from noveltrans.youtube_upload import _cue_probe, upload_subtitle_one
+
+        request = self._request(part, tmp_path)
+        page = _FakeSubtitlePage(
+            clicks_to_input=1, cue=_cue_probe(request.subtitle), editor_polls=3
+        )
+        upload_subtitle_one(page, request)
+        assert page.editor_polls == 0  # it really waited, rather than pressing on
+        assert any("Xuất bản" in s or "Publish" in s for s in page.clicked)
+
+    def test_an_editor_that_never_loads_is_not_published_at_all(self, part, tmp_path):
+        """The safe end of the same rule: no cues on screen, no Publish click. The .srt is
+        already in Studio as a draft, so refusing costs nothing and pressing costs the
+        track."""
+        from noveltrans.youtube_upload import _cue_probe, upload_subtitle_one
+
+        request = self._request(part, tmp_path)
+        page = _FakeSubtitlePage(
+            clicks_to_input=1, cue=_cue_probe(request.subtitle), editor_polls=10**6
+        )
+        with pytest.raises(YouTubeUploadError, match="không tải xong"):
+            upload_subtitle_one(page, request)
+        assert not any("Xuất bản" in s or "Publish" in s for s in page.clicked)
+        assert "subtitle_uploaded_at" not in read_upload_state(part)
+
+    def test_a_dense_caption_table_is_enough_when_the_cue_cannot_be_searched(
+        self, part, tmp_path
+    ):
+        """The structural fallback, for a .srt whose first line is too short to probe with:
+        a loaded editor carries a text box and two timestamps per cue, the list page it was
+        opened from carries none."""
+        from noveltrans.youtube_upload import upload_subtitle_one
+
+        request = self._request(part, tmp_path)
+        request.subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\nÀ\n")
+        page = _FakeSubtitlePage(clicks_to_input=1, cue="never-visible", caption_fields=9)
+        upload_subtitle_one(page, request)
+        assert any("Xuất bản" in s or "Publish" in s for s in page.clicked)
+
+    def test_an_unconfirmed_publish_says_the_track_is_still_a_draft(self, part, tmp_path):
+        """The failure a user can act on: the file IS in Studio, it just is not live. The
+        message has to say that and name the two clicks that finish it by hand."""
+        from noveltrans.youtube_upload import upload_subtitle_one
+
+        page = _FakeSubtitlePage(clicks_to_input=1, published=False)
+        with pytest.raises(YouTubeUploadError, match="bản nháp"):
+            upload_subtitle_one(page, self._request(part, tmp_path))
+
+    def test_an_unconfirmed_publish_is_a_failure_not_a_success(self, part, tmp_path):
+        """Same posture as 034's save gate: report a track because Studio says it exists,
+        never because a click was made."""
+        from noveltrans.youtube_upload import upload_subtitle_one
+
+        page = _FakeSubtitlePage(clicks_to_input=1, published=False)
+        with pytest.raises(YouTubeUploadError, match="không xác nhận"):
+            upload_subtitle_one(page, self._request(part, tmp_path))
+
+    def test_nothing_is_recorded_when_the_publish_is_not_confirmed(self, part, tmp_path):
+        from noveltrans.youtube_upload import upload_subtitle_one
+
+        page = _FakeSubtitlePage(clicks_to_input=1, published=False)
+        with pytest.raises(YouTubeUploadError):
+            upload_subtitle_one(page, self._request(part, tmp_path))
+        assert "subtitle_uploaded_at" not in read_upload_state(part)
+
+    def test_success_records_only_the_subtitle_fields(self, part, tmp_path):
+        """A caption upload cannot change publication state, so writing one would be a lie."""
+        from noveltrans.youtube_upload import upload_subtitle_one
+
+        page = _FakeSubtitlePage(clicks_to_input=1)
+        upload_subtitle_one(page, self._request(part, tmp_path))
+        state = read_upload_state(part)
+        assert state["status"] == STATE_PUBLISHED
+        assert state["video_id"] == "dQw4w9WgXcQ"
+        assert state["subtitle_uploaded_at"] and state["subtitle_file"] == "a.srt"
+
+    def test_a_logged_out_bounce_raises_needs_login(self, part, tmp_path):
+        from noveltrans.youtube_upload import upload_subtitle_one
+
+        page = _FakeSubtitlePage(lands_on="https://accounts.google.com/signin")
+        with pytest.raises(YouTubeUploadError) as excinfo:
+            upload_subtitle_one(page, self._request(part, tmp_path))
+        assert excinfo.value.needs_login is True
+
+    def test_it_tries_the_next_url_shape_when_studio_errors(self, part, tmp_path):
+        """Built in from the start this time rather than after three failed live runs."""
+        import noveltrans.youtube_upload as mod
+
+        page = _FakeSubtitlePage(clicks_to_input=1)
+        seen = {"n": 0}
+
+        def fake_error(_p):
+            seen["n"] += 1
+            return seen["n"] == 1  # the first URL renders Studio's error page
+
+        original = mod._page_shows_studio_error
+        mod._page_shows_studio_error = fake_error
+        try:
+            mod.upload_subtitle_one(page, self._request(part, tmp_path))
+        finally:
+            mod._page_shows_studio_error = original
+        assert len(page.goto_urls) == 2
+
+
+class TestSubtitleLanguageGate:
+    """Regression from the first live run.
+
+    `/translations` loaded correctly, but the video had no language set, so YouTube showed
+    a "Set language" dropdown and a Confirm button INSTEAD of the subtitles table. There is
+    no file input until that is answered — so the click ladder found nothing and blamed the
+    selectors for a page that was working exactly as designed.
+    """
+
+    def _request(self, part, tmp_path):
+        from noveltrans.youtube_upload import SubtitleRequest
+
+        write_upload_state(part, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
+        srt = tmp_path / "a.srt"
+        srt.write_text(_SRT_TEXT)
+        return SubtitleRequest(video=part, subtitle=srt, label="Phần 1")
+
+    def test_the_gate_is_detected_by_its_confirm_button(self):
+        from noveltrans.youtube_upload import _subtitle_language_gate
+
+        assert _subtitle_language_gate(_FakeSubtitlePage(language_gate=True)) is True
+        assert _subtitle_language_gate(_FakeSubtitlePage(language_gate=False)) is False
+
+    def test_it_answers_the_gate_and_carries_on_to_upload(self, part, tmp_path):
+        from noveltrans.youtube_upload import upload_subtitle_one
+
+        page = _FakeSubtitlePage(language_gate=True, clicks_to_input=3)
+        assert upload_subtitle_one(page, self._request(part, tmp_path)) == "dQw4w9WgXcQ"
+        assert page.sent == [str(tmp_path / "a.srt")]
+        assert page.language_gate is False  # it was actually answered, not skipped
+
+    def test_a_gate_that_will_not_clear_says_what_to_do_by_hand(self, part, tmp_path):
+        """Refuses with instructions rather than sending a file into a page that cannot
+        accept one."""
+        from noveltrans.youtube_upload import YouTubeUploadError, upload_subtitle_one
+
+        page = _FakeSubtitlePage(language_gate=True, gate_clears=False)
+        with pytest.raises(YouTubeUploadError, match="chưa đặt ngôn ngữ"):
+            upload_subtitle_one(page, self._request(part, tmp_path))
+        assert page.sent == []
+
+    def test_a_video_without_the_gate_is_untouched_by_it(self, part, tmp_path):
+        from noveltrans.youtube_upload import upload_subtitle_one
+
+        page = _FakeSubtitlePage(language_gate=False, clicks_to_input=1)
+        upload_subtitle_one(page, self._request(part, tmp_path))
+        assert page.sent == [str(tmp_path / "a.srt")]
+
+
+class TestFailureDiagnostics:
+    """A click ladder fails because the label it wants isn't there. The diagnostic that
+    resolves that is the list of labels that ARE — not the component tags, which answer a
+    different question."""
+
+    class _Page:
+        def __init__(self, labels=("Confirm", "Set language"), tags=("ytcp-app×1",)):
+            self.labels = list(labels)
+            self.tags = list(tags)
+
+        def evaluate(self, script):
+            return self.labels if "getBoundingClientRect" in script else self.tags
+
+    def test_it_lists_the_visible_clickable_labels(self):
+        from noveltrans.youtube_upload import _page_actions
+
+        assert "Confirm" in _page_actions(self._Page())
+        assert "Set language" in _page_actions(self._Page())
+
+    def test_it_never_raises_on_a_hostile_page(self):
+        from noveltrans.youtube_upload import _page_actions
+
+        class _Broken:
+            def evaluate(self, script):
+                raise RuntimeError("nope")
+
+        assert "không đọc được" in _page_actions(_Broken())
+
+    def test_an_empty_page_says_so_rather_than_returning_nothing(self):
+        from noveltrans.youtube_upload import _page_actions
+
+        assert "không có nút" in _page_actions(self._Page(labels=[]))
+
+    def test_every_subtitle_failure_path_carries_the_labels(self):
+        """No failure in this flow may say only "giao diện có thể đã thay đổi" — that was
+        the 039 mistake and it cost three rounds. Checked across the whole flow, since the
+        dialog handling moved out of `upload_subtitle_one` into `_send_subtitle_file`."""
+        import inspect
+
+        from noveltrans import youtube_upload as mod
+
+        src = "".join(
+            inspect.getsource(f)
+            for f in (mod.upload_subtitle_one, mod._send_subtitle_file)
+        )
+        assert src.count("_page_actions(page)") >= 3
+        assert src.count("_dom_inventory(page)") >= 3
+
+
+class TestClickTextAnywhere:
+    """Regression: the live failure was a DROPDOWN reading "Set language".
+
+    `_click_by_text` only searches `ytcp-button` / `tp-yt-paper-button` / `button`, so a
+    control that is none of those was invisible to it — and the id guesses missed too. The
+    run sat on a page whose control was plainly on screen.
+    """
+
+    class _Page:
+        """Only `:text(...)` selectors resolve here — button-scoped ones do not, exactly
+        as a non-button control behaves live."""
+
+        def __init__(self, *, texts=("Set language",)):
+            self.texts = list(texts)
+            self.clicked: list = []
+
+        def locator(self, selector):
+            page = self
+
+            class _Loc:
+                @property
+                def last(self):
+                    return self
+
+                @property
+                def first(self):
+                    return self
+
+                def _matches(self):
+                    if not selector.startswith(":text("):
+                        return False  # a button-scoped selector finds nothing here
+                    return any(t in selector for t in page.texts)
+
+                def is_visible(self, timeout=None):
+                    return self._matches()
+
+                def click(self):
+                    page.clicked.append(selector)
+
+            return _Loc()
+
+    def test_it_clicks_a_control_that_is_not_a_button(self):
+        from noveltrans.youtube_upload import _click_text_anywhere
+
+        page = self._Page()
+        assert _click_text_anywhere(page, ("Set language",)) is True
+        assert page.clicked and ":text(" in page.clicked[0]
+
+    def test_the_button_only_search_would_have_missed_it(self):
+        """Pins why the extra helper exists — remove it and this control is unreachable."""
+        from noveltrans.youtube_upload import _click_by_text
+
+        page = self._Page()
+        assert _click_by_text(page, ("Set language",)) is False
+        assert page.clicked == []
+
+    def test_it_reports_failure_when_the_text_is_absent(self):
+        from noveltrans.youtube_upload import _click_text_anywhere
+
+        page = self._Page(texts=())
+        assert _click_text_anywhere(page, ("Set language",)) is False
+
+    def test_it_uses_last_so_it_lands_on_the_innermost_element(self):
+        """`:text()` matches the smallest element containing the text; `.last` keeps the
+        control itself rather than a wrapper that merely contains it."""
+        import inspect
+
+        from noveltrans import youtube_upload as mod
+
+        src = inspect.getsource(mod._click_text_anywhere)
+        assert '.last' in src
+
+    def test_every_gate_step_falls_back_to_it(self):
+        """All three steps — open the dropdown, pick the language, press Confirm — must
+        survive a non-button control, not just the one that failed live."""
+        import inspect
+
+        from noveltrans import youtube_upload as mod
+
+        gate = inspect.getsource(mod._answer_subtitle_language_gate)
+        pick = inspect.getsource(mod._pick_vietnamese)
+        assert gate.count("_click_text_anywhere") == 2  # open + confirm
+        assert pick.count("_click_text_anywhere") == 2  # item, and item-after-search
+
+
+class TestPickVietnameseOnAnEnglishList:
+    """Regression, measured live: the Languages page renders in ENGLISH even with `?hl=vi`.
+
+        :text("Tiếng Việt")   matches=0
+        :text("Vietnamese")   matches=1  visible
+
+    The old code typed "Tiếng Việt" into the dropdown's search box before looking, which
+    filtered the English list to nothing — so the item it then searched for genuinely did
+    not exist, and the run parked on the page with Confirm greyed out.
+    """
+
+    class _Page:
+        def __init__(self, *, offers=("Vietnamese",), has_search=False):
+            self.offers = list(offers)
+            self.has_search = has_search
+            self.typed: list = []
+            self.clicked: list = []
+
+        @property
+        def keyboard(self):
+            page = self
+
+            class _Kb:
+                def press(self, key):
+                    pass
+
+                def type(self, text, delay=None):
+                    page.typed.append(text)
+                    # a search box filters the list to what actually matches
+                    page.offers = [o for o in page.offers if text.lower() in o.lower()]
+
+            return _Kb()
+
+        def wait_for_timeout(self, ms):
+            pass
+
+        def locator(self, selector):
+            page = self
+
+            class _Loc:
+                @property
+                def first(self):
+                    return self
+
+                @property
+                def last(self):
+                    return self
+
+                def is_visible(self, timeout=None):
+                    return any(f'"{o}"' in selector for o in page.offers)
+
+                def wait_for(self, state=None, timeout=None):
+                    from playwright.sync_api import (
+                        TimeoutError as PlaywrightTimeoutError,
+                    )
+
+                    if "search-input" in selector and page.has_search:
+                        return
+                    raise PlaywrightTimeoutError(selector)
+
+                def click(self):
+                    page.clicked.append(selector)
+
+            return _Loc()
+
+    def test_it_finds_the_english_name_when_the_vietnamese_one_is_absent(self):
+        from noveltrans.youtube_upload import _pick_vietnamese
+
+        page = self._Page(offers=("Vietnamese",))
+        assert _pick_vietnamese(page) is True
+        assert any("Vietnamese" in c for c in page.clicked)
+
+    def test_it_does_not_type_into_the_search_box_before_looking(self):
+        """The bug in one assertion: typing first is what emptied the list."""
+        from noveltrans.youtube_upload import _pick_vietnamese
+
+        page = self._Page(offers=("Vietnamese",), has_search=True)
+        assert _pick_vietnamese(page) is True
+        assert page.typed == []
+
+    def test_it_still_uses_the_search_box_for_a_list_that_needs_one(self):
+        from noveltrans.youtube_upload import _pick_vietnamese
+
+        page = self._Page(offers=(), has_search=True)
+        page.offers = []  # nothing on screen until searched
+        assert _pick_vietnamese(page) is False
+        assert page.typed  # it did try the search box
+
+    def test_it_searches_for_the_same_name_it_then_looks_for(self):
+        """Typing one name and looking for another is exactly what broke live."""
+        import inspect
+
+        from noveltrans import youtube_upload as mod
+
+        src = inspect.getsource(mod._pick_vietnamese)
+        # inside the search loop, both the type and the click use the loop variable
+        assert "page.keyboard.type(text" in src
+        assert "_click_text_anywhere(page, (text,)" in src
+
+    def test_the_vietnamese_names_include_the_english_form(self):
+        from noveltrans.youtube_upload import _VIETNAMESE_TEXTS
+
+        assert "Vietnamese" in _VIETNAMESE_TEXTS
+
+
+class TestSubtitleEditRowScoping:
+    """The translations page lists one row per language, and `_click_text_anywhere` takes
+    `.last` — so on a video that already carries an English track, the page-wide click for
+    "Edit subtitles" opens the English row and publishes somebody else's captions."""
+
+    class _Page:
+        def __init__(self, *, has_vi_row=True):
+            self.has_vi_row = has_vi_row
+            self.clicked: list = []
+
+        def locator(self, selector):
+            page = self
+            is_row = "[role='row']" in selector
+            vi = any(t in selector for t in ("Tiếng Việt", "Vietnamese"))
+
+            class _InRow:
+                @property
+                def first(self):
+                    return self
+
+                def is_visible(self, timeout=None):
+                    return page.has_vi_row and vi
+
+                def click(self):
+                    page.clicked.append("vi-row")
+
+            class _Loc:
+                @property
+                def first(self):
+                    return self
+
+                @property
+                def last(self):
+                    return self
+
+                def locator(self, sub):
+                    return _InRow()
+
+                def is_visible(self, timeout=None):
+                    # The page-wide text search always finds a control; it is the LAST
+                    # row's, which is the whole problem.
+                    return not is_row
+
+                def click(self):
+                    page.clicked.append("last-row")
+
+            return _Loc()
+
+    def test_the_vietnamese_row_wins_over_the_last_row_on_the_page(self):
+        from noveltrans.youtube_upload import _click_subtitle_edit
+
+        page = self._Page()
+        assert _click_subtitle_edit(page) is True
+        assert page.clicked == ["vi-row"]
+
+    def test_a_page_with_no_such_row_still_gets_its_editor_opened(self):
+        """Scoping is a preference, not a gate — one-row videos are the common case."""
+        from noveltrans.youtube_upload import _click_subtitle_edit
+
+        page = self._Page(has_vi_row=False)
+        assert _click_subtitle_edit(page) is True
+        assert page.clicked == ["last-row"]
+
+
+def _body_of(name: str) -> str:
+    """The source of `youtube_upload.<name>` with its docstring removed.
+
+    Order-of-operations tests read the source, and a docstring that *describes* the order
+    made them pass or fail on prose rather than code — the rewrite that fixed the hang
+    tripped two of them by explaining itself.
+    """
+    import inspect
+
+    from noveltrans import youtube_upload as mod
+
+    src = inspect.getsource(getattr(mod, name))
+    head, sep, rest = src.partition('"""')
+    return head + rest.partition('"""')[2] if sep else src
+
+
+class TestMeasuredUploadDialog:
+    """Feature 044, measured — the labels four rounds of guessing never found.
+
+    The post-gate page offers `Edit subtitles | Upload manual | Add language`. "Upload
+    file", which every earlier attempt assumed, does not exist anywhere on it.
+    """
+
+    def test_upload_manual_is_the_label_that_exists(self):
+        from noveltrans.youtube_upload import _SUB_UPLOAD_TEXTS
+
+        assert "Upload manual" in _SUB_UPLOAD_TEXTS
+        assert _SUB_UPLOAD_TEXTS[0] == "Upload manual"  # tried first
+
+    def test_the_timing_branch_keeps_our_timings(self):
+        """"Without timing" would make YouTube re-align by speech recognition and discard
+        the exact boundaries feature 040 captured from the TTS run."""
+        from noveltrans.youtube_upload import _SUB_WITH_TIMING_TEXTS
+
+        assert _SUB_WITH_TIMING_TEXTS[0] == "With timing"
+        assert not any("Without" in t for t in _SUB_WITH_TIMING_TEXTS)
+
+    def test_continue_is_its_own_step(self):
+        from noveltrans.youtube_upload import _SUB_CONTINUE_TEXTS
+
+        assert "Continue" in _SUB_CONTINUE_TEXTS
+
+    def test_the_dialog_is_driven_in_the_measured_order(self):
+        """upload -> timing -> file input -> continue. Any other order fails live."""
+        src = _body_of("_send_subtitle_file")
+        assert src.index("_SUB_UPLOAD_TEXTS") < src.index("_choose_with_timing")
+        assert src.index("_choose_with_timing") < src.index("set_input_files")
+
+    def test_a_video_input_is_never_handed_the_srt(self):
+        """Studio's shell carries file inputs for videos and thumbnails too. Feeding one of
+        those an .srt is not a harmless no-op — it starts an upload of the wrong thing."""
+        from noveltrans.youtube_upload import _input_takes_subtitles
+
+        class _Input:
+            def __init__(self, accept):
+                self.accept = accept
+
+            def get_attribute(self, name, timeout=None):
+                return self.accept
+
+        assert _input_takes_subtitles(_Input("video/*")) is False
+        assert _input_takes_subtitles(_Input("image/jpeg,image/png")) is False
+        assert _input_takes_subtitles(_Input(".srt,.sbv,.vtt")) is True
+        assert _input_takes_subtitles(_Input(None)) is True  # no claim -> scoping decides
+
+    def test_the_vietnamese_label_cannot_select_without_timing(self):
+        """`:text()` is a case-insensitive SUBSTRING match and `_click_text_anywhere` takes
+        `.last` — so on a Vietnamese dialog `Có mã thời gian` also matches "**Không** có mã
+        thời gian", the radio that throws our timings away, and it is the later of the two.
+        """
+        from noveltrans.youtube_upload import _choose_with_timing
+
+        class _Page:
+            """Both radios are present; the exact form only reaches the right one."""
+
+            def __init__(self):
+                self.clicked: list = []
+
+            def locator(self, selector):
+                page = self
+                # The exact form does not match the longer label; the substring form does.
+                exact = selector.startswith(":text-is(")
+                start = selector.find('("') + 2
+                wanted = selector[start : selector.find('")', start)]
+                reads = wanted if exact else f"Không {wanted.lower()}"
+
+                class _Loc:
+                    @property
+                    def first(self):
+                        return self
+
+                    def is_visible(self, timeout=None):
+                        return wanted in ("Có mã thời gian", "Có thời gian")
+
+                    def inner_text(self, timeout=None):
+                        return reads
+
+                    def click(self):
+                        page.clicked.append(reads)
+
+                return _Loc()
+
+        page = _Page()
+        assert _choose_with_timing(page) is True
+        assert page.clicked == ["Có mã thời gian"]
+
+    def test_the_cue_probe_is_the_first_spoken_line(self, tmp_path):
+        """Not the index, not the `-->` timings, and never a double quote — the snippet
+        goes straight into a `:text("…")` selector."""
+        from noveltrans.youtube_upload import _cue_probe
+
+        srt = tmp_path / "a.srt"
+        srt.write_text('1\n00:00:00,000 --> 00:00:02,000\nĐêm ấy trời "mưa" rất to\n')
+        assert _cue_probe(srt) == "Đêm ấy trời"
+
+        srt.write_text("1\n00:00:00,000 --> 00:00:02,000\nÀ\n")
+        assert _cue_probe(srt) == ""  # too short to search for; the field count answers
+
+        assert _cue_probe(tmp_path / "missing.srt") == ""
+
+    def test_the_editor_is_waited_for_before_publish_is_pressed(self):
+        """Structural half of the "no subtitles" fix: no reordering may put the Publish
+        click above the wait."""
+        src = _body_of("_publish_subtitle_track")
+        assert src.index("_wait_for_subtitle_editor") < src.index("_SUB_PUBLISH_TEXTS")
+        assert src.index("_click_subtitle_edit") < src.index("_wait_for_subtitle_editor")
+
+    def test_the_file_input_is_set_directly_before_falling_back_to_a_chooser(self):
+        """Setting a hidden input needs no OS dialog to intercept; the chooser path stays
+        for a build with no reachable input."""
+        src = _body_of("_send_subtitle_file")
+        assert src.index("set_input_files") < src.index("expect_file_chooser")
+
+    def test_every_continue_click_is_inside_the_chooser_interception(self):
+        """The structural half of the hang regression. The behavioural test proves the
+        current path is safe; this one stops a future edit from adding a second, unguarded
+        Continue click somewhere else in the function — which is precisely the shape the
+        bug had: set an input, then press Continue with nothing armed to catch the OS
+        window."""
+        src = _body_of("_send_subtitle_file")
+        guard = src.index("expect_file_chooser")
+        clicks, at = [], src.find("_click_text_anywhere(page, _SUB_CONTINUE_TEXTS")
+        while at != -1:
+            clicks.append(at)
+            at = src.find("_click_text_anywhere(page, _SUB_CONTINUE_TEXTS", at + 1)
+        assert clicks, "the Continue click disappeared — this test is now checking nothing"
+        assert all(at > guard for at in clicks)

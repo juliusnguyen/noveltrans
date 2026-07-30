@@ -1153,6 +1153,66 @@ class VideoWorker(QThread):
             pass
 
 
+class SubtitleUploadWorker(QThread):
+    """Upload each part's `.srt` to its YouTube video, in one browser session.
+
+    Signal-for-signal a sibling of YouTubeThumbnailWorker, so the Video tab drives all four
+    browser runs with one set of handlers and one cancel button.
+    """
+
+    progress = Signal(int, int, str)
+    part_done = Signal(int, str, str)  # index, label ("" on failure), error
+    finished_ok = Signal(int, int)  # uploaded, failed
+    failed = Signal(str)
+    needs_login = Signal(str)
+
+    def __init__(self, requests: list, parent=None):
+        super().__init__(parent)
+        self.requests = list(requests)
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        from noveltrans.youtube_upload import (
+            UploadCancelled,
+            YouTubeUploadError,
+            upload_subtitle_batch,
+        )
+
+        total = len(self.requests)
+        done = 0
+        errors = 0
+
+        def on_part_done(index: int, label: str, error: str) -> None:
+            nonlocal done, errors
+            done += 1
+            if error:
+                errors += 1
+            self.part_done.emit(index, label or "", error)
+            name = self.requests[index].label or f"phần {index + 1}"
+            self.progress.emit(done, total, f"{name}: {'lỗi' if error else 'xong'}")
+
+        try:
+            upload_subtitle_batch(
+                self.requests,
+                on_progress=lambda msg: self.progress.emit(done, total, msg),
+                on_part_done=on_part_done,
+                should_cancel=lambda: self._cancelled,
+            )
+        except UploadCancelled:
+            # Nothing half-done survives: a track is published or it isn't, and an
+            # unfinished one leaves the video exactly as it was.
+            self.failed.emit(f"Đã dừng tải phụ đề. {done} phần đã xong vẫn giữ phụ đề.")
+        except YouTubeUploadError as exc:
+            (self.needs_login if exc.needs_login else self.failed).emit(str(exc))
+        except Exception as exc:
+            self.failed.emit(repr(exc))
+        else:
+            self.finished_ok.emit(done - errors, errors)
+
+
 class SubtitleWorker(QThread):
     """Write each part's `.srt`, backfilling missing cues from the audio first.
 
