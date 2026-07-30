@@ -10,6 +10,7 @@ from __future__ import annotations
 from PySide6.QtCore import QEvent, Qt, QUrl
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
+    QApplication,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -33,6 +34,13 @@ class MainWindow(QMainWindow):
         self.config = config
         self.setWindowTitle("NovelTrans")
         self.resize(1000, 700)
+
+        # Flipped on by TrayController once a menu-bar icon actually installs. Defaults
+        # off so that with no system tray the close button still really quits — with
+        # `setQuitOnLastWindowClosed(False)` in app.py, the other way round would leave
+        # the app running with no window and no way to get back to it.
+        self.hide_to_tray_enabled = False
+        self._shut_down = False
 
         # one shared state file across all workspaces; a project path may be open in at
         # most one workspace at a time (the guard below enforces it)
@@ -91,6 +99,14 @@ class MainWindow(QMainWindow):
         settings_action.triggered.connect(self._open_settings)
         library_action = QAction("&Mở thư mục thư viện", self)
         library_action.triggered.connect(self._open_library)
+        # QuitRole makes THIS the macOS app-menu Quit item, so ⌘Q, the popup's "Thoát"
+        # and app.quit() all land on the same path instead of three different ones.
+        # Kept on self: macOS moves a QuitRole action into the native application menu,
+        # so the menu bar is not a reliable place to find it again.
+        self.quit_action = QAction("&Thoát", self)
+        self.quit_action.setMenuRole(QAction.MenuRole.QuitRole)
+        self.quit_action.setShortcut(QKeySequence("Ctrl+Q"))  # Qt maps Ctrl→⌘ on macOS
+        self.quit_action.triggered.connect(self.quit_app)
 
         menu = self.menuBar().addMenu("&App")
         menu.addAction(new_action)
@@ -98,6 +114,8 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         menu.addAction(settings_action)
         menu.addAction(library_action)
+        menu.addSeparator()
+        menu.addAction(self.quit_action)
 
     # ----------------------------------------------------------- workspaces
 
@@ -134,7 +152,8 @@ class MainWindow(QMainWindow):
             answer = QMessageBox.question(
                 self,
                 "Đang chạy",
-                "Truyện này đang tải/dịch/tạo audio. Đóng tab và huỷ tiến trình?",
+                "Truyện này đang tải/dịch/tạo audio (kể cả khi đang tạm dừng). "
+                "Đóng tab và huỷ tiến trình?",
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
@@ -220,10 +239,47 @@ class MainWindow(QMainWindow):
         library_dir.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(library_dir)))
 
-    def closeEvent(self, event) -> None:
-        self.config.window_geometry = self.saveGeometry()
+    # -------------------------------------------------------- hide vs. quit
+
+    def show_from_tray(self) -> None:
+        """Bring the window back from the menu bar."""
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        clear_dock_badge()
+
+    def quit_app(self) -> None:
+        """The one way out — ⌘Q, the App menu, and the popup's Thoát all come here."""
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()  # aboutToQuit runs shutdown_all
+
+    def shutdown_all(self) -> None:
+        """Cancel and join every workspace's workers. Idempotent.
+
+        Runs on `aboutToQuit` (the normal path) and from `closeEvent` when there is no
+        tray to hide into. Cancelling resumes a paused worker's gate, so a paused job
+        cannot hold the join open — see `PausableWorker.cancel`.
+        """
+        if self._shut_down:
+            return
+        self._shut_down = True
+        if self.isVisible():
+            # A hidden window has a meaningless geometry; the hide already saved the
+            # real one.
+            self.config.window_geometry = self.saveGeometry()
         for index in range(self.workspaces.count()):
             ws = self.workspaces.widget(index)
             if hasattr(ws, "shutdown"):
                 ws.shutdown()
+
+    def closeEvent(self, event) -> None:
+        self.config.window_geometry = self.saveGeometry()
+        if self.hide_to_tray_enabled:
+            # Hide, never shut down: `ws.shutdown()` cancels and joins every worker,
+            # which is the exact opposite of "keep running in the menu bar".
+            event.ignore()
+            self.hide()
+            return
+        self.shutdown_all()
         super().closeEvent(event)

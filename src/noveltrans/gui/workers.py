@@ -22,6 +22,7 @@ from noveltrans.errors import (
     RateLimitedError,
     UnsupportedSiteError,
 )
+from noveltrans.gui.pause import PauseGate
 from noveltrans.models import ChapterRef
 from noveltrans.scrapers import adapter_for_url
 from noveltrans.scrapers.base import HttpClient
@@ -31,6 +32,49 @@ from noveltrans.storage import Library, NovelProject
 # On a rate-limit signal the download waits, then retries the same chapter.
 _RATE_LIMIT_WAIT_SECONDS = 60
 _RATE_LIMIT_MAX_RETRIES = 8
+
+
+class PausableWorker(QThread):
+    """A long batch worker that can be stopped, or held between items.
+
+    Pause deliberately holds at the SAME points that already test `_cancelled` — the
+    boundary between one chapter/part and the next. The item in flight always finishes,
+    so nothing is ever half-written and resuming costs nothing. The price is that pause
+    is not instant: a TTS chapter takes ~a minute, and a single ffmpeg merge or video
+    encode can take far longer (see the `cancelled=` hand-offs, which must NOT gate).
+
+    `cancel()` resumes the gate. That one line is why quitting with a paused job works:
+    every tab's `shutdown()` calls `cancel()` and then `wait()` on the thread for up to
+    two minutes, so a gate that stayed shut through a cancel would freeze the GUI thread
+    and then abandon a running QThread. `PauseGate.wait` polls as well, so the two guards
+    are independent (see `gui/pause.py`).
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._cancelled = False
+        self._gate = PauseGate()
+
+    def cancel(self) -> None:
+        self._cancelled = True
+        self._gate.resume()  # never let a paused worker outlive its cancel
+
+    def pause(self) -> None:
+        self._gate.pause()
+
+    def resume(self) -> None:
+        self._gate.resume()
+
+    def is_paused(self) -> bool:
+        # A cancelled worker is on its way out, not paused, however the gate looks.
+        return self._gate.paused and not self._cancelled
+
+    def _checkpoint(self) -> bool:
+        """Hold here while paused. True means the run should stop (cancelled)."""
+        if self._cancelled:
+            return True
+        self._gate.wait(lambda: self._cancelled)
+        return self._cancelled
 
 
 class ScanWorker(QThread):
@@ -85,7 +129,7 @@ class ScanWorker(QThread):
                 adapter.close()  # 69shuba holds a browser; don't leak it
 
 
-class TranslateWorker(QThread):
+class TranslateWorker(PausableWorker):
     """Translate pending chapters of a project (or specific ones), resumably."""
 
     progress = Signal(int, int, str)  # done, total, chapter title
@@ -118,10 +162,7 @@ class TranslateWorker(QThread):
         self.cli_command = cli_command
         self.base_url = base_url
         self.indices = indices  # None = all pending; else re-translate exactly these
-        self._cancelled = False
 
-    def cancel(self) -> None:
-        self._cancelled = True
 
     def engine_label(self) -> str:
         """Human-readable record of what translated a chapter, e.g. 'CLI (agy)'."""
@@ -147,7 +188,7 @@ class TranslateWorker(QThread):
                 project.meta.author,  # identity: source already in the target language
             )
         for chapter in pending:
-            if self._cancelled:
+            if self._checkpoint():
                 break
             self.progress.emit(done, total, chapter.title)
             project.save_translation(
@@ -234,7 +275,7 @@ class TranslateWorker(QThread):
                     pass
 
             for chapter in pending:
-                if self._cancelled:
+                if self._checkpoint():
                     break
                 self.progress.emit(done, total, chapter.title)
                 try:
@@ -472,7 +513,7 @@ class _AudioResult:
     error: str = ""
 
 
-class AudioWorker(QThread):
+class AudioWorker(PausableWorker):
     """Generate audio for a project's translated (or original) chapters, resumably.
 
     A single orchestrator QThread: it loads one "probe" engine up front (fail-fast
@@ -521,10 +562,7 @@ class AudioWorker(QThread):
         self.temperature = temperature
         self.precision = precision
         self.style = style
-        self._cancelled = False
 
-    def cancel(self) -> None:
-        self._cancelled = True
 
     def _effective_temperature(self) -> float | None:
         """0.0 (the config "unset" sentinel) → None, so the engine passes nothing."""
@@ -631,7 +669,7 @@ class AudioWorker(QThread):
         done = 0
         errors = 0
         for chapter in pending:
-            if self._cancelled:
+            if self._checkpoint():
                 break
             title, text = self._title_text_for(chapter)
             self.progress.emit(done, total, title)
@@ -645,6 +683,9 @@ class AudioWorker(QThread):
                     title,
                     text,
                     out_path,
+                    # Cancel only — do NOT gate pause here. This callback is polled inside a
+                    # deadline-bounded ffmpeg/TTS wait; holding it would trip the timeout, and
+                    # synthesize_chapter buffers the whole chapter in RAM until it writes.
                     cancelled=lambda: self._cancelled,
                     clean=self.clean_text,
                     clean_extra_remove=self.clean_extra_remove,
@@ -722,6 +763,9 @@ class AudioWorker(QThread):
                 title,
                 text,
                 out_path,
+                # Cancel only — do NOT gate pause here. This callback is polled inside a
+                # deadline-bounded ffmpeg/TTS wait; holding it would trip the timeout, and
+                # synthesize_chapter buffers the whole chapter in RAM until it writes.
                 cancelled=lambda: self._cancelled,
                 clean=self.clean_text,
                 clean_extra_remove=self.clean_extra_remove,
@@ -769,7 +813,10 @@ class AudioWorker(QThread):
         pool = ThreadPoolExecutor(max_workers=n_workers)
 
         def submit_next() -> bool:
-            if self._cancelled:
+            # Paused means "start nothing new". Returning False here cannot end the run
+            # early: the drain loop holds at its checkpoint while paused instead of
+            # treating an empty pool as "finished".
+            if self._cancelled or self.is_paused():
                 return False
             try:
                 chapter = next(pending_iter)
@@ -786,7 +833,18 @@ class AudioWorker(QThread):
             for _ in range(n_workers):
                 if not submit_next():
                     break
-            while inflight:
+            while True:
+                # Hold here while paused — never break out of the loop for a pause, or
+                # the run would report itself finished. Nothing new is submitted while
+                # held (submit_next gates on it too); chapters already on pool threads
+                # keep going and are committed below once we resume.
+                self._checkpoint()
+                if not inflight:
+                    # Pool is empty: either the batch is done, or a pause drained it and
+                    # a resume should refill it. submit_next says which.
+                    if not submit_next():
+                        break
+                    continue
                 finished, still = wait(inflight, return_when=FIRST_COMPLETED)
                 inflight = set(still)
                 for fut in finished:
@@ -815,7 +873,7 @@ class AudioWorker(QThread):
         self.finished_ok.emit(done - errors, errors)
 
 
-class MergeWorker(QThread):
+class MergeWorker(PausableWorker):
     """Merge per-chapter audio into one or more files (all / range / batch), off-thread."""
 
     progress = Signal(int, int, str)  # windows done, total windows, label
@@ -844,10 +902,7 @@ class MergeWorker(QThread):
         self.start_num = start
         self.end_num = end
         self.batch_size = batch
-        self._cancelled = False
 
-    def cancel(self) -> None:
-        self._cancelled = True
 
     def run(self) -> None:
         from noveltrans.errors import TtsError
@@ -881,7 +936,7 @@ class MergeWorker(QThread):
             total = len(windows)
             written = 0
             for i, window in enumerate(windows):
-                if self._cancelled:
+                if self._checkpoint():
                     break
                 # resolve to on-disk segments, skipping any file that went missing
                 segments = [
@@ -902,6 +957,9 @@ class MergeWorker(QThread):
                 out_path = project.audio_dir / name  # alongside the per-chapter files
                 self.progress.emit(i, total, name)
                 try:
+                    # Cancel only — do NOT gate pause here. This callback is polled inside a
+                    # deadline-bounded ffmpeg/TTS wait; holding it would trip the timeout, and
+                    # synthesize_chapter buffers the whole chapter in RAM until it writes.
                     merge_chapters(segments, out_path, self.fmt, cancelled=lambda: self._cancelled)
                     written += 1
                     self.file_done.emit(str(out_path))
@@ -918,7 +976,7 @@ class MergeWorker(QThread):
             project.close()
 
 
-class VideoWorker(QThread):
+class VideoWorker(PausableWorker):
     """Render per-chapter audio into MP4 video(s) (all / range / batch), off-thread.
 
     A structural clone of MergeWorker: same window selection, same one-file-per-window
@@ -992,10 +1050,7 @@ class VideoWorker(QThread):
         self.tagline = tagline
         self.thumb_image_path = str(thumb_image_path or "")
         self.tags = tags
-        self._cancelled = False
 
-    def cancel(self) -> None:
-        self._cancelled = True
 
     def run(self) -> None:
         from noveltrans.errors import TtsError
@@ -1043,7 +1098,7 @@ class VideoWorker(QThread):
             written = 0
             with font_dir_context() as font_dir:
                 for i, window in enumerate(windows):
-                    if self._cancelled:
+                    if self._checkpoint():
                         break
                     segments = [
                         MergeSegment(
@@ -1075,6 +1130,9 @@ class VideoWorker(QThread):
                             width=self.width, height=self.height, fps=self.fps,
                             spin_vinyl=self.spin_vinyl, font_name=self.font or FONT_NAME,
                             bg_color=bg_rgb, burn_subtitles=self.burn_subtitles,
+                            # Cancel only — do NOT gate pause here. This callback is polled inside a
+                            # deadline-bounded ffmpeg/TTS wait; holding it would trip the timeout, and
+                            # synthesize_chapter buffers the whole chapter in RAM until it writes.
                             cancelled=lambda: self._cancelled,
                         )
                         self._write_metadata(
@@ -1155,7 +1213,7 @@ class VideoWorker(QThread):
             pass
 
 
-class SubtitleUploadWorker(QThread):
+class SubtitleUploadWorker(PausableWorker):
     """Upload each part's `.srt` to its YouTube video, in one browser session.
 
     Signal-for-signal a sibling of YouTubeThumbnailWorker, so the Video tab drives all four
@@ -1171,10 +1229,7 @@ class SubtitleUploadWorker(QThread):
     def __init__(self, requests: list, parent=None):
         super().__init__(parent)
         self.requests = list(requests)
-        self._cancelled = False
 
-    def cancel(self) -> None:
-        self._cancelled = True
 
     def run(self) -> None:
         from noveltrans.youtube_upload import (
@@ -1202,6 +1257,7 @@ class SubtitleUploadWorker(QThread):
                 on_progress=lambda msg: self.progress.emit(done, total, msg),
                 on_part_done=on_part_done,
                 should_cancel=lambda: self._cancelled,
+                on_checkpoint=self._checkpoint,
             )
         except UploadCancelled:
             # Nothing half-done survives: a track is published or it isn't, and an
@@ -1215,7 +1271,7 @@ class SubtitleUploadWorker(QThread):
             self.finished_ok.emit(done - errors, errors)
 
 
-class SubtitleWorker(QThread):
+class SubtitleWorker(PausableWorker):
     """Write each part's `.srt`, backfilling missing cues from the audio first.
 
     Two jobs, one button, because on their own neither is what the user wants: writing
@@ -1259,10 +1315,7 @@ class SubtitleWorker(QThread):
         self.clean_extra_remove = clean_extra_remove
         self.gap_seconds = gap_seconds
         self.speed = speed
-        self._cancelled = False
 
-    def cancel(self) -> None:
-        self._cancelled = True
 
     def _backfill(self, project, chapter) -> bool:
         """Recover one chapter's cues from its audio. False if it couldn't be trusted."""
@@ -1320,12 +1373,12 @@ class SubtitleWorker(QThread):
             written = backfilled = skipped = 0
 
             for i, window in enumerate(windows):
-                if self._cancelled:
+                if self._checkpoint():
                     break
                 label = "Toàn bộ" if (total == 1 and self.mode == "all") else f"Phần {i + 1}"
                 self.progress.emit(i, total, f"{label}: dò mốc thời gian…")
                 for chapter in window.chapters:
-                    if self._cancelled:
+                    if self._checkpoint():
                         break
                     if self._backfill(project, chapter):
                         backfilled += 1
@@ -1476,7 +1529,7 @@ class ExportWorker(QThread):
             project.close()
 
 
-class DownloadWorker(QThread):
+class DownloadWorker(PausableWorker):
     """Download all pending chapters of a project, resumably."""
 
     progress = Signal(int, int, str)  # done, total, chapter title
@@ -1507,7 +1560,6 @@ class DownloadWorker(QThread):
         self.start_index = start_index
         self.end_index = end_index
         self.force = force
-        self._cancelled = False
 
     def _select_chapters(self, project) -> list:
         """The chapters this run will fetch, honouring the range and `force`."""
@@ -1515,8 +1567,6 @@ class DownloadWorker(QThread):
             return project.chapters_in_range(self.start_index, self.end_index)
         return project.pending_download(self.start_index, self.end_index)
 
-    def cancel(self) -> None:
-        self._cancelled = True
 
     def _fetch_with_backoff(self, adapter, chapter, done: int, total: int) -> str:
         """Fetch a chapter, waiting and retrying when the site throttles reads."""
@@ -1560,7 +1610,7 @@ class DownloadWorker(QThread):
             # mid-batch browser relaunch reports the real position, not 0.
             adapter.on_status = lambda msg: self.progress.emit(done, total, msg)
             for chapter in pending:
-                if self._cancelled:
+                if self._checkpoint():
                     break
                 ref_title = chapter.title
                 self.progress.emit(done, total, ref_title)
@@ -1705,7 +1755,7 @@ def _drop_cues(audio_path) -> None:
         pass
 
 
-class YouTubeUploadWorker(QThread):
+class YouTubeUploadWorker(PausableWorker):
     """Upload a list of rendered parts to YouTube through one browser session.
 
     Structurally a sibling of VideoWorker — same progress/finished/failed signal shape,
@@ -1723,10 +1773,7 @@ class YouTubeUploadWorker(QThread):
     def __init__(self, requests: list, parent=None):
         super().__init__(parent)
         self.requests = list(requests)
-        self._cancelled = False
 
-    def cancel(self) -> None:
-        self._cancelled = True
 
     def run(self) -> None:
         # Imported here so a missing Playwright (optional dep) only bites when the user
@@ -1756,6 +1803,7 @@ class YouTubeUploadWorker(QThread):
                 on_progress=lambda msg: self.progress.emit(done, total, msg),
                 on_part_done=on_part_done,
                 should_cancel=lambda: self._cancelled,
+                on_checkpoint=self._checkpoint,
             )
         except UploadCancelled as exc:
             # Cancelling mid-part can leave a draft on the channel; say so rather than
@@ -1803,7 +1851,7 @@ class PlaylistFetchWorker(QThread):
             self.failed.emit(repr(exc))
 
 
-class PlaylistSyncWorker(QThread):
+class PlaylistSyncWorker(PausableWorker):
     """Empty a playlist, then add every part's video to it in order.
 
     Signal shape copied from YouTubeThumbnailWorker so the Video tab drives all three
@@ -1820,10 +1868,7 @@ class PlaylistSyncWorker(QThread):
         super().__init__(parent)
         self.playlist = playlist
         self.requests = list(requests)
-        self._cancelled = False
 
-    def cancel(self) -> None:
-        self._cancelled = True
 
     def run(self) -> None:
         from noveltrans.youtube_upload import (
@@ -1852,6 +1897,7 @@ class PlaylistSyncWorker(QThread):
                 on_progress=lambda msg: self.progress.emit(done, total, msg),
                 on_part_done=on_part_done,
                 should_cancel=lambda: self._cancelled,
+                on_checkpoint=self._checkpoint,
             )
         except UploadCancelled:
             # Cancelling here CAN leave a half-filled playlist — the clear already ran.
@@ -1871,7 +1917,7 @@ class PlaylistSyncWorker(QThread):
             self.finished_ok.emit(result["removed"], len(result["added"]), errors)
 
 
-class YouTubeThumbnailWorker(QThread):
+class YouTubeThumbnailWorker(PausableWorker):
     """Replace the thumbnails of already-uploaded parts, in one browser session.
 
     A sibling of YouTubeUploadWorker down to the signal shapes, so the Video tab drives
@@ -1889,10 +1935,7 @@ class YouTubeThumbnailWorker(QThread):
     def __init__(self, requests: list, parent=None):
         super().__init__(parent)
         self.requests = list(requests)
-        self._cancelled = False
 
-    def cancel(self) -> None:
-        self._cancelled = True
 
     def run(self) -> None:
         from noveltrans.youtube_upload import (
@@ -1920,6 +1963,7 @@ class YouTubeThumbnailWorker(QThread):
                 on_progress=lambda msg: self.progress.emit(done, total, msg),
                 on_part_done=on_part_done,
                 should_cancel=lambda: self._cancelled,
+                on_checkpoint=self._checkpoint,
             )
         except UploadCancelled:
             # Nothing half-done can be left behind here: a part is either saved or

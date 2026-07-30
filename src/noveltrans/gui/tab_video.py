@@ -46,8 +46,10 @@ from PySide6.QtWidgets import (
 )
 
 from noveltrans.config import AppConfig, translator_labels
+from noveltrans.gui.job_popup import BROWSER_PAUSE_HINT
+from noveltrans.gui.jobs import job_registry
 from noveltrans.gui.keep_awake import track_worker
-from noveltrans.gui.widgets import CheckableHeaderView, ProjectPicker
+from noveltrans.gui.widgets import CheckableHeaderView, PauseButton, ProjectPicker
 from noveltrans.gui.workers import (
     CompletionWorker,
     TagsWorker,
@@ -240,6 +242,7 @@ class VideoTab(QWidget):
         self.cancel_button = QPushButton("Dừng")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self._cancel)
+        self.pause_button = PauseButton()
         if not ffmpeg_available():
             for b in (self.video_button, self.redo_all_button, self.video_preview_button):
                 b.setEnabled(False)
@@ -281,6 +284,7 @@ class VideoTab(QWidget):
         row2.addWidget(self.video_button)
         row2.addWidget(self.redo_all_button)
         row2.addWidget(self.cancel_button)
+        row2.addWidget(self.pause_button)
         row2.addWidget(self.subtitle_button)
         row2.addWidget(self.open_video_dir_button)
 
@@ -452,6 +456,11 @@ class VideoTab(QWidget):
         self.upload_cancel_button = QPushButton("Dừng")
         self.upload_cancel_button.setEnabled(False)
         self.upload_cancel_button.clicked.connect(self._cancel_upload)
+        # The browser runs get their own pause, next to their own Dừng. One shared button
+        # in the render row would sit in the wrong half of the tab AND get stolen from a
+        # running render the moment an upload started.
+        self.upload_pause_button = PauseButton()
+        self.upload_pause_button.set_extra_hint(BROWSER_PAUSE_HINT)
 
         action_row = QHBoxLayout()
         action_row.addWidget(QLabel("Danh sách phát:"))
@@ -463,6 +472,7 @@ class VideoTab(QWidget):
         action_row.addWidget(self.subtitle_upload_button)
         action_row.addWidget(self.upload_button)
         action_row.addWidget(self.upload_cancel_button)
+        action_row.addWidget(self.upload_pause_button)
 
         self.schedule_preview = QLabel("")
         self.schedule_preview.setProperty("muted", True)
@@ -2001,6 +2011,10 @@ class VideoTab(QWidget):
         self._video_worker.finished_ok.connect(self._on_video_finished)
         self._video_worker.failed.connect(self._on_video_failed)
         track_worker(self._video_worker)  # keep the Mac awake while encoding
+        self._job = job_registry.register(
+            self._video_worker, kind="Tạo video", novel=self._job_novel()
+        )
+        self.pause_button.set_job(self._job.id if self._job else None)
         self._video_worker.start()
 
     def _on_video_progress(self, done: int, total: int, name: str) -> None:
@@ -2348,6 +2362,10 @@ class VideoTab(QWidget):
         self._upload_worker.failed.connect(self._on_upload_failed)
         self._upload_worker.needs_login.connect(self._on_upload_needs_login)
         track_worker(self._upload_worker)  # don't let the Mac sleep mid-upload
+        self._job = job_registry.register(
+            self._upload_worker, kind="Tải video lên", novel=self._job_novel()
+        )
+        self.upload_pause_button.set_job(self._job.id if self._job else None)
 
         self.upload_button.setEnabled(False)
         # Rendering would overwrite the very files being uploaded — keep them apart.
@@ -2509,6 +2527,10 @@ class VideoTab(QWidget):
         self._subtitle_upload_worker.failed.connect(self._on_subtitle_upload_failed)
         self._subtitle_upload_worker.needs_login.connect(self._on_upload_needs_login)
         track_worker(self._subtitle_upload_worker)
+        self._job = job_registry.register(
+            self._subtitle_upload_worker, kind="Tải phụ đề lên", novel=self._job_novel()
+        )
+        self.upload_pause_button.set_job(self._job.id if self._job else None)
 
         self.subtitle_upload_button.setEnabled(False)
         self.upload_button.setEnabled(False)
@@ -2587,6 +2609,10 @@ class VideoTab(QWidget):
         self._subtitle_worker.finished_ok.connect(self._on_subtitles_finished)
         self._subtitle_worker.failed.connect(self._on_subtitles_failed)
         track_worker(self._subtitle_worker)
+        self._job = job_registry.register(
+            self._subtitle_worker, kind="Tạo phụ đề", novel=self._job_novel()
+        )
+        self.pause_button.set_job(self._job.id if self._job else None)
 
         self.subtitle_button.setEnabled(False)
         self.progress.setValue(0)
@@ -2733,6 +2759,10 @@ class VideoTab(QWidget):
         self._playlist_worker.failed.connect(self._on_playlist_failed)
         self._playlist_worker.needs_login.connect(self._on_playlist_needs_login)
         track_worker(self._playlist_worker)
+        self._job = job_registry.register(
+            self._playlist_worker, kind="Danh sách phát", novel=self._job_novel()
+        )
+        self.upload_pause_button.set_job(self._job.id if self._job else None)
 
         self.playlist_sync_button.setEnabled(False)
         self.playlist_fetch_button.setEnabled(False)
@@ -2907,6 +2937,10 @@ class VideoTab(QWidget):
         self._thumbnail_worker.failed.connect(self._on_thumbnail_failed)
         self._thumbnail_worker.needs_login.connect(self._on_thumbnail_needs_login)
         track_worker(self._thumbnail_worker)  # don't let the Mac sleep mid-run
+        self._job = job_registry.register(
+            self._thumbnail_worker, kind="Đổi ảnh bìa", novel=self._job_novel()
+        )
+        self.upload_pause_button.set_job(self._job.id if self._job else None)
 
         self.thumbnail_update_button.setEnabled(False)
         # One browser profile between them, and a render would rewrite the very .jpg
@@ -2982,6 +3016,14 @@ class VideoTab(QWidget):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.project.video_dir)))
 
     # ------------------------------------------------------- lifecycle (host)
+
+    def _job_novel(self) -> str:
+        """The novel label for the menu-bar job row — this tab's own project.
+
+        Deliberately not Workspace.current_title(): each tab has an independent picker,
+        so a video job on a different novel would be labelled with the scrape tab's.
+        """
+        return self.project.meta.display_name() if self.project is not None else ""
 
     def has_running_workers(self) -> bool:
         return self._video_worker is not None and self._video_worker.isRunning()

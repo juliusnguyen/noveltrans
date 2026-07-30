@@ -266,3 +266,79 @@ class TestChapterTableModelHelpers:
         col = m.STATUS_COLUMN
         assert m.data(m.index(0, col)) == "Đã tải"
         assert m.data(m.index(1, col)) == "Chưa tải"
+
+
+class TestPauseButton:
+    """One button class backs both the tab row and the popup row — see 049."""
+
+    def _setup(self, qapp):
+        from PySide6.QtCore import QObject, Signal
+
+        from noveltrans.gui.jobs import JobRegistry
+        from noveltrans.gui.widgets import PauseButton
+
+        class _Worker(QObject):
+            progress = Signal(int, int, str)
+            finished = Signal()
+
+            def __init__(self):
+                super().__init__()
+                self.paused = False
+
+            def isFinished(self):
+                return False
+
+            def pause(self):
+                self.paused = True
+
+            def resume(self):
+                self.paused = False
+
+        registry = JobRegistry()
+        worker = _Worker()
+        job = registry.register(worker, kind="Dịch", novel="Truyện A")
+        return registry, worker, job, PauseButton(job.id, registry=registry)
+
+    def test_it_starts_as_pause_and_enabled(self, qapp):
+        _registry, _worker, _job, button = self._setup(qapp)
+        assert button.text() == "⏸ Tạm dừng"
+        assert button.isEnabled()
+
+    def test_clicking_pauses_the_worker_and_flips_the_label(self, qapp):
+        _registry, worker, _job, button = self._setup(qapp)
+        button.click()
+        assert worker.paused
+        assert button.text() == "▶ Tiếp tục"
+        assert "Chạy tiếp" in button.toolTip()
+
+    def test_two_buttons_on_one_job_stay_in_step(self, qapp):
+        # The tab's button and the popup's are separate widgets on the same Job; neither
+        # owns state, so pressing one must relabel the other.
+        from noveltrans.gui.widgets import PauseButton
+
+        registry, worker, job, first = self._setup(qapp)
+        second = PauseButton(job.id, registry=registry)
+        first.click()
+        assert worker.paused
+        assert second.text() == "▶ Tiếp tục"
+        second.click()
+        assert not worker.paused
+        assert first.text() == "⏸ Tạm dừng"
+
+    def test_it_parks_itself_when_the_job_finishes(self, qapp):
+        _registry, worker, _job, button = self._setup(qapp)
+        worker.finished.emit()
+        assert not button.isEnabled()
+        assert button.text() == "⏸ Tạm dừng"
+
+    def test_an_unbound_button_is_disabled_and_inert(self, qapp):
+        from noveltrans.gui.widgets import PauseButton
+
+        button = PauseButton()
+        assert not button.isEnabled()
+        button.click()  # must not raise
+
+    def test_set_job_none_parks_it(self, qapp):
+        _registry, _worker, _job, button = self._setup(qapp)
+        button.set_job(None)
+        assert not button.isEnabled()

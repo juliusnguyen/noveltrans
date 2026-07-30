@@ -21,8 +21,10 @@ from PySide6.QtWidgets import (
 
 from noveltrans.config import TARGET_LANGS, AppConfig, translator_labels
 from noveltrans.gui.find_replace_dialog import FindReplaceDialog
+from noveltrans.gui.jobs import job_registry
 from noveltrans.gui.keep_awake import track_worker
 from noveltrans.gui.widgets import (
+    PauseButton,
     ChapterTableModel,
     ProjectPicker,
     CellEditorDelegate,
@@ -154,6 +156,7 @@ class TranslateTab(QWidget):
         self.cancel_button = QPushButton("Dừng")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self._cancel)
+        self.pause_button = PauseButton()
         self.progress = QProgressBar()
         self.progress.setFormat("%v / %m chương")
         self.status_label = QLabel("")
@@ -162,6 +165,7 @@ class TranslateTab(QWidget):
         bottom_row.addWidget(self.retranslate_button)
         bottom_row.addWidget(self.find_replace_button)
         bottom_row.addWidget(self.cancel_button)
+        bottom_row.addWidget(self.pause_button)
         bottom_row.addWidget(self.progress, stretch=1)
 
         layout = QVBoxLayout(self)
@@ -447,6 +451,10 @@ class TranslateTab(QWidget):
         self._worker.failed.connect(self._on_failed)
         self._worker.finished_ok.connect(self._on_finished)
         track_worker(self._worker)  # keep the Mac awake while translating
+        self._job = job_registry.register(
+            self._worker, kind="Dịch", novel=self._job_novel()
+        )
+        self.pause_button.set_job(self._job.id if self._job else None)
         self._worker.start()
 
     def _retranslate_row(self, row: int) -> None:
@@ -541,6 +549,14 @@ class TranslateTab(QWidget):
         self.find_replace_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
         self.picker.setEnabled(True)
+
+    def _job_novel(self) -> str:
+        """The novel label for the menu-bar job row — this tab's own project.
+
+        Deliberately not Workspace.current_title(): each tab has an independent picker,
+        so an audio job on a different novel would be labelled with the scrape tab's.
+        """
+        return self.project.meta.display_name() if self.project is not None else ""
 
     def has_running_workers(self) -> bool:
         # Only the translation run is user-meaningful work worth a close-confirm; the

@@ -1996,6 +1996,7 @@ def sync_playlist_batch(
     on_progress=None,
     on_part_done=None,
     should_cancel=None,
+    on_checkpoint=None,
 ) -> dict:
     """Empty `playlist`, then add every request's video in order. ONE browser session.
 
@@ -2040,6 +2041,8 @@ def sync_playlist_batch(
 
         for index, request in enumerate(requests):
             _check_cancel(should_cancel)
+            if on_checkpoint is not None:
+                on_checkpoint()  # pause holds BETWEEN parts, never mid-transfer
             label = request.label or Path(request.video).stem
             if index:
                 page.wait_for_timeout(_BETWEEN_PLAYLIST_OPS_MS)
@@ -2626,6 +2629,7 @@ def upload_subtitle_one(page, request: SubtitleRequest, *, on_progress=None) -> 
 def upload_subtitle_batch(
     requests, *, headless: bool = False, on_progress=None,
     on_part_done=None, should_cancel=None,
+    on_checkpoint=None,
 ) -> list:
     """Upload every request's `.srt` through ONE browser session.
 
@@ -2644,6 +2648,8 @@ def upload_subtitle_batch(
         page.set_default_timeout(_STEP_WAIT_MS)
         for index, request in enumerate(requests):
             _check_cancel(should_cancel)
+            if on_checkpoint is not None:
+                on_checkpoint()  # pause holds BETWEEN parts, never mid-transfer
             label = request.label or Path(request.video).stem
             if index:
                 page.wait_for_timeout(_BETWEEN_SUBTITLES_MS)
@@ -2782,6 +2788,7 @@ def upload_batch(
     on_progress=None,
     on_part_done=None,
     should_cancel=None,
+    on_checkpoint=None,
 ) -> list:
     """Upload every request in order through ONE browser session. Returns the results.
 
@@ -2811,6 +2818,8 @@ def upload_batch(
         for index, request in enumerate(requests):
             label = request.label or Path(request.video).stem
             _check_cancel(should_cancel)
+            if on_checkpoint is not None:
+                on_checkpoint()  # pause holds BETWEEN parts, never mid-transfer
             if index:
                 # Human pacing between parts. Cheap, and the main thing separating
                 # "automation" from "hammering".
@@ -2910,6 +2919,7 @@ def update_thumbnail_batch(
     on_progress=None,
     on_part_done=None,
     should_cancel=None,
+    on_checkpoint=None,
 ) -> list:
     """Update every request's thumbnail through ONE browser session. Returns the results.
 
@@ -2936,6 +2946,8 @@ def update_thumbnail_batch(
         for index, request in enumerate(requests):
             label = request.label or Path(request.video).stem
             _check_cancel(should_cancel)
+            if on_checkpoint is not None:
+                on_checkpoint()  # pause holds BETWEEN parts, never mid-transfer
             if index:
                 _dismiss_unsaved_changes(page)
                 page.wait_for_timeout(_BETWEEN_THUMBNAILS_MS)
