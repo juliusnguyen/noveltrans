@@ -8,7 +8,7 @@ from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 from noveltrans.errors import ExportError
-from noveltrans.exporters.base import Exporter, meta_text
+from noveltrans.exporters.base import Exporter, meta_text, source_note
 from noveltrans.models import Chapter, NovelMeta
 
 
@@ -49,7 +49,9 @@ class DocxExporter(Exporter):
             author_par.alignment = WD_ALIGN_PARAGRAPH.CENTER
         if description:
             document.add_paragraph(description)
-        document.add_paragraph(f"Nguồn: {meta.url} — xuất bởi NovelTrans")
+        note = source_note(meta)
+        if note:
+            document.add_paragraph(note)
         if skipped:
             document.add_paragraph(f"Bỏ qua {len(skipped)} chương chưa có nội dung.")
         document.add_page_break()

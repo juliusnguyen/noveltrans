@@ -18,6 +18,18 @@ class ExportText:
     body: str
 
 
+def source_note(meta: NovelMeta) -> str:
+    """The "Nguồn: …" front-matter line, or "" when there is no real source.
+
+    A hand-written novel's URL is a synthetic `local://<uuid>` used only to key its
+    folder on disk. Printing it would put a meaningless identifier into the user's own
+    book and, worse, imply their writing came from somewhere else.
+    """
+    if not meta.url.startswith(("http://", "https://")):
+        return ""
+    return f"Nguồn: {meta.url} — xuất bởi NovelTrans"
+
+
 def meta_text(meta: NovelMeta, use_translation: bool) -> tuple[str, str]:
     """(title, description) for the front matter, translated when available."""
     if use_translation and meta.translated_title:

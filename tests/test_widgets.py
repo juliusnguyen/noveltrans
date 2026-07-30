@@ -235,3 +235,34 @@ class TestCheckableHeaderView:
         _table, header = self._header(qapp)
         x = header.sectionViewportPosition(1) + 6
         assert self._click(header, x) == []
+
+
+class TestChapterTableModelHelpers:
+    def _model(self, qapp):
+        from noveltrans.gui.widgets import ChapterTableModel
+
+        model = ChapterTableModel()
+        model.set_chapters(
+            [
+                Chapter(index=0, title="Chương 1", url="", content="Nội dung.",
+                        status="downloaded"),
+                # a chapter added after a delete: index 2 sits at row 1
+                Chapter(index=2, title="Chương 3", url="", status="pending"),
+            ]
+        )
+        return model
+
+    def test_row_for_index_is_not_the_identity_across_a_gap(self, qapp):
+        m = self._model(qapp)
+        assert m.row_for_index(0) == 0
+        assert m.row_for_index(2) == 1
+        assert m.row_for_index(1) is None  # deleted
+
+    def test_hand_typed_content_reads_as_downloaded(self, qapp):
+        # The status column is the one place that reads `status` rather than deriving it
+        # from `content`, so a chapter whose text arrived via edit_content must not still
+        # say "Chưa tải" while its content is plainly on screen.
+        m = self._model(qapp)
+        col = m.STATUS_COLUMN
+        assert m.data(m.index(0, col)) == "Đã tải"
+        assert m.data(m.index(1, col)) == "Chưa tải"

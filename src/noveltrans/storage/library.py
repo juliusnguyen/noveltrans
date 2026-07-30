@@ -6,7 +6,7 @@ import json
 import shutil
 from pathlib import Path
 
-from noveltrans.models import ChapterRef, NovelMeta
+from noveltrans.models import LOCAL_SITE, ChapterRef, NovelMeta, new_local_url
 from noveltrans.storage.project import META_FILE, NovelProject
 
 DEFAULT_LIBRARY_DIR = Path.home() / "NovelTrans"
@@ -19,6 +19,17 @@ class Library:
 
     def create_project(self, meta: NovelMeta, refs: list[ChapterRef]) -> NovelProject:
         return NovelProject.create(self.root, meta, refs)
+
+    def create_local_project(self, meta: NovelMeta) -> NovelProject:
+        """Start a novel the user writes themselves — no site, no TOC, no chapters yet.
+
+        The synthetic URL is what keeps two local novels apart on disk; see
+        `new_local_url` for the folder-collision it exists to prevent.
+        """
+        meta.site = LOCAL_SITE
+        if not meta.url:
+            meta.url = new_local_url()
+        return NovelProject.create(self.root, meta, [])
 
     def list_projects(self) -> list[Path]:
         """Project folders sorted by title, without opening their databases."""
@@ -33,6 +44,11 @@ class Library:
         return NovelMeta.from_dict(data)
 
     def find_by_url(self, url: str) -> Path | None:
+        # A blank URL is "I don't know which novel", not "the first one with no URL".
+        # Without this, any project whose meta.json lost its url would be adopted by
+        # every lookup that came in empty.
+        if not url:
+            return None
         for path in self.list_projects():
             if self.project_meta(path).url == url:
                 return path

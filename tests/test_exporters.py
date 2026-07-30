@@ -226,3 +226,36 @@ class TestRegistry:
     def test_unknown(self):
         with pytest.raises(ExportError):
             get_exporter("pdf")
+
+
+class TestSourceNote:
+    """A hand-written novel must not carry a "Nguồn:" line into the user's own book."""
+
+    def _local_meta(self) -> NovelMeta:
+        return NovelMeta(
+            url="local://3f9cdeadbeef",
+            site="local",
+            title="Truyện Của Tôi",
+            author="Tôi",
+            source_lang="vi",
+        )
+
+    def _local_chapters(self) -> list[Chapter]:
+        return [Chapter(index=0, title="Chương 1", url="", content="Nội dung tôi viết.")]
+
+    @pytest.mark.parametrize("name", ["markdown", "docx", "epub"])
+    def test_local_export_omits_the_synthetic_url(self, tmp_path, name):
+        exporter = get_exporter(name)
+        out = exporter.export(
+            self._local_meta(),
+            self._local_chapters(),
+            tmp_path / f"local{exporter.extension}",
+            use_translation=False,
+        )
+        blob = out.read_bytes()
+        assert b"local://" not in blob
+        assert "Nguồn:".encode() not in blob
+
+    def test_scraped_export_still_prints_the_source(self, tmp_path, meta, chapters):
+        out = get_exporter("markdown").export(meta, chapters, tmp_path / "s.md")
+        assert "Nguồn: https://example.com/novel/1" in out.read_text(encoding="utf-8")

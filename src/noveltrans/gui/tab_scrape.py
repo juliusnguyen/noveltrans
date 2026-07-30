@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 from noveltrans.config import AppConfig
 from noveltrans.discord_unlock import valid_channel_url
 from noveltrans.gui.keep_awake import track_worker
+from noveltrans.gui.local_novel_dialog import AddChaptersDialog, LocalNovelDialog
 from noveltrans.gui.notify import clear_dock_badge, request_attention, set_dock_badge
 from noveltrans.gui.widgets import (
     CellEditorDelegate,
@@ -33,8 +34,9 @@ from noveltrans.gui.widgets import (
     ProjectPicker,
     enable_cell_copy,
 )
-from noveltrans.gui.workers import DownloadWorker, ScanWorker, UnlockWorker
-from noveltrans.storage import NovelProject
+from noveltrans.gui.workers import DownloadWorker, ScanWorker, UnlockWorker, _drop_cues
+from noveltrans.models import LOCAL_URL_PREFIX
+from noveltrans.storage import Library, NovelProject
 
 _MAX_AUTO_UNLOCKS = 3  # consecutive auto-unlocks with no progress before giving up
 # Grace period after the /mochuong command is sent before resuming the download.
@@ -92,9 +94,15 @@ class ScrapeTab(QWidget):
         self.scan_button.setProperty("primary", True)
         self.scan_button.clicked.connect(self._start_scan)
         self.url_edit.returnPressed.connect(self._start_scan)
+        # Starting your own novel is the same kind of act as starting one from a URL, so
+        # it lives on the same row rather than behind a menu.
+        self.local_button = QPushButton("✍️ Truyện tự viết")
+        self.local_button.setToolTip("Tạo truyện do bạn tự viết (không cần link nguồn).")
+        self.local_button.clicked.connect(self._create_local_novel)
         url_row = QHBoxLayout()
         url_row.addWidget(self.url_edit, stretch=1)
         url_row.addWidget(self.scan_button)
+        url_row.addWidget(self.local_button)
 
         # --- metadata panel
         self.title_label = QLabel("—")
@@ -138,6 +146,13 @@ class ScrapeTab(QWidget):
         enable_cell_copy(self.table, extra_actions=self._add_download_actions)
 
         # --- download row
+        # A hand-written novel has no TOC to scan, so chapters are created here. It has
+        # to be a button and not just a context-menu item: a brand-new local novel has no
+        # rows at all, and the table's menu only opens over a valid one.
+        self.add_chapter_button = QPushButton("＋ Thêm chương")
+        self.add_chapter_button.setToolTip("Thêm chương cho truyện tự viết (mỗi dòng một tên).")
+        self.add_chapter_button.setVisible(False)
+        self.add_chapter_button.clicked.connect(self._add_chapters)
         self.download_button = QPushButton("Tải các chương")
         self.download_button.setProperty("primary", True)
         self.download_button.setEnabled(False)
@@ -150,6 +165,7 @@ class ScrapeTab(QWidget):
         self.status_label = QLabel("")
         self.status_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         download_row = QHBoxLayout()
+        download_row.addWidget(self.add_chapter_button)
         download_row.addWidget(self.download_button)
         download_row.addWidget(self.cancel_button)
         download_row.addWidget(self.progress, stretch=1)
@@ -210,25 +226,114 @@ class ScrapeTab(QWidget):
         if self.project is not None:
             self.project.close()
         self.project = NovelProject.open(path)
+        self._apply_project_ui()
+        self.project_changed.emit(path)
+
+    def _is_local(self) -> bool:
+        return self.project is not None and self.project.meta.is_local
+
+    def _apply_project_ui(self) -> None:
+        """Show the open project and set the chrome its kind supports.
+
+        A local novel has nothing to scan and nothing to fetch, so the whole download
+        half of this tab is switched off and the "Thêm chương" button takes its place.
+        The URL box is *blanked but left enabled* — it is still how you scan a different
+        novel while this one is open, and showing `local://3f9c…` would only invite
+        someone to press Quét on it.
+        """
+        if self.project is None:
+            return
         meta = self.project.meta
-        self.url_edit.setText(meta.url)
+        local = meta.is_local
+        self.url_edit.setText("" if local else meta.url)
         self._show_meta(meta)
         self._reload_table()
         counts = self.project.counts()
         self.count_label.setText(str(counts["total"]))
-        self.download_button.setEnabled(True)
-        self.range_button.setEnabled(True)
+        self.download_button.setEnabled(not local)
+        self.range_button.setEnabled(not local)
+        self.range_from.setEnabled(not local)
+        self.range_to.setEnabled(not local)
+        self.add_chapter_button.setVisible(local)
+        if local:
+            self.status_label.setText(
+                f"Truyện tự viết: {counts['total']} chương, "
+                f"{counts['downloaded']} đã có nội dung. Thêm chương ở đây, rồi dán nội "
+                "dung vào ô “Bản gốc” ở tab Dịch."
+            )
+        else:
+            self.status_label.setText(
+                f"Đang làm: {counts['downloaded']}/{counts['total']} chương đã tải, "
+                f"{counts['translated']} đã dịch. Bấm 'Quét' nếu truyện có chương mới."
+            )
+
+    # ---------------------------------------------------------- self-written
+
+    def _create_local_novel(self) -> None:
+        """Create a novel with no source website and open it in this tab."""
+        dialog = LocalNovelDialog(self)
+        if dialog.exec() != LocalNovelDialog.DialogCode.Accepted:
+            return
+        project = Library(self.config.library_dir).create_local_project(dialog.meta())
+        path = str(project.path)
+        project.close()  # _load_project opens it again; never hold two handles
+        self.refresh_recent(select_path=path)
+        self._load_project(path)
+
+    def _add_chapters(self) -> None:
+        if self.project is None or not self._is_local():
+            return
+        dialog = AddChaptersDialog(self)
+        if dialog.exec() != AddChaptersDialog.DialogCode.Accepted:
+            return
+        indices = self.project.add_chapters(dialog.titles())
+        if not indices:
+            return
+        self._reload_table()
+        row = self.model.row_for_index(indices[0])
+        if row is not None:
+            self.table.selectRow(row)
+            self.table.scrollTo(self.model.index(row, self.model.TITLE_COLUMN))
+        self.count_label.setText(str(self.project.counts()["total"]))
         self.status_label.setText(
-            f"Đang làm: {counts['downloaded']}/{counts['total']} chương đã tải, "
-            f"{counts['translated']} đã dịch. Bấm 'Quét' nếu truyện có chương mới."
+            f"Đã thêm {len(indices)} chương. Dán nội dung vào ô “Bản gốc” ở tab Dịch."
         )
-        self.project_changed.emit(path)
+        self.project_changed.emit(str(self.project.path))
+
+    def _delete_chapter(self, idx: int) -> None:
+        """Remove one hand-written chapter, and the audio nothing points at any more."""
+        if self.project is None or not self._is_local():
+            return
+        chapter = self.project.chapter(idx)
+        if chapter is None:
+            return
+        question = f"Xoá chương {idx + 1} — “{chapter.title}”?"
+        if chapter.has_audio:
+            question += "\n\nFile audio của chương này cũng sẽ bị xoá."
+        answer = QMessageBox.question(self, "Xoá chương", question)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        deleted = self.project.delete_chapter(idx)
+        if deleted is None:
+            return
+        if deleted.audio_path:
+            audio = self.project.path / deleted.audio_path
+            audio.unlink(missing_ok=True)
+            _drop_cues(audio)  # stale cues describe a take that no longer exists
+        self._reload_table()
+        self.count_label.setText(str(self.project.counts()["total"]))
+        self.status_label.setText(f"Đã xoá chương {idx + 1}.")
+        self.project_changed.emit(str(self.project.path))
 
     # ------------------------------------------------------------------ scan
 
     def _start_scan(self) -> None:
         url = self.url_edit.text().strip()
         if not url:
+            return
+        # Nothing serves local://; refuse before building a worker so the user gets
+        # silence rather than "Chưa hỗ trợ trang web này".
+        if url.startswith(LOCAL_URL_PREFIX):
             return
         self.scan_button.setEnabled(False)
         self.download_button.setEnabled(False)
@@ -252,11 +357,8 @@ class ScrapeTab(QWidget):
             self.project.close()
         self.project = NovelProject.open(path)
         # display the on-disk meta — it keeps translations from earlier runs
-        self._show_meta(self.project.meta)
+        self._apply_project_ui()
         self.count_label.setText(str(count))
-        self._reload_table()
-        self.download_button.setEnabled(True)
-        self.range_button.setEnabled(True)
         counts = self.project.counts()
         self.status_label.setText(
             f"Đã quét xong: {counts['total']} chương, {counts['downloaded']} đã tải."
@@ -287,6 +389,13 @@ class ScrapeTab(QWidget):
             restore = menu.addAction("Lấy lại tên gốc từ trang web")
             restore.triggered.connect(lambda: self._reset_title(chapter.index))
         menu.addSeparator()
+        if self._is_local():
+            # Nothing to re-download; the destructive counterpart belongs here instead.
+            # Deliberately NOT offered on a scraped novel: the next scan's replace_toc
+            # would put the row back, so the delete would silently undo itself.
+            remove = menu.addAction(f"Xoá chương {chapter.index + 1}")
+            remove.triggered.connect(lambda: self._delete_chapter(chapter.index))
+            return
         from_here = menu.addAction(f"Tải từ chương {chapter.index + 1}")
         from_here.setEnabled(not running)
         from_here.triggered.connect(lambda: self._begin_download(chapter.index, None, False))
@@ -308,6 +417,8 @@ class ScrapeTab(QWidget):
 
     def _begin_download(self, start_index: int, end_index: int | None, force: bool) -> None:
         """Record the scope, then launch. Resume-after-unlock reuses this scope."""
+        if self._is_local():
+            return  # backstop behind the disabled buttons — there is nothing to fetch
         self._dl_start = start_index
         self._dl_end = end_index
         self._dl_force = force

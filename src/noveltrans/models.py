@@ -2,7 +2,31 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import asdict, dataclass
+
+# A novel the user wrote themselves — no source website, nothing to scrape.
+LOCAL_SITE = "local"
+LOCAL_URL_PREFIX = "local://"
+
+
+def new_local_url() -> str:
+    """A collision-proof synthetic URL for a hand-written novel.
+
+    A local novel has no real URL, but the URL is *identity* in two places that would
+    both break on an empty string:
+
+    * `NovelProject.create` derives the project folder from `sha1(meta.url)[:8]`, so a
+      blank URL gives every local novel the SAME hash — two novels whose titles slugify
+      alike would share one folder, and the second one's chapters would be merged into
+      the first one's `chapters.db` without a word of warning.
+    * `Library.find_by_url("")` would match the first blank-URL project it walked past.
+
+    A uuid4 is unique by construction, so neither can happen. `local://` also guarantees
+    no `SiteAdapter.matches` will ever claim it — `adapter_for_url` returns None, which
+    is exactly what the download path already treats as "nothing to fetch".
+    """
+    return f"{LOCAL_URL_PREFIX}{uuid.uuid4().hex}"
 
 
 @dataclass
@@ -51,6 +75,16 @@ class NovelMeta:
             if text:
                 return text
         return ""
+
+    @property
+    def is_local(self) -> bool:
+        """True for a novel the user wrote themselves — no site, nothing to scrape.
+
+        Checked on BOTH fields on purpose: `site` carries the behaviour flag and the URL
+        carries identity, and a hand-edited `meta.json` that drops one of them must not
+        turn a local novel back into something the download path will try to fetch.
+        """
+        return self.site == LOCAL_SITE or self.url.startswith(LOCAL_URL_PREFIX)
 
     def to_dict(self) -> dict:
         return asdict(self)

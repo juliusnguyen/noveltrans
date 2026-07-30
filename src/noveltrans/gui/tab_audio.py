@@ -273,7 +273,18 @@ class AudioTab(QWidget):
             ready = f"{counts['translated']}/{counts['total']} chương đã dịch"
         else:
             ready = f"{counts['downloaded']}/{counts['total']} chương đã tải"
-        self.status_label.setText(f"{ready}, {counts['audio']} đã có audio.")
+        message = f"{ready}, {counts['audio']} đã có audio."
+        # A self-written Vietnamese novel usually has no translation and doesn't need
+        # one — point at the radio instead of letting "0 đã dịch" look like a dead end.
+        # Deliberately doesn't flip the radio: that writes a persisted preference.
+        if (
+            self._use_translation()
+            and counts["translated"] == 0
+            and counts["downloaded"] > 0
+            and (self.project.meta.source_lang or "") == "vi"
+        ):
+            message += " Chưa có bản dịch — chọn “Bản gốc” để đọc thẳng nội dung."
+        self.status_label.setText(message)
 
     def _on_source_changed(self) -> None:
         use_translation = self._use_translation()
