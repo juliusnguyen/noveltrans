@@ -1,7 +1,7 @@
 """AppConfig — typed wrapper around QSettings.
 
-Note: the Claude API key and the medoctruyen.vn session cookie are stored
-unencrypted in the native QSettings location (plist on macOS, registry on
+Note: the Claude API key and the per-site session cookies (see `SITE_COOKIES`) are
+stored unencrypted in the native QSettings location (plist on macOS, registry on
 Windows, ini on Linux).
 """
 
@@ -16,6 +16,14 @@ from noveltrans.storage.library import DEFAULT_LIBRARY_DIR
 # How many previously-used library folders to keep. Enough for a few real libraries,
 # short enough that the dropdown stays scannable.
 MAX_LIBRARY_HISTORY = 8
+# Sites whose full chapter text needs the user's own logged-in session, mapped from a
+# substring of the novel URL to the QSettings key holding that site's cookie. Adding a
+# cookie-gated site means adding a line here and a field in the settings dialog — the
+# workers stay unconditional.
+SITE_COOKIES = {
+    "medoctruyen.vn": "medoctruyen_cookies",
+    "tieuthuyetmang.com": "tieuthuyetmang_cookies",
+}
 DEFAULT_REQUEST_DELAY = 1.5
 DEFAULT_TARGET_LANG = "vi"
 DEFAULT_TRANSLATOR = "google"
@@ -176,6 +184,28 @@ class AppConfig:
     @medoctruyen_cookies.setter
     def medoctruyen_cookies(self, value: str) -> None:
         self._s.setValue("medoctruyen_cookies", value)
+
+    @property
+    def tieuthuyetmang_cookies(self) -> str:
+        return str(self._s.value("tieuthuyetmang_cookies", ""))
+
+    @tieuthuyetmang_cookies.setter
+    def tieuthuyetmang_cookies(self, value: str) -> None:
+        self._s.setValue("tieuthuyetmang_cookies", value)
+
+    def cookies_for_url(self, url: str) -> str:
+        """The stored session cookie for whichever site this novel is on, or "".
+
+        The workers used to carry the mapping themselves as
+        `if adapter.name == "medoctruyen": client.set_cookies(...)`, which meant every
+        new cookie-gated site added a second branch in two places. Deciding here — where
+        the cookies already live — makes the workers unconditional: `set_cookies` ignores
+        a blank string, so a site with no cookie is simply a site with no cookie.
+        """
+        for host, key in SITE_COOKIES.items():
+            if host in url:
+                return str(self._s.value(key, ""))
+        return ""
 
     @property
     def discord_autounlock_enabled(self) -> bool:

@@ -202,3 +202,54 @@ class TestLibraryDirDropdown:
         dialog.library_edit.setCurrentText(str(tmp_path / "A"))
         dialog.accept()
         assert config.library_dir == tmp_path / "A"
+
+
+class TestSiteCookies:
+    """Feature 046 — a second cookie-gated site, and the special case it deleted.
+
+    Both workers used to carry `if adapter.name == "medoctruyen": client.set_cookies(...)`,
+    so every new gated site meant a second branch in two places. The mapping now lives in
+    `AppConfig`, where the cookies already are, and the workers are unconditional.
+    """
+
+    def test_the_tieuthuyetmang_cookie_round_trips(self, tmp_path):
+        config = _isolated_config(tmp_path)
+        config.tieuthuyetmang_cookies = "session=abc"
+        assert AppConfig.tieuthuyetmang_cookies.fget(config) == "session=abc"
+
+    def test_it_defaults_to_empty(self, tmp_path):
+        assert _isolated_config(tmp_path).tieuthuyetmang_cookies == ""
+
+    def test_cookies_for_url_picks_the_cookie_of_the_site_in_the_url(self, tmp_path):
+        config = _isolated_config(tmp_path)
+        config.medoctruyen_cookies = "med=1"
+        config.tieuthuyetmang_cookies = "ttm=1"
+        assert config.cookies_for_url("https://medoctruyen.vn/abc") == "med=1"
+        assert (
+            config.cookies_for_url("https://tieuthuyetmang.com/truyen/abc/doc/1") == "ttm=1"
+        )
+
+    def test_a_site_with_no_stored_cookie_gets_a_blank_one(self, tmp_path):
+        """`HttpClient.set_cookies` ignores a blank string, which is what lets the workers
+        call it unconditionally."""
+        config = _isolated_config(tmp_path)
+        assert config.cookies_for_url("https://ixdzs.com/read/123") == ""
+
+    def test_the_dialog_loads_and_saves_the_cookie(self, qapp, tmp_path):
+        config = _isolated_config(tmp_path)
+        config.tieuthuyetmang_cookies = "session=old"
+        dialog = SettingsDialog(config)
+        assert dialog.tieuthuyetmang_cookie_edit.text() == "session=old"
+        dialog.tieuthuyetmang_cookie_edit.setText("  session=new  ")
+        dialog.accept()
+        assert config.tieuthuyetmang_cookies == "session=new"  # whitespace stripped
+
+    def test_neither_worker_still_special_cases_one_site_by_name(self):
+        """The point of `cookies_for_url`: a name check in the worker would have to grow
+        a branch per site, and silently drop the cookie for any site not listed."""
+        import inspect
+
+        from noveltrans.gui import workers
+
+        source = inspect.getsource(workers)
+        assert 'adapter.name == "medoctruyen"' not in source

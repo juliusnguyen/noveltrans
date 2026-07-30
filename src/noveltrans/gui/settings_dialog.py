@@ -61,6 +61,41 @@ hãy lấy lại cookie mới và dán lại.\
 """
 
 
+_TIEUTHUYETMANG_LOGIN_URL = "https://tieuthuyetmang.com/dang-nhap"
+
+_TIEUTHUYETMANG_COOKIE_HELP = """\
+tieuthuyetmang.com khoá phần lớn chương sau đăng nhập và trả phí. \
+Hãy lấy cookie phiên đăng nhập của bạn từ trình duyệt:
+
+1. Mở trình duyệt (Chrome / Edge / Cốc Cốc) và ĐĂNG NHẬP vào tieuthuyetmang.com.
+
+2. Mở một trang chương bất kỳ, ví dụ:
+   https://tieuthuyetmang.com/truyen/<tên-truyện>/doc/1
+
+3. Mở Developer Tools:
+   • macOS:  ⌥ + ⌘ + I
+   • Windows / Linux:  F12  (hoặc Ctrl + Shift + I)
+
+4. Chọn tab “Network” (Mạng), rồi tải lại trang (⌘R hoặc F5).
+
+5. Bấm vào request đầu tiên trong danh sách (thường trùng tên trang, ví dụ “1”).
+
+6. Kéo xuống mục “Request Headers”, tìm dòng bắt đầu bằng “cookie:”.
+
+7. Sao chép TOÀN BỘ giá trị phía sau chữ “cookie:” (gồm nhiều cặp tên=giá_trị, \
+ngăn cách bằng “; ”).
+
+8. Dán vào ô “Cookie tieuthuyetmang.com” trong cửa sổ Cài đặt rồi bấm OK.
+
+Lưu ý:
+• Phải đang ĐĂNG NHẬP khi sao chép — cookie khi đăng xuất sẽ không mở được nội dung.
+• Cookie KHÔNG mở khoá chương trả phí: chương có biểu tượng khoá vẫn cần tài khoản \
+đã mua/mở khoá chương đó. Ứng dụng chỉ tải những chương tài khoản của bạn đọc được.
+• Cookie sẽ hết hạn sau một thời gian; nếu tải chương báo lỗi “cần đăng nhập”, \
+hãy lấy lại cookie mới và dán lại.\
+"""
+
+
 class SettingsDialog(QDialog):
     def __init__(self, config: AppConfig, parent=None):
         super().__init__(parent)
@@ -162,6 +197,30 @@ class SettingsDialog(QDialog):
         cookie_hint.setProperty("muted", True)
         cookie_hint.setWordWrap(True)
         form.addRow("", cookie_hint)
+
+        # tieuthuyetmang.com session cookie — same shape, different site
+        self.tieuthuyetmang_cookie_edit = QLineEdit(config.tieuthuyetmang_cookies)
+        self.tieuthuyetmang_cookie_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.tieuthuyetmang_cookie_edit.setPlaceholderText("__Secure-…=…; session=…")
+        self.tieuthuyetmang_cookie_edit.setToolTip(
+            "Đăng nhập tieuthuyetmang.com trên trình duyệt, sao chép header 'Cookie' của "
+            "request rồi dán vào đây. Cần thiết để tải các chương đã mở khoá."
+        )
+        ttm_help = QPushButton("Hướng dẫn")
+        ttm_help.setToolTip("Xem các bước lấy cookie tieuthuyetmang.com")
+        ttm_help.clicked.connect(self._show_tieuthuyetmang_cookie_help)
+        ttm_row = QHBoxLayout()
+        ttm_row.addWidget(self.tieuthuyetmang_cookie_edit, stretch=1)
+        ttm_row.addWidget(ttm_help)
+        form.addRow("Cookie tieuthuyetmang.com:", ttm_row)
+
+        ttm_hint = QLabel(
+            "Phần lớn chương trên tieuthuyetmang.com là chương trả phí — cookie chỉ tải "
+            "được những chương tài khoản của bạn đã mở khoá."
+        )
+        ttm_hint.setProperty("muted", True)
+        ttm_hint.setWordWrap(True)
+        form.addRow("", ttm_hint)
 
         # Auto-unlock: run medoctruyen's Discord /mochuong unlock automatically when
         # the 50-chapters/day cap is hit, so a download batch resumes unattended.
@@ -347,6 +406,18 @@ class SettingsDialog(QDialog):
         if box.clickedButton() is open_login:
             QDesktopServices.openUrl(QUrl(_MEDOCTRUYEN_LOGIN_URL))
 
+    def _show_tieuthuyetmang_cookie_help(self) -> None:
+        box = QMessageBox(self)
+        box.setWindowTitle("Cách lấy cookie tieuthuyetmang.com")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText("Hướng dẫn lấy cookie đăng nhập")
+        box.setInformativeText(_TIEUTHUYETMANG_COOKIE_HELP)
+        open_login = box.addButton("Mở trang đăng nhập", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Ok)
+        box.exec()
+        if box.clickedButton() is open_login:
+            QDesktopServices.openUrl(QUrl(_TIEUTHUYETMANG_LOGIN_URL))
+
     def _discord_login(self) -> None:
         """Open the one-time Discord login window for the throwaway account."""
         self._login_worker = DiscordLoginWorker(self)
@@ -441,6 +512,9 @@ class SettingsDialog(QDialog):
         self.config.cli_command = self.cli_edit.text().strip()
         self.config.claude_cli_command = self.claude_cli_edit.text().strip()
         self.config.medoctruyen_cookies = self.medoctruyen_cookie_edit.text().strip()
+        self.config.tieuthuyetmang_cookies = (
+            self.tieuthuyetmang_cookie_edit.text().strip()
+        )
         channel_url = self.discord_channel_edit.text().strip()
         if (
             self.discord_enable.isChecked()

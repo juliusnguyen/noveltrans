@@ -58,8 +58,9 @@ class ScanWorker(QThread):
                 raise UnsupportedSiteError(
                     f"Chưa hỗ trợ trang web này: {self.url}"
                 )
-            if adapter.name == "medoctruyen":
-                client.set_cookies(self.cookies)
+            # Unconditional: the caller resolved which site's cookie this is
+            # (`AppConfig.cookies_for_url`), and `set_cookies` ignores a blank string.
+            client.set_cookies(self.cookies)
             adapter.on_status = self.progress.emit
             meta = adapter.fetch_metadata(self.url)
             refs = adapter.fetch_chapter_list(self.url)
@@ -69,6 +70,7 @@ class ScanWorker(QThread):
             if existing is not None:
                 project = NovelProject.open(existing)
                 project.replace_toc(refs)  # pick up newly published chapters
+                project.refresh_meta(meta)  # …and a corrected title/author/description
             else:
                 project = library.create_project(meta, refs)
             path = str(project.path)
@@ -1546,8 +1548,9 @@ class DownloadWorker(QThread):
             if adapter is None:
                 self.finished_ok.emit(0, 0)
                 return
-            if adapter.name == "medoctruyen":
-                client.set_cookies(self.cookies)
+            # Unconditional: the caller resolved which site's cookie this is
+            # (`AppConfig.cookies_for_url`), and `set_cookies` ignores a blank string.
+            client.set_cookies(self.cookies)
 
             pending = self._select_chapters(project)
             total = len(pending)

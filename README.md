@@ -17,6 +17,7 @@
 | 爱下电子书 (ixdzs8.com) | `https://ixdzs8.com/read/620438/` |
 | 69书吧 (69shuba.com) | `https://www.69shuba.com/book/59024/` (có kiểm tra Cloudflare — app tự mở trình duyệt để vượt qua; cần Google Chrome hoặc `playwright install chromium`) |
 | Mê Đọc Truyện (medoctruyen.vn) | `https://medoctruyen.vn/tu-bao-tien-bon` (nội dung tiếng Việt; cần dán cookie đăng nhập trong Cài đặt để tải chương) |
+| Tiểu Thuyết Mạng (tieuthuyetmang.com) | `https://tieuthuyetmang.com/truyen/<slug>` (nội dung tiếng Việt; **phần lớn chương là trả phí** — cần dán cookie đăng nhập trong Cài đặt, và chỉ tải được những chương tài khoản của bạn đã mở khoá) |
 
 Thêm site mới = thêm 1 file adapter trong `src/noveltrans/scrapers/` (kế thừa `SiteAdapter`, đăng ký bằng `@register`).
 

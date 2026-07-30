@@ -165,6 +165,42 @@ class CheckableHeaderView(QHeaderView):
         super().mousePressEvent(event)
 
 
+class CellEditorDelegate(QStyledItemDelegate):
+    """Makes an in-cell editor actually fit the cell.
+
+    The app stylesheet gives every `QLineEdit` `padding: 6px 9px` and a 1px border, which
+    is right for a form field and ~14px too tall for a table row. Qt sizes an editor to
+    the cell rectangle, so the styled editor's *content* area ended up shorter than the
+    text and the chapter name was clipped mid-glyph — visible, unreadable, and easy to
+    mistake for lost text.
+
+    Two things fix it together: strip the padding so the editor matches the row's own
+    metrics, and let the editor grow past a short row rather than clipping (Qt allows an
+    editor to overflow its cell — this is what a compact table is supposed to do).
+    """
+
+    _EDITOR_QSS = "QLineEdit { padding: 0 4px; border-radius: 4px; margin: 0; }"
+
+    def createEditor(self, parent, option, index):
+        editor = super().createEditor(parent, option, index)
+        if editor is None:  # Qt returns None for a column it has no editor for
+            return editor
+        editor.setStyleSheet(self._EDITOR_QSS)
+        return editor
+
+    def updateEditorGeometry(self, editor, option, index) -> None:
+        if editor is None:
+            return
+        rect = QRect(option.rect)
+        wanted = editor.sizeHint().height()
+        if wanted > rect.height():
+            # Grow symmetrically so the text stays on the row's own baseline.
+            grow = wanted - rect.height()
+            rect.setTop(rect.top() - grow // 2)
+            rect.setHeight(wanted)
+        editor.setGeometry(rect)
+
+
 class RowButtonDelegate(QStyledItemDelegate):
     """Paints a per-row push button without creating row widgets.
 
@@ -312,9 +348,16 @@ class AudioChapterTableModel(QAbstractTableModel):
 
 
 class ChapterTableModel(QAbstractTableModel):
-    """Table over a list of Chapter rows; 'Tên dịch' is editable in place."""
+    """Table over a list of Chapter rows; 'Tên dịch' is editable in place.
+
+    'Tên chương' is editable too, but only where a tab has opted in with
+    `set_title_editable(True)` and connected `title_edited`. Off by default on purpose:
+    an editable cell whose edits nobody saves looks like it worked and loses the text on
+    the next refresh.
+    """
 
     translated_title_edited = Signal(int, str)  # chapter.index, new title
+    title_edited = Signal(int, str)  # chapter.index, new chapter title
 
     COLUMNS = ("#", "Tên chương", "Tên dịch", "Trạng thái", "Dịch bằng", "Thời gian", "Lỗi", "")
     TITLE_COLUMN = 1
@@ -328,6 +371,11 @@ class ChapterTableModel(QAbstractTableModel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._chapters: list[Chapter] = []
+        self._title_editable = False
+
+    def set_title_editable(self, editable: bool) -> None:
+        """Opt this table in to renaming chapters. Connect `title_edited` as well."""
+        self._title_editable = editable
 
     # ------------------------------------------------------------- population
 
@@ -384,12 +432,25 @@ class ChapterTableModel(QAbstractTableModel):
             return chapter.error  # full text on hover (cell is truncated)
         if role == Qt.ItemDataRole.EditRole and column == self.TRANSLATED_TITLE_COLUMN:
             return chapter.translated_title
+        if role == Qt.ItemDataRole.EditRole and column == self.TITLE_COLUMN:
+            return chapter.title
         if (
             role == Qt.ItemDataRole.ToolTipRole
             and column == self.TRANSLATED_TITLE_COLUMN
             and chapter.is_translated
         ):
             return "Nháy đúp để sửa tên dịch"
+        if role == Qt.ItemDataRole.ToolTipRole and column == self.TITLE_COLUMN:
+            if chapter.title_custom:
+                original = (
+                    f"\nTên gốc: {chapter.title_source}" if chapter.title_source else ""
+                )
+                return (
+                    f"{chapter.title}\n(tên bạn đặt — quét lại sẽ không ghi đè){original}"
+                )
+            if self._title_editable:
+                return f"{chapter.title}\nNháy đúp để sửa tên chương"
+            return chapter.title
         if role == Qt.ItemDataRole.ForegroundRole and column == self.STATUS_COLUMN:
             return STATUS_COLORS.get(chapter.status)
         if role == Qt.ItemDataRole.TextAlignmentRole and column == self.DURATION_COLUMN:
@@ -403,23 +464,34 @@ class ChapterTableModel(QAbstractTableModel):
 
     def flags(self, index):
         flags = super().flags(index)
+        if not index.isValid():
+            return flags
         if (
-            index.isValid()
-            and index.column() == self.TRANSLATED_TITLE_COLUMN
+            index.column() == self.TRANSLATED_TITLE_COLUMN
             and self._chapters[index.row()].is_translated
         ):
+            flags |= Qt.ItemFlag.ItemIsEditable
+        if index.column() == self.TITLE_COLUMN and self._title_editable:
             flags |= Qt.ItemFlag.ItemIsEditable
         return flags
 
     def setData(self, index, value, role=Qt.ItemDataRole.EditRole) -> bool:
-        if (
-            not index.isValid()
-            or role != Qt.ItemDataRole.EditRole
-            or index.column() != self.TRANSLATED_TITLE_COLUMN
-        ):
+        if not index.isValid() or role != Qt.ItemDataRole.EditRole:
             return False
         chapter = self._chapters[index.row()]
         title = str(value).strip()
+        if index.column() == self.TITLE_COLUMN:
+            # A blank name is a mis-edit, not an instruction: the title is what the
+            # export, the video and the TTS narration all use.
+            if not self._title_editable or not title or title == chapter.title:
+                return False
+            chapter.title = title
+            chapter.title_custom = True
+            self.dataChanged.emit(index, index)
+            self.title_edited.emit(chapter.index, title)
+            return True
+        if index.column() != self.TRANSLATED_TITLE_COLUMN:
+            return False
         if not title or title == chapter.translated_title:
             return False
         chapter.translated_title = title
