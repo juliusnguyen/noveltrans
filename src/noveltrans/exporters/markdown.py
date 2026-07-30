@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from noveltrans.errors import ExportError
-from noveltrans.exporters.base import Exporter, meta_text
+from noveltrans.exporters.base import Exporter, meta_text, source_note
 from noveltrans.models import Chapter, NovelMeta
 
 
@@ -34,7 +34,9 @@ class MarkdownExporter(Exporter):
             lines += [f"**Tác giả:** {meta.author}", ""]
         if description:
             lines += [f"> {description.replace(chr(10), chr(10) + '> ')}", ""]
-        lines += [f"*Nguồn: {meta.url} — xuất bởi NovelTrans*", ""]
+        note = source_note(meta)
+        if note:
+            lines += [f"*{note}*", ""]
         if skipped:
             names = ", ".join(c.title for c in skipped[:10])
             more = "…" if len(skipped) > 10 else ""

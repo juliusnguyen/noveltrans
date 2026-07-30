@@ -219,6 +219,58 @@ class NovelProject:
                     (ref.index, ref.title, ref.url, _now()),
                 )
 
+    def add_chapters(self, titles: list[str]) -> list[int]:
+        """Append hand-written chapters by name; returns the new 0-based indices.
+
+        For novels the user writes themselves — there is no TOC to scan, so this is the
+        only way rows get created. Blank names are dropped and the rest are stripped.
+
+        **Appends at `max(idx) + 1`, so a gap left by a delete is never filled.** An idx
+        is not just a row key: it is baked into the audio filename (`{index+1:04d}-…`),
+        the merged part names and the YouTube upload records beside them, so dropping a
+        new chapter into a hole would silently adopt the deleted one's audio file.
+
+        The one number that *does* come back is the tail: delete the last chapter and
+        `MAX(idx)` shrinks, so the next chapter takes its number again. Nothing here
+        remembers a trimmed tail, and giving it that memory would mean persisting a
+        high-water mark. It stays safe because `ScrapeTab._delete_chapter` unlinks the
+        deleted chapter's audio and cue sidecar, leaving no stale take to inherit.
+        """
+        titles = [t.strip() for t in titles]
+        titles = [t for t in titles if t]
+        if not titles:
+            return []
+        # MAX() over an empty table is NULL, not 0 — a fresh local novel has no rows yet.
+        highest = self._db.execute("SELECT MAX(idx) FROM chapters").fetchone()[0]
+        next_idx = 0 if highest is None else highest + 1
+        indices = list(range(next_idx, next_idx + len(titles)))
+        with self._db:
+            for idx, title in zip(indices, titles):
+                self._db.execute(
+                    "INSERT INTO chapters (idx, title, url, updated_at) VALUES (?, ?, '', ?)",
+                    (idx, title, _now()),
+                )
+        return indices
+
+    def delete_chapter(self, idx: int) -> Chapter | None:
+        """Remove one chapter; returns the deleted row, or None if it wasn't there.
+
+        The row is read before the DELETE so the caller can clean up what the database
+        no longer points at — chiefly `audio_path`, which is otherwise an unreachable
+        file in `exports/audio/`.
+
+        The freed index stays a **gap**; nothing renumbers. `plan_merge_windows` already
+        ranges and batches by 1-based chapter number precisely so a missing chapter can't
+        shift later boundaries, and renumbering would instead invalidate every existing
+        audio filename, rendered video part and upload record in one go.
+        """
+        chapter = self.chapter(idx)
+        if chapter is None:
+            return None
+        with self._db:
+            self._db.execute("DELETE FROM chapters WHERE idx = ?", (idx,))
+        return chapter
+
     # ---------------------------------------------------------------- queries
 
     def chapters(self) -> list[Chapter]:
@@ -417,16 +469,32 @@ class NovelProject:
             )
 
     def edit_content(self, idx: int, text: str) -> None:
-        """Manual edit of a chapter's original text.
+        """Manual edit of a chapter's original text — a correction, or the whole thing.
 
-        Unlike save_content, this does NOT touch status/error: a text correction is
-        not a re-download, and flipping a translated chapter back to "downloaded" would
-        wrongly re-queue it in pending_translation.
+        The status move is deliberately one-way. A chapter that *gains* text goes
+        pending/error -> downloaded, because that is how the user gets original text into
+        a hand-written novel: without it the row still reads "Chưa tải" while its content
+        is plainly on screen. A chapter that already reads `translated` is left alone —
+        flipping it back to "downloaded" would wrongly re-queue it in pending_translation,
+        and a text correction is not a re-download.
+
+        Writing an empty string never changes status either, so clearing a chapter
+        doesn't dress it up as downloaded.
         """
         with self._db:
             self._db.execute(
-                "UPDATE chapters SET content = ?, updated_at = ? WHERE idx = ?",
-                (text, _now(), idx),
+                "UPDATE chapters SET content = ?,"
+                "  status = CASE WHEN ? != '' AND status IN (?, ?) THEN ? ELSE status END,"
+                "  updated_at = ? WHERE idx = ?",
+                (
+                    text,
+                    text,
+                    STATUS_PENDING,
+                    STATUS_ERROR,
+                    STATUS_DOWNLOADED,
+                    _now(),
+                    idx,
+                ),
             )
 
     def apply_replacements(self, changes: dict[int, dict[str, str]]) -> None:

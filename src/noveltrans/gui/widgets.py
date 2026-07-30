@@ -395,6 +395,17 @@ class ChapterTableModel(QAbstractTableModel):
     def chapter_at(self, row: int) -> Chapter | None:
         return self._chapters[row] if 0 <= row < len(self._chapters) else None
 
+    def row_for_index(self, chapter_index: int) -> int | None:
+        """The table row showing chapter `chapter_index`, or None.
+
+        Not the identity function: a deleted chapter leaves a gap in the index sequence,
+        so row N and chapter N part ways as soon as one is removed.
+        """
+        for row, chapter in enumerate(self._chapters):
+            if chapter.index == chapter_index:
+                return row
+        return None
+
     # ---------------------------------------------------------------- Qt API
 
     def rowCount(self, parent=QModelIndex()) -> int:

@@ -8,7 +8,7 @@ from pathlib import Path
 from ebooklib import epub
 
 from noveltrans.errors import ExportError
-from noveltrans.exporters.base import Exporter, meta_text
+from noveltrans.exporters.base import Exporter, meta_text, source_note
 from noveltrans.models import Chapter, NovelMeta
 
 _LANG_BY_TRANSLATION = {True: None, False: "zh"}  # None -> set from target lang
@@ -48,7 +48,9 @@ class EpubExporter(Exporter):
             intro_html.append(f"<p><b>{html.escape(meta.author)}</b></p>")
         if description:
             intro_html.append(f"<p>{html.escape(description)}</p>")
-        intro_html.append(f"<p><i>Nguồn: {html.escape(meta.url)} — xuất bởi NovelTrans</i></p>")
+        note = source_note(meta)
+        if note:
+            intro_html.append(f"<p><i>{html.escape(note)}</i></p>")
         if skipped:
             intro_html.append(f"<p><i>Bỏ qua {len(skipped)} chương chưa có nội dung.</i></p>")
         intro = epub.EpubHtml(title="Giới thiệu", file_name="intro.xhtml", lang=language)

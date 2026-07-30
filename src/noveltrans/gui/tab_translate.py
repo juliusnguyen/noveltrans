@@ -113,8 +113,13 @@ class TranslateTab(QWidget):
         self.table.setColumnWidth(ChapterTableModel.RETRANSLATE_COLUMN, 100)
 
         self.original_view = QPlainTextEdit()
-        self.original_view.setReadOnly(True)
-        self.original_view.setPlaceholderText("Bản gốc")
+        self.original_view.setReadOnly(True)  # editable once a chapter loads
+        self.original_view.setPlaceholderText("Bản gốc (bấm vào để sửa/dán, tự lưu khi rời ô)")
+        self.original_view.setToolTip(
+            "Dán hoặc sửa nội dung gốc — dòng đầu là tên chương, cách một dòng trống rồi "
+            "đến nội dung. Đây là chỗ nhập nội dung cho truyện tự viết."
+        )
+        self.original_view.installEventFilter(self)  # save edits on focus-out
         self.translated_view = QPlainTextEdit()
         self.translated_view.setReadOnly(True)  # editable once a translated chapter loads
         self.translated_view.setPlaceholderText("Bản dịch (bấm vào để sửa, tự lưu khi rời ô)")
@@ -262,6 +267,7 @@ class TranslateTab(QWidget):
 
     def _on_project_selected(self, path: str) -> None:
         self._save_preview_edits()
+        self._save_original_edits()
         if self.project is not None:
             self.project.close()
             self.project = None
@@ -269,14 +275,22 @@ class TranslateTab(QWidget):
             self.project = NovelProject.open(path)
             self.model.set_chapters(self.project.chapters())
             counts = self.project.counts()
-            self.status_label.setText(
+            message = (
                 f"{counts['downloaded']}/{counts['total']} chương đã tải, "
                 f"{counts['translated']} đã dịch."
             )
+            if self.project.meta.is_local:
+                message = (
+                    f"Truyện tự viết — {counts['downloaded']}/{counts['total']} chương đã có "
+                    f"nội dung, {counts['translated']} đã dịch. Chọn một chương rồi dán nội "
+                    "dung vào ô “Bản gốc” bên trái."
+                )
+            self.status_label.setText(message)
         else:
             self.model.set_chapters([])
             self.status_label.setText("")
         self.original_view.clear()
+        self.original_view.setReadOnly(True)
         self.translated_view.clear()
         self.translated_view.setReadOnly(True)
         self._preview_idx = None
@@ -285,6 +299,7 @@ class TranslateTab(QWidget):
 
     def _on_row_selected(self, current, _previous) -> None:
         self._save_preview_edits()
+        self._save_original_edits()
         chapter = self.model.chapter_at(current.row()) if current.isValid() else None
         if chapter is None or self.project is None:
             return
@@ -295,6 +310,11 @@ class TranslateTab(QWidget):
             return
         self._preview_idx = fresh.index
         self.original_view.setPlainText(f"{fresh.title}\n\n{fresh.content}")
+        self.original_view.setReadOnly(False)
+        # setPlainText already clears the modified flag, so this is belt-and-braces: it
+        # states the invariant the save-on-blur guard depends on — a freshly loaded pane
+        # has nothing pending, so moving through chapters writes nothing back.
+        self.original_view.document().setModified(False)
         if fresh.translated:
             self.translated_view.setPlainText(f"{fresh.translated_title}\n\n{fresh.translated}")
             self.translated_view.setReadOnly(False)
@@ -323,6 +343,38 @@ class TranslateTab(QWidget):
         if chapter is not None:
             self.model.update_chapter(chapter)
 
+    def _save_original_edits(self) -> None:
+        """Persist manual edits typed into the original preview pane.
+
+        Mirrors `_save_preview_edits` deliberately — same first-line-is-the-title
+        convention, same "an emptied pane is an accident" guard — because this is the
+        only place a hand-written novel gets its text, and two different rules for two
+        panes sitting side by side would be a trap.
+        """
+        if (
+            self.project is None
+            or self._preview_idx is None
+            or not self.original_view.document().isModified()
+        ):
+            return
+        raw = self.original_view.toPlainText()
+        if not raw.strip():  # an emptied pane is treated as an accidental clear
+            return
+        title, sep, body = raw.partition("\n\n")
+        if not sep:  # blank line removed — fall back to first line = title
+            title, _, body = raw.partition("\n")
+        self.project.edit_content(self._preview_idx, body.strip())
+        title = title.strip()
+        stored = self.project.chapter(self._preview_idx)
+        # Only on a real change: edit_title sets title_custom, and marking every blur as
+        # a rename would make "Lấy lại tên gốc" appear on chapters nobody renamed.
+        if title and stored is not None and title != stored.title:
+            self.project.edit_title(self._preview_idx, title)
+        self.original_view.document().setModified(False)
+        chapter = self.project.chapter(self._preview_idx)
+        if chapter is not None:
+            self.model.update_chapter(chapter)
+
     def _on_translated_title_edited(self, idx: int, title: str) -> None:
         if self.project is None:
             return
@@ -331,8 +383,11 @@ class TranslateTab(QWidget):
             self._load_preview(self.project.chapter(idx))
 
     def eventFilter(self, obj, event) -> bool:
-        if obj is self.translated_view and event.type() == QEvent.Type.FocusOut:
-            self._save_preview_edits()
+        if event.type() == QEvent.Type.FocusOut:
+            if obj is self.translated_view:
+                self._save_preview_edits()
+            elif obj is self.original_view:
+                self._save_original_edits()
         return super().eventFilter(obj, event)
 
     # ------------------------------------------------------------- translate
@@ -430,8 +485,10 @@ class TranslateTab(QWidget):
             return
         # Flush a half-typed manual edit to disk FIRST, so the scan sees the latest text
         # and a later focus-out can't overwrite the replacement. The modal then blocks
-        # further pane edits while it's open.
+        # further pane edits while it's open. Both panes — a replace can target the
+        # original text too (FIELD_CONTENT).
         self._save_preview_edits()
+        self._save_original_edits()
 
         dialog = FindReplaceDialog(self.project, self._preview_idx, self)
         dialog.applied.connect(self._on_replacements_applied)
@@ -492,6 +549,7 @@ class TranslateTab(QWidget):
 
     def shutdown(self) -> None:
         self._save_preview_edits()
+        self._save_original_edits()
         if self._worker is not None and self._worker.isRunning():
             self._worker.cancel()
             self._worker.wait(60_000)

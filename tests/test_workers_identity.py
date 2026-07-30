@@ -75,3 +75,35 @@ def test_identity_skipped_when_target_differs(qapp, library_dir, monkeypatch):
     worker.run()
 
     assert took_identity["yes"] is False
+
+
+def test_a_self_written_vi_novel_becomes_voiceable_either_way(qapp, library_dir):
+    """The Tab 4 "works with either radio button" claim, for a hand-written novel.
+
+    A local Vietnamese novel gets its text via edit_content, never save_content. Running
+    "Dịch tất cả" sang Tiếng Việt takes the identity path, which both fills `translated`
+    AND `meta.translated_title` — the value the video slug is keyed to.
+    """
+    from noveltrans.storage import Library
+
+    project = Library(library_dir).create_local_project(
+        NovelMeta(url="", site="", title="Truyện Của Tôi", source_lang="vi")
+    )
+    project.add_chapters(["Chương 1", "Chương 2"])
+    project.edit_content(0, "Nội dung tôi tự viết.")
+    path = project.path
+    # Bản gốc works before any translation exists at all.
+    assert [c.index for c in project.pending_audio("v1", use_translation=False)] == [0]
+    project.close()
+
+    TranslateWorker(path, engine_name="google", target_lang="vi").run()
+
+    reopened = NovelProject.open(path)
+    try:
+        assert reopened.chapter(0).translated == "Nội dung tôi tự viết."
+        assert reopened.chapter(0).translator == "(nguyên bản)"
+        assert reopened.meta.translated_title == "Truyện Của Tôi"
+        # …and now Bản dịch works too
+        assert [c.index for c in reopened.pending_audio("v1", use_translation=True)] == [0]
+    finally:
+        reopened.close()
