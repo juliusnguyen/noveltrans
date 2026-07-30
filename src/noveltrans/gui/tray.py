@@ -134,6 +134,10 @@ class TrayController(QObject):
         # Only when the window is hidden — with it open, the tab's own status line has
         # already said so, and a notification on top of that is noise.
         if label and not self.window.isVisible():
+            # Since 050 the Dock tile is gone while hidden, so this badge normally lands
+            # nowhere and the notification is the real signal. Kept for the case where
+            # `hide_dock_icon()` declined (non-macOS, or an odd Objective-C runtime) and
+            # the tile is still there.
             set_dock_badge(1)
             self.notify_finished(label)
 
