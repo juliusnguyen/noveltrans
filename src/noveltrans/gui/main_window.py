@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from noveltrans.config import AppConfig
+from noveltrans.gui.dock import hide_dock_icon, show_dock_icon
 from noveltrans.gui.notify import clear_dock_badge
 from noveltrans.gui.settings_dialog import SettingsDialog
 from noveltrans.gui.workspace import Workspace
@@ -242,7 +243,13 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------- hide vs. quit
 
     def show_from_tray(self) -> None:
-        """Bring the window back from the menu bar."""
+        """Bring the window back from the menu bar, Dock icon and all.
+
+        The Dock tile goes back FIRST: switching out of Accessory is what gives the app
+        an application menu again, and a window raised before the switch can end up
+        behind whatever the user was looking at.
+        """
+        show_dock_icon()
         self.showNormal()
         self.raise_()
         self.activateWindow()
@@ -280,6 +287,10 @@ class MainWindow(QMainWindow):
             # which is the exact opposite of "keep running in the menu bar".
             event.ignore()
             self.hide()
+            # Only reached when a tray icon actually installed, so there is always a
+            # menu-bar item left to get back in through. Dropping the Dock tile without
+            # one would leave the app running with no way to reach it at all.
+            hide_dock_icon()
             return
         self.shutdown_all()
         super().closeEvent(event)

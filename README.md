@@ -29,9 +29,20 @@ nào bị ghi dở và chạy tiếp thì tiếp đúng chỗ cũ — đổi l�
 | Ghép audio / render video | khi xong **file** đang ffmpeg — có thể vài chục phút |
 | Tải lên YouTube | xong phần đang tải; cửa sổ Chrome và phiên đăng nhập Google **vẫn mở** cho tới khi chạy tiếp |
 
-Chỉ **Thoát** (hoặc ⌘Q) mới thật sự đóng app — lúc đó mọi tiến trình đang chạy sẽ bị huỷ.
-Bấm biểu tượng app dưới Dock cũng mở lại cửa sổ. Máy nào không có thanh menu (system tray)
-thì ✕ vẫn thoát như cũ.
+Khi thu nhỏ xuống thanh menu, **icon dưới Dock cũng biến mất** — app chỉ còn một biểu tượng
+nhỏ trên thanh menu. Mở lại cửa sổ (**Mở cửa sổ**) thì icon Dock hiện lại.
+
+Đổi lại, trong lúc đang ẩn:
+
+- **Bấm biểu tượng trên thanh menu là cách duy nhất để mở lại cửa sổ** (không còn icon Dock
+  để bấm).
+- **⌘Q không hoạt động** — lúc này app không giữ thanh menu ứng dụng nên phím tắt không tới
+  được. Dùng **Thoát** trong bảng tiến trình.
+- Báo "đã xong" dựa vào thông báo của macOS (không còn icon Dock để hiện chấm đỏ).
+
+Chỉ **Thoát** mới thật sự đóng app — lúc đó mọi tiến trình đang chạy sẽ bị huỷ. Khi cửa sổ
+đang mở thì ⌘Q vẫn thoát như bình thường. Máy nào không có thanh menu (system tray) thì ✕
+vẫn thoát như cũ và icon Dock không bị đụng tới.
 
 ## Trang web được hỗ trợ
 

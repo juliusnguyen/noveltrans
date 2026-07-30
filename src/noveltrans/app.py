@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QApplication
 from noveltrans import __version__
 from noveltrans.config import AppConfig
 from noveltrans.gui import keep_awake
+from noveltrans.gui.dock import POLICY_REGULAR, current_policy
 from noveltrans.gui.main_window import MainWindow
 from noveltrans.gui.style import apply_theme
 from noveltrans.gui.tray import TrayController
@@ -21,6 +22,14 @@ class DockActivateFilter(QObject):
 
     A free-standing filter rather than a QApplication subclass, so the tests' shared
     QApplication keeps working and the filter can be handed a synthetic event.
+
+    **Only when the Dock icon is actually there.** `ApplicationActivate` fires on *any*
+    activation, and clicking our own menu-bar item activates the app too — so without the
+    policy check this filter reopened the window (Dock icon and all) the instant the user
+    clicked the status item, and the progress panel never appeared. Since 050 the Dock
+    tile is gone while hidden, so in the normal hidden state this correctly does nothing
+    and the tray click gets to show the popup. The check keeps the Dock-click fallback
+    alive for the case where `hide_dock_icon()` declined and the tile is still present.
     """
 
     def __init__(self, window, parent=None):
@@ -28,7 +37,11 @@ class DockActivateFilter(QObject):
         self.window = window
 
     def eventFilter(self, obj, event) -> bool:
-        if event.type() == QEvent.Type.ApplicationActivate and not self.window.isVisible():
+        if (
+            event.type() == QEvent.Type.ApplicationActivate
+            and not self.window.isVisible()
+            and current_policy() == POLICY_REGULAR  # a Dock icon exists to have been clicked
+        ):
             self.window.show_from_tray()
         return super().eventFilter(obj, event)
 

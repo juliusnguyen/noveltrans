@@ -340,20 +340,85 @@ class TestQuit:
 
 
 class TestDockActivate:
-    def test_clicking_the_dock_reshows_a_hidden_window(self, main):
+    """Re-show on activation, but ONLY when a Dock icon exists to have been clicked.
+
+    The policy is monkeypatched in every case: it is process-wide state that other tests
+    (and Qt itself) can move, so reading the real one would make these pass or fail on
+    test ordering.
+    """
+
+    def _activate(
+        self, main, monkeypatch, policy, event_type=QEvent.Type.ApplicationActivate
+    ) -> list:
+        import noveltrans.app as app_module
+
+        calls: list = []
+        monkeypatch.setattr(app_module, "current_policy", lambda: policy)
+        monkeypatch.setattr(main, "show_from_tray", lambda: calls.append(True))
+        DockActivateFilter(main).eventFilter(main, QEvent(event_type))
+        return calls
+
+    def test_clicking_the_dock_reshows_a_hidden_window(self, main, monkeypatch):
         main.hide()
-        f = DockActivateFilter(main)
-        f.eventFilter(main, QEvent(QEvent.Type.ApplicationActivate))
-        assert main.isVisible()
+        assert self._activate(main, monkeypatch, 0) == [True]  # Regular = tile present
+
+    def test_clicking_the_menu_bar_icon_does_not_reopen_the_window(self, main, monkeypatch):
+        # The reported bug. Clicking the status item activates the app, so an unguarded
+        # filter reopened the window — Dock icon and all — before the progress panel
+        # could appear. While hidden the policy is Accessory, so nothing happens here and
+        # the tray's own `activated` handler gets to show the popup.
+        main.hide()
+        assert self._activate(main, monkeypatch, 1) == []  # Accessory = no tile
 
     def test_it_leaves_a_visible_window_alone(self, main, monkeypatch):
         main.show()
+        assert self._activate(main, monkeypatch, 0) == []
+
+    def test_other_events_are_ignored(self, main, monkeypatch):
+        main.hide()
+        assert self._activate(main, monkeypatch, 0, QEvent.Type.WindowActivate) == []
+
+
+class TestDockIcon:
+    """Hiding to the menu bar drops the Dock tile too, and reopening puts it back (050).
+
+    The real calls are patched out: they would change pytest's OWN activation policy,
+    and `tests/test_dock.py` already exercises the Objective-C side for real.
+    """
+
+    def _patch(self, monkeypatch) -> list:
         calls: list = []
-        monkeypatch.setattr(main, "show_from_tray", lambda: calls.append(True))
-        DockActivateFilter(main).eventFilter(main, QEvent(QEvent.Type.ApplicationActivate))
+        monkeypatch.setattr(mw, "hide_dock_icon", lambda: calls.append("hide") or True)
+        monkeypatch.setattr(mw, "show_dock_icon", lambda: calls.append("show") or True)
+        return calls
+
+    def test_hiding_to_the_menu_bar_drops_the_dock_icon(self, main, monkeypatch):
+        calls = self._patch(monkeypatch)
+        main.show()
+        main.hide_to_tray_enabled = True
+        main.closeEvent(QCloseEvent())
+        assert calls == ["hide"]
+
+    def test_reopening_brings_the_dock_icon_back(self, main, monkeypatch):
+        calls = self._patch(monkeypatch)
+        main.hide()
+        main.show_from_tray()
+        assert calls == ["show"]
+        assert main.isVisible()
+
+    def test_without_a_tray_the_dock_icon_is_left_alone(self, main, monkeypatch):
+        # The close really quits in that case, and dropping the tile with no menu-bar
+        # item would leave a running app with no way to reach it at all.
+        calls = self._patch(monkeypatch)
+        main.hide_to_tray_enabled = False
+        main.closeEvent(QCloseEvent())
         assert calls == []
 
-    def test_other_events_are_ignored(self, main):
-        main.hide()
-        DockActivateFilter(main).eventFilter(main, QEvent(QEvent.Type.WindowActivate))
-        assert not main.isVisible()
+    def test_the_dock_icon_returns_before_the_window_is_raised(self, main, monkeypatch):
+        # Switching out of Accessory is what gives the app its menu bar back; a window
+        # raised first can land behind whatever the user was looking at.
+        order: list = []
+        monkeypatch.setattr(mw, "show_dock_icon", lambda: order.append("dock") or True)
+        monkeypatch.setattr(main, "showNormal", lambda: order.append("window"))
+        main.show_from_tray()
+        assert order == ["dock", "window"]
