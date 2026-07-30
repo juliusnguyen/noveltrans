@@ -25,10 +25,12 @@ from PySide6.QtWidgets import (
 
 from noveltrans.config import AppConfig
 from noveltrans.discord_unlock import valid_channel_url
+from noveltrans.gui.jobs import job_registry
 from noveltrans.gui.keep_awake import track_worker
 from noveltrans.gui.local_novel_dialog import AddChaptersDialog, LocalNovelDialog
 from noveltrans.gui.notify import clear_dock_badge, request_attention, set_dock_badge
 from noveltrans.gui.widgets import (
+    PauseButton,
     CellEditorDelegate,
     ChapterTableModel,
     ProjectPicker,
@@ -160,6 +162,7 @@ class ScrapeTab(QWidget):
         self.cancel_button = QPushButton("Dừng")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self._cancel_download)
+        self.pause_button = PauseButton()
         self.progress = QProgressBar()
         self.progress.setFormat("%v / %m chương")
         self.status_label = QLabel("")
@@ -168,6 +171,7 @@ class ScrapeTab(QWidget):
         download_row.addWidget(self.add_chapter_button)
         download_row.addWidget(self.download_button)
         download_row.addWidget(self.cancel_button)
+        download_row.addWidget(self.pause_button)
         download_row.addWidget(self.progress, stretch=1)
 
         # --- range row: download a chosen span of chapters (1-based chapter numbers)
@@ -468,6 +472,10 @@ class ScrapeTab(QWidget):
         self._download_worker.daily_limit_hit.connect(self._on_daily_limit)
         self._download_worker.finished_ok.connect(self._on_download_finished)
         track_worker(self._download_worker)  # keep the Mac awake for the batch
+        self._job = job_registry.register(
+            self._download_worker, kind="Tải truyện", novel=self._job_novel()
+        )
+        self.pause_button.set_job(self._job.id if self._job else None)
         self._download_worker.start()
 
     def _cancel_download(self) -> None:
@@ -677,6 +685,14 @@ class ScrapeTab(QWidget):
     def current_title(self) -> str:
         """The loaded novel's title (for the workspace tab label), or ""."""
         return self.project.meta.title if self.project is not None else ""
+
+    def _job_novel(self) -> str:
+        """The novel label for the menu-bar job row — this tab's own project.
+
+        Deliberately not Workspace.current_title(): each tab has an independent picker,
+        so an audio job on a different novel would be labelled with the scrape tab's.
+        """
+        return self.project.meta.display_name() if self.project is not None else ""
 
     def has_running_workers(self) -> bool:
         return any(

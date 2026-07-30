@@ -4,10 +4,34 @@
 
 | Tab | Chức năng |
 |---|---|
-| **1. Tải truyện** | Dán URL truyện → Quét metadata (tên, tác giả, mô tả, mục lục) → Tải toàn bộ chương về máy. Sau khi dịch, tên dịch hiện kế bên tên gốc và mô tả hiển thị bản dịch (rê chuột xem bản gốc). Có progress bar, nút Dừng, và tự resume (chạy lại chỉ tải chương còn thiếu). Hoặc bấm **✍️ Truyện tự viết** để tạo truyện của chính bạn (không cần link nguồn): thêm chương bằng tên (mỗi dòng một tên), đổi tên chương, chuột phải để xoá chương. |
-| **2. Dịch** | Dịch Trung → Việt/Anh bằng **Google Translate (miễn phí)**, **Claude API**, **CLI Agent** (agy/claude) hoặc **LM Studio** (model local). Xem song song bản gốc/bản dịch. Resume + retry chương lỗi, dịch lại từng chương. Sửa tay cả hai ô: bấm vào ô **Bản gốc** để dán/sửa nội dung gốc (đây cũng là chỗ nhập nội dung cho truyện tự viết), bấm vào ô **Bản dịch** để sửa bản dịch — cả hai tự lưu khi rời ô, dòng đầu là tên chương. Nháy đúp cột "Tên dịch" để đổi tên chương dịch. **Tìm & thay thế** hàng loạt (một chương hoặc cả truyện) — xem trước số khớp rồi mới áp dụng. |
+| **1. Tải truyện** | Dán URL truyện → Quét metadata (tên, tác giả, mô tả, mục lục) → Tải toàn bộ chương về máy. Sau khi dịch, tên dịch hiện kế bên tên gốc và mô tả hiển thị bản dịch (rê chuột xem bản gốc). Có progress bar, nút Dừng, và tự resume (chạy lại chỉ tải chương còn thiếu). Hoặc bấm **✍️ Truyện tự viết** để tạo truyện của chính bạn (không cần link nguồn): thêm chương bằng tên (mỗi dòng một tên), đổi tên chương, chuột phải để xoá chương. Có nút **⏸ Tạm dừng** cạnh nút Dừng. |
+| **2. Dịch** | Dịch Trung → Việt/Anh bằng **Google Translate (miễn phí)**, **Claude API**, **CLI Agent** (agy/claude) hoặc **LM Studio** (model local). Xem song song bản gốc/bản dịch. Resume + retry chương lỗi, dịch lại từng chương. Sửa tay cả hai ô: bấm vào ô **Bản gốc** để dán/sửa nội dung gốc (đây cũng là chỗ nhập nội dung cho truyện tự viết), bấm vào ô **Bản dịch** để sửa bản dịch — cả hai tự lưu khi rời ô, dòng đầu là tên chương. Nháy đúp cột "Tên dịch" để đổi tên chương dịch. **Tìm & thay thế** hàng loạt (một chương hoặc cả truyện) — xem trước số khớp rồi mới áp dụng. Có nút **⏸ Tạm dừng** cạnh nút Dừng. |
 | **3. Xuất file** | Xuất bản dịch (hoặc bản gốc) ra **DOCX**, **Markdown**, **EPUB**. Tên file mặc định lấy theo tên truyện đã dịch. |
-| **4. Nghe audio** | Đọc bản dịch thành audio bằng **VieNeu-TTS** (chạy local, 14 giọng tiếng Việt × 3 phong cách). MP3/WAV từng chương, resume, tạo lại từng chương, double-click để nghe. Chọn **giọng** và **phong cách** riêng, xem trước văn bản engine sẽ đọc, và tinh chỉnh **tốc độ / âm lượng / khoảng lặng / độ biểu cảm / chất lượng** trong Cài đặt. Truyện tự viết bằng tiếng Việt thì chọn nguồn **Bản gốc** để đọc thẳng nội dung (không cần dịch). |
+| **4. Nghe audio** | Đọc bản dịch thành audio bằng **VieNeu-TTS** (chạy local, 14 giọng tiếng Việt × 3 phong cách). MP3/WAV từng chương, resume, tạo lại từng chương, double-click để nghe. Chọn **giọng** và **phong cách** riêng, xem trước văn bản engine sẽ đọc, và tinh chỉnh **tốc độ / âm lượng / khoảng lặng / độ biểu cảm / chất lượng** trong Cài đặt. Truyện tự viết bằng tiếng Việt thì chọn nguồn **Bản gốc** để đọc thẳng nội dung (không cần dịch). Có nút **⏸ Tạm dừng** cạnh nút Dừng. |
+
+## Chạy nền ở thanh menu
+
+Việc tải / dịch / tạo audio / render video chạy hàng giờ, nên **đóng cửa sổ (✕) sẽ thu nhỏ
+app xuống thanh menu macOS chứ không thoát** — tiến trình vẫn chạy tiếp.
+
+Bấm biểu tượng NovelTrans trên thanh menu để mở bảng tiến trình: mỗi việc đang chạy là một
+dòng có tên truyện, thanh tiến trình, số chương, và nút **⏸ Tạm dừng / ▶ Tiếp tục**. Cuối
+bảng có **Mở cửa sổ** và **Thoát**. Nút ⏸ cũng nằm sẵn cạnh nút **Dừng** trong từng tab, để
+tạm dừng mà không cần đóng cửa sổ.
+
+**Tạm dừng = dừng lại sau khi xong mục đang chạy**, không bỏ dở giữa chừng. Không có file
+nào bị ghi dở và chạy tiếp thì tiếp đúng chỗ cũ — đổi lại, nó không tức thì:
+
+| Đang làm | Tạm dừng có hiệu lực sau |
+|---|---|
+| Tải / dịch chương | gần như ngay (xong chương hiện tại) |
+| Tạo audio | khoảng một phút (xong chương đang đọc) |
+| Ghép audio / render video | khi xong **file** đang ffmpeg — có thể vài chục phút |
+| Tải lên YouTube | xong phần đang tải; cửa sổ Chrome và phiên đăng nhập Google **vẫn mở** cho tới khi chạy tiếp |
+
+Chỉ **Thoát** (hoặc ⌘Q) mới thật sự đóng app — lúc đó mọi tiến trình đang chạy sẽ bị huỷ.
+Bấm biểu tượng app dưới Dock cũng mở lại cửa sổ. Máy nào không có thanh menu (system tray)
+thì ✕ vẫn thoát như cũ.
 
 ## Trang web được hỗ trợ
 

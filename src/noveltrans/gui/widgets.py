@@ -14,11 +14,13 @@ from PySide6.QtWidgets import (
     QStyle,
     QStyledItemDelegate,
     QStyleOptionButton,
+    QPushButton,
     QTableView,
 )
 
 from PySide6.QtGui import QColor, QKeySequence, QShortcut
 
+from noveltrans.gui.jobs import job_registry
 from noveltrans.models import (
     STATUS_DOWNLOADED,
     STATUS_ERROR,
@@ -550,3 +552,66 @@ def enable_cell_copy(table: QTableView, extra_actions=None) -> None:
     shortcut = QShortcut(QKeySequence.StandardKey.Copy, table)
     shortcut.activated.connect(copy_current)
     table.customContextMenuRequested.connect(show_menu)
+
+
+class PauseButton(QPushButton):
+    """⏸ Tạm dừng / ▶ Tiếp tục for one job, wherever it is shown.
+
+    The same class backs the button in a tab's button row and the one in the menu-bar
+    popup, and neither holds any state: both read `Job.paused` and both write through
+    `job_registry.toggle`. That is what stops the two copies from ever disagreeing.
+
+    Bound to a job id rather than a Job so a tab can keep one button across many runs —
+    `set_job(...)` rebinds it, `set_job(None)` parks it.
+    """
+
+    def __init__(self, job_id: int | None = None, registry=None, parent=None):
+        super().__init__(parent)
+        # Injectable so a popup built against a throwaway registry (tests) doesn't drive
+        # the app-wide one. Production always passes none of it and gets the singleton.
+        self.registry = registry if registry is not None else job_registry
+        self._job_id: int | None = None
+        # Appended to the tooltip on every state change rather than set once by the
+        # caller: `_apply` rewrites the tooltip each time the job flips, so a tooltip
+        # assigned from outside would vanish on the first press — which is exactly when
+        # a warning like "this leaves Chrome open" needs to still be there.
+        self._extra_hint = ""
+        self.clicked.connect(self._toggle)
+        self.registry.job_changed.connect(self._on_job_changed)
+        self.registry.job_removed.connect(self._on_job_removed)
+        self.set_job(job_id)
+
+    def set_job(self, job_id: int | None) -> None:
+        self._job_id = job_id
+        job = self.registry.job(job_id) if job_id is not None else None
+        self.setEnabled(job is not None and job.pausable)
+        self._apply(job)
+
+    def set_extra_hint(self, hint: str) -> None:
+        """A job-kind-specific warning kept on the tooltip through every state change."""
+        self._extra_hint = hint or ""
+        self._apply(self.registry.job(self._job_id) if self._job_id is not None else None)
+
+    def _apply(self, job) -> None:
+        paused = bool(job is not None and job.paused)
+        self.setText("▶ Tiếp tục" if paused else "⏸ Tạm dừng")
+        tip = (
+            "Chạy tiếp từ chỗ đang dừng."
+            if paused
+            else "Dừng lại sau khi xong mục đang chạy (không bỏ dở chương nào)."
+        )
+        if self._extra_hint:
+            tip = f"{tip}\n\n{self._extra_hint}"
+        self.setToolTip(tip)
+
+    def _toggle(self) -> None:
+        if self._job_id is not None:
+            self.registry.toggle(self._job_id)
+
+    def _on_job_changed(self, job) -> None:
+        if job.id == self._job_id:
+            self._apply(job)
+
+    def _on_job_removed(self, job_id: int) -> None:
+        if job_id == self._job_id:
+            self.set_job(None)

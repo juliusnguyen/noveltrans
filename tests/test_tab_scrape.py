@@ -239,3 +239,49 @@ def test_delete_chapter_is_refused_on_a_scraped_project(qapp, library_dir, monke
     )
     tab._delete_chapter(1)
     assert tab.model.rowCount() == 5  # replace_toc would restore it anyway
+
+
+# ------------------------------------------------ menu-bar job registration (049)
+
+
+def test_launching_a_download_registers_a_job(qapp, library_dir, monkeypatch):
+    from noveltrans.gui.jobs import job_registry
+
+    job_registry.reset()
+    tab = _tab_with_project(qapp, library_dir)
+
+    class _Sig:
+        def connect(self, *_a):
+            pass
+
+    class _FakeWorker:
+        progress = _Sig()
+        finished = _Sig()
+
+        def __init__(self, *a, **kw):
+            self.finished_ok = self.chapter_done = self.chapter_error = _Sig()
+            self.daily_limit_hit = _Sig()
+
+        def start(self):
+            pass
+
+        def isRunning(self):
+            return False
+
+        def isFinished(self):
+            return False
+
+    monkeypatch.setattr("noveltrans.gui.tab_scrape.DownloadWorker", _FakeWorker)
+    monkeypatch.setattr("noveltrans.gui.tab_scrape.track_worker", lambda *_a: None)
+    tab._begin_download(0, None, False)
+
+    jobs = job_registry.jobs()
+    assert [j.kind for j in jobs] == ["Tải truyện"]
+    assert jobs[0].novel == "T"  # this tab's own novel, not the workspace's
+    assert tab.pause_button.isEnabled()
+    job_registry.reset()
+
+
+def test_the_pause_button_starts_disabled(qapp, library_dir):
+    tab = _tab_with_project(qapp, library_dir)
+    assert not tab.pause_button.isEnabled()  # nothing running yet

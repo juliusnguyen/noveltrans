@@ -2916,3 +2916,44 @@ class TestMeasuredUploadDialog:
             at = src.find("_click_text_anywhere(page, _SUB_CONTINUE_TEXTS", at + 1)
         assert clicks, "the Continue click disappeared — this test is now checking nothing"
         assert all(at > guard for at in clicks)
+
+
+class TestPauseHook:
+    """The per-part `on_checkpoint` hook the browser workers pass in (049).
+
+    Only the API shape is pinned here: the batch functions drive a real Playwright
+    session, so that the hook actually fires between parts is verified by inspection and
+    by the manual run recorded in 049.01-HISTORY.md — not by this suite.
+    """
+
+    @pytest.mark.parametrize(
+        "name",
+        ["upload_batch", "upload_subtitle_batch", "update_thumbnail_batch", "sync_playlist_batch"],
+    )
+    def test_the_hook_is_optional_and_keyword_only(self, name):
+        import inspect
+
+        from noveltrans import youtube_upload
+
+        param = inspect.signature(getattr(youtube_upload, name)).parameters["on_checkpoint"]
+        assert param.default is None  # every existing caller keeps working untouched
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY
+
+    @pytest.mark.parametrize(
+        "name",
+        ["upload_batch", "upload_subtitle_batch", "update_thumbnail_batch", "sync_playlist_batch"],
+    )
+    def test_the_hook_sits_at_the_part_boundary_not_mid_transfer(self, name):
+        # Guards the one thing that would break a live upload: holding inside
+        # `_wait_for_bytes_uploaded` would freeze a transfer mid-stream and trip
+        # Playwright's timeout. It must only ever follow the per-part cancel check.
+        import inspect
+        import re
+
+        from noveltrans import youtube_upload
+
+        source = inspect.getsource(getattr(youtube_upload, name))
+        calls = [m.start() for m in re.finditer(r"on_checkpoint\(\)", source)]
+        assert len(calls) == 1
+        preceding = source[: calls[0]].rstrip().splitlines()[-3:]
+        assert any("_check_cancel(should_cancel)" in line for line in preceding)

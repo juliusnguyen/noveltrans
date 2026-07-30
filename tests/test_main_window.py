@@ -9,7 +9,10 @@ worker lifecycles are verified manually (see 007.02-INITIAL-PLAN.md §Manual).
 from __future__ import annotations
 
 import pytest
+from PySide6.QtCore import QEvent
+from PySide6.QtGui import QCloseEvent
 
+from noveltrans.app import DockActivateFilter
 from noveltrans.config import AppConfig
 from noveltrans.gui import main_window as mw
 from noveltrans.gui.workspace import Workspace
@@ -245,3 +248,112 @@ class TestLibraryFolderChange:
             assert reloaded == []
         finally:
             window.close()
+
+
+class TestHideToMenuBar:
+    """Closing the window hides it once a tray is installed — and must NOT shut down."""
+
+    def _spy_shutdowns(self, main) -> list:
+        closed: list = []
+        for index in range(main.workspaces.count()):
+            ws = main.workspaces.widget(index)
+            original = ws.shutdown
+
+            def wrapped(_ws=ws, _original=original):
+                closed.append(_ws)
+                _original()
+
+            ws.shutdown = wrapped  # type: ignore[method-assign]
+        return closed
+
+    def test_close_hides_instead_of_quitting(self, main):
+        main.show()
+        main.hide_to_tray_enabled = True
+        closed = self._spy_shutdowns(main)
+
+        event = QCloseEvent()
+        main.closeEvent(event)
+
+        assert not event.isAccepted()  # ignored → Qt does not destroy the window
+        assert not main.isVisible()
+        # The whole feature: a hide must not cancel and join the running workers.
+        assert closed == []
+
+    def test_close_still_saves_geometry(self, main):
+        main.show()
+        main.hide_to_tray_enabled = True
+        main.config.window_geometry = None
+        main.closeEvent(QCloseEvent())
+        assert main.config.window_geometry is not None
+
+    def test_without_a_tray_close_still_shuts_down(self, main):
+        # The degrade path. If this regressed, a machine with no system tray would hide
+        # its only window with no way to bring it back or quit.
+        main.hide_to_tray_enabled = False
+        closed = self._spy_shutdowns(main)
+        main.closeEvent(QCloseEvent())
+        assert len(closed) == main.workspaces.count()
+
+    def test_show_from_tray_restores_and_clears_the_badge(self, main, monkeypatch):
+        cleared: list = []
+        monkeypatch.setattr(mw, "clear_dock_badge", lambda: cleared.append(True))
+        main.hide()
+        main.show_from_tray()
+        assert main.isVisible()
+        assert cleared == [True]
+
+
+class TestQuit:
+    def test_quit_app_asks_the_application_to_quit(self, main, monkeypatch):
+        calls: list = []
+        monkeypatch.setattr(mw.QApplication.instance(), "quit", lambda: calls.append(True))
+        main.quit_app()
+        assert calls == [True]
+
+    def test_shutdown_all_shuts_every_workspace(self, main):
+        main._add_workspace()
+        closed = TestHideToMenuBar()._spy_shutdowns(main)
+        main.shutdown_all()
+        assert len(closed) == 2
+
+    def test_shutdown_all_is_idempotent(self, main):
+        closed = TestHideToMenuBar()._spy_shutdowns(main)
+        main.shutdown_all()
+        main.shutdown_all()  # aboutToQuit and closeEvent can both reach it
+        assert len(closed) == 1
+
+    def test_a_quit_action_exists_with_the_macos_quit_role(self, main):
+        # QuitRole is what makes this THE macOS Quit item, so ⌘Q, the App menu and the
+        # popup's "Thoát" all converge on one path. Asserted on the action rather than
+        # the menu bar: macOS relocates the action into the native application menu.
+        action = main.quit_action
+        assert action.text() == "&Thoát"
+        assert action.menuRole() == mw.QAction.MenuRole.QuitRole
+
+    def test_triggering_the_quit_action_quits(self, main, monkeypatch):
+        calls: list = []
+        monkeypatch.setattr(main, "quit_app", lambda: calls.append(True))
+        main.quit_action.triggered.disconnect()
+        main.quit_action.triggered.connect(main.quit_app)
+        main.quit_action.trigger()
+        assert calls == [True]
+
+
+class TestDockActivate:
+    def test_clicking_the_dock_reshows_a_hidden_window(self, main):
+        main.hide()
+        f = DockActivateFilter(main)
+        f.eventFilter(main, QEvent(QEvent.Type.ApplicationActivate))
+        assert main.isVisible()
+
+    def test_it_leaves_a_visible_window_alone(self, main, monkeypatch):
+        main.show()
+        calls: list = []
+        monkeypatch.setattr(main, "show_from_tray", lambda: calls.append(True))
+        DockActivateFilter(main).eventFilter(main, QEvent(QEvent.Type.ApplicationActivate))
+        assert calls == []
+
+    def test_other_events_are_ignored(self, main):
+        main.hide()
+        DockActivateFilter(main).eventFilter(main, QEvent(QEvent.Type.WindowActivate))
+        assert not main.isVisible()

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QDate, QDateTime, QSettings, QTime
+from PySide6.QtCore import QDate, QDateTime, QObject, QSettings, QTime, Signal
 
 from noveltrans.config import AppConfig
 from noveltrans.gui.tab_video import VideoTab
@@ -2663,3 +2663,80 @@ class TestSubtitleUploadUi:
         assert tab.upload_button.isEnabled()
         assert not tab.upload_cancel_button.isEnabled()
         tab.shutdown()
+
+
+class TestPauseButtonRouting:
+    """Two Dừng buttons in this tab, so two pause buttons — one per section (049).
+
+    A single shared pause button sat in the render row while four of the six jobs live
+    in the upload row, and starting an upload rebound it away from a running render.
+    """
+
+    def _tab(self, tmp_path):
+        tab = VideoTab(_config(tmp_path))
+        tab.voice_combo.addItem("V", "V")
+        tab.voice_combo.setCurrentIndex(tab.voice_combo.findData("V"))
+        return tab
+
+    def test_each_section_has_its_own_pause_button(self, qapp, tmp_path):
+        tab = self._tab(tmp_path)
+        assert tab.pause_button is not tab.upload_pause_button
+
+    def test_both_start_disabled(self, qapp, tmp_path):
+        tab = self._tab(tmp_path)
+        assert not tab.pause_button.isEnabled()
+        assert not tab.upload_pause_button.isEnabled()
+
+    def test_the_upload_button_warns_about_the_browser_session(self, qapp, tmp_path):
+        tab = self._tab(tmp_path)
+        assert "Chrome" in tab.upload_pause_button.toolTip()
+        assert "Chrome" not in tab.pause_button.toolTip()
+
+    def test_an_upload_never_steals_the_render_pause(self, qapp, tmp_path):
+        from noveltrans.gui.jobs import job_registry
+
+        job_registry.reset()
+        tab = self._tab(tmp_path)
+        try:
+            render = job_registry.register(_StubWorker(), kind="Tạo video", novel="A")
+            tab.pause_button.set_job(render.id)
+            upload = job_registry.register(_StubWorker(), kind="Tải video lên", novel="A")
+            tab.upload_pause_button.set_job(upload.id)
+
+            # The render must still be pausable from its own row.
+            assert tab.pause_button._job_id == render.id
+            assert tab.upload_pause_button._job_id == upload.id
+        finally:
+            job_registry.reset()
+
+    def test_every_registration_targets_the_button_beside_its_own_dung(self):
+        # Source-level, because driving all six launches needs a browser and ffmpeg.
+        # `_cancel` stops the render worker; `_cancel_upload` stops the four browser ones.
+        import inspect
+        import re
+
+        from noveltrans.gui import tab_video
+
+        source = inspect.getsource(tab_video)
+        upload_kinds = {"Tải video lên", "Tải phụ đề lên", "Danh sách phát", "Đổi ảnh bìa"}
+        pairs = re.findall(
+            r'kind="([^"]+)", novel=self\._job_novel\(\)\s*\)\s*self\.(\w*pause_button)', source
+        )
+        assert len(pairs) == 6
+        for kind, button in pairs:
+            expected = "upload_pause_button" if kind in upload_kinds else "pause_button"
+            assert button == expected, f"{kind} binds {button}, expected {expected}"
+
+
+class _StubWorker(QObject):
+    progress = Signal(int, int, str)
+    finished = Signal()
+
+    def isFinished(self) -> bool:  # noqa: N802 — mirrors QThread's Qt-cased API
+        return False
+
+    def pause(self) -> None:
+        pass
+
+    def resume(self) -> None:
+        pass

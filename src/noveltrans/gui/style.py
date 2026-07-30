@@ -25,6 +25,28 @@ ACCENT = "#3f7bef"
 ACCENT_HI = "#5590ff"
 ACCENT_LO = "#3468d6"
 
+# The menu-bar popup is a top-level window, so it does NOT inherit the main window's
+# styling context — it needs its own surface/border rules or it renders as a bare grey box.
+_POPUP_QSS = f"""
+QWidget#jobPopup {{
+    background-color: {SURFACE};
+    border: 1px solid {BORDER_HI};
+    border-radius: 8px;
+}}
+QWidget#jobPopup QLabel {{ background: transparent; color: {TEXT}; }}
+QLabel#jobCounter, QLabel#jobEmpty {{ color: {MUTED}; font-size: 11px; }}
+QFrame#jobSeparator {{ background-color: {BORDER}; max-height: 1px; border: none; }}
+QPushButton#jobCommand {{
+    background-color: transparent;
+    border: none;
+    border-radius: 5px;
+    text-align: left;
+    padding: 6px 12px;
+    color: {TEXT};
+}}
+QPushButton#jobCommand:hover {{ background-color: {SURFACE_HI}; }}
+"""
+
 _QSS = f"""
 * {{ outline: none; }}
 
@@ -426,7 +448,7 @@ def apply_theme(app: QApplication) -> None:
         pal.setColor(QPalette.ColorGroup.Disabled, role, disabled)
     app.setPalette(pal)
 
-    app.setStyleSheet(_QSS + _icon_qss(_make_icons()))
+    app.setStyleSheet(_QSS + _POPUP_QSS + _icon_qss(_make_icons()))
 
 
 def mark_primary(*buttons) -> None:

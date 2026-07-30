@@ -27,8 +27,10 @@ from PySide6.QtWidgets import (
 )
 
 from noveltrans.config import TTS_STYLES, AppConfig
+from noveltrans.gui.jobs import job_registry
 from noveltrans.gui.keep_awake import track_worker
 from noveltrans.gui.widgets import (
+    PauseButton,
     AudioChapterTableModel,
     ProjectPicker,
     RowButtonDelegate,
@@ -147,6 +149,7 @@ class AudioTab(QWidget):
         self.cancel_button = QPushButton("Dừng")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self._cancel)
+        self.pause_button = PauseButton()
         self.open_dir_button = QPushButton("Mở thư mục audio")
         self.open_dir_button.clicked.connect(self._open_audio_dir)
         self.preview_button = QPushButton("Xem trước văn bản")
@@ -162,6 +165,7 @@ class AudioTab(QWidget):
         bottom_row.addWidget(self.generate_button)
         bottom_row.addWidget(self.regenerate_button)
         bottom_row.addWidget(self.cancel_button)
+        bottom_row.addWidget(self.pause_button)
         bottom_row.addWidget(self.open_dir_button)
         bottom_row.addWidget(self.preview_button)
         bottom_row.addWidget(self.progress, stretch=1)
@@ -387,6 +391,10 @@ class AudioTab(QWidget):
         self._worker.failed.connect(self._on_failed)
         self._worker.finished_ok.connect(self._on_finished)
         track_worker(self._worker)  # keep the Mac awake while generating audio
+        self._job = job_registry.register(
+            self._worker, kind="Nghe audio", novel=self._job_novel()
+        )
+        self.pause_button.set_job(self._job.id if self._job else None)
         self._worker.start()
 
     def _regenerate_row(self, row: int) -> None:
@@ -585,6 +593,10 @@ class AudioTab(QWidget):
         self._merge_worker.finished_ok.connect(self._on_merge_finished)
         self._merge_worker.failed.connect(self._on_merge_failed)
         track_worker(self._merge_worker)  # keep the Mac awake while merging
+        self._job = job_registry.register(
+            self._merge_worker, kind="Ghép audio", novel=self._job_novel()
+        )
+        self.pause_button.set_job(self._job.id if self._job else None)
         self._merge_worker.start()
 
     def _on_merge_progress(self, done: int, total: int, name: str) -> None:
@@ -611,6 +623,14 @@ class AudioTab(QWidget):
         self._reset_merge_ui()
         self.status_label.setText("")
         QMessageBox.warning(self, "Ghép audio thất bại", message)
+
+    def _job_novel(self) -> str:
+        """The novel label for the menu-bar job row — this tab's own project.
+
+        Deliberately not Workspace.current_title(): each tab has an independent picker,
+        so an audio job on a different novel would be labelled with the scrape tab's.
+        """
+        return self.project.meta.display_name() if self.project is not None else ""
 
     def has_running_workers(self) -> bool:
         # Only TTS generation / merge are user-meaningful work worth a close-confirm; the
