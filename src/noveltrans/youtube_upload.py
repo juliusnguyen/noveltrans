@@ -115,7 +115,11 @@ _SHOW_MORE_SEL = "#toggle-button, ytcp-button#toggle-button"
 _TAGS_INPUT_SEL = "#tags-container #text-input, ytcp-form-input-container#tags-container input"
 _LANGUAGE_TRIGGER_SEL = "#language-container ytcp-text-dropdown-trigger, #language-container"
 _LANGUAGE_SEARCH_SEL = "#search-input input, tp-yt-paper-dialog #search-input input"
-_LANGUAGE_ITEM_SEL = "tp-yt-paper-item, ytcp-text-menu tp-yt-paper-item"
+# `tp-yt-paper-icon-item` measured live; the plain `paper-item` forms are kept for the
+# upload dialog, which may still use them.
+_LANGUAGE_ITEM_SEL = (
+    "tp-yt-paper-icon-item, tp-yt-paper-item, ytcp-text-menu tp-yt-paper-item"
+)
 # Studio lists the language under its *own* name in a Vietnamese UI and under the
 # English name otherwise; accept either.
 _VIETNAMESE_TEXTS = ("Tiếng Việt", "Vietnamese")
@@ -173,6 +177,91 @@ _PERCENT_RE = re.compile(r"(\d+)\s*%")
 # that it quietly reports success: this flow's only output is the thumbnail, so a
 # skipped step would be a lie.
 _EDIT_URL = "https://studio.youtube.com/video/{video_id}/edit?hl=vi"
+
+# -- subtitles surface (044) ---------------------------------------------------
+#
+# The THIRD Studio surface this module drives, and unverified like the others. Two lessons
+# from 039 are built in from the start rather than after three failed live runs:
+#   * several URL shapes are tried and the DOM decides, because a wrong Studio URL renders
+#     an error page rather than failing the navigation;
+#   * nothing gates on a guessed container element. The gate is the file input, which is
+#     what the step actually needs and is plain HTML that cannot be renamed away.
+# The plain form first: measured live, `?hl=vi` does NOT localise this page (it rendered
+# in English regardless), so it adds a variable and buys nothing.
+_SUBTITLE_URLS = (
+    "https://studio.youtube.com/video/{video_id}/translations",
+    "https://studio.youtube.com/video/{video_id}/translations?hl=vi",
+    "https://studio.youtube.com/video/{video_id}/subtitles",
+)
+# Getting from the page to a file chooser. Studio nests this behind a language row, an
+# "Add"/"Thêm" affordance and an "Upload file" menu item, and the exact shape differs by
+# whether the video already has a track. Each is tried and a miss is not fatal on its own —
+# only failing to reach a file input is.
+# MEASURED on the post-gate page (see scripts/diagnose_subtitles.py):
+#   labels present -> "Edit subtitles | Upload manual | Add language"
+# "Upload file" — what four rounds of guessing assumed — does not exist.
+_SUB_ADD_TEXTS = ("Add language", "Thêm ngôn ngữ", "Thêm", "Add")
+_SUB_UPLOAD_TEXTS = (
+    "Upload manual", "Tải lên thủ công", "Tải tệp lên", "Tải file lên", "Upload file",
+)
+# The dialog "Upload manual" opens: a timing choice, then Continue, then a file input.
+# Our .srt carries timings, so "With timing" is the correct branch — "Without timing"
+# would make YouTube re-align the text by speech recognition and discard the exact
+# boundaries feature 040 went to some trouble to capture.
+_SUB_WITH_TIMING_TEXTS = ("With timing", "Có mã thời gian", "Có thời gian")
+_SUB_CONTINUE_TEXTS = ("Continue", "Tiếp tục")
+_SUB_VIETNAMESE_TEXTS = ("Tiếng Việt", "Vietnamese")
+# The gate seen on the first live run: a video with no language set shows a "Set language"
+# dropdown and a Confirm button INSTEAD of the subtitles table. Nothing can be uploaded
+# until it is answered, and it is a dropdown rather than a button — so the click-through
+# ladder had nothing to hit and reported "no file input" for a page that was working fine.
+# MEASURED against a live channel (scripts/diagnose_subtitles.py), not guessed:
+#   :text("Set language") -> span.dropdown-trigger-text < div.left-container
+#                            < ytcp-dropdown-trigger < ytcp-text-dropdown-trigger#trigger
+_SUB_LANG_GATE_SEL = (
+    "ytcp-text-dropdown-trigger#trigger, ytcp-text-dropdown-trigger, "
+    "#video-language-select, ytcp-form-select#language, #language-select"
+)
+_SUB_LANG_GATE_TEXTS = ("Set language", "Đặt ngôn ngữ", "Video language", "Ngôn ngữ video")
+_SUB_CONFIRM_TEXTS = ("Confirm", "Xác nhận")
+# The one structural handle on the whole flow: an `input[type=file]` is plain HTML.
+# All four are scoped to the DIALOG. The page-wide `input[type=file]` that used to close
+# this list was the first live hang: Studio's app shell carries its own file inputs, a
+# page-wide match landed on one of those, `set_input_files` succeeded silently against the
+# wrong element, and the flow walked on to Continue believing the file was in.
+_SUB_FILE_INPUT_SELS = (
+    "ytcp-uploads-file-picker input[type='file']",
+    "tp-yt-paper-dialog input[type='file']",
+    "ytcp-dialog input[type='file']",
+    "[role='dialog'] input[type='file']",
+)
+# How long to hold the file-chooser interception open around the Continue click. Only the
+# fallback path pays this, and it must not be `_STEP_WAIT_MS`: a run that already fed the
+# input directly would sit here for 30s per part waiting for a window that never opens.
+_SUB_CHOOSER_WAIT_MS = 15_000
+# MEASURED live: the upload leaves a DRAFT and Studio toasts "Vietnamese subtitles
+# uploaded". Publishing is a second surface reached through the row's "Edit subtitles".
+_SUB_EDIT_TEXTS = ("Edit subtitles", "Chỉnh sửa phụ đề", "Sửa phụ đề", "Edit")
+# One row per language. `tr` / `[role=row]` are plain HTML/ARIA and outlive renames.
+_SUB_ROW_SEL = "ytcp-video-row, ytcp-table-row, tr, [role='row']"
+# Publish first, always: "Lưu"/"Save" in the caption editor keeps the draft a draft.
+_SUB_PUBLISH_TEXTS = ("Xuất bản", "Publish", "Lưu", "Save", "Xong", "Done")
+# MEASURED live: Publish on a still-loading editor publishes an EMPTY track and Studio
+# answers "no subtitles". Long, because being slow here costs a minute and being early
+# costs the track. A loaded editor has a text box and two timestamp boxes per cue, so three
+# filled fields is well under one cue and far above the list page's zero.
+_SUB_EDITOR_WAIT_MS = 60_000
+_SUB_EDITOR_MIN_FIELDS = 3
+_SUB_EDITOR_SETTLE_MS = 2_000
+# Studio shows the track's state in the subtitles table. "Đã xuất bản"/"Published" is the
+# only value that means a viewer can turn the captions on.
+_SUB_PUBLISHED_TEXTS = ("Đã xuất bản", "Published")
+# Same rows as `_SUB_ROW_SEL`: the state is a cell inside the language row, and a check
+# that misses it fails a part whose captions are already live.
+_SUB_STATE_SEL = f"{_SUB_ROW_SEL}, #status, .status"
+
+_SUBTITLE_PAGE_WAIT_MS = 45_000
+_BETWEEN_SUBTITLES_MS = 5_000
 # The metadata editor mounting is how we know the id resolved to a real video on this
 # channel — a deleted or foreign id bounces to the video list instead.
 _EDIT_PAGE_SEL = "ytcp-video-metadata-editor, #metadata-container, ytcp-uploads-details"
@@ -1534,14 +1623,19 @@ class PlaylistSyncRequest:
 def _page_shows_studio_error(page) -> bool:
     """True if Studio rendered its generic "Oops, something went wrong" page.
 
-    Worth its own check because that page is a *successful* navigation with a normal DOM —
-    indistinguishable from a slow-mounting one unless you read the text. Without this, a
-    wrong URL burns the full page-wait and then reports "giao diện có thể đã thay đổi",
-    sending the reader after a selector bug that isn't there.
+    Uses `:text()`, which matches the SMALLEST element containing the string, and then
+    checks that element's visibility.
+
+    The obvious `body:has-text(...)` is WRONG here and was measured to be: `has-text`
+    matches when the string appears anywhere in the subtree, and Studio pre-renders a
+    hidden error component (`ytcp-permanent-operational-error-manager`) on every page. So
+    `body` matched on a perfectly good page — and `body` is always visible, making the
+    visibility check meaningless. Every page read as an error page, every URL candidate was
+    rejected, and the flow reported "Không mở được trang phụ đề" for a page that had loaded.
     """
     for text in _STUDIO_ERROR_TEXTS:
         try:
-            if page.locator(f'body:has-text("{text}")').first.is_visible(timeout=1_500):
+            if page.locator(f':text("{text}")').last.is_visible(timeout=1_500):
                 return True
         except Exception:
             continue
@@ -1966,6 +2060,612 @@ def sync_playlist_batch(
     finally:
         _close(context, playwright)
     return {"had": had, "removed": removed, "added": added}
+
+
+# -- uploading a subtitle track (044) -----------------------------------------
+
+
+@dataclass
+class SubtitleRequest:
+    """One part's `.srt` and the video it belongs on."""
+
+    video: Path  # the .mp4 — key to <stem>.upload.json and to <stem>.srt
+    subtitle: Path
+    video_id: str = ""
+    label: str = ""
+
+    def resolve(self) -> str:
+        self.video_id = self.video_id or uploaded_video_id(Path(self.video))
+        return self.video_id
+
+    def validate(self) -> None:
+        name = self.label or Path(self.video).stem
+        if not self.resolve():
+            raise YouTubeUploadError(
+                f"{name}: chưa có video trên YouTube nên không tải phụ đề lên được."
+            )
+        srt = Path(self.subtitle)
+        if not srt.is_file():
+            raise YouTubeUploadError(f"{name}: không tìm thấy file phụ đề {srt.name}.")
+        if not srt.stat().st_size:
+            raise YouTubeUploadError(f"{name}: file phụ đề rỗng.")
+
+
+def _open_subtitles_page(page, video_id: str) -> str:
+    """Navigate to a video's subtitles surface. Returns the URL that worked.
+
+    Tries each known shape and lets the DOM decide, because a wrong Studio URL renders an
+    error page rather than failing the navigation — the 039 lesson, applied up front.
+    Deliberately does NOT wait for a container element: 039 spent two rounds walking away
+    from a page that had loaded because a guessed `ytcp-*` wrapper wasn't there.
+    """
+    tried: list[str] = []
+    for template in _SUBTITLE_URLS:
+        url = template.format(video_id=video_id)
+        tried.append(url)
+        try:
+            page.goto(url, wait_until="domcontentloaded")
+        except Exception as exc:
+            if _browser_gone(exc):
+                raise YouTubeUploadError(
+                    "Cửa sổ trình duyệt đã bị đóng khi đang tải phụ đề lên.",
+                    video_id=video_id,
+                ) from exc
+            continue
+        if _LOGGED_OUT_URL_RE.search(page.url or ""):
+            raise YouTubeUploadError(
+                "Profile YouTube chưa đăng nhập. Vào Settings → “Đăng nhập YouTube”.",
+                needs_login=True, video_id=video_id,
+            )
+        if _page_shows_studio_error(page):
+            continue
+        try:
+            page.wait_for_load_state("networkidle", timeout=_SETTLE_AFTER_NAV_MS)
+        except Exception:
+            pass
+        return page.url or url
+    raise YouTubeUploadError(
+        f"Không mở được trang phụ đề của video {video_id}. Đã thử:\n  "
+        + "\n  ".join(tried),
+        video_id=video_id,
+    )
+
+
+def _click_text_anywhere(page, texts, *, timeout_ms: int = _STEP_WAIT_MS) -> bool:
+    """Click whatever element actually shows `text`, whatever tag it happens to be.
+
+    `_click_by_text` only looks at `ytcp-button` / `tp-yt-paper-button` / `button`, which is
+    right for buttons and useless for anything else. The live failure was a *dropdown*
+    reading "Set language": not a button, so both the id guesses and the button-text search
+    missed it, and the run sat on a page whose control was plainly visible.
+
+    Playwright's `:text()` matches the SMALLEST element containing the text, so this lands
+    on the control itself rather than a wrapper that happens to contain it — and it needs
+    no knowledge of Studio's component names, which is the part that keeps being wrong.
+    """
+    for text in texts:
+        locator = page.locator(f':text("{text}")').last
+        try:
+            if locator.is_visible(timeout=max(1_000, timeout_ms // max(1, len(texts)))):
+                locator.click()
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _text_is_visible(page, texts, *, timeout_ms: int = 2_000) -> bool:
+    """True if any of `texts` is on screen. The read-only half of `_click_text_anywhere`.
+
+    Used to decide whether a control is there *before* clicking it, which matters when the
+    click has a side effect that cannot be undone — a Continue that opens an OS file window
+    being the one that hung a live run.
+    """
+    for text in texts:
+        try:
+            if page.locator(f':text("{text}")').last.is_visible(timeout=timeout_ms):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _page_actions(page, limit: int = 30) -> str:
+    """The visible clickable labels on the page, deduped.
+
+    A click ladder fails because the label it wants isn't there — so the diagnostic that
+    actually resolves it is the list of labels that ARE. `_dom_inventory` names components
+    and answers a different question (which selectors exist); this answers "what could I
+    have clicked".
+    """
+    try:
+        labels = page.evaluate(
+            r"""() => {
+                const out = [];
+                const sel = 'button, ytcp-button, tp-yt-paper-button, [role=button],'
+                          + ' ytcp-text-dropdown-trigger, ytcp-form-select, a';
+                const walk = (root) => {
+                    for (const el of root.querySelectorAll(sel)) {
+                        const r = el.getBoundingClientRect();
+                        if (r.width < 2 || r.height < 2) continue;
+                        const t = (el.innerText || el.getAttribute('aria-label') || '')
+                                    .trim().split('\n')[0];
+                        if (t) out.push(t.slice(0, 60));
+                    }
+                    for (const el of root.querySelectorAll('*'))
+                        if (el.shadowRoot) walk(el.shadowRoot);
+                };
+                walk(document);
+                return [...new Set(out)];
+            }"""
+        )
+    except Exception as exc:
+        # Report the reason: a diagnostic that fails silently is worse than none, and this
+        # one did exactly that on its first real use.
+        return f"(không đọc được các nút trên trang: {exc!r})"
+    return " | ".join(list(labels)[:limit]) or "(trang không có nút nào)"
+
+
+def _subtitle_language_gate(page) -> bool:
+    """True if the page is showing the "Set language" gate rather than the subtitles table.
+
+    Detected by its Confirm button, which the subtitles table does not have. Reading the
+    gate rather than assuming it away is the whole point: the first live run hit it, found
+    no file input (correctly — there is none until it is answered) and blamed the selectors.
+    """
+    for text in _SUB_CONFIRM_TEXTS:
+        try:
+            if page.locator(
+                f'ytcp-button:has-text("{text}"), button:has-text("{text}")'
+            ).first.is_visible(timeout=2_000):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _pick_vietnamese(page) -> bool:
+    """Choose Vietnamese in an open language dropdown.
+
+    MEASURED live (scripts/diagnose_subtitles.py): the list renders in ENGLISH even with
+    `?hl=vi`, so `:text("Tiếng Việt")` matches nothing while `:text("Vietnamese")` matches
+    and is visible. The previous version typed the Vietnamese name into the dropdown's
+    search box *before* looking — filtering an English list down to nothing, then correctly
+    finding nothing. That is why the run sat on the Languages page with Confirm greyed out.
+
+    So: look for the item FIRST, and fall back to the search box only for a list long enough
+    to need it — typing the same name that is then looked for, never a different one.
+    """
+    for text in _VIETNAMESE_TEXTS:
+        if _click_text_anywhere(page, (text,), timeout_ms=4_000):
+            return True
+
+    search = _first_present(page, _LANGUAGE_SEARCH_SEL, timeout_ms=3_000)
+    if search is None:
+        return False
+    for text in _VIETNAMESE_TEXTS:
+        try:
+            search.click()
+            page.keyboard.press("ControlOrMeta+A")
+            page.keyboard.type(text, delay=_TYPE_DELAY_MS)
+        except Exception:
+            return False
+        page.wait_for_timeout(_SETTLE_MS)
+        if _click_text_anywhere(page, (text,), timeout_ms=4_000):
+            return True
+    return False
+
+
+def _answer_subtitle_language_gate(page) -> bool:
+    """Set the video's language to Vietnamese and confirm. False if the gate is still up.
+
+    The "Make this the default for my channel" checkbox is left exactly as YouTube presents
+    it (ticked). Changing a channel-level default is not this feature's business, and
+    unticking it would make every later video hit this same gate again.
+    """
+    opened = _click_any(
+        page, _SUB_LANG_GATE_SEL, _SUB_LANG_GATE_TEXTS, timeout_ms=10_000
+    ) or _click_text_anywhere(page, _SUB_LANG_GATE_TEXTS, timeout_ms=10_000)
+    if not opened:
+        return False
+    page.wait_for_timeout(_SETTLE_MS)
+
+    if not _pick_vietnamese(page):
+        page.keyboard.press("Escape")
+        return False
+    page.wait_for_timeout(_SETTLE_MS)
+
+    if not _click_by_text(page, _SUB_CONFIRM_TEXTS, timeout_ms=_STEP_WAIT_MS):
+        _click_text_anywhere(page, _SUB_CONFIRM_TEXTS, timeout_ms=8_000)
+    page.wait_for_timeout(_SETTLE_MS)
+    return not _subtitle_language_gate(page)
+
+
+def _input_takes_subtitles(locator) -> bool:
+    """False when a file input plainly wants something other than a caption file.
+
+    `set_input_files` does not care what an input is *for*: hand the .srt to Studio's
+    video-upload input and the browser starts uploading a caption file as a video. The
+    dialog scoping in `_SUB_FILE_INPUT_SELS` is the first guard against that; this is the
+    second, and it asks the element itself — `accept` is the input's own statement of what
+    it wants. Silence is not treated as a refusal: plenty of Studio inputs carry no
+    `accept` at all, and the scoping already covers those.
+    """
+    try:
+        accept = (locator.get_attribute("accept", timeout=1_000) or "").lower()
+    except Exception:
+        return True
+    return not ("video" in accept or "image" in accept)
+
+
+def _choose_with_timing(page) -> bool:
+    """Tick the "With timing" branch of the file-type dialog — never the other one.
+
+    Worth its own function because the tag-agnostic click cannot be trusted here.
+    Playwright's `:text()` is a case-insensitive SUBSTRING match and `_click_text_anywhere`
+    takes `.last`, so on a Vietnamese-rendered dialog `:text("Có mã thời gian")` also
+    matches "**Không** có mã thời gian" — the *Without timing* radio, which is the last of
+    the two and would therefore win. That branch hands the file to speech recognition and
+    discards the exact boundaries feature 040 measured out of the TTS run.
+
+    `:text-is()` is the exact-match form and is tried first; the substring form stays as a
+    fallback for a label with trailing markup, with an explicit "is this the other radio?"
+    read on whatever it lands on.
+    """
+    for text in _SUB_WITH_TIMING_TEXTS:
+        for selector in (f':text-is("{text}")', f':text("{text}")'):
+            locator = page.locator(selector).first
+            try:
+                if not locator.is_visible(timeout=2_000):
+                    continue
+                label = (locator.inner_text(timeout=1_500) or "").lower()
+            except Exception:
+                continue
+            if "without" in label or "không" in label:
+                continue  # the other radio, caught by the substring match
+            try:
+                locator.click()
+                return True
+            except Exception:
+                continue
+    return False
+
+
+def _send_subtitle_file(page, srt: Path, *, video_id: str) -> None:
+    """Drive the "Upload manual" dialog and hand it the .srt.
+
+    The whole sequence is measured, not guessed:
+        page ->  "Upload manual"  ->  [ With timing | Without timing ]  ->  Continue
+    and an `input[type=file]` exists inside that dialog.
+
+    **Continue is only ever clicked inside `expect_file_chooser`.** That single rule is what
+    the shape of this function is for. Studio's Continue calls `.click()` on the picker's
+    input, which opens the operating system's file window; Playwright can only intercept
+    that while an expectation is armed, and an un-intercepted native window blocks the whole
+    browser with no exception and no timeout. The first live run hung exactly there — the
+    macOS file table on screen, the run waiting forever — because the old loop set an input
+    directly and then clicked Continue unguarded.
+
+    The direct set still comes first: it needs no OS window at all. It is no longer treated
+    as proof of anything, because `set_input_files` against the wrong element is a silent
+    no-op — the guarded Continue below is what covers that case.
+    """
+    if not _click_text_anywhere(page, _SUB_UPLOAD_TEXTS, timeout_ms=10_000):
+        raise YouTubeUploadError(
+            "Không tìm thấy nút tải phụ đề lên trên trang phụ đề.\n\n"
+            f"Nút trên trang: {_page_actions(page)}\n"
+            f"Component: {_dom_inventory(page)}",
+            video_id=video_id,
+        )
+    page.wait_for_timeout(_SETTLE_MS)
+
+    # Our file has timings; the other branch throws them away.
+    _choose_with_timing(page)
+    page.wait_for_timeout(_SETTLE_MS)
+
+    sent_directly = False
+    for selector in _SUB_FILE_INPUT_SELS:
+        locator = page.locator(selector).first
+        try:
+            locator.wait_for(state="attached", timeout=5_000)
+            if not _input_takes_subtitles(locator):
+                continue
+            locator.set_input_files(str(srt))
+        except Exception:
+            continue
+        sent_directly = True
+        page.wait_for_timeout(_SETTLE_MS)
+        break
+
+    # Dialog gone after the direct set: the file was taken and there is nothing to press.
+    if not _text_is_visible(page, _SUB_CONTINUE_TEXTS):
+        if sent_directly:
+            return
+        raise YouTubeUploadError(
+            "Hộp thoại tải phụ đề không hiện nút tiếp tục, và không có ô nhận file.\n\n"
+            f"Nút trên trang: {_page_actions(page)}\n"
+            f"Component: {_dom_inventory(page)}",
+            video_id=video_id,
+        )
+
+    try:
+        with page.expect_file_chooser(timeout=_SUB_CHOOSER_WAIT_MS) as chooser:
+            _click_text_anywhere(page, _SUB_CONTINUE_TEXTS, timeout_ms=10_000)
+        chooser.value.set_files(str(srt))
+    except Exception as exc:
+        # No OS window opened. If the input already has the file that is the *expected*
+        # outcome — Studio moved on without asking. If it does not, this is a real failure.
+        if sent_directly:
+            return
+        raise YouTubeUploadError(
+            "Không đưa được file phụ đề vào hộp thoại tải lên.\n\n"
+            f"Nút trên trang: {_page_actions(page)}\n"
+            f"Component: {_dom_inventory(page)}",
+            video_id=video_id,
+        ) from exc
+
+
+def _click_subtitle_edit(page) -> bool:
+    """Open the caption editor for the track that was just uploaded.
+
+    Scoped to the Vietnamese row first. The page lists one row per language and
+    `_click_text_anywhere` takes `.last`, so on a video that already carries other tracks
+    the page-wide click would open somebody else's row. The scoping uses row selectors that
+    are plain HTML/ARIA (`tr`, `[role=row]`) alongside the Studio ones, for the same reason
+    the file input is the gate in `_send_subtitle_file`: those cannot be renamed away.
+
+    A single-row video — the common case here — needs no scoping at all, so failing to find
+    a row is not a failure; it falls through to the page-wide click.
+    """
+    for lang in _SUB_VIETNAMESE_TEXTS:
+        for text in _SUB_EDIT_TEXTS:
+            try:
+                row = page.locator(f'{_SUB_ROW_SEL}:has-text("{lang}")').first
+                target = row.locator(f':text("{text}")').first
+                if target.is_visible(timeout=2_000):
+                    target.click()
+                    return True
+            except Exception:
+                continue
+    return _click_text_anywhere(page, _SUB_EDIT_TEXTS, timeout_ms=15_000)
+
+
+def _cue_probe(srt: Path) -> str:
+    """A short piece of the .srt's first spoken line, for finding it on screen later.
+
+    The editor is loaded when it is showing *our* track, and the only thing that proves
+    that is our own text. Index numbers and `-->` timing lines are skipped; what comes back
+    is a snippet short enough to survive the editor's own wrapping and free of the double
+    quotes and backslashes that would break the `:text("…")` selector it goes into.
+
+    Empty when the file offers nothing usable — the caller has a structural fallback.
+    """
+    try:
+        lines = srt.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return ""
+    for line in lines:
+        text = line.strip()
+        if not text or text.isdigit() or "-->" in text:
+            continue
+        snippet = text[:24].split('"')[0].split("\\")[0].strip()
+        return snippet if len(snippet) >= 4 else ""
+    return ""
+
+
+def _editor_caption_fields(page) -> int:
+    """How many filled text fields are on screen.
+
+    The structural half of `_wait_for_subtitle_editor`, used when the .srt yields no probe
+    text. A loaded caption editor is dense with them — a text box plus two timestamp boxes
+    per cue — while the translations list it was opened from has none. That gap is wide
+    enough to read without naming a single Studio component, which is the point.
+    """
+    try:
+        return int(
+            page.evaluate(
+                r"""() => {
+                    let n = 0;
+                    const walk = (root) => {
+                        for (const el of root.querySelectorAll(
+                                'textarea, input, [contenteditable]')) {
+                            const raw = el.value !== undefined ? el.value : el.innerText;
+                            if ((raw || '').trim()) n++;
+                        }
+                        for (const el of root.querySelectorAll('*'))
+                            if (el.shadowRoot) walk(el.shadowRoot);
+                    };
+                    walk(document);
+                    return n;
+                }"""
+            )
+        )
+    except Exception:
+        return 0
+
+
+def _wait_for_subtitle_editor(page, srt: Path, *, timeout_ms: int = _SUB_EDITOR_WAIT_MS) -> bool:
+    """Block until the caption editor is actually showing the track.
+
+    MEASURED live: **Publish pressed on a still-loading editor fails with "no subtitles".**
+    Studio publishes what is on screen, and for a second or two after "Edit subtitles" that
+    is nothing at all. This is the one step in the flow where being early is worse than
+    being slow — the click is not a no-op, it is a publish of an empty track.
+
+    Two independent signals, either of which is enough:
+
+    * our own first cue appears on screen — proof the editor loaded *this* track, not just
+      that some editor mounted;
+    * failing that (a file whose first line is too short to search for), enough filled text
+      fields to be a caption table rather than the list we came from.
+    """
+    probe = _cue_probe(srt)
+    waited = 0
+    while waited < timeout_ms:
+        if probe and _text_is_visible(page, (probe,), timeout_ms=1_000):
+            return True
+        if _editor_caption_fields(page) >= _SUB_EDITOR_MIN_FIELDS:
+            return True
+        page.wait_for_timeout(1_000)
+        waited += 2_000
+    return False
+
+
+def _publish_subtitle_track(page, srt: Path, *, video_id: str) -> bool:
+    """Publish the draft that the upload created.
+
+    MEASURED live, on the run that finally got the file in: sending the .srt only produces a
+    **draft**. Studio says so itself — "Vietnamese subtitles uploaded" — and the track stays
+    unpublished, which means no viewer can turn the captions on. The upload and the publish
+    are two different surfaces:
+
+        translations page -> "Edit subtitles" -> [ editor loads the cues ] -> "Publish"
+
+    Before this, the flow pressed Publish on the translations page, where there is nothing
+    of that name to press; `_subtitle_is_published` then correctly refused to confirm and
+    the part failed with the file sitting in Studio as a draft.
+
+    The wait between the two clicks is not politeness. An editor that has not finished
+    loading publishes nothing and reports "no subtitles", so this raises rather than press
+    a button that would replace a good draft with an empty track.
+    """
+    if _click_subtitle_edit(page):
+        page.wait_for_timeout(_SETTLE_MS)
+    if not _wait_for_subtitle_editor(page, srt):
+        raise YouTubeUploadError(
+            "Trình chỉnh sửa phụ đề không tải xong nội dung, nên không bấm Publish "
+            "(bấm sớm sẽ xuất bản một bản phụ đề rỗng).\n\n"
+            f"Nút trên trang: {_page_actions(page)}\n"
+            f"Component: {_dom_inventory(page)}\n\n"
+            f"File .srt vẫn nằm trong Studio ở dạng bản nháp: mở "
+            f"https://studio.youtube.com/video/{video_id}/translations, bấm "
+            "'Edit subtitles', đợi phụ đề hiện ra rồi bấm 'Publish'.",
+            video_id=video_id,
+        )
+    # Even with the cues on screen, Studio keeps wiring the editor up for a moment.
+    page.wait_for_timeout(_SUB_EDITOR_SETTLE_MS)
+    # `_click_by_text` first: the editor's Publish is a Studio button, and the button-scoped
+    # search cannot land on a stray row label that happens to read "Published".
+    if _click_by_text(page, _SUB_PUBLISH_TEXTS, timeout_ms=_STEP_WAIT_MS):
+        return True
+    return _click_text_anywhere(page, _SUB_PUBLISH_TEXTS, timeout_ms=10_000)
+
+
+def _subtitle_is_published(page, *, timeout_ms: int = _STEP_WAIT_MS) -> bool:
+    """True once the subtitles table reports a published track.
+
+    The confirmation, and the reason this flow can claim success at all. Same posture as
+    034's save gate: never report a track uploaded because a click was made — report it
+    because Studio says the track exists.
+    """
+    waited = 0
+    while waited < timeout_ms:
+        for text in _SUB_PUBLISHED_TEXTS:
+            try:
+                if page.locator(f'{_SUB_STATE_SEL}:has-text("{text}")').first.is_visible(
+                    timeout=1_500
+                ):
+                    return True
+            except Exception:
+                continue
+        page.wait_for_timeout(1_000)
+        waited += 2_500
+    return False
+
+
+def upload_subtitle_one(page, request: SubtitleRequest, *, on_progress=None) -> str:
+    """Upload one part's `.srt` to its video. Returns the video id.
+
+    Nothing is recorded until Studio shows a published track, so a failure leaves the
+    record untouched — a subtitle upload cannot duplicate or destroy anything, which is
+    what makes this the least dangerous of the three Studio flows.
+    """
+    request.validate()
+    video_id = request.resolve()
+
+    _report(on_progress, "Mở trang phụ đề…")
+    _open_subtitles_page(page, video_id)
+
+    if _subtitle_language_gate(page):
+        _report(on_progress, "Đặt ngôn ngữ video…")
+        if not _answer_subtitle_language_gate(page):
+            raise YouTubeUploadError(
+                "Video này chưa đặt ngôn ngữ, và không đặt tự động được.\n\n"
+                f"Nút trên trang: {_page_actions(page)}\n"
+                f"Component: {_dom_inventory(page)}\n\n"
+                "Gửi hai dòng trên để cập nhật selector. Trong lúc đó: mở "
+                f"https://studio.youtube.com/video/{video_id}/translations, chọn ngôn ngữ "
+                "rồi bấm Confirm, sau đó chạy lại.",
+                video_id=video_id,
+            )
+
+    _report(on_progress, "Gửi file phụ đề…")
+    _send_subtitle_file(page, Path(request.subtitle), video_id=video_id)
+    page.wait_for_timeout(_SETTLE_MS)
+
+    _report(on_progress, "Mở trình chỉnh sửa & xuất bản phụ đề…")
+    _publish_subtitle_track(page, Path(request.subtitle), video_id=video_id)
+    if not _subtitle_is_published(page):
+        raise YouTubeUploadError(
+            "Đã gửi file phụ đề nhưng YouTube Studio không xác nhận đã xuất bản — phụ đề "
+            "có thể đang ở dạng bản nháp.\n\n"
+            f"Nút trên trang: {_page_actions(page)}\n"
+            f"Component: {_dom_inventory(page)}\n\n"
+            f"Mở https://studio.youtube.com/video/{video_id}/translations, bấm "
+            "'Edit subtitles' rồi 'Publish' để xuất bản thủ công.",
+            video_id=video_id,
+        )
+    write_upload_state(
+        Path(request.video),
+        subtitle_uploaded_at=_now_iso(),
+        subtitle_file=Path(request.subtitle).name,
+    )
+    return video_id
+
+
+def upload_subtitle_batch(
+    requests, *, headless: bool = False, on_progress=None,
+    on_part_done=None, should_cancel=None,
+) -> list:
+    """Upload every request's `.srt` through ONE browser session.
+
+    Same contract as the other batches: headed, one failing part does not abort the run,
+    `needs_login` does.
+    """
+    requests = list(requests)
+    for request in requests:  # fail fast, before the browser costs anything
+        request.validate()
+
+    sync_playwright = _require_playwright()
+    playwright, context = _launch_context(sync_playwright, headless=headless)
+    done: list = []
+    try:
+        page = context.pages[0] if context.pages else context.new_page()
+        page.set_default_timeout(_STEP_WAIT_MS)
+        for index, request in enumerate(requests):
+            _check_cancel(should_cancel)
+            label = request.label or Path(request.video).stem
+            if index:
+                page.wait_for_timeout(_BETWEEN_SUBTITLES_MS)
+            try:
+                upload_subtitle_one(
+                    page, request,
+                    on_progress=lambda m, lbl=label: _report(on_progress, f"{lbl}: {m}"),
+                )
+            except UploadCancelled:
+                raise
+            except YouTubeUploadError as exc:
+                if on_part_done is not None:
+                    on_part_done(index, "", str(exc))
+                if exc.needs_login:
+                    raise
+                continue
+            done.append(label)
+            if on_part_done is not None:
+                on_part_done(index, label, "")
+    finally:
+        _close(context, playwright)
+    return done
 
 
 # -- public entry points ------------------------------------------------------

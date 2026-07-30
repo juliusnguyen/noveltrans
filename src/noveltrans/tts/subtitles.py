@@ -200,13 +200,17 @@ def part_srt(segments) -> tuple[str, int, int]:
 _SILENCE_RE = re.compile(
     r"silence_(start|end):\s*(-?[\d.]+)", re.IGNORECASE
 )
-# How far a detected silence may differ from the expected gap and still count as one.
-# Generous, because the encoder's edges and the detector's threshold both shave a little.
-_GAP_TOLERANCE = 0.25
-_SILENCE_NOISE_DB = -50  # true zeros are -inf dB; this is loose enough to survive encoding
-
-
-def detect_silences(audio_path: Path | str, *, min_seconds: float) -> list[tuple[float, float]]:
+# Thresholds tried in order, quietest first. The inter-chunk gaps are `np.zeros` — true
+# digital silence — while a natural pause in speech is quiet but NOT zero, so the
+# threshold is what separates them. Measured against a chapter whose real cues were known:
+#   -50 dB -> 98 silences (catches quiet speech)      -70 dB -> 76  EXACT
+#   -60 dB -> 77 silences                              -80 dB -> 76  EXACT
+# The ladder exists because a lossy format re-encodes digital silence as near-silence, so
+# the right threshold depends on the file, not on a constant we can pick in advance.
+_SILENCE_THRESHOLDS_DB = (-90, -80, -70, -60, -50)
+def detect_silences(
+    audio_path: Path | str, *, min_seconds: float, noise_db: int = -80
+) -> list[tuple[float, float]]:
     """`(start, end)` of every silence at least `min_seconds` long. `[]` if ffmpeg can't.
 
     One audio-only ffmpeg pass — fast even on a 20-minute chapter, and it reads the file
@@ -215,7 +219,7 @@ def detect_silences(audio_path: Path | str, *, min_seconds: float) -> list[tuple
     try:
         result = subprocess.run(
             ["ffmpeg", "-i", str(audio_path), "-af",
-             f"silencedetect=noise={_SILENCE_NOISE_DB}dB:d={max(0.05, min_seconds):.3f}",
+             f"silencedetect=noise={noise_db}dB:d={max(0.05, min_seconds):.3f}",
              "-f", "null", "-"],
             capture_output=True, text=True, timeout=300,
         )
@@ -230,6 +234,29 @@ def detect_silences(audio_path: Path | str, *, min_seconds: float) -> list[tuple
             continue
         (starts if kind.lower() == "start" else ends).append(seconds)
     return list(zip(starts, ends))
+
+
+def find_chunk_gaps(
+    audio_path: Path | str, *, want: int, gap: float
+) -> list[tuple[float, float]]:
+    """The `want` inter-chunk gaps in this file, or `[]` if they can't be identified.
+
+    Tries progressively louder thresholds and accepts the FIRST that yields exactly `want`
+    silences. The expected count is known from the text, so it is used as a calibration
+    signal rather than only as a safety check — which is what makes this work across
+    formats and speeds instead of depending on a constant chosen in advance.
+
+    Filtering by silence *length* was tried and abandoned: `silencedetect` reports a region
+    slightly inside the gap (speech trails off around it), so a real 0.348 s gap is never
+    reported as 0.348 s and a length filter rejects every one of them.
+    """
+    for noise_db in _SILENCE_THRESHOLDS_DB:
+        found = detect_silences(
+            audio_path, min_seconds=max(0.05, gap * 0.5), noise_db=noise_db
+        )
+        if len(found) == want:
+            return found
+    return []
 
 
 def expected_gap(gap_seconds: float, speed: float) -> float:
@@ -292,14 +319,7 @@ def backfill_cues(
         return [Cue(0.0, float(duration), chunks[0])]
 
     gap = expected_gap(gap_seconds, speed)
-    silences = detect_silences(audio_path, min_seconds=max(0.05, gap - _GAP_TOLERANCE))
-    # Keep only silences the right length to be an inter-chunk gap. A long pause the
-    # engine rendered inside a sentence is usually much shorter; a trailing silence at the
-    # end of the file is usually much longer.
-    gaps = [
-        (s, e) for s, e in silences
-        if abs((e - s) - gap) <= _GAP_TOLERANCE and s > 0
-    ]
+    gaps = find_chunk_gaps(audio_path, want=len(chunks) - 1, gap=gap)
     if len(gaps) != len(chunks) - 1:
         return None
 

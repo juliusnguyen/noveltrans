@@ -71,11 +71,23 @@ class SettingsDialog(QDialog):
         form = QFormLayout()
 
         # Library directory
-        self.library_edit = QLineEdit(str(config.library_dir))
+        # Editable combo, not a plain field: someone with several libraries can switch
+        # between them without re-browsing, and a path that isn't in the list can still be
+        # typed or pasted exactly as before.
+        self.library_edit = QComboBox()
+        self.library_edit.setEditable(True)
+        self.library_edit.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.library_edit.addItems(config.library_dir_history)
+        self.library_edit.setCurrentText(str(config.library_dir))
+        self.library_edit.setToolTip(
+            "Thư mục chứa các truyện. Danh sách là những thư mục đã dùng trước đây — "
+            "chọn để chuyển thư viện, hoặc gõ/dán đường dẫn mới."
+        )
+        self.library_edit.setMinimumWidth(320)
         browse = QPushButton("Chọn…")
         browse.clicked.connect(self._browse_library)
         lib_row = QHBoxLayout()
-        lib_row.addWidget(self.library_edit)
+        lib_row.addWidget(self.library_edit, stretch=1)
         lib_row.addWidget(browse)
         form.addRow("Thư mục thư viện:", lib_row)
 
@@ -414,13 +426,13 @@ class SettingsDialog(QDialog):
 
     def _browse_library(self) -> None:
         path = QFileDialog.getExistingDirectory(
-            self, "Chọn thư mục thư viện", self.library_edit.text()
+            self, "Chọn thư mục thư viện", self.library_edit.currentText()
         )
         if path:
-            self.library_edit.setText(path)
+            self.library_edit.setCurrentText(path)
 
     def accept(self) -> None:
-        self.config.library_dir = self.library_edit.text()
+        self.config.library_dir = self.library_edit.currentText()
         self.config.request_delay = self.delay_spin.value()
         self.config.translator = self.translator_combo.currentData()
         self.config.target_lang = self.lang_combo.currentData()

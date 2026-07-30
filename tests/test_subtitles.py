@@ -243,9 +243,14 @@ class TestBackfillRefusesRatherThanGuesses:
         )) == 2
 
     def _fake_silences(self, monkeypatch, gaps):
+        """Patch the calibrating finder: it returns the gaps only when the count matches,
+        so a test supplying the wrong number gets `[]`, exactly as the real one does."""
         import noveltrans.tts.subtitles as mod
 
-        monkeypatch.setattr(mod, "detect_silences", lambda p, *, min_seconds: gaps)
+        monkeypatch.setattr(
+            mod, "find_chunk_gaps",
+            lambda p, *, want, gap: gaps if len(gaps) == want else [],
+        )
 
     def test_a_single_chunk_needs_no_gaps_at_all(self, tmp_path, monkeypatch):
         from noveltrans.tts.subtitles import backfill_cues
@@ -277,18 +282,20 @@ class TestBackfillRefusesRatherThanGuesses:
             max_chars=120, min_chars=30,
         ) is None
 
-    def test_a_wrong_length_silence_is_not_counted_as_a_gap(self, tmp_path, monkeypatch):
-        """A long pause the engine rendered inside a sentence, or trailing silence at the
-        end of the file, must not masquerade as a chunk boundary."""
+    def test_gap_length_is_not_used_as_a_filter(self, tmp_path, monkeypatch):
+        """Measured on real audio: `silencedetect` reports a region slightly INSIDE the
+        gap, because speech trails off around it. A real 0.348 s gap is never reported as
+        0.348 s, so filtering by length rejected every one of them — 76 expected, 7 kept.
+        Length must not gate the result; the count does."""
         from noveltrans.tts.subtitles import backfill_cues
 
-        body = self.TWO_CHUNKS
-        self._fake_silences(monkeypatch, [(3.0, 3.4), (7.0, 9.5)])  # second is 2.5s
+        # a "gap" nothing like the nominal 0.4 s — still accepted, because the count fits
+        self._fake_silences(monkeypatch, [(6.0, 6.05)])
         cues = backfill_cues(
-            tmp_path / "a.wav", "", body, duration=20.0, gap_seconds=0.4,
+            tmp_path / "a.wav", "", self.TWO_CHUNKS, duration=13.0, gap_seconds=0.4,
             max_chars=120, min_chars=30,
         )
-        assert cues is not None and len(cues) == 2  # the 2.5s silence was ignored
+        assert cues is not None and len(cues) == 2
 
     def test_matching_gaps_produce_cues_bounded_by_them(self, tmp_path, monkeypatch):
         from noveltrans.tts.subtitles import backfill_cues
@@ -345,3 +352,42 @@ class TestDetectSilences:
         assert mod.detect_silences(tmp_path / "a.wav", min_seconds=0.3) == [
             (3.2, 3.6), (10.5, 10.9)
         ]
+
+
+class TestThresholdCalibration:
+    """The count expected from the text is used to CHOOSE the silence threshold, not only
+    to check the answer. Measured on a real chapter with known cues:
+
+        -50 dB -> 98 silences (catches quiet speech)   -70 dB -> 76  EXACT
+        -60 dB -> 77 silences                          -80 dB -> 76  EXACT
+    """
+
+    def test_it_takes_the_first_threshold_that_yields_the_expected_count(self, monkeypatch):
+        import noveltrans.tts.subtitles as mod
+
+        by_db = {-90: [], -80: [(1, 1.3), (2, 2.3)], -70: [(1, 1.3)], -60: [], -50: []}
+        tried: list = []
+
+        def fake(path, *, min_seconds, noise_db=-80):
+            tried.append(noise_db)
+            return by_db[noise_db]
+
+        monkeypatch.setattr(mod, "detect_silences", fake)
+        assert mod.find_chunk_gaps("a.wav", want=2, gap=0.35) == [(1, 1.3), (2, 2.3)]
+        assert tried == [-90, -80]  # stopped as soon as the count matched
+
+    def test_no_threshold_matching_the_count_returns_nothing(self, monkeypatch):
+        """Refusal, not a best guess — the chapter is skipped and reported."""
+        import noveltrans.tts.subtitles as mod
+
+        monkeypatch.setattr(
+            mod, "detect_silences", lambda p, *, min_seconds, noise_db=-80: [(1, 2)] * 9
+        )
+        assert mod.find_chunk_gaps("a.wav", want=2, gap=0.35) == []
+
+    def test_the_quietest_threshold_is_tried_first(self):
+        """Digital silence is -inf dB; quiet speech is not. Starting loud would match
+        speech pauses on a chapter where the quiet threshold would have been exact."""
+        from noveltrans.tts.subtitles import _SILENCE_THRESHOLDS_DB
+
+        assert list(_SILENCE_THRESHOLDS_DB) == sorted(_SILENCE_THRESHOLDS_DB)

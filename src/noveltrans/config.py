@@ -13,6 +13,9 @@ from PySide6.QtCore import QSettings
 
 from noveltrans.storage.library import DEFAULT_LIBRARY_DIR
 
+# How many previously-used library folders to keep. Enough for a few real libraries,
+# short enough that the dropdown stays scannable.
+MAX_LIBRARY_HISTORY = 8
 DEFAULT_REQUEST_DELAY = 1.5
 DEFAULT_TARGET_LANG = "vi"
 DEFAULT_TRANSLATOR = "google"
@@ -84,7 +87,55 @@ class AppConfig:
 
     @library_dir.setter
     def library_dir(self, value: Path) -> None:
-        self._s.setValue("library_dir", str(value))
+        """Set the active library, recording it in the history.
+
+        Recording happens HERE rather than in the settings dialog so the history cannot
+        drift from what was actually used: every path that becomes the library is in the
+        list, whatever set it.
+        """
+        value = str(value).strip()
+        if not value:
+            return  # an empty box must not blank the library or poison the history
+        self._s.setValue("library_dir", value)
+        self._remember_library_dir(value)
+
+    @property
+    def library_dir_history(self) -> list[str]:
+        """Previously-used library folders, most recent first, current one included.
+
+        Lets someone with several libraries switch between them without browsing each
+        time. Stored as a plain list so a hand-edited settings file degrades to "fewer
+        entries", never to a broken dialog.
+        """
+        raw = self._s.value("library_dir_history", [])
+        if isinstance(raw, str):  # QSettings collapses a one-item list to a bare string
+            raw = [raw]
+        seen: list[str] = []
+        for item in list(raw or []):
+            text = str(item).strip()
+            if text and text not in seen:
+                seen.append(text)
+        current = str(self.library_dir)
+        if current and current not in seen:
+            seen.insert(0, current)
+        return seen[:MAX_LIBRARY_HISTORY]
+
+    def _remember_library_dir(self, value: str) -> None:
+        """Move `value` to the front of the history, capped and deduped."""
+        history = [h for h in self.library_dir_history if h != value]
+        self._s.setValue(
+            "library_dir_history", [value, *history][:MAX_LIBRARY_HISTORY]
+        )
+
+    def forget_library_dir(self, value: str) -> None:
+        """Drop one entry from the history. The active library is never removed."""
+        value = str(value).strip()
+        if value == str(self.library_dir):
+            return
+        self._s.setValue(
+            "library_dir_history",
+            [h for h in self.library_dir_history if h != value],
+        )
 
     @property
     def request_delay(self) -> float:
