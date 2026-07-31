@@ -22,6 +22,10 @@ dist/
 *.db-wal
 *.db-shm
 
+# Windows packaging: bundled ffmpeg/ffprobe binaries, fetched locally before `.\make.ps1
+# app` — see README "Đóng gói thành app Windows". Not committed (license + size).
+/packaging/ffmpeg/
+
 # OS
 .DS_Store
 

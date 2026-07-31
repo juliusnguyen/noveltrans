@@ -22,6 +22,8 @@ def ffmpeg_has_encoder(name: str) -> bool:
             ["ffmpeg", "-hide_banner", "-encoders"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=15,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -37,6 +39,8 @@ def convert_to_mp3(wav_path: Path, bitrate: str = "96k") -> Path:
             ["ffmpeg", "-y", "-i", str(wav_path), "-b:a", bitrate, str(mp3_path)],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=600,
         )
     except FileNotFoundError as exc:
@@ -89,6 +93,8 @@ def apply_tempo(wav_path: Path, tempo: float) -> Path:
             ["ffmpeg", "-y", "-i", str(wav_path), "-filter:a", chain, str(tmp_path)],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=600,
         )
     except FileNotFoundError as exc:

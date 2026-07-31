@@ -110,6 +110,8 @@ class CliAgentTranslator(Translator):
                     cmd,
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=self.timeout,
                     cwd=tempfile.gettempdir(),
                 )

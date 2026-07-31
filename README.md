@@ -12,7 +12,8 @@
 ## Chạy nền ở thanh menu
 
 Việc tải / dịch / tạo audio / render video chạy hàng giờ, nên **đóng cửa sổ (✕) sẽ thu nhỏ
-app xuống thanh menu macOS chứ không thoát** — tiến trình vẫn chạy tiếp.
+app xuống thanh menu macOS (hoặc khay hệ thống Windows) chứ không thoát** — tiến trình vẫn
+chạy tiếp.
 
 Bấm biểu tượng NovelTrans trên thanh menu để mở bảng tiến trình: mỗi việc đang chạy là một
 dòng có tên truyện, thanh tiến trình, số chương, và nút **⏸ Tạm dừng / ▶ Tiếp tục**. Cuối
@@ -30,19 +31,22 @@ nào bị ghi dở và chạy tiếp thì tiếp đúng chỗ cũ — đổi l�
 | Tải lên YouTube | xong phần đang tải; cửa sổ Chrome và phiên đăng nhập Google **vẫn mở** cho tới khi chạy tiếp |
 
 Khi thu nhỏ xuống thanh menu, **icon dưới Dock cũng biến mất** — app chỉ còn một biểu tượng
-nhỏ trên thanh menu. Mở lại cửa sổ (**Mở cửa sổ**) thì icon Dock hiện lại.
+nhỏ trên thanh menu. Mở lại cửa sổ (**Mở cửa sổ**) thì icon Dock hiện lại. (Chỉ macOS có
+Dock — trên Windows, cửa sổ chỉ đơn giản ẩn xuống khay hệ thống, icon taskbar không có gì
+để ẩn/hiện.)
 
 Đổi lại, trong lúc đang ẩn:
 
-- **Bấm biểu tượng trên thanh menu là cách duy nhất để mở lại cửa sổ** (không còn icon Dock
-  để bấm).
-- **⌘Q không hoạt động** — lúc này app không giữ thanh menu ứng dụng nên phím tắt không tới
-  được. Dùng **Thoát** trong bảng tiến trình.
-- Báo "đã xong" dựa vào thông báo của macOS (không còn icon Dock để hiện chấm đỏ).
+- **Bấm biểu tượng trên thanh menu / khay hệ thống là cách duy nhất để mở lại cửa sổ**
+  (macOS: không còn icon Dock để bấm).
+- **⌘Q không hoạt động** trên macOS lúc này — app không giữ thanh menu ứng dụng nên phím
+  tắt không tới được. Dùng **Thoát** trong bảng tiến trình. (Không áp dụng cho Windows.)
+- Báo "đã xong" dựa vào thông báo của hệ điều hành (macOS: không còn icon Dock để hiện
+  chấm đỏ; Windows: thông báo khay hệ thống bình thường).
 
 Chỉ **Thoát** mới thật sự đóng app — lúc đó mọi tiến trình đang chạy sẽ bị huỷ. Khi cửa sổ
-đang mở thì ⌘Q vẫn thoát như bình thường. Máy nào không có thanh menu (system tray) thì ✕
-vẫn thoát như cũ và icon Dock không bị đụng tới.
+đang mở thì ⌘Q (macOS) hoặc nút ✕ vẫn thoát/ẩn như bình thường. Máy nào không có thanh
+menu/khay hệ thống thì ✕ vẫn thoát như cũ và icon Dock (macOS) không bị đụng tới.
 
 ## Trang web được hỗ trợ
 
@@ -76,6 +80,18 @@ pip install -e ".[dev]"
 noveltrans
 ```
 
+**Windows** (PowerShell), dùng [uv](https://docs.astral.sh/uv/):
+
+```powershell
+uv venv --python 3.12 .venv
+uv pip install -e ".[dev]"
+.venv\Scripts\noveltrans.exe    # mở ứng dụng
+```
+
+Có thể thay các bước trên bằng `.\make.ps1 run` (tự cài venv lần đầu nếu chưa có) — xem
+`## Phát triển` để biết các target khác. Không cần cài GNU `make`, script này là thuần
+PowerShell.
+
 ## Đóng gói thành app macOS
 
 Tạo `NovelTrans.app` (và file `.dmg` để kéo vào Applications) bằng PyInstaller:
@@ -90,6 +106,32 @@ App **chưa được ký (unsigned)**, nên lần đầu mở macOS sẽ cảnh 
 chuột phải vào app → **Open** → **Open**, hoặc chạy `xattr -cr /Applications/NovelTrans.app`.
 Model TTS (~334 MB) tải về lần đầu khi dùng tab "Nghe audio" (cần mạng).
 Đổi icon: sửa `packaging/make_icon.py` rồi `make icon`.
+
+## Đóng gói thành app Windows
+
+Tạo `NovelTrans.exe` (thư mục portable, không cần cài đặt) bằng PyInstaller:
+
+```powershell
+uv pip install -e ".[tts]"        # để gói kèm engine đọc audio
+.\make.ps1 zip                     # → dist/NovelTrans-windows.zip
+# hoặc chỉ tạo thư mục app, không nén: .\make.ps1 app  → dist/NovelTrans/NovelTrans.exe
+```
+
+App **chưa được ký (unsigned)**, nên Windows SmartScreen sẽ cảnh báo lần đầu mở. Cách mở:
+**More info** → **Run anyway**.
+
+Build kèm sẵn `ffmpeg.exe`/`ffprobe.exe` nếu bạn đặt chúng vào `packaging/ffmpeg/win/`
+trước khi build (không bắt buộc — thiếu thì vẫn build và chạy được, chỉ là tab "Nghe audio"
+sẽ giới hạn ở WAV và không đổi được tốc độ đọc, giống hệt máy Mac chưa cài `ffmpeg`). Tải
+bản **essentials** (không phải "full", để dung lượng gói cài nhỏ hơn) từ
+[gyan.dev](https://www.gyan.dev/ffmpeg/builds/), giải nén rồi copy `ffmpeg.exe` và
+`ffprobe.exe` từ thư mục `bin/` vào `packaging/ffmpeg/win/`. Các binary này không được
+commit vào git (xem `.gitignore`).
+
+Model TTS (~330 MB) tải về lần đầu khi dùng tab "Nghe audio" (cần mạng), giống macOS.
+Icon dùng chung `packaging/NovelTrans.png`; `.\make.ps1 icon` chỉ tạo lại
+`packaging/NovelTrans.ico` từ PNG đã có sẵn — **không** vẽ lại PNG (script vẽ icon dùng
+font "Songti SC" chỉ có trên macOS).
 
 ## Cấu hình
 
@@ -118,7 +160,8 @@ uv pip install -e ".[tts]"    # cài vieneu (ONNX, không cần PyTorch)
 - **Giọng** (người đọc) và **phong cách** (Tự nhiên / Kể chuyện / Tin tức) chọn riêng — kết hợp giọng bất kỳ với phong cách bất kỳ.
 - **Làm sạch ký tự đặc biệt** trước khi đọc (emoji, ký hiệu, chữ Hán sót, markdown) để audio mượt hơn — giữ nguyên tiếng Việt và dấu câu; có ô "bỏ thêm ký tự" tuỳ chọn. Nút **Xem trước văn bản** cho thấy đúng những gì engine sẽ đọc.
 - **Tinh chỉnh trong Cài đặt**: khoảng lặng giữa đoạn, tốc độ đọc (cần ffmpeg), âm lượng, độ biểu cảm (temperature), và chất lượng model (int8 nhanh / fp32 chất lượng cao hơn). Mặc định giữ nguyên như cũ.
-- MP3 và **đổi tốc độ** cần `ffmpeg` (`brew install ffmpeg`); không có thì dùng WAV (~6 MB/phút).
+- MP3 và **đổi tốc độ** cần `ffmpeg` (`brew install ffmpeg` trên macOS, `winget install ffmpeg`
+  hoặc `scoop install ffmpeg` trên Windows); không có thì dùng WAV (~6 MB/phút).
 - Chạy nhiều luồng song song được (mỗi luồng ~334 MB RAM) để tạo audio nhanh hơn.
 - File nằm trong `exports/audio/` của từng truyện; đã tạo rồi thì lần sau chỉ tạo chương còn thiếu.
 
@@ -129,6 +172,18 @@ uv pip install -e ".[tts]"    # cài vieneu (ONNX, không cần PyTorch)
 .venv/bin/python -m pytest -m live      # test chạm site thật (kiểm tra site đổi giao diện)
 .venv/bin/python -m noveltrans.scrapers <url>   # debug một adapter với site thật
 .venv/bin/ruff check src tests          # lint
+```
+
+Trên Windows, dùng `.venv\Scripts\...` thay cho `.venv/bin/...`, hoặc dùng `make.ps1`
+(tương đương `Makefile`, không cần cài GNU `make`):
+
+```powershell
+.\make.ps1 test        # test offline
+.\make.ps1 test-live   # test chạm site thật
+.\make.ps1 lint        # lint
+.\make.ps1 app         # đóng gói dist/NovelTrans/NovelTrans.exe
+.\make.ps1 zip         # đóng gói + nén dist/NovelTrans-windows.zip
+.\make.ps1 clean       # xoá venv và cache
 ```
 
 Kiến trúc: 3 plugin ABC tách hoàn toàn khỏi GUI — `SiteAdapter` (scrapers/), `Translator` (translators/), `Exporter` (exporters/). GUI (gui/) chỉ ghép các phần qua QThread worker + Signal. Xem `changes/001-NOVEL-TRANSLATOR-GUI/001.02-INITIAL-PLAN.md` để biết chi tiết thiết kế.

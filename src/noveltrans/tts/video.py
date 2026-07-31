@@ -128,7 +128,7 @@ def _probe_duration(path: Path | str) -> float:
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "default=nw=1:nokey=1", str(path)],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return 0.0

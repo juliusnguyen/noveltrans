@@ -132,7 +132,7 @@ class TestRealMerge:
 
         probe = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_chapters", str(out)],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8",
         )
         chapters = json.loads(probe.stdout)["chapters"]
         assert [c["tags"]["title"] for c in chapters] == ["Chương 1", "Chương 2"]
