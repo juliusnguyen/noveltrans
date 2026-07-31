@@ -14,7 +14,7 @@ from noveltrans.gui.dock import POLICY_REGULAR, current_policy
 from noveltrans.gui.main_window import MainWindow
 from noveltrans.gui.style import apply_theme
 from noveltrans.gui.tray import TrayController
-from noveltrans.runtime_env import augment_tool_path
+from noveltrans.runtime_env import augment_tool_path, ensure_std_streams
 
 
 class DockActivateFilter(QObject):
@@ -47,6 +47,10 @@ class DockActivateFilter(QObject):
 
 
 def main() -> int:
+    # A console-less Windows build has no stdout/stderr/stdin at all (None, not just
+    # redirected) — fix this first, before any dependency (e.g. VieNeu-TTS's first-run
+    # model download progress bar) can crash trying to write to it.
+    ensure_std_streams()
     # Finder-launched .apps inherit a minimal PATH without Homebrew / ~/.local/bin, so
     # ffmpeg would be invisible (the Tạo video button greys out). Fix PATH before any
     # ffmpeg_available() check or subprocess runs.

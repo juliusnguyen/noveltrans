@@ -70,12 +70,13 @@ class TestRefCounting:
 
 
 class TestGuards:
-    def test_non_macos_never_spawns(self, monkeypatch):
+    def test_unsupported_platform_never_spawns(self, monkeypatch):
         m = keep_awake._KeepAwake()
         monkeypatch.setattr(keep_awake.sys, "platform", "linux")
         monkeypatch.setattr(keep_awake.subprocess, "Popen", lambda *a, **k: pytest.fail("spawned"))
         m.acquire()
         assert m._proc is None
+        assert m._win_active is False
 
     def test_missing_binary_no_spawn(self, monkeypatch):
         m = keep_awake._KeepAwake()
@@ -97,6 +98,56 @@ class TestGuards:
         assert m._proc is not None
         m.set_enabled(False)
         assert spawned[0].terminated and m._proc is None
+
+
+class TestWindows:
+    """The SetThreadExecutionState backend — `_win_set_execution_state` is monkeypatched
+    wholesale rather than run for real, since `ctypes.windll` doesn't exist off Windows."""
+
+    @pytest.fixture
+    def win_mgr(self, monkeypatch):
+        m = keep_awake._KeepAwake()
+        calls: list[int] = []
+        monkeypatch.setattr(keep_awake.sys, "platform", "win32")
+        monkeypatch.setattr(keep_awake, "_win_set_execution_state", calls.append)
+        return m, calls
+
+    def test_acquire_sets_continuous_and_system_required(self, win_mgr):
+        m, calls = win_mgr
+        m.acquire()
+        assert calls == [keep_awake._ES_CONTINUOUS | keep_awake._ES_SYSTEM_REQUIRED]
+        assert m._win_active is True
+
+    def test_acquire_twice_calls_once(self, win_mgr):
+        m, calls = win_mgr
+        m.acquire()
+        m.acquire()
+        assert len(calls) == 1
+
+    def test_release_to_zero_clears_continuous(self, win_mgr):
+        m, calls = win_mgr
+        m.acquire()
+        m.release()
+        assert calls[-1] == keep_awake._ES_CONTINUOUS
+        assert m._win_active is False
+
+    def test_a_failing_call_leaves_state_inactive(self, monkeypatch):
+        m = keep_awake._KeepAwake()
+        monkeypatch.setattr(keep_awake.sys, "platform", "win32")
+
+        def _boom(_flags):
+            raise OSError("no thread execution state for you")
+
+        monkeypatch.setattr(keep_awake, "_win_set_execution_state", _boom)
+        m.acquire()  # must not raise
+        assert m._win_active is False
+
+    def test_shutdown_force_releases(self, win_mgr):
+        m, calls = win_mgr
+        m.acquire()
+        m.shutdown()
+        assert calls[-1] == keep_awake._ES_CONTINUOUS
+        assert m._count == 0 and m._win_active is False
 
 
 def test_track_worker_acquires_and_releases_on_finished(qapp, monkeypatch):

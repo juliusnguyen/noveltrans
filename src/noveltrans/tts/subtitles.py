@@ -221,7 +221,7 @@ def detect_silences(
             ["ffmpeg", "-i", str(audio_path), "-af",
              f"silencedetect=noise={noise_db}dB:d={max(0.05, min_seconds):.3f}",
              "-f", "null", "-"],
-            capture_output=True, text=True, timeout=300,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return []

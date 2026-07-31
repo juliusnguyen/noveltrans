@@ -2034,7 +2034,7 @@ class TestSubtitleRequestValidation:
         from noveltrans.youtube_upload import SubtitleRequest
 
         srt = tmp_path / "a.srt"
-        srt.write_text(_SRT_TEXT)
+        srt.write_text(_SRT_TEXT, encoding="utf-8")
         with pytest.raises(YouTubeUploadError, match="chưa có video"):
             SubtitleRequest(video=part, subtitle=srt, label="Phần 1").validate()
 
@@ -2050,7 +2050,7 @@ class TestSubtitleRequestValidation:
 
         write_upload_state(part, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
         srt = tmp_path / "a.srt"
-        srt.write_text("")
+        srt.write_text("", encoding="utf-8")
         with pytest.raises(YouTubeUploadError, match="rỗng"):
             SubtitleRequest(video=part, subtitle=srt).validate()
 
@@ -2059,7 +2059,7 @@ class TestSubtitleRequestValidation:
 
         write_upload_state(part, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
         srt = tmp_path / "a.srt"
-        srt.write_text(_SRT_TEXT)
+        srt.write_text(_SRT_TEXT, encoding="utf-8")
         request = SubtitleRequest(video=part, subtitle=srt)
         request.validate()
         assert request.resolve() == "dQw4w9WgXcQ"
@@ -2244,7 +2244,7 @@ class TestSubtitleUploadFlow:
 
         write_upload_state(part, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
         srt = tmp_path / "a.srt"
-        srt.write_text(_SRT_TEXT)
+        srt.write_text(_SRT_TEXT, encoding="utf-8")
         return SubtitleRequest(video=part, subtitle=srt, label="Phần 1")
 
     def test_it_clicks_through_to_the_file_input_and_sends_the_srt(self, part, tmp_path):
@@ -2347,7 +2347,7 @@ class TestSubtitleUploadFlow:
         from noveltrans.youtube_upload import upload_subtitle_one
 
         request = self._request(part, tmp_path)
-        request.subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\nÀ\n")
+        request.subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\nÀ\n", encoding="utf-8")
         page = _FakeSubtitlePage(clicks_to_input=1, cue="never-visible", caption_fields=9)
         upload_subtitle_one(page, request)
         assert any("Xuất bản" in s or "Publish" in s for s in page.clicked)
@@ -2431,7 +2431,7 @@ class TestSubtitleLanguageGate:
 
         write_upload_state(part, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
         srt = tmp_path / "a.srt"
-        srt.write_text(_SRT_TEXT)
+        srt.write_text(_SRT_TEXT, encoding="utf-8")
         return SubtitleRequest(video=part, subtitle=srt, label="Phần 1")
 
     def test_the_gate_is_detected_by_its_confirm_button(self):
@@ -2881,10 +2881,12 @@ class TestMeasuredUploadDialog:
         from noveltrans.youtube_upload import _cue_probe
 
         srt = tmp_path / "a.srt"
-        srt.write_text('1\n00:00:00,000 --> 00:00:02,000\nĐêm ấy trời "mưa" rất to\n')
+        srt.write_text(
+            '1\n00:00:00,000 --> 00:00:02,000\nĐêm ấy trời "mưa" rất to\n', encoding="utf-8"
+        )
         assert _cue_probe(srt) == "Đêm ấy trời"
 
-        srt.write_text("1\n00:00:00,000 --> 00:00:02,000\nÀ\n")
+        srt.write_text("1\n00:00:00,000 --> 00:00:02,000\nÀ\n", encoding="utf-8")
         assert _cue_probe(srt) == ""  # too short to search for; the field count answers
 
         assert _cue_probe(tmp_path / "missing.srt") == ""
