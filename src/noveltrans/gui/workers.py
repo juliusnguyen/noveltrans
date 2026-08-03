@@ -1195,7 +1195,11 @@ class VideoWorker(PausableWorker):
         sidecar(".txt").write_text(desc, encoding="utf-8")  # richer than render_video's
 
         if self.tags.strip():
-            sidecar(".tags.txt").write_text(self.tags.strip() + "\n", encoding="utf-8")
+            from noveltrans.tts.tags import format_tags, parse_tags
+
+            capped = format_tags(parse_tags(self.tags))
+            if capped:
+                sidecar(".tags.txt").write_text(capped + "\n", encoding="utf-8")
 
         try:
             font_file = video_font(self.thumb_font_key or self.font_key)["file"]

@@ -64,7 +64,7 @@ def test_work_this_app_produced_is_never_overwritten(tmp_path):
     blank defaults must not land on top of them."""
     project = _project(tmp_path)
     project.save_meta_translation("Tựa đã dịch", "mô tả đã dịch", "vi", author="Dịch giả")
-    project.save_tags("tag1,tag2")
+    project.save_tags("tag1, tag2")
     project.save_thumbnail_prompt("a moody alley at night")
 
     project.refresh_meta(_fresh())
@@ -74,7 +74,7 @@ def test_work_this_app_produced_is_never_overwritten(tmp_path):
     assert stored["translated_title"] == "Tựa đã dịch"  # our own work kept
     assert stored["translated_description"] == "mô tả đã dịch"
     assert stored["translated_author"] == "Dịch giả"
-    assert stored["tags"] == "tag1,tag2"
+    assert stored["tags"] == "tag1, tag2"
     assert stored["thumbnail_prompt"] == "a moody alley at night"
     project.close()
 

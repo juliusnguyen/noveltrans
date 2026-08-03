@@ -19,6 +19,7 @@ from pathlib import Path
 
 from noveltrans.errors import TtsError
 from noveltrans.models import Chapter
+from noveltrans.runtime_env import no_console_kwargs
 from noveltrans.tts.convert import ffmpeg_available  # noqa: F401 (re-exported for callers)
 
 
@@ -179,7 +180,9 @@ def merge_chapters(
         # and deadlock, while we poll for cancellation.
         with open(err_file, "w", encoding="utf-8") as err:
             try:
-                proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=err)
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.DEVNULL, stderr=err, **no_console_kwargs()
+                )
             except FileNotFoundError as exc:
                 raise TtsError("Không tìm thấy ffmpeg — cài ffmpeg để ghép audio.") from exc
             while True:

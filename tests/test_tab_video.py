@@ -41,6 +41,139 @@ class TestVideoTab:
         assert tab.image_prompt_edit.toPlainText() == "a cinematic xianxia scene, 16:9"
         tab.shutdown()
 
+    def test_loads_saved_image_and_playlist_on_project_select(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_video_image_path("C:/covers/bg.png")
+        project.save_upload_playlist("Truyện A")
+        path = project.path
+        project.close()
+
+        tab = VideoTab(_config(tmp_path))
+        tab._on_project_selected(str(path))
+        assert tab.video_image_edit.text() == "C:/covers/bg.png"
+        assert tab.upload_playlist.currentText() == "Truyện A"
+        tab.shutdown()
+
+    def test_switching_novels_does_not_leak_image_or_playlist(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """The reported bug: picking a background image / playlist for one novel, then
+        opening another, used to keep showing the first novel's choices on the second's
+        video tab — because neither was ever persisted per-novel."""
+        from dataclasses import replace
+
+        project_a = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project_a.save_video_image_path("C:/covers/a.png")
+        project_a.save_upload_playlist("Playlist A")
+        path_a = project_a.path
+        project_a.close()
+
+        # `sample_meta` is mutated in place by `save_video_image_path`/`save_upload_playlist`
+        # above (NovelProject keeps the same object, doesn't copy it) — reset both explicitly
+        # so novel B starts with neither set, rather than inheriting A's just-saved values.
+        meta_b = replace(
+            sample_meta,
+            url="https://example.com/novel/456",
+            title="Novel B",
+            video_image_path="",
+            upload_playlist="",
+        )
+        project_b = NovelProject.create(library_dir, meta_b, sample_refs)
+        path_b = project_b.path
+        project_b.close()
+
+        tab = VideoTab(_config(tmp_path))
+        tab._on_project_selected(str(path_a))
+        assert tab.video_image_edit.text() == "C:/covers/a.png"
+        assert tab.upload_playlist.currentText() == "Playlist A"
+
+        tab._on_project_selected(str(path_b))
+        assert tab.video_image_edit.text() == ""  # no leak from novel A
+        assert tab.upload_playlist.currentText() == ""
+
+        tab._on_project_selected(str(path_a))  # switching back still remembers A
+        assert tab.video_image_edit.text() == "C:/covers/a.png"
+        assert tab.upload_playlist.currentText() == "Playlist A"
+        tab.shutdown()
+
+    def test_picking_playlist_text_persists_to_the_open_novel(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        path = project.path
+        project.close()
+
+        tab = VideoTab(_config(tmp_path))
+        tab._on_project_selected(str(path))
+        tab.upload_playlist.setCurrentText("Danh sách mới")
+
+        reopened = NovelProject.open(path)
+        assert reopened.meta.upload_playlist == "Danh sách mới"
+        reopened.close()
+        tab.shutdown()
+
+    def test_loads_saved_visibility_on_project_select(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_upload_visibility("public")
+        path = project.path
+        project.close()
+
+        tab = VideoTab(_config(tmp_path))
+        tab._on_project_selected(str(path))
+        assert tab.upload_visibility.currentData() == "public"
+        tab.shutdown()
+
+    def test_unset_visibility_defaults_to_private_not_another_novels_choice(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """The one thing worth being paranoid about here: a novel that never had a
+        visibility chosen must land on Riêng tư (private), never on whatever a
+        DIFFERENT novel — possibly Public or Schedule — had selected last."""
+        from dataclasses import replace
+
+        project_a = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project_a.save_upload_visibility("public")
+        path_a = project_a.path
+        project_a.close()
+
+        meta_b = replace(
+            sample_meta,
+            url="https://example.com/novel/456",
+            title="Novel B",
+            upload_visibility="",
+        )
+        project_b = NovelProject.create(library_dir, meta_b, sample_refs)
+        path_b = project_b.path
+        project_b.close()
+
+        tab = VideoTab(_config(tmp_path))
+        tab._on_project_selected(str(path_a))
+        assert tab.upload_visibility.currentData() == "public"
+
+        tab._on_project_selected(str(path_b))
+        assert tab.upload_visibility.currentData() == "private"  # safe default, no leak
+        tab.shutdown()
+
+    def test_changing_visibility_persists_to_the_open_novel(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        path = project.path
+        project.close()
+
+        tab = VideoTab(_config(tmp_path))
+        tab._on_project_selected(str(path))
+        tab.upload_visibility.setCurrentIndex(tab.upload_visibility.findData("schedule"))
+
+        reopened = NovelProject.open(path)
+        assert reopened.meta.upload_visibility == "schedule"
+        reopened.close()
+        tab.shutdown()
+
     def test_shared_ai_engine_combo_excludes_google(self, qapp, tmp_path):
         tab = VideoTab(_config(tmp_path))
         keys = {tab.ai_engine_combo.itemData(i) for i in range(tab.ai_engine_combo.count())}
@@ -606,6 +739,59 @@ class TestYouTubeUploadUi:
         assert request.title.endswith("- Phần 1")  # computed, not read
         assert request.description  # the timestamp table, computed on the fly
         assert request.thumbnail is None
+        tab.shutdown()
+
+    def test_saving_tags_resyncs_already_rendered_parts(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """Regenerating/editing tags used to leave every already-rendered part's
+        `.tags.txt` frozen at whatever it was written at render time — stale both for
+        "Chi tiết phần" and for that part's next upload (`_upload_request` reads the
+        sidecar directly). Saving tags must re-stamp every rendered part's sidecar."""
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        _, out0 = self._render_part(tab, 0)
+        _, out1 = self._render_part(tab, 1)
+        sidecar0 = out0.parent / (out0.stem + ".tags.txt")
+        sidecar1 = out1.parent / (out1.stem + ".tags.txt")
+        sidecar0.write_text("old, tags", encoding="utf-8")
+        sidecar1.write_text("old, tags", encoding="utf-8")
+
+        tab.tags_edit.setPlainText("new, tags")
+        tab._save_tags()
+
+        assert sidecar0.read_text(encoding="utf-8").strip() == "new, tags"
+        assert sidecar1.read_text(encoding="utf-8").strip() == "new, tags"
+        tab.shutdown()
+
+    def test_resync_skips_parts_with_no_rendered_video(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """A part that hasn't been rendered yet has nowhere to write a sidecar into —
+        `_resync_tags_sidecars` must not create one out of thin air."""
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        self._render_part(tab, 0)  # part 1 rendered, part 2 (index 1) is not
+
+        updated = tab._resync_tags_sidecars("new, tags")
+
+        assert updated == 1
+        tab.shutdown()
+
+    def test_generating_tags_resyncs_already_rendered_parts(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """Same as saving, but via the "Tạo tags" auto-generate path (`_on_tags_ready`),
+        which is the more common way tags actually get (re)created."""
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        _, out0 = self._render_part(tab, 0)
+        sidecar0 = out0.parent / (out0.stem + ".tags.txt")
+        sidecar0.write_text("old, tags", encoding="utf-8")
+
+        tab._on_tags_ready("fresh, tags")
+
+        assert sidecar0.read_text(encoding="utf-8").strip() == "fresh, tags"
         tab.shutdown()
 
     def test_schedule_controls_only_show_for_scheduling(self, qapp, tmp_path):

@@ -353,9 +353,13 @@ class VideoTab(QWidget):
     def _build_upload_box(self) -> QGroupBox:
         """Controls for the YouTube upload run: visibility/schedule, playlist, go.
 
-        Deliberately per-run rather than per-project settings: the release plan for a
-        novel ("một phần mỗi tối 20h từ thứ hai") is a decision the user makes once at
-        upload time, not a property of the project worth persisting.
+        The playlist and visibility CHOICE are per-novel (`NovelMeta.upload_playlist` /
+        `.upload_visibility`), loaded/saved in `_on_project_selected` / `_save_upload_
+        playlist_choice` / `_on_visibility_changed` — so switching novels doesn't leak one
+        novel's selection into another's. The actual SCHEDULE (`upload_start`/
+        `upload_spacing`) stays per-run and un-persisted: "một phần mỗi tối 20h từ thứ hai"
+        starting from *today* is a decision made fresh each time, not a fact about the
+        project — reusing a stale date/time would be actively wrong, not just inconvenient.
         """
         self.upload_visibility = QComboBox()
         # Private first, and the default: an accidental click can't publish anything.
@@ -411,6 +415,9 @@ class VideoTab(QWidget):
         self.upload_playlist.setToolTip(
             "Mỗi phần sẽ được thêm vào danh sách phát này; nếu chưa có, YouTube sẽ tạo mới."
         )
+        # Per-novel, like the background image — so picking a playlist for this novel
+        # doesn't leave it selected the next time a DIFFERENT novel is opened.
+        self.upload_playlist.currentTextChanged.connect(self._save_upload_playlist_choice)
 
         self.upload_button = QPushButton("⬆️ Tải lên YouTube")
         self.upload_button.setToolTip(
@@ -498,7 +505,9 @@ class VideoTab(QWidget):
         return box
 
     def _on_visibility_changed(self) -> None:
-        """Show the schedule controls only when they mean something."""
+        """Show the schedule controls only when they mean something, and remember the
+        choice on the open novel (per-novel, not the old always-reset-to-private default —
+        see NovelMeta.upload_visibility)."""
         scheduling = self.upload_visibility.currentData() == "schedule"
         for widget in (
             self.upload_start_label,
@@ -509,6 +518,8 @@ class VideoTab(QWidget):
             widget.setVisible(scheduling)
         self.schedule_preview.setVisible(scheduling)
         self._refresh_schedule_preview()
+        if self.project is not None:
+            self.project.save_upload_visibility(self.upload_visibility.currentData())
 
     def _refresh_schedule_preview(self) -> None:
         """Spell out when each pending part would actually go live.
@@ -1444,7 +1455,19 @@ class VideoTab(QWidget):
         )
         if path:
             self.video_image_edit.setText(path)
-            self.config.video_image_path = path
+            self.config.video_image_path = path  # last-picked default, for a new novel
+            if self.project is not None:
+                self.project.save_video_image_path(path)  # THIS novel's own choice
+
+    def _save_upload_playlist_choice(self, text: str) -> None:
+        """Persist the playlist box's current text onto the open novel, if any.
+
+        Fires on every keystroke/selection (`currentTextChanged`) — cheap (one small
+        meta.json rewrite) and simplest way to keep it in sync without a separate save
+        step the user could forget, same tradeoff `_pick_video_image` makes.
+        """
+        if self.project is not None:
+            self.project.save_upload_playlist(text)
 
     def _pick_bg_color(self) -> None:
         initial = QColor(self.bg_color) if self.bg_color else QColor("#e9d5ff")
@@ -1529,11 +1552,28 @@ class VideoTab(QWidget):
             self.video_range_from.setValue(1)
             self.tags_edit.setPlainText(self.project.meta.tags)
             self.image_prompt_edit.setPlainText(self.project.meta.thumbnail_prompt)
+            # Per-novel — falls back to the last-picked image (the old global default) so
+            # a brand new novel that never had one chosen isn't left blank, but a novel
+            # that HAS its own choice never shows another novel's leftover selection.
+            self.video_image_edit.setText(
+                self.project.meta.video_image_path or self.config.video_image_path
+            )
+            self.upload_playlist.setCurrentText(self.project.meta.upload_playlist)
+            # No global fallback here, unlike the image: an unset/unknown key must land
+            # on "private" (index 0), the deliberately-safe default — never on whatever
+            # visibility some OTHER novel happened to have chosen last.
+            visibility_index = self.upload_visibility.findData(
+                self.project.meta.upload_visibility
+            )
+            self.upload_visibility.setCurrentIndex(max(visibility_index, 0))
             self._sync_display_title()
             self._update_status_line()
         else:
             self.tags_edit.setPlainText("")
             self.image_prompt_edit.setPlainText("")
+            self.video_image_edit.setText(self.config.video_image_path)
+            self.upload_playlist.setCurrentText("")
+            self.upload_visibility.setCurrentIndex(0)  # back to Riêng tư, no novel open
             self.display_title_edit.clear()
             self.display_title_edit.setPlaceholderText("")
             self.status_label.setText("")
@@ -1609,10 +1649,36 @@ class VideoTab(QWidget):
         track_worker(self._tags_worker)
         self._tags_worker.start()
 
+    def _resync_tags_sidecars(self, tags: str) -> int:
+        """Rewrite `.tags.txt` for every already-rendered part with the given tags.
+
+        A part's `.tags.txt` is written once, at render time, and never touched again —
+        so regenerating or editing tags afterward left every existing part's sidecar
+        stale: `_upload_request` reads tags straight from that file (an already-rendered
+        part's *next* upload would still send the old tags), and `_part_metadata` prefers
+        the sidecar over the live tags box whenever it exists (so "Chi tiết phần" kept
+        showing the old value too). Re-stamping every rendered part's sidecar here keeps
+        both in sync with whatever was just saved/generated. Returns how many were updated.
+        """
+        if self.project is None or not tags.strip():
+            return 0
+        windows = self._windows_for_current_selection()
+        whole = len(windows) == 1 and self.video_mode.currentData() == "all"
+        updated = 0
+        for window in windows:
+            if not self._part_output_path(window, whole_novel=whole).is_file():
+                continue
+            sidecar = self._part_sidecar(window, whole, ".tags.txt")
+            sidecar.write_text(tags + "\n", encoding="utf-8")
+            updated += 1
+        return updated
+
     def _on_tags_ready(self, tags: str) -> None:
         self.tags_button.setEnabled(True)
         self.tags_edit.setPlainText(tags)
-        self.status_label.setText("✅ Đã tạo tags.")
+        updated = self._resync_tags_sidecars(tags)
+        suffix = f" (đã cập nhật {updated} phần đã tạo)" if updated else ""
+        self.status_label.setText(f"✅ Đã tạo tags.{suffix}")
         if self._render_after_tags:
             self._render_after_tags = False
             self._launch_video(skip_existing=True)
@@ -1636,7 +1702,9 @@ class VideoTab(QWidget):
         tags = format_tags(parse_tags(self.tags_edit.toPlainText()))
         self.project.save_tags(tags)
         self.tags_edit.setPlainText(tags)
-        self.status_label.setText("✅ Đã lưu tags.")
+        updated = self._resync_tags_sidecars(tags)
+        suffix = f" (đã cập nhật {updated} phần đã tạo)" if updated else ""
+        self.status_label.setText(f"✅ Đã lưu tags.{suffix}")
 
     # -------------------------------------------------- thumbnail image prompt
 

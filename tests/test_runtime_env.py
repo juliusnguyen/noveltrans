@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import os
+import subprocess
 
 from noveltrans import runtime_env
-from noveltrans.runtime_env import augment_tool_path, ensure_std_streams
+from noveltrans.runtime_env import augment_tool_path, ensure_std_streams, no_console_kwargs
 
 
 def test_prepends_existing_tool_dirs_and_user_local_bin(monkeypatch, tmp_path):
@@ -180,3 +181,23 @@ class TestEnsureStdStreams:
         ensure_std_streams()
 
         assert runtime_env.sys.stdout is sentinel
+
+
+class TestNoConsoleKwargs:
+    """Every ffmpeg/ffprobe spawn passes `**no_console_kwargs()` so a console-less Windows
+    build doesn't flash a fresh console window per spawn — see the module docstring's
+    "Flashing consoles" gap."""
+
+    def test_returns_create_no_window_flag_on_win32(self, monkeypatch):
+        monkeypatch.setattr(runtime_env.sys, "platform", "win32")
+        # subprocess.CREATE_NO_WINDOW only exists as an attribute on a real Windows
+        # interpreter (see the module docstring) — fall back to its documented value
+        # (0x08000000) so this test itself runs on any platform's CI.
+        create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+        assert no_console_kwargs() == {"creationflags": create_no_window}
+
+    def test_empty_on_other_platforms(self, monkeypatch):
+        monkeypatch.setattr(runtime_env.sys, "platform", "darwin")
+
+        assert no_console_kwargs() == {}

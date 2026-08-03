@@ -4,17 +4,26 @@ Tags are semantic (genre inference, title variants with/without diacritics) so t
 produced by an LLM engine — the same CLI Agent / Claude / LM Studio engines used to
 translate (via their `complete()` method). These helpers are pure (no network): a tab
 worker calls `build_tags_prompt`, sends it to the chosen engine, then runs the reply
-through `parse_tags`. `parse_tags` enforces YouTube's 500-character tag budget the way
-YouTube counts it — a tag containing a space is billed with +2 for the quotes it needs —
-so the kept list pastes in under the limit.
+through `parse_tags`. `parse_tags` enforces YouTube's 500-character tag budget.
+
+YouTube's own counting algorithm for this field isn't publicly documented, and it does NOT
+match a naive "sum of tag lengths" — confirmed live: a tag list this app judged as fitting
+under 500 (summing each tag's length plus 2 for the ", " `format_tags` inserts before it)
+showed 516/500 in YouTube Studio's own counter. Rather than chase Studio's exact undocumented
+formula (and risk being wrong again), `parse_tags` charges each tag the worst case of every
+plausible contributor at once — its own length, +2 if it's multi-word (YouTube's documented
+API rule: a tag containing a space costs 2 extra, as if quoted), AND +2 for the ", " separator
+before every tag but the first. This double-counts under some readings of the real rule —
+that's intentional headroom, not a bug: it guarantees the output stays under YouTube's real
+cap regardless of which contributor(s) actually apply, at the cost of a few fewer tags kept.
 """
 
 from __future__ import annotations
 
 import re
 
-# YouTube caps the *combined* tag text at 500 characters; a multi-word tag is quoted, which
-# costs 2 extra characters toward that budget (why the reference thumbnail reads "405/500").
+# YouTube caps the combined tag text at 500 characters — see the module docstring for why
+# `parse_tags`'s cost model is deliberately more conservative than a literal char count.
 YOUTUBE_TAG_CHAR_LIMIT = 500
 
 _LEADING_BULLET = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s*")
@@ -101,11 +110,6 @@ def build_thumbnail_image_prompt(
     )
 
 
-def _tag_cost(tag: str) -> int:
-    """How many characters `tag` consumes of YouTube's 500-char budget."""
-    return len(tag) + (2 if " " in tag else 0)
-
-
 def _clean_tag(raw: str) -> str:
     """Normalise one candidate tag: strip bullets/quotes/hashes and collapse whitespace."""
     tag = _LEADING_BULLET.sub("", raw.strip())
@@ -118,7 +122,9 @@ def parse_tags(raw: str, *, max_total_chars: int = YOUTUBE_TAG_CHAR_LIMIT) -> li
 
     Splits on commas and newlines, normalises each tag, drops empties, de-duplicates
     case-insensitively (first occurrence wins, order preserved), then keeps tags in order
-    until the running YouTube cost would exceed `max_total_chars`.
+    until the running cost would exceed `max_total_chars`. See the module docstring for why
+    each tag's cost combines its length, a multi-word bonus, AND a separator cost, rather
+    than picking one — it's deliberate headroom against YouTube's undocumented real budget.
     """
     pieces = re.split(r"[,\n]+", raw or "")
     seen: set[str] = set()
@@ -131,9 +137,13 @@ def parse_tags(raw: str, *, max_total_chars: int = YOUTUBE_TAG_CHAR_LIMIT) -> li
         key = tag.casefold()
         if key in seen:
             continue
-        cost = _tag_cost(tag)
+        cost = (
+            len(tag)
+            + (2 if " " in tag else 0)  # multi-word "quote" cost (YouTube's documented rule)
+            + (2 if kept else 0)  # ", " separator before every tag but the first
+        )
         if cost > max_total_chars:
-            continue  # a single tag longer than the whole budget — skip it
+            continue  # even alone this tag would blow the budget — skip, keep scanning
         if total + cost > max_total_chars:
             break
         seen.add(key)
