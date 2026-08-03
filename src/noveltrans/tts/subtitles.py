@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from noveltrans.runtime_env import no_console_kwargs
 from noveltrans.tts.clean import clean_for_tts
 
 _CUES_EXT = ".cues.json"
@@ -222,6 +223,7 @@ def detect_silences(
              f"silencedetect=noise={noise_db}dB:d={max(0.05, min_seconds):.3f}",
              "-f", "null", "-"],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300,
+            **no_console_kwargs(),
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return []

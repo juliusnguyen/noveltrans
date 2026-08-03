@@ -34,6 +34,7 @@ from importlib import resources
 from pathlib import Path
 
 from noveltrans.errors import TtsError
+from noveltrans.runtime_env import no_console_kwargs
 from noveltrans.tts.convert import ffmpeg_available  # noqa: F401 (re-exported for callers)
 from noveltrans.tts.subtitles import part_cues, part_srt
 from noveltrans.tts.player_skin import (
@@ -129,6 +130,7 @@ def _probe_duration(path: Path | str) -> float:
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "default=nw=1:nokey=1", str(path)],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+            **no_console_kwargs(),
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return 0.0
@@ -481,7 +483,9 @@ def _run_ffmpeg(
     """
     with open(err_file, "w", encoding="utf-8") as err:
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=err)
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=err, **no_console_kwargs()
+            )
         except FileNotFoundError as exc:
             raise TtsError("Không tìm thấy ffmpeg — cài ffmpeg để tạo video.") from exc
         while True:
@@ -532,6 +536,7 @@ def _concat_audio(
                 ["ffmpeg", "-y", *_PCM_ARGS, "-i", "pipe:0",
                  "-c:a", "aac", "-b:a", "96k", str(audio_file)],
                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err,
+                **no_console_kwargs(),
             )
         except FileNotFoundError as exc:
             raise TtsError("Không tìm thấy ffmpeg — cài ffmpeg để tạo video.") from exc
@@ -559,6 +564,7 @@ def _concat_audio(
                 dec = subprocess.Popen(
                     ["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), *_PCM_ARGS, "pipe:1"],
                     stdout=enc.stdin, stderr=subprocess.DEVNULL,
+                    **no_console_kwargs(),
                 )
                 _poll(dec, enc)
                 if dec.returncode != 0:

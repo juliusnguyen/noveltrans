@@ -30,16 +30,37 @@ class TestParseTags:
     def test_collapses_internal_whitespace(self):
         assert parse_tags("truyện   audio") == ["truyện audio"]
 
-    def test_multiword_tag_costs_two_extra_toward_budget(self):
-        # 'aa bb' costs len(5)+2 = 7; only one fits in a budget of 7, none in 6
-        assert parse_tags("aa bb, cc dd", max_total_chars=7) == ["aa bb"]
+    def test_first_tag_alone_has_no_separator_cost(self):
+        # "abcde" alone costs just its own length (5) — no ", " separator yet.
+        assert parse_tags("abcde", max_total_chars=5) == ["abcde"]
+
+    def test_every_tag_after_the_first_costs_two_extra_for_the_separator(self):
+        # "abcde" (5) fits; adding ", fg" costs 2 + 2 = 4 more, totalling 9 — exactly the
+        # length of "abcde, fg". A budget one short of that must drop the second tag.
+        assert parse_tags("abcde, fg", max_total_chars=9) == ["abcde", "fg"]
+        assert parse_tags("abcde, fg", max_total_chars=8) == ["abcde"]
+
+    def test_single_oversized_tag_is_skipped_not_fatal(self):
+        # A tag too long for the whole budget on its own is dropped; scanning continues.
+        assert parse_tags("wayyyyytoolong, ok", max_total_chars=5) == ["ok"]
+
+    def test_first_multiword_tag_pays_quote_cost_but_not_separator(self):
+        # "aa bb" alone (first tag, no separator yet): 5 (length) + 2 (multi-word "quote"
+        # cost) = 7. This is deliberate double-counting headroom — see the module docstring
+        # for why a naive char-count model let real tags exceed YouTube's actual 500 budget.
+        assert parse_tags("aa bb", max_total_chars=7) == ["aa bb"]
         assert parse_tags("aa bb", max_total_chars=6) == []
+
+    def test_multiword_tag_pays_both_quote_and_separator_cost(self):
+        # "aa bb" as the SECOND tag: 5 (length) + 2 (multi-word) + 2 (", " separator) = 9.
+        # "c" alone costs 1.
+        assert parse_tags("c, aa bb", max_total_chars=10) == ["c", "aa bb"]
+        assert parse_tags("c, aa bb", max_total_chars=9) == ["c"]
 
     def test_trims_to_budget_without_exceeding(self):
         many = ", ".join(f"tag{i}" for i in range(300))
         kept = parse_tags(many, max_total_chars=20)
-        total = sum(len(t) + (2 if " " in t else 0) for t in kept)
-        assert total <= 20
+        assert len(format_tags(kept)) <= 20  # the exact string this app types/writes
         assert kept  # some kept
 
     def test_default_budget_is_500(self):

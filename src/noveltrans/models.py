@@ -52,6 +52,15 @@ class NovelMeta:
     # User override for how the title appears on video output — the point is dropping a
     # source tag like "[ĐM/EDIT] " without editing the scraped metadata. See display_name().
     display_title: str = ""
+    # Per-novel video export choices, remembered so switching between novels in the GUI
+    # doesn't leave one novel's background image or playlist selected on another's video
+    # tab — see VideoTab._on_project_selected. "" means "nothing chosen for this novel yet".
+    video_image_path: str = ""
+    upload_playlist: str = ""
+    # Last-chosen YouTube visibility ("private"/"unlisted"/"public"/"schedule"). "" means
+    # "never chosen for this novel" — VideoTab falls back to "private" (the safe default)
+    # rather than to whatever some OTHER novel happened to have selected last.
+    upload_visibility: str = ""
 
     def display_name(self) -> str:
         """The novel title as it should appear on a video, thumbnail and description.

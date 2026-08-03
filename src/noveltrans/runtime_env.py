@@ -1,6 +1,6 @@
 """Make the process environment sane regardless of how the app was launched.
 
-Two unrelated gaps, both only visible once you're launched a way a terminal never would:
+Three unrelated gaps, all only visible once you're launched a way a terminal never would:
 
 * **PATH.** A macOS GUI app opened from Finder/Launchpad/Dock inherits only a minimal
   PATH (`/usr/bin:/bin:/usr/sbin:/sbin`) — it does **not** include Homebrew, MacPorts, or
@@ -20,15 +20,26 @@ Two unrelated gaps, both only visible once you're launched a way a terminal neve
   ...) then crashes the instant it runs, with "'NoneType' object has no attribute
   'write'". `ensure_std_streams()` gives them a devnull sink instead.
 
-Both are fixed once at startup — `augment_tool_path()` mutates `os.environ["PATH"]` so
-`shutil.which` and every `subprocess` call inherit it; `ensure_std_streams()` mutates
-`sys.stdout`/`sys.stderr`/`sys.stdin` so anything downstream that assumes they exist
-stops crashing.
+* **Flashing consoles.** A Windows build is frozen with `console=False` (see
+  `NovelTrans-windows.spec`) — the app itself has no console. But every `ffmpeg`/`ffprobe`
+  child process is a console-subsystem executable, and spawning one from a console-less
+  parent makes Windows allocate it a brand-new console window, shown for the life of that
+  child. Tight per-item loops (probing a duration per segment, decoding one chapter at a
+  time) spawn dozens of these back to back, which reads as the console rapidly flashing on
+  and off. `no_console_kwargs()` gives `subprocess.run`/`Popen` callers the flag that stops
+  Windows allocating a window at all.
+
+All three are fixed once at startup or threaded through per call — `augment_tool_path()`
+mutates `os.environ["PATH"]` so `shutil.which` and every `subprocess` call inherit it;
+`ensure_std_streams()` mutates `sys.stdout`/`sys.stderr`/`sys.stdin` so anything downstream
+that assumes they exist stops crashing; `no_console_kwargs()` is spread into each
+ffmpeg/ffprobe spawn's kwargs so no window ever appears in the first place.
 """
 
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -110,3 +121,18 @@ def ensure_std_streams() -> None:
         sys.stderr = open(os.devnull, "w")  # noqa: SIM115
     if sys.stdin is None:
         sys.stdin = open(os.devnull, "r")  # noqa: SIM115
+
+
+def no_console_kwargs() -> dict:
+    """Extra `subprocess.run`/`Popen` kwargs to stop a spawned console app flashing a window.
+
+    See the module docstring's "Flashing consoles" gap. No-op (`{}`) on macOS/Linux — Windows
+    is the only platform where a subprocess gets its own console window. `CREATE_NO_WINDOW`
+    only exists as a `subprocess` module attribute on a real Windows interpreter, so this uses
+    `getattr` with its documented value (0x08000000) as a fallback — keeps this callable (and
+    testable via a monkeypatched `sys.platform`) on interpreters where the real attribute was
+    never defined, without changing the value used on real Windows.
+    """
+    if sys.platform == "win32":
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+    return {}
