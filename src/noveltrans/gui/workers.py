@@ -1981,3 +1981,317 @@ class YouTubeThumbnailWorker(PausableWorker):
             self.failed.emit(repr(exc))
         else:
             self.finished_ok.emit(done - errors, errors)
+
+
+class OneDriveLoginWorker(QThread):
+    """Open the one-time OneDrive/Microsoft login window off-thread.
+
+    `switch=True` drops the saved profile first so Microsoft shows its account chooser —
+    the way to move to a different account once one is already connected. Without it a
+    valid session loads straight through and the window closes before the user can change
+    anything.
+    """
+
+    done = Signal(str)  # account name or email ("" if it could not be read)
+    failed = Signal(str)
+
+    def __init__(self, parent=None, *, switch: bool = False):
+        super().__init__(parent)
+        self.switch = switch
+
+    def run(self) -> None:
+        from noveltrans.onedrive_upload import OneDriveUploadError, open_login
+
+        try:
+            account = open_login(switch=self.switch)
+        except OneDriveUploadError as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:
+            self.failed.emit(repr(exc))
+        else:
+            self.done.emit(account)
+
+
+class OneDrivePushWorker(PausableWorker):
+    """Mirror one novel's project folder to OneDrive, in a single browser session.
+
+    Pausable because a sixty-gigabyte push is exactly the job someone wants to hold while
+    they need the bandwidth back. **The gate holds between batches, never mid-transfer** —
+    the same contract as every other pausable worker here, and stated because it is the
+    question people ask: pausing mid-transfer would mean sitting on a half-sent batch with
+    a browser holding it open.
+
+    The request is built on the GUI thread (it only names a folder and a title); this
+    worker never touches a NovelProject.
+    """
+
+    progress = Signal(int, int, str)  # files done, files planned, status line
+    file_done = Signal(str, str)  # relpath, error ("" on success)
+    finished_ok = Signal(int, int, int)  # uploaded, skipped, failed
+    failed = Signal(str)  # the run could not start, or was cancelled
+    needs_login = Signal(str)  # profile has no valid Microsoft session
+
+    def __init__(self, request, parent=None):
+        super().__init__(parent)
+        self.request = request
+
+    def run(self) -> None:
+        # Imported here so a missing Playwright (optional dep) only bites when the user
+        # actually pushes, not at app import time.
+        from noveltrans.onedrive_upload import (
+            OneDriveCancelled,
+            OneDriveUploadError,
+            format_size,
+            push_project,
+        )
+
+        try:
+            result = push_project(
+                self.request,
+                on_progress=lambda done, total, msg: self.progress.emit(done, total, msg),
+                on_file_done=lambda relpath, error: self.file_done.emit(relpath, error),
+                should_cancel=lambda: self._cancelled,
+                on_checkpoint=self._checkpoint,
+            )
+        except OneDriveCancelled as exc:
+            # Nothing is left half-written on OneDrive: a file is either fully there or
+            # not, and the manifest was flushed on the way out. So this is not the YouTube
+            # worker's "a stray draft is on your channel" — the honest message is that the
+            # files already up will simply be skipped next time.
+            self.failed.emit(
+                f"Đã dừng tải lên OneDrive. {exc.uploaded} file đã lên vẫn còn — "
+                "chạy lại sẽ bỏ qua chúng."
+            )
+        except OneDriveUploadError as exc:
+            if exc.needs_login:
+                self.needs_login.emit(str(exc))
+            else:
+                self.failed.emit(str(exc))
+        except Exception as exc:  # keep unexpected automation errors on-screen
+            self.failed.emit(repr(exc))
+        else:
+            if result.bytes_sent:
+                self.progress.emit(
+                    result.uploaded,
+                    result.uploaded,
+                    f"Đã tải lên {format_size(result.bytes_sent)} vào {result.remote_root}",
+                )
+            self.finished_ok.emit(result.uploaded, result.skipped, result.failed)
+
+
+class OneDriveFoldersWorker(QThread):
+    """List the subfolders of one OneDrive path, off the GUI thread.
+
+    Its own worker rather than a blocking call because it opens a real browser — seconds
+    at best, and a sign-in prompt at worst. Same shape as `PlaylistFetchWorker`.
+    """
+
+    fetched = Signal(str, list)  # the path listed, its subfolder names
+    failed = Signal(str)
+    needs_login = Signal(str)
+
+    def __init__(self, path: str = "", parent=None):
+        super().__init__(parent)
+        self.path = path
+
+    def run(self) -> None:
+        from noveltrans.onedrive_upload import (
+            OneDriveUploadError,
+            list_destination_folders,
+        )
+
+        try:
+            folders = list_destination_folders(self.path)
+        except OneDriveUploadError as exc:
+            if exc.needs_login:
+                self.needs_login.emit(str(exc))
+            else:
+                self.failed.emit(str(exc))
+        except Exception as exc:
+            self.failed.emit(repr(exc))
+        else:
+            self.fetched.emit(self.path, folders)
+
+
+class OneDriveSyncScanWorker(QThread):
+    """Work out what each novel in the library would send, without opening a browser.
+
+    Its own thread because it snapshots every project's database to size it honestly —
+    cheap per novel, but a library of thirty is long enough to freeze the GUI.
+
+    Results are emitted per novel rather than as one list at the end, so a large library
+    fills the table as it goes instead of showing nothing for half a minute.
+    """
+
+    # `qlonglong`, not `int`, for the byte count. Qt's `int` is 32-bit, so a novel with
+    # more than ~2 GB to send overflows it and the emit raises OverflowError — measured
+    # on a real library at 154 GB. The file count stays `int`; nobody has two billion
+    # files, and if they did the scan would be the least of it.
+    scanned = Signal(str, str, int, "qlonglong", str)  # path, title, files, bytes, error
+    progress = Signal(int, int, str)  # novels scanned, total, current title
+    finished_ok = Signal()
+
+    def __init__(self, library_dir, root_folder: str, parent=None):
+        super().__init__(parent)
+        self.library_dir = library_dir
+        self.root_folder = root_folder
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        from noveltrans.onedrive_upload import PushRequest, preview_push
+        from noveltrans.storage.library import Library
+
+        try:
+            library = Library(self.library_dir)
+            paths = library.list_projects()
+        except Exception as exc:
+            self.progress.emit(0, 0, f"Không đọc được thư viện: {exc}")
+            self.finished_ok.emit()
+            return
+
+        total = len(paths)
+        for index, path in enumerate(paths):
+            if self._cancelled:
+                break
+            title = ""
+            try:
+                meta = library.project_meta(path)
+                title = meta.translated_title or meta.title or path.name
+                self.progress.emit(index, total, title)
+                preview = preview_push(
+                    PushRequest(
+                        project_path=path,
+                        novel_title=title,
+                        root_folder=self.root_folder,
+                    )
+                )
+            except Exception as exc:
+                # One unreadable novel must not stop the scan — the others are still
+                # worth offering, and the row says why this one cannot be ticked.
+                self.scanned.emit(str(path), title or path.name, 0, 0, str(exc))
+                continue
+            self.scanned.emit(
+                str(path),
+                title,
+                len(preview.to_upload),
+                sum(item.size for item in preview.to_upload),
+                "",
+            )
+        self.progress.emit(total, total, "")
+        self.finished_ok.emit()
+
+
+class OneDriveSyncWorker(PausableWorker):
+    """Back up several novels in one run, one after another.
+
+    One browser per novel rather than one for the whole run: `push_project` owns its
+    browser, and reusing it across novels would mean holding Chrome open through every
+    gap. The launch costs seconds against a per-novel transfer measured in minutes.
+
+    A novel that fails does not stop the run — the same rule `push_project` applies to a
+    batch, one level up. `needs_login` is the exception: every remaining novel would fail
+    the same way.
+    """
+
+    progress = Signal(int, int, str)  # novels done, total, status line
+    novel_done = Signal(str, int, int, int, str)  # title, uploaded, skipped, failed, error
+    finished_ok = Signal(int, int)  # novels backed up, novels with errors
+    failed = Signal(str)
+    needs_login = Signal(str)
+
+    def __init__(self, requests: list, parent=None):
+        super().__init__(parent)
+        self.requests = list(requests)
+
+    def run(self) -> None:
+        from noveltrans.onedrive_upload import (
+            OneDriveCancelled,
+            OneDriveUploadError,
+            push_project,
+        )
+
+        total = len(self.requests)
+        done = 0
+        errors = 0
+        try:
+            for request in self.requests:
+                if self._checkpoint():
+                    raise OneDriveCancelled(uploaded=done)
+                title = request.novel_title
+                self.progress.emit(done, total, f"⬆️ {title}")
+                try:
+                    result = push_project(
+                        request,
+                        on_progress=lambda _d, _t, msg, _n=title: self.progress.emit(
+                            done, total, f"{_n}: {msg}"
+                        ),
+                        should_cancel=lambda: self._cancelled,
+                        on_checkpoint=self._checkpoint,
+                    )
+                except OneDriveUploadError as exc:
+                    if exc.needs_login:
+                        raise
+                    errors += 1
+                    self.novel_done.emit(title, 0, 0, 0, str(exc))
+                else:
+                    self.novel_done.emit(
+                        title, result.uploaded, result.skipped, result.failed, ""
+                    )
+                done += 1
+                self.progress.emit(done, total, f"✅ {title}")
+        except OneDriveCancelled:
+            self.failed.emit(
+                f"Đã dừng đồng bộ. {done}/{total} truyện đã xong — chạy lại sẽ bỏ qua "
+                "những file đã lên."
+            )
+        except OneDriveUploadError as exc:
+            if exc.needs_login:
+                self.needs_login.emit(str(exc))
+            else:
+                self.failed.emit(str(exc))
+        except Exception as exc:
+            self.failed.emit(repr(exc))
+        else:
+            self.finished_ok.emit(done - errors, errors)
+
+
+class OneDriveVerifyWorker(QThread):
+    """Check which part-videos really are on OneDrive, before anything is deleted.
+
+    Its own thread because it opens a browser and walks one folder per part. The answer
+    it produces is the *only* thing that authorises deleting a video — the local manifest
+    is not accepted as proof, having been measured wrong on a real library.
+    """
+
+    progress = Signal(int, int, str)  # folders checked, total, current folder
+    done = Signal(list, list)  # confirmed, unconfirmed (lists of Removable)
+    failed = Signal(str)
+    needs_login = Signal(str)
+
+    def __init__(self, project_path, candidates: list, parent=None):
+        super().__init__(parent)
+        self.project_path = project_path
+        self.candidates = list(candidates)
+
+    def run(self) -> None:
+        from noveltrans.cleanup import verify_on_onedrive
+        from noveltrans.onedrive_upload import OneDriveUploadError
+
+        try:
+            confirmed, unconfirmed = verify_on_onedrive(
+                self.project_path,
+                self.candidates,
+                on_progress=lambda i, n, folder: self.progress.emit(i, n, folder),
+            )
+        except OneDriveUploadError as exc:
+            if exc.needs_login:
+                self.needs_login.emit(str(exc))
+            else:
+                self.failed.emit(str(exc))
+        except Exception as exc:
+            self.failed.emit(repr(exc))
+        else:
+            self.done.emit(confirmed, unconfirmed)

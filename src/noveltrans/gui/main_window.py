@@ -214,9 +214,23 @@ class MainWindow(QMainWindow):
 
     def _open_settings(self) -> None:
         before = self.config.library_dir
-        SettingsDialog(self.config, self).exec()
+        dialog = SettingsDialog(self.config, self)
+        dialog.exec()
         if self.config.library_dir != before:
             self._reload_library()
+        # A multi-novel OneDrive sync is started from Settings but must not run inside it:
+        # Settings is modal and a sync takes hours. It hands the chosen novels over here,
+        # where the run gets its own modeless window and the app stays usable.
+        if getattr(dialog, "sync_requests", None):
+            self._start_onedrive_sync(dialog.sync_requests)
+
+    def _start_onedrive_sync(self, requests: list) -> None:
+        from noveltrans.gui.onedrive_sync_dialog import OneDriveSyncWindow
+
+        # Kept on self so the window is not garbage-collected the moment this returns —
+        # it owns the worker, and losing it mid-sync would abandon a live browser.
+        self._onedrive_sync_window = OneDriveSyncWindow(requests, self)
+        self._onedrive_sync_window.show()
 
     def _reload_library(self) -> None:
         """Re-list every workspace's project pickers after the library folder changed.

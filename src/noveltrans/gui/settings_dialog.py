@@ -21,10 +21,19 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from noveltrans.config import TARGET_LANGS, AppConfig, translator_labels
+from noveltrans.config import (
+    DEFAULT_ONEDRIVE_ROOT,
+    TARGET_LANGS,
+    AppConfig,
+    translator_labels,
+)
 from noveltrans.discord_unlock import valid_channel_url
 from noveltrans.gui import keep_awake
-from noveltrans.gui.workers import DiscordLoginWorker, YouTubeLoginWorker
+from noveltrans.gui.workers import (
+    DiscordLoginWorker,
+    OneDriveLoginWorker,
+    YouTubeLoginWorker,
+)
 from noveltrans.tts.convert import ffmpeg_available
 
 _MEDOCTRUYEN_LOGIN_URL = "https://medoctruyen.vn/auth/login"
@@ -287,6 +296,76 @@ class SettingsDialog(QDialog):
         youtube_hint.setWordWrap(True)
         form.addRow("", youtube_hint)
 
+        # OneDrive backup: the Export tab mirrors a whole novel folder up, in its own
+        # browser profile. Like YouTube, only the one-time sign-in lives here. There is
+        # deliberately no destination field — every novel goes to /NovelTrans/<tên
+        # truyện>/, derived from its title, so there is nothing per-run to configure.
+        onedrive_login = QPushButton("Đăng nhập OneDrive")
+        onedrive_login.setToolTip(
+            "Mở cửa sổ Chrome riêng để đăng nhập tài khoản Microsoft một lần, cho tính "
+            "năng sao lưu truyện lên OneDrive ở tab Xuất bản."
+        )
+        onedrive_login.clicked.connect(self._onedrive_login)
+        onedrive_switch = QPushButton("Đổi tài khoản…")
+        onedrive_switch.setToolTip(
+            "Đăng xuất tài khoản hiện tại rồi đăng nhập lại — dùng khi lỡ đăng nhập nhầm."
+        )
+        onedrive_switch.clicked.connect(self._onedrive_switch)
+        self.onedrive_status = QLabel("")
+        self.onedrive_status.setProperty("muted", True)
+        self._refresh_onedrive_status()
+        onedrive_row = QHBoxLayout()
+        onedrive_row.addWidget(onedrive_login)
+        onedrive_row.addWidget(onedrive_switch)
+        onedrive_row.addWidget(self.onedrive_status, stretch=1)
+        form.addRow("Sao lưu OneDrive:", onedrive_row)
+
+        # Backs up several novels in one go. The run itself is handed to MainWindow —
+        # this dialog is modal, and a sync can take hours; owning it here would lock the
+        # whole app for the duration. `sync_requests` is what MainWindow reads.
+        self.sync_requests: list = []
+        onedrive_sync = QPushButton("Đồng bộ nhiều truyện…")
+        onedrive_sync.setToolTip(
+            "Xem cả thư viện, chọn những truyện muốn sao lưu, rồi đẩy lần lượt lên "
+            "OneDrive."
+        )
+        onedrive_sync.clicked.connect(self._start_onedrive_sync)
+        sync_row = QHBoxLayout()
+        sync_row.addWidget(onedrive_sync)
+        sync_row.addStretch()
+        form.addRow("", sync_row)
+
+        # One destination for the whole library; each novel becomes a subfolder of it.
+        # A single choice rather than a per-novel picker, which is what was asked for.
+        self.onedrive_root_edit = QLineEdit(config.onedrive_root)
+        self.onedrive_root_edit.setPlaceholderText(DEFAULT_ONEDRIVE_ROOT)
+        self.onedrive_root_edit.setToolTip(
+            "Thư mục trên OneDrive chứa toàn bộ bản sao lưu. Mỗi truyện là một thư mục "
+            "con bên trong, đặt theo tên truyện. Ví dụ: /Fox Novel"
+        )
+        onedrive_browse = QPushButton("Chọn…")
+        onedrive_browse.setToolTip(
+            "Mở OneDrive và chọn thư mục có sẵn — khỏi phải gõ đúng tên."
+        )
+        onedrive_browse.clicked.connect(self._browse_onedrive_root)
+        onedrive_root_row = QHBoxLayout()
+        onedrive_root_row.addWidget(self.onedrive_root_edit, stretch=1)
+        onedrive_root_row.addWidget(onedrive_browse)
+        form.addRow("Thư mục đích:", onedrive_root_row)
+
+        onedrive_hint = QLabel(
+            "Mỗi truyện được đẩy vào <thư mục đích>/<tên truyện>/ trên OneDrive, giữ "
+            "nguyên cấu trúc thư mục trên máy. File trùng tên trên OneDrive sẽ bị GHI ĐÈ bằng "
+            "bản trên máy — đây là sao lưu một chiều, không phải đồng bộ hai chiều. "
+            "Tự động hoá giao diện web OneDrive không được Microsoft hỗ trợ chính thức; "
+            "đích đến là kho lưu trữ riêng của bạn nên rủi ro thấp, nhưng vẫn nên dùng ở "
+            "mức vừa phải. Cần cài Playwright: pip install 'noveltrans[browser]' rồi "
+            "playwright install chromium."
+        )
+        onedrive_hint.setProperty("muted", True)
+        onedrive_hint.setWordWrap(True)
+        form.addRow("", onedrive_hint)
+
         # Keep the Mac awake while a job runs so it doesn't idle-sleep mid-download.
         self.keep_awake_check = QCheckBox("Giữ máy thức khi đang chạy (tải/dịch/tạo audio)")
         self.keep_awake_check.setChecked(config.keep_awake_enabled)
@@ -495,6 +574,124 @@ class SettingsDialog(QDialog):
     def _youtube_switch(self) -> None:
         self._youtube_login(switch=True)
 
+    def _refresh_onedrive_status(self) -> None:
+        """Show which account is connected, so a wrong one is noticeable.
+
+        Reads the recorded account, NOT `profile_dir().is_dir()`. Playwright creates the
+        profile folder before the user types anything, so a folder proves only that a
+        browser was once opened — an abandoned or failed sign-in leaves one that looks
+        exactly like a good one, and reading it claimed "đã kết nối" over a profile that
+        had never been logged into.
+        """
+        account = self.config.onedrive_account
+        if not account:
+            self.onedrive_status.setText("⬜ Chưa đăng nhập tài khoản nào")
+        elif account == "?":
+            self.onedrive_status.setText("✅ Đã kết nối (không đọc được tên tài khoản)")
+        else:
+            self.onedrive_status.setText(f"✅ {account}")
+
+    def _onedrive_login(self, *, switch: bool = False) -> None:
+        """Open the Microsoft sign-in window for the account that will hold the backups.
+
+        `switch` drops the saved session first, which is the only reliable way to change
+        account: with a valid session OneDrive loads straight through and the window
+        closes before the user can pick anything.
+        """
+        if switch:
+            confirm = QMessageBox.question(
+                self,
+                "Đổi tài khoản OneDrive",
+                "Sẽ đăng xuất tài khoản đang kết nối và mở lại cửa sổ đăng nhập để bạn "
+                "chọn tài khoản khác.\n\nCác file đã tải lên tài khoản cũ vẫn còn trên "
+                "OneDrive — việc này chỉ đổi tài khoản cho những lần sao lưu sau. "
+                "Tiếp tục?",
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+
+        def _done(account: str) -> None:
+            # "?" rather than "": the worker only reports success once a file list was
+            # actually opened, so a name we could not read still means signed in.
+            self.config.onedrive_account = account or "?"
+            self.config.sync()
+            self._refresh_onedrive_status()
+            QMessageBox.information(
+                self,
+                "Đăng nhập OneDrive",
+                f"Đã kết nối tài khoản: {account or '(không đọc được tên tài khoản)'}"
+                "\n\nKiểm tra đúng tài khoản chưa — nếu sai, bấm “Đổi tài khoản…” để "
+                "chọn lại.",
+            )
+
+        def _failed(message: str) -> None:
+            # Forget any previous account: the sign-in that just failed may well have
+            # dropped the old session on its way (a switch always does), and claiming a
+            # connection we no longer have is the failure this whole indicator exists to
+            # avoid.
+            self.config.onedrive_account = ""
+            self.config.sync()
+            self._refresh_onedrive_status()
+            QMessageBox.warning(self, "Đăng nhập OneDrive", message)
+
+        self._od_login_worker = OneDriveLoginWorker(self, switch=switch)
+        self._od_login_worker.done.connect(_done)
+        self._od_login_worker.failed.connect(_failed)
+        self._od_login_worker.start()
+        QMessageBox.information(
+            self,
+            "Đăng nhập OneDrive",
+            "Một cửa sổ trình duyệt riêng sẽ mở ra. Đăng nhập tài khoản Microsoft giữ "
+            "bản sao lưu — cửa sổ sẽ TỰ ĐÓNG khi vào được kho file, không cần đóng tay.",
+        )
+
+    def _onedrive_switch(self) -> None:
+        self._onedrive_login(switch=True)
+
+    def _start_onedrive_sync(self) -> None:
+        """Pick the novels here, then close so MainWindow can run them modelessly.
+
+        Settings is modal. Running a multi-hour sync inside it would lock the app, so the
+        choice is made here and the run is handed over — `accept()` also saves whatever
+        else was edited, including a destination the user just changed for this very sync.
+        """
+        from noveltrans.gui.onedrive_sync_dialog import OneDriveSyncPickerDialog
+
+        if not self.config.onedrive_account:
+            QMessageBox.information(
+                self,
+                "Chưa đăng nhập OneDrive",
+                "Bấm “Đăng nhập OneDrive” trước khi đồng bộ.",
+            )
+            return
+        # Use the field's current text, not the saved value: the user may have just
+        # picked a destination and would reasonably expect this sync to honour it.
+        root = self.onedrive_root_edit.text().strip() or DEFAULT_ONEDRIVE_ROOT
+        picker = OneDriveSyncPickerDialog(self.config.library_dir, root, self)
+        if picker.exec() != QDialog.DialogCode.Accepted or not picker.requests:
+            return
+        self.sync_requests = picker.requests
+        self.accept()
+
+    def _browse_onedrive_root(self) -> None:
+        """Pick the destination by browsing OneDrive rather than typing it.
+
+        Refuses before there is a session, because the alternative is opening a browser
+        that lands on a sign-in page inside a dialog whose only job is to list folders.
+        """
+        from noveltrans.gui.onedrive_folder_dialog import pick_onedrive_folder
+
+        if not self.config.onedrive_account:
+            QMessageBox.information(
+                self,
+                "Chưa đăng nhập OneDrive",
+                "Bấm “Đăng nhập OneDrive” trước, rồi mới chọn được thư mục.",
+            )
+            return
+        chosen = pick_onedrive_folder(self, self.onedrive_root_edit.text().strip())
+        if chosen:
+            self.onedrive_root_edit.setText(chosen)
+
     def _browse_library(self) -> None:
         path = QFileDialog.getExistingDirectory(
             self, "Chọn thư mục thư viện", self.library_edit.currentText()
@@ -530,6 +727,7 @@ class SettingsDialog(QDialog):
             )
         self.config.discord_autounlock_enabled = self.discord_enable.isChecked()
         self.config.discord_channel_url = channel_url
+        self.config.onedrive_root = self.onedrive_root_edit.text()
         self.config.keep_awake_enabled = self.keep_awake_check.isChecked()
         keep_awake.set_enabled(self.keep_awake_check.isChecked())  # apply live
         self.config.tts_workers = self.tts_workers_spin.value()

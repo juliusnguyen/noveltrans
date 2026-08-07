@@ -6,10 +6,55 @@ following the pattern in test_main_window.py.
 
 from __future__ import annotations
 
+import pytest
 from PySide6.QtCore import QSettings
+from PySide6.QtWidgets import QLabel
 
 from noveltrans.config import AppConfig
 from noveltrans.gui.settings_dialog import SettingsDialog
+
+
+class _FakeLoginWorker:
+    """Stands in for OneDriveLoginWorker: records how it was built, never opens Chrome.
+
+    `fire_done` / `fire_failed` replay what the real worker emits, so a test can watch
+    what the dialog does with each outcome.
+    """
+
+    def __init__(self, record):
+        self._record = record
+        self._slots: dict[str, list] = {"done": [], "failed": []}
+
+    def __call__(self, parent=None, *, switch=False):
+        self._record["switch"] = switch
+        return self
+
+    def start(self):
+        self._record["started"] = True
+
+    @property
+    def done(self):
+        return _FakeWorkerSignal(self._slots["done"])
+
+    @property
+    def failed(self):
+        return _FakeWorkerSignal(self._slots["failed"])
+
+    def fire_done(self, account):
+        for slot in self._slots["done"]:
+            slot(account)
+
+    def fire_failed(self, message):
+        for slot in self._slots["failed"]:
+            slot(message)
+
+
+class _FakeWorkerSignal:
+    def __init__(self, slots):
+        self._slots = slots
+
+    def connect(self, slot):
+        self._slots.append(slot)
 
 
 def _isolated_config(tmp_path) -> AppConfig:
@@ -106,8 +151,6 @@ class TestLibraryDirHistory:
     """Feature 045 — remember previously-used library folders so they can be switched to."""
 
     def _config(self, tmp_path):
-        from PySide6.QtCore import QSettings
-
         from noveltrans.config import AppConfig
 
         config = AppConfig()
@@ -171,8 +214,6 @@ class TestLibraryDirHistory:
 
 class TestLibraryDirDropdown:
     def _dialog(self, qapp, tmp_path):
-        from PySide6.QtCore import QSettings
-
         from noveltrans.config import AppConfig
         from noveltrans.gui.settings_dialog import SettingsDialog
 
@@ -253,3 +294,171 @@ class TestSiteCookies:
 
         source = inspect.getsource(workers)
         assert 'adapter.name == "medoctruyen"' not in source
+
+
+# -- OneDrive sign-in row (051) -----------------------------------------------
+
+
+def test_onedrive_status_says_not_connected_before_any_login(qapp, tmp_path):
+    dialog = SettingsDialog(_isolated_config(tmp_path))
+    assert "Chưa đăng nhập" in dialog.onedrive_status.text()
+
+
+def test_onedrive_status_names_the_connected_account(qapp, tmp_path):
+    """The whole failure this exists for is signing into the wrong account and not
+    finding out until a novel is sitting in someone else's OneDrive — so it names it."""
+    config = _isolated_config(tmp_path)
+    config.onedrive_account = "ai-do@example.com"
+    dialog = SettingsDialog(config)
+    assert "ai-do@example.com" in dialog.onedrive_status.text()
+
+
+def test_a_signed_in_account_with_no_readable_name_still_reads_as_connected(qapp, tmp_path):
+    config = _isolated_config(tmp_path)
+    config.onedrive_account = "?"
+    dialog = SettingsDialog(config)
+    assert "Đã kết nối" in dialog.onedrive_status.text()
+    assert "Chưa đăng nhập" not in dialog.onedrive_status.text()
+
+
+def test_an_existing_profile_folder_is_not_treated_as_a_login(qapp, tmp_path, monkeypatch):
+    """MEASURED, and it caught this out: Playwright creates the profile folder before the
+    user types anything, so a probe run or an abandoned sign-in leaves one that looks
+    exactly like a good session. Reading the folder told the user “✅ đã kết nối” over a
+    profile that had never been logged into."""
+    import noveltrans.onedrive_upload as od
+
+    profile = tmp_path / ".onedrive-profile"
+    profile.mkdir()
+    monkeypatch.setattr(od, "profile_dir", lambda: profile)
+    dialog = SettingsDialog(_isolated_config(tmp_path))
+    assert "Chưa đăng nhập" in dialog.onedrive_status.text()
+
+
+def test_the_status_refreshes_rather_than_being_read_once(qapp, tmp_path):
+    config = _isolated_config(tmp_path)
+    dialog = SettingsDialog(config)
+    assert "Chưa đăng nhập" in dialog.onedrive_status.text()
+    config.onedrive_account = "ai-do@example.com"
+    dialog._refresh_onedrive_status()
+    assert "ai-do@example.com" in dialog.onedrive_status.text()
+
+
+def test_a_successful_login_records_the_account(qapp, tmp_path, monkeypatch):
+    import noveltrans.gui.settings_dialog as sd
+
+    started = {}
+    monkeypatch.setattr(sd.QMessageBox, "information", lambda *a, **k: None)
+    worker = _FakeLoginWorker(started)
+    monkeypatch.setattr(sd, "OneDriveLoginWorker", worker)
+    config = _isolated_config(tmp_path)
+    dialog = SettingsDialog(config)
+    dialog._onedrive_login()
+    worker.fire_done("ai-do@example.com")
+    assert config.onedrive_account == "ai-do@example.com"
+    assert "ai-do@example.com" in dialog.onedrive_status.text()
+
+
+def test_a_failed_login_forgets_the_previous_account(qapp, tmp_path, monkeypatch):
+    """A switch drops the old session on its way in. Claiming a connection we no longer
+    have is the exact failure this indicator exists to prevent."""
+    import noveltrans.gui.settings_dialog as sd
+
+    started = {}
+    monkeypatch.setattr(sd.QMessageBox, "information", lambda *a, **k: None)
+    monkeypatch.setattr(sd.QMessageBox, "warning", lambda *a, **k: None)
+    worker = _FakeLoginWorker(started)
+    monkeypatch.setattr(sd, "OneDriveLoginWorker", worker)
+    config = _isolated_config(tmp_path)
+    config.onedrive_account = "cu@example.com"
+    dialog = SettingsDialog(config)
+    dialog._onedrive_login()
+    worker.fire_failed("Hết thời gian chờ đăng nhập OneDrive.")
+    assert config.onedrive_account == ""
+    assert "Chưa đăng nhập" in dialog.onedrive_status.text()
+
+
+def test_switching_account_asks_first_and_a_no_stops_it(qapp, tmp_path, monkeypatch):
+    """Switching drops the saved session. A misclick would sign the user out for nothing."""
+    from PySide6.QtWidgets import QMessageBox
+
+    import noveltrans.gui.settings_dialog as sd
+
+    monkeypatch.setattr(
+        QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.No
+    )
+    monkeypatch.setattr(
+        sd, "OneDriveLoginWorker", lambda *a, **k: pytest.fail("started a login anyway")
+    )
+    SettingsDialog(_isolated_config(tmp_path))._onedrive_switch()
+
+
+def test_signing_in_starts_a_worker_with_switch_off(qapp, tmp_path, monkeypatch):
+    import noveltrans.gui.settings_dialog as sd
+
+    started = {}
+    monkeypatch.setattr(sd.QMessageBox, "information", lambda *a, **k: None)
+    monkeypatch.setattr(sd, "OneDriveLoginWorker", _FakeLoginWorker(started))
+    SettingsDialog(_isolated_config(tmp_path))._onedrive_login()
+    assert started == {"switch": False, "started": True}
+
+
+def test_confirming_a_switch_starts_a_worker_with_switch_on(qapp, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    import noveltrans.gui.settings_dialog as sd
+
+    started = {}
+    monkeypatch.setattr(
+        QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes
+    )
+    monkeypatch.setattr(sd.QMessageBox, "information", lambda *a, **k: None)
+    monkeypatch.setattr(sd, "OneDriveLoginWorker", _FakeLoginWorker(started))
+    SettingsDialog(_isolated_config(tmp_path))._onedrive_switch()
+    assert started == {"switch": True, "started": True}
+
+
+def test_the_hint_states_the_destination_and_the_overwrite(qapp, tmp_path):
+    """There is no destination field, so the hint is the only place the user learns
+    where their files go — and that a same-named file up there gets replaced."""
+    dialog = SettingsDialog(_isolated_config(tmp_path))
+    labels = [
+        w.text()
+        for w in dialog.findChildren(QLabel)
+        if "OneDrive" in w.text() and len(w.text()) > 80
+    ]
+    assert labels, "the OneDrive hint went missing"
+    hint = labels[0]
+    assert "<thư mục đích>/<tên truyện>/" in hint
+    assert "GHI ĐÈ" in hint
+    assert "playwright install chromium" in hint
+
+
+def test_the_destination_folder_round_trips(qapp, tmp_path):
+    """One destination for the whole library; each novel is a subfolder of it."""
+    config = _isolated_config(tmp_path)
+    dialog = SettingsDialog(config)
+    dialog.onedrive_root_edit.setText("/Fox Novel")
+    dialog.accept()
+    assert config.onedrive_root == "/Fox Novel"
+    assert SettingsDialog(config).onedrive_root_edit.text() == "/Fox Novel"
+
+
+def test_an_emptied_destination_falls_back_to_the_default(qapp, tmp_path):
+    """A blank destination would put every novel in the OneDrive root, which is not a
+    thing anyone means to ask for."""
+    from noveltrans.config import DEFAULT_ONEDRIVE_ROOT
+
+    config = _isolated_config(tmp_path)
+    dialog = SettingsDialog(config)
+    dialog.onedrive_root_edit.setText("   ")
+    dialog.accept()
+    assert config.onedrive_root == DEFAULT_ONEDRIVE_ROOT
+
+
+def test_the_onedrive_row_does_not_disturb_the_youtube_one(qapp, tmp_path):
+    """They are separate accounts and separate profiles; the two rows must both exist."""
+    dialog = SettingsDialog(_isolated_config(tmp_path))
+    assert dialog.youtube_status.text()
+    assert dialog.onedrive_status.text()
+    assert dialog.youtube_status is not dialog.onedrive_status
