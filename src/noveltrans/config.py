@@ -32,6 +32,10 @@ DEFAULT_CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 DEFAULT_CLI_COMMAND = "agy -p"
 DEFAULT_CLAUDE_CLI_COMMAND = "claude -p"
 DEFAULT_LMSTUDIO_URL = "http://127.0.0.1:1234"
+# Where OneDrive backups go. One folder for the whole library; each novel is a subfolder
+# of it. Kept here rather than in `onedrive_upload` so that module stays free of AppConfig
+# — the GUI reads this and hands it over in the PushRequest.
+DEFAULT_ONEDRIVE_ROOT = "/NovelTrans"
 DEFAULT_TTS_VOICE = "Ngọc Linh"
 DEFAULT_TTS_FORMAT = "mp3"  # falls back to wav when ffmpeg is missing
 DEFAULT_TTS_WORKERS = 1  # sequential; >1 loads one ~334MB engine per worker
@@ -192,6 +196,45 @@ class AppConfig:
     @tieuthuyetmang_cookies.setter
     def tieuthuyetmang_cookies(self, value: str) -> None:
         self._s.setValue("tieuthuyetmang_cookies", value)
+
+    @property
+    def onedrive_root(self) -> str:
+        """The OneDrive folder every novel's backup goes under, e.g. `/Fox Novel`.
+
+        Each novel becomes a subfolder of it named after the novel, so one choice covers
+        the whole library. Nested paths are allowed (`/Backup/Truyện`); each segment is
+        sanitised before use.
+        """
+        return str(self._s.value("onedrive_root", DEFAULT_ONEDRIVE_ROOT)).strip() or (
+            DEFAULT_ONEDRIVE_ROOT
+        )
+
+    @onedrive_root.setter
+    def onedrive_root(self, value: str) -> None:
+        self._s.setValue("onedrive_root", (value or "").strip() or DEFAULT_ONEDRIVE_ROOT)
+
+    @property
+    def onedrive_account(self) -> str:
+        """The OneDrive account the last successful sign-in reached, or "".
+
+        Written only after `open_login` has actually opened a file list, so this is
+        evidence of a working session rather than of a folder existing.
+
+        The folder is NOT evidence: `launch_persistent_context` creates the profile
+        directory before anything is typed, so an abandoned or failed sign-in leaves one
+        behind that looks identical to a good one. Settings used to read the directory
+        and told the user "✅ đã kết nối" over a profile that had never been logged into
+        — measured, not hypothetical.
+
+        A blank name is stored as "?" rather than "": some pages do not expose the
+        account name, and the difference between "signed in, name unknown" and "not
+        signed in" is the whole point of this setting.
+        """
+        return str(self._s.value("onedrive_account", ""))
+
+    @onedrive_account.setter
+    def onedrive_account(self, value: str) -> None:
+        self._s.setValue("onedrive_account", value)
 
     def cookies_for_url(self, url: str) -> str:
         """The stored session cookie for whichever site this novel is on, or "".

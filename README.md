@@ -6,7 +6,7 @@
 |---|---|
 | **1. Tải truyện** | Dán URL truyện → Quét metadata (tên, tác giả, mô tả, mục lục) → Tải toàn bộ chương về máy. Sau khi dịch, tên dịch hiện kế bên tên gốc và mô tả hiển thị bản dịch (rê chuột xem bản gốc). Có progress bar, nút Dừng, và tự resume (chạy lại chỉ tải chương còn thiếu). Hoặc bấm **✍️ Truyện tự viết** để tạo truyện của chính bạn (không cần link nguồn): thêm chương bằng tên (mỗi dòng một tên), đổi tên chương, chuột phải để xoá chương. Có nút **⏸ Tạm dừng** cạnh nút Dừng. |
 | **2. Dịch** | Dịch Trung → Việt/Anh bằng **Google Translate (miễn phí)**, **Claude API**, **CLI Agent** (agy/claude) hoặc **LM Studio** (model local). Xem song song bản gốc/bản dịch. Resume + retry chương lỗi, dịch lại từng chương. Sửa tay cả hai ô: bấm vào ô **Bản gốc** để dán/sửa nội dung gốc (đây cũng là chỗ nhập nội dung cho truyện tự viết), bấm vào ô **Bản dịch** để sửa bản dịch — cả hai tự lưu khi rời ô, dòng đầu là tên chương. Nháy đúp cột "Tên dịch" để đổi tên chương dịch. **Tìm & thay thế** hàng loạt (một chương hoặc cả truyện) — xem trước số khớp rồi mới áp dụng. Có nút **⏸ Tạm dừng** cạnh nút Dừng. |
-| **3. Xuất file** | Xuất bản dịch (hoặc bản gốc) ra **DOCX**, **Markdown**, **EPUB**. Tên file mặc định lấy theo tên truyện đã dịch. |
+| **3. Xuất file** | Xuất bản dịch (hoặc bản gốc) ra **DOCX**, **Markdown**, **EPUB**. Tên file mặc định lấy theo tên truyện đã dịch. Cũng là nơi **sao lưu cả truyện lên OneDrive** (xem bên dưới). |
 | **4. Nghe audio** | Đọc bản dịch thành audio bằng **VieNeu-TTS** (chạy local, 14 giọng tiếng Việt × 3 phong cách). MP3/WAV từng chương, resume, tạo lại từng chương, double-click để nghe. Chọn **giọng** và **phong cách** riêng, xem trước văn bản engine sẽ đọc, và tinh chỉnh **tốc độ / âm lượng / khoảng lặng / độ biểu cảm / chất lượng** trong Cài đặt. Truyện tự viết bằng tiếng Việt thì chọn nguồn **Bản gốc** để đọc thẳng nội dung (không cần dịch). Có nút **⏸ Tạm dừng** cạnh nút Dừng. |
 
 ## Chạy nền ở thanh menu
@@ -29,6 +29,7 @@ nào bị ghi dở và chạy tiếp thì tiếp đúng chỗ cũ — đổi l�
 | Tạo audio | khoảng một phút (xong chương đang đọc) |
 | Ghép audio / render video | khi xong **file** đang ffmpeg — có thể vài chục phút |
 | Tải lên YouTube | xong phần đang tải; cửa sổ Chrome và phiên đăng nhập Google **vẫn mở** cho tới khi chạy tiếp |
+| Sao lưu OneDrive | xong **đợt file** đang gửi (tối đa 20 file / 4 GB); cửa sổ Chrome **vẫn mở** cho tới khi chạy tiếp |
 
 Khi thu nhỏ xuống thanh menu, **icon dưới Dock cũng biến mất** — app chỉ còn một biểu tượng
 nhỏ trên thanh menu. Mở lại cửa sổ (**Mở cửa sổ**) thì icon Dock hiện lại. (Chỉ macOS có
@@ -165,6 +166,60 @@ uv pip install -e ".[tts]"    # cài vieneu (ONNX, không cần PyTorch)
 - Chạy nhiều luồng song song được (mỗi luồng ~334 MB RAM) để tạo audio nhanh hơn.
 - File nằm trong `exports/audio/` của từng truyện; đã tạo rồi thì lần sau chỉ tạo chương còn thiếu.
 
+## Sao lưu lên OneDrive
+
+Tab 3 có nhóm **Sao lưu OneDrive**: đẩy **toàn bộ thư mục truyện** lên OneDrive để công
+sức không chỉ nằm trên một cái máy.
+
+> ⚠️ **Mới.** Tính năng điều khiển giao diện web của OneDrive, nên khi Microsoft đổi giao
+> diện là hỏng. Toàn bộ luồng đã chạy thử trên tài khoản thật — đăng nhập, tạo thư mục,
+> tải file lên, và lần chạy thứ hai bỏ qua file không đổi. Nó được viết để **dừng lại và
+> nói rõ hỏng ở bước nào**, không bao giờ báo thành công khống. Xem
+> `changes/051-ONEDRIVE-UPLOAD/`.
+
+```bash
+uv pip install -e ".[browser]"   # cần Playwright
+playwright install chromium      # bỏ qua nếu đã có Google Chrome
+```
+
+Đăng nhập một lần ở **App → Cài đặt → Sao lưu OneDrive → “Đăng nhập OneDrive”**. Phiên
+được lưu trong profile trình duyệt **riêng** của ứng dụng (`~/NovelTrans/.onedrive-profile`),
+tách hẳn khỏi profile YouTube và trình duyệt thường ngày.
+
+**Đẩy gì lên:** cả thư mục truyện, giữ nguyên cấu trúc — `meta.json`, `chapters.db`, và
+`exports/` với audio, video từng phần cùng mọi file đi kèm (`.title.txt`, `.txt`,
+`.tags.txt`, `.jpg`, `.srt`). `chapters.db` được chụp bản sao nhất quán bằng sqlite chứ
+không copy thẳng file — copy thẳng khi app đang mở sẽ ra một file **mở được nhưng thiếu
+sạch những chương mới nhất**.
+
+**Đẩy vào đâu:** một **thư mục đích duy nhất** cho cả thư viện, chọn một lần ở Cài đặt
+(mặc định `/NovelTrans`, đổi được thành ví dụ `/Fox Novel`). Mỗi truyện là một thư mục con
+bên trong, đặt theo tên truyện đã dịch — `/Fox Novel/<tên truyện>/`.
+
+Đổi tên truyện, hoặc đổi thư mục đích sau này, **không** làm mất cây thư mục cũ: đường dẫn
+được ghi lại từ lần đẩy đầu và những lần sau vẫn dùng nó. Truyện chưa từng đẩy thì vào chỗ
+mới. Hộp thoại xác nhận nói rõ khi hai chỗ khác nhau; muốn chuyển hẳn thì bấm **Quên trạng
+thái** rồi đẩy lại.
+
+**Một chiều, và ghi đè.** Đây là *sao lưu*, không phải đồng bộ hai chiều: file trùng tên
+trên OneDrive sẽ bị ghi đè bằng bản trên máy. Sửa file trên OneDrive thì lần đẩy sau sẽ
+mất. Hộp thoại xác nhận nói rõ điều này trước khi chạy, kèm số file và dung lượng —
+12 file / 4 GB và 3 200 file / 61 GB là hai câu chuyện rất khác nhau.
+
+**Lần sau chỉ đẩy phần thay đổi.** Ứng dụng ghi lại đã đẩy những gì vào
+`.onedrive-upload.json` trong thư mục truyện; file không đổi (cùng dung lượng, không mới
+hơn) được bỏ qua. Render lại phần 7 rồi đẩy tiếp thì chỉ 3 GB đi lên, không phải 60 GB.
+Muốn đẩy lại tất cả thì bấm **Quên trạng thái** — thao tác này **không xoá gì trên
+OneDrive**, chỉ khiến lần sau tải lại từ đầu.
+
+**Chạy dở thì chạy lại.** Không có chuyện file lên "một nửa": mỗi file hoặc lên đủ hoặc
+chưa lên. Dừng giữa chừng, mất mạng, hay một thư mục lỗi đều không huỷ cả lượt — những
+file đã lên vẫn còn và lần chạy sau bỏ qua chúng. Đổi lại, **không resume giữa một file**:
+mất mạng lúc đang gửi file 3 GB thì file đó phải gửi lại từ đầu.
+
+Tự động hoá giao diện web OneDrive không được Microsoft hỗ trợ chính thức. Đích đến là kho
+lưu trữ riêng của bạn nên rủi ro thấp, nhưng vẫn nên dùng ở mức vừa phải.
+
 ## Phát triển
 
 ```bash
@@ -185,5 +240,17 @@ Trên Windows, dùng `.venv\Scripts\...` thay cho `.venv/bin/...`, hoặc dùng 
 .\make.ps1 zip         # đóng gói + nén dist/NovelTrans-windows.zip
 .\make.ps1 clean       # xoá venv và cache
 ```
+
+Khi một tính năng điều khiển trình duyệt hỏng vì site đổi giao diện, `scripts/` có sẵn
+công cụ *quan sát* trước khi đoán selector:
+
+```bash
+.venv/bin/python scripts/diagnose_onedrive.py            # chỉ xem, không tạo/xoá gì
+.venv/bin/python scripts/diagnose_onedrive.py --upload F # thêm: thử đẩy một file nhỏ
+.venv/bin/python scripts/diagnose_subtitles.py <video_id>
+```
+
+Chúng mở đúng profile mà ứng dụng dùng, in ra những nút và hook thật sự có trên trang, rồi
+báo selector nào khớp và bước nào gãy — dán nguyên output đó ra là đủ để chỉnh lại.
 
 Kiến trúc: 3 plugin ABC tách hoàn toàn khỏi GUI — `SiteAdapter` (scrapers/), `Translator` (translators/), `Exporter` (exporters/). GUI (gui/) chỉ ghép các phần qua QThread worker + Signal. Xem `changes/001-NOVEL-TRANSLATOR-GUI/001.02-INITIAL-PLAN.md` để biết chi tiết thiết kế.
