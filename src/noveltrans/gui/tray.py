@@ -1,12 +1,18 @@
-"""The macOS menu-bar icon, and the controller that ties it to the job popup.
+"""The system tray/menu-bar icon, and the controller that ties it to the job popup.
 
-Two rules worth knowing before changing anything here:
+Rules worth knowing before changing anything here:
 
-* **The icon must be a template image.** macOS recolours menu-bar icons itself — dark
-  glyph on a light bar, light on dark, inverted while the item is highlighted — but only
-  if the image is a mask. It is drawn here with QPainter in pure black on transparent and
-  marked `setIsMask(True)`; a coloured PNG would look wrong in one theme or the other.
-  Nothing ships as an asset, so `packaging/NovelTrans.spec` needs no change.
+* **On macOS the icon must be a template image.** macOS recolours menu-bar icons itself —
+  dark glyph on a light bar, light on dark, inverted while the item is highlighted — but
+  only if the image is a mask. It is drawn here with QPainter in pure black on transparent
+  and marked `setIsMask(True)`; a coloured PNG would look wrong in one theme or the other.
+
+* **Elsewhere (Windows/Linux) the icon is drawn filled, not masked.** Those platforms
+  don't recolour a `setIsMask` icon per-theme the way macOS does, so a pure-black glyph
+  would go invisible/low-contrast against a dark taskbar. Instead it's filled with the
+  app's own accent blue (`packaging/make_icon.py`'s gradient), which reads on both light
+  and dark taskbars. Nothing ships as an asset either way — everything is drawn at
+  runtime, so `packaging/NovelTrans.spec` / `NovelTrans-windows.spec` need no change.
 
 * **No tray means close really quits.** `TrayController` sets
   `window.hide_to_tray_enabled` only after a tray icon actually installs. On a machine
@@ -18,22 +24,28 @@ Two rules worth knowing before changing anything here:
 
 from __future__ import annotations
 
+import sys
+
 from PySide6.QtCore import QObject, QRect, Qt
-from PySide6.QtGui import QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
 from noveltrans.gui.job_popup import JobPopup
 from noveltrans.gui.jobs import job_registry
 from noveltrans.gui.notify import set_dock_badge
 
+# The app icon's accent blue (packaging/make_icon.py) — used as the filled glyph color
+# on platforms that don't recolour a template/mask icon per-theme.
+_ACCENT_COLOR = QColor("#2f5fd0")
 
-def _glyph(size: int) -> QPixmap:
+
+def _glyph(size: int, color: QColor) -> QPixmap:
     """A book-ish mark: a spine and three lines, at `size` px."""
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    pen = QPen(Qt.GlobalColor.black)
+    pen = QPen(color)
     pen.setWidthF(max(1.0, size / 14))
     pen.setCapStyle(Qt.PenCapStyle.RoundCap)
     painter.setPen(pen)
@@ -51,11 +63,20 @@ def _glyph(size: int) -> QPixmap:
 
 
 def build_tray_icon() -> QIcon:
-    """A template QIcon for the menu bar (1x and 2x)."""
+    """A tray/menu-bar QIcon at several sizes.
+
+    macOS gets a pure-black template mask it can recolour per-theme; every other
+    platform gets the same glyph filled with the app's accent color instead, since only
+    macOS treats `setIsMask` icons specially — see the module docstring.
+    """
+    is_macos = sys.platform == "darwin"
+    color = Qt.GlobalColor.black if is_macos else _ACCENT_COLOR
     icon = QIcon()
-    for size in (22, 44):
-        icon.addPixmap(_glyph(size))
-    icon.setIsMask(True)  # let macOS invert it per theme — see the module docstring
+    sizes = (22, 44) if is_macos else (16, 22, 32, 44)
+    for size in sizes:
+        icon.addPixmap(_glyph(size, color))
+    if is_macos:
+        icon.setIsMask(True)  # let macOS invert it per theme — see the module docstring
     return icon
 
 

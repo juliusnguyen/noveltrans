@@ -608,7 +608,15 @@ class NovelProject:
         )
 
     def save_tags(self, tags: str) -> None:
-        """Persist the generated YouTube tag list (comma-joined) into meta.json."""
+        """Persist the generated YouTube tag list (comma-joined) into meta.json.
+
+        Re-caps to the 500-char YouTube budget regardless of whether the caller already did —
+        this is the single choke point every tags write goes through, so it's the one place
+        that must never let an over-budget string reach disk.
+        """
+        from noveltrans.tts.tags import format_tags, parse_tags
+
+        tags = format_tags(parse_tags(tags))
         self.meta.tags = tags
         meta_path = self.path / META_FILE
         data = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -638,6 +646,47 @@ class NovelProject:
         meta_path = self.path / META_FILE
         data = json.loads(meta_path.read_text(encoding="utf-8"))
         data.update(display_title=title)
+        meta_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    def save_video_image_path(self, path: str) -> None:
+        """Persist this novel's chosen video background image into meta.json.
+
+        Per-novel, not a single global default: without this, the video tab's image box
+        just held whatever was last picked for ANY novel, so switching novels could carry
+        the previous novel's background image straight into this one's render.
+        """
+        path = (path or "").strip()
+        self.meta.video_image_path = path
+        meta_path = self.path / META_FILE
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+        data.update(video_image_path=path)
+        meta_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    def save_upload_playlist(self, name: str) -> None:
+        """Persist this novel's chosen YouTube playlist into meta.json. Same reasoning as
+        `save_video_image_path` — one novel's playlist choice must not leak into another's."""
+        name = (name or "").strip()
+        self.meta.upload_playlist = name
+        meta_path = self.path / META_FILE
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+        data.update(upload_playlist=name)
+        meta_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    def save_upload_visibility(self, key: str) -> None:
+        """Persist this novel's chosen YouTube visibility ("private"/"unlisted"/"public"/
+        "schedule") into meta.json — same per-novel reasoning as `save_video_image_path`,
+        chosen explicitly by the user over the safer "always reset to Riêng tư" default."""
+        key = (key or "").strip()
+        self.meta.upload_visibility = key
+        meta_path = self.path / META_FILE
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+        data.update(upload_visibility=key)
         meta_path.write_text(
             json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
         )

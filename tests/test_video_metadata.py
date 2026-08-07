@@ -102,4 +102,50 @@ class TestMetaRoundtrip:
         reopened = NovelProject.open(path)
         assert reopened.meta.translated_author == ""
         assert reopened.meta.tags == ""
+        assert reopened.meta.video_image_path == ""
+        assert reopened.meta.upload_playlist == ""
+        assert reopened.meta.upload_visibility == ""
+        reopened.close()
+
+    def test_video_image_path_and_upload_playlist_persist(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        """Each novel remembers its own background image + playlist choice — without
+        this, switching novels in the video tab left the previous novel's image/playlist
+        selected on the newly opened one."""
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_video_image_path("C:/covers/bg.png")
+        project.save_upload_playlist("Truyện A")
+        path = project.path
+        project.close()
+
+        reopened = NovelProject.open(path)
+        assert reopened.meta.video_image_path == "C:/covers/bg.png"
+        assert reopened.meta.upload_playlist == "Truyện A"
+        reopened.close()
+
+    def test_upload_visibility_persists(self, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_upload_visibility("public")
+        path = project.path
+        project.close()
+
+        reopened = NovelProject.open(path)
+        assert reopened.meta.upload_visibility == "public"
+        reopened.close()
+
+    def test_save_tags_caps_to_youtube_budget(self, library_dir, sample_meta, sample_refs):
+        # A caller that skips parse_tags (e.g. a raw textbox edit) must still come out
+        # capped — save_tags is the one choke point every tags write goes through.
+        from noveltrans.tts.tags import format_tags, parse_tags
+
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        over_budget = ", ".join(f"tag{i}" for i in range(300))  # far more than 500 chars raw
+        project.save_tags(over_budget)
+        path = project.path
+        project.close()
+
+        reopened = NovelProject.open(path)
+        assert reopened.meta.tags == format_tags(parse_tags(over_budget))
+        assert len(reopened.meta.tags) <= 500  # the literal string YouTube's tag box counts
         reopened.close()

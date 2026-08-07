@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 from noveltrans.errors import TtsError
+from noveltrans.runtime_env import no_console_kwargs
 
 
 def ffmpeg_available() -> bool:
@@ -22,7 +23,10 @@ def ffmpeg_has_encoder(name: str) -> bool:
             ["ffmpeg", "-hide_banner", "-encoders"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=15,
+            **no_console_kwargs(),
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
@@ -37,7 +41,10 @@ def convert_to_mp3(wav_path: Path, bitrate: str = "96k") -> Path:
             ["ffmpeg", "-y", "-i", str(wav_path), "-b:a", bitrate, str(mp3_path)],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=600,
+            **no_console_kwargs(),
         )
     except FileNotFoundError as exc:
         raise TtsError("Không tìm thấy ffmpeg — cài ffmpeg hoặc chọn định dạng WAV.") from exc
@@ -89,7 +96,10 @@ def apply_tempo(wav_path: Path, tempo: float) -> Path:
             ["ffmpeg", "-y", "-i", str(wav_path), "-filter:a", chain, str(tmp_path)],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=600,
+            **no_console_kwargs(),
         )
     except FileNotFoundError as exc:
         raise TtsError("Không tìm thấy ffmpeg — cài ffmpeg hoặc đặt tốc độ về 1.0×.") from exc

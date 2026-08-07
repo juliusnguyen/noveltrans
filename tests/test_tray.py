@@ -27,12 +27,21 @@ class _FakeWindow:
 
 
 class TestIcon:
-    def test_it_is_a_template_image(self, qapp):
+    def test_it_is_a_template_image_on_macos(self, qapp, monkeypatch):
         # macOS only recolours a menu-bar icon per theme if it is a mask; a coloured
         # icon looks wrong on a light bar or while the item is highlighted.
+        monkeypatch.setattr(tray_module.sys, "platform", "darwin")
         icon = build_tray_icon()
         assert not icon.isNull()
         assert icon.isMask()
+
+    def test_it_is_a_filled_color_icon_off_macos(self, qapp, monkeypatch):
+        # Windows/Linux don't recolour a template/mask icon per-theme, so a pure-black
+        # glyph would go invisible against a dark taskbar — it must be filled instead.
+        monkeypatch.setattr(tray_module.sys, "platform", "win32")
+        icon = build_tray_icon()
+        assert not icon.isNull()
+        assert not icon.isMask()
 
     def test_it_carries_a_1x_and_a_2x_pixmap(self, qapp):
         icon = build_tray_icon()

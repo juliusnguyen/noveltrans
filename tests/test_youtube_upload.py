@@ -31,6 +31,7 @@ from noveltrans.youtube_upload import (
     _CONFIRM_DIALOG_SEL,
     _DIALOG_SEL,
     _DONE_SEL,
+    _STILL_CHECKING_PUBLISH_ANYWAY_SEL,
     _TITLE_SEL,
     _format_date,
     _format_time,
@@ -419,11 +420,15 @@ class _FakeStudioPage:
     at it. Anything waiting for it to become visible waits forever.
     """
 
-    def __init__(self, *, step="SELECT_FILES", attached=True, visible=(), confirm=False):
+    def __init__(
+        self, *, step="SELECT_FILES", attached=True, visible=(), confirm=False,
+        still_checking=False,
+    ):
         self.step = step
         self.attached = attached
         self.visible = set(visible)
         self.confirm = confirm
+        self.still_checking = still_checking  # "We're still checking your content" gate
         self.clicked: list = []
         self.waits: list = []
 
@@ -436,6 +441,10 @@ class _FakeStudioPage:
         class _Loc:
             @property
             def first(self):
+                return self
+
+            @property
+            def last(self):
                 return self
 
             def get_attribute(self, name, timeout=None):
@@ -461,8 +470,15 @@ class _FakeStudioPage:
                 if not ok:
                     raise PlaywrightTimeoutError(f"{selector} not {state}")
 
+            def is_visible(self, timeout=None):
+                if selector == _STILL_CHECKING_PUBLISH_ANYWAY_SEL:
+                    return page.still_checking
+                return selector in page.visible
+
             def click(self):
                 page.clicked.append(selector)
+                if selector == _STILL_CHECKING_PUBLISH_ANYWAY_SEL:
+                    page.still_checking = False  # "Publish anyway" dismisses the gate
 
             def is_enabled(self, timeout=None):
                 return selector in page.visible
@@ -669,6 +685,16 @@ class TestFinishConfirmation:
         page.visible = {_DONE_SEL}
         with pytest.raises(YouTubeUploadError, match="CHECKS"):
             _finish(page, video_id="")
+
+    def test_still_checking_content_dialog_is_dismissed_then_confirms(self):
+        """YouTube's "We're still checking your content" gate (Publish anyway / Go back)
+        must be clicked through, not left to stall the run until the timeout fires."""
+        from noveltrans.youtube_upload import _finish
+
+        page = _FakeStudioPage(attached=True, confirm=True, still_checking=True)
+        page.visible = {_DONE_SEL}
+        _finish(page, video_id="dQw4w9WgXcQ")  # does not raise
+        assert _STILL_CHECKING_PUBLISH_ANYWAY_SEL in page.clicked
 
 
 class TestClearProfile:
@@ -1521,6 +1547,61 @@ class _FakePlaylistPage:
         return _Loc()
 
 
+class TestSetPlaylistReportsFailures:
+    """`_set_playlist` used to fail silently on a drifted picker DOM — the video just
+    ended up in no playlist with no explanation, which read as the run "freezing" on
+    the playlist step. It must now report why via `on_progress` instead."""
+
+    class _TriggerNeverFound:
+        """Every lookup times out — simulates Studio's playlist-picker DOM having moved."""
+
+        @property
+        def first(self):
+            return self
+
+        @property
+        def last(self):
+            return self
+
+        def wait_for(self, state=None, timeout=None):
+            from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+            raise PlaywrightTimeoutError("not found")
+
+        def is_visible(self, timeout=None):
+            return False
+
+        def click(self):
+            pass
+
+    class _Page:
+        def __init__(self, loc):
+            self._loc = loc
+
+        def locator(self, selector):
+            return self._loc
+
+        def wait_for_timeout(self, ms):
+            pass
+
+    def test_missing_trigger_reports_and_returns(self):
+        from noveltrans.youtube_upload import _set_playlist
+
+        messages: list[str] = []
+        _set_playlist(
+            self._Page(self._TriggerNeverFound()), "Truyện A", on_progress=messages.append
+        )
+
+        assert messages
+        assert "bỏ qua" in messages[0]
+
+    def test_missing_trigger_is_silent_without_on_progress(self):
+        """No callback given (the default) must not raise — best-effort stays best-effort."""
+        from noveltrans.youtube_upload import _set_playlist
+
+        _set_playlist(self._Page(self._TriggerNeverFound()), "Truyện A")  # does not raise
+
+
 class TestClearPlaylistSafety:
     def test_captures_what_was_in_it_before_removing_anything(self):
         """Clearing is destructive and per-row. If it fails halfway, this list is the only
@@ -1625,7 +1706,7 @@ class TestSyncPlaylistBatch:
         monkeypatch.setattr(mod, "_playlist_is_empty", lambda p: empty_after)
         added: list = []
         monkeypatch.setattr(
-            mod, "_add_to_playlist", lambda p, vid, name: added.append(vid)
+            mod, "_add_to_playlist", lambda p, vid, name, **kw: added.append(vid)
         )
         return added
 
@@ -2034,7 +2115,7 @@ class TestSubtitleRequestValidation:
         from noveltrans.youtube_upload import SubtitleRequest
 
         srt = tmp_path / "a.srt"
-        srt.write_text(_SRT_TEXT)
+        srt.write_text(_SRT_TEXT, encoding="utf-8")
         with pytest.raises(YouTubeUploadError, match="chưa có video"):
             SubtitleRequest(video=part, subtitle=srt, label="Phần 1").validate()
 
@@ -2050,7 +2131,7 @@ class TestSubtitleRequestValidation:
 
         write_upload_state(part, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
         srt = tmp_path / "a.srt"
-        srt.write_text("")
+        srt.write_text("", encoding="utf-8")
         with pytest.raises(YouTubeUploadError, match="rỗng"):
             SubtitleRequest(video=part, subtitle=srt).validate()
 
@@ -2059,7 +2140,7 @@ class TestSubtitleRequestValidation:
 
         write_upload_state(part, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
         srt = tmp_path / "a.srt"
-        srt.write_text(_SRT_TEXT)
+        srt.write_text(_SRT_TEXT, encoding="utf-8")
         request = SubtitleRequest(video=part, subtitle=srt)
         request.validate()
         assert request.resolve() == "dQw4w9WgXcQ"
@@ -2244,7 +2325,7 @@ class TestSubtitleUploadFlow:
 
         write_upload_state(part, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
         srt = tmp_path / "a.srt"
-        srt.write_text(_SRT_TEXT)
+        srt.write_text(_SRT_TEXT, encoding="utf-8")
         return SubtitleRequest(video=part, subtitle=srt, label="Phần 1")
 
     def test_it_clicks_through_to_the_file_input_and_sends_the_srt(self, part, tmp_path):
@@ -2347,7 +2428,7 @@ class TestSubtitleUploadFlow:
         from noveltrans.youtube_upload import upload_subtitle_one
 
         request = self._request(part, tmp_path)
-        request.subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\nÀ\n")
+        request.subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\nÀ\n", encoding="utf-8")
         page = _FakeSubtitlePage(clicks_to_input=1, cue="never-visible", caption_fields=9)
         upload_subtitle_one(page, request)
         assert any("Xuất bản" in s or "Publish" in s for s in page.clicked)
@@ -2431,7 +2512,7 @@ class TestSubtitleLanguageGate:
 
         write_upload_state(part, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
         srt = tmp_path / "a.srt"
-        srt.write_text(_SRT_TEXT)
+        srt.write_text(_SRT_TEXT, encoding="utf-8")
         return SubtitleRequest(video=part, subtitle=srt, label="Phần 1")
 
     def test_the_gate_is_detected_by_its_confirm_button(self):
@@ -2881,10 +2962,12 @@ class TestMeasuredUploadDialog:
         from noveltrans.youtube_upload import _cue_probe
 
         srt = tmp_path / "a.srt"
-        srt.write_text('1\n00:00:00,000 --> 00:00:02,000\nĐêm ấy trời "mưa" rất to\n')
+        srt.write_text(
+            '1\n00:00:00,000 --> 00:00:02,000\nĐêm ấy trời "mưa" rất to\n', encoding="utf-8"
+        )
         assert _cue_probe(srt) == "Đêm ấy trời"
 
-        srt.write_text("1\n00:00:00,000 --> 00:00:02,000\nÀ\n")
+        srt.write_text("1\n00:00:00,000 --> 00:00:02,000\nÀ\n", encoding="utf-8")
         assert _cue_probe(srt) == ""  # too short to search for; the field count answers
 
         assert _cue_probe(tmp_path / "missing.srt") == ""

@@ -326,7 +326,12 @@ class CliModelsWorker(QThread):
 
         try:
             result = subprocess.run(
-                [self.binary, "models"], capture_output=True, text=True, timeout=15
+                [self.binary, "models"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
             )
             models = (
                 [line.strip() for line in result.stdout.splitlines() if line.strip()]
@@ -698,7 +703,7 @@ class AudioWorker(PausableWorker):
                     from noveltrans.tts.convert import convert_to_mp3
 
                     out_path = convert_to_mp3(out_path)
-                rel_path = str(out_path.relative_to(project.path))
+                rel_path = out_path.relative_to(project.path).as_posix()
                 if chapter.audio_path and chapter.audio_path != rel_path:
                     # re-voiced with another format — drop the stale old file
                     (project.path / chapter.audio_path).unlink(missing_ok=True)
@@ -782,7 +787,7 @@ class AudioWorker(PausableWorker):
             # chapter owns a distinct path, so there is nothing to serialise, and the
             # orchestrator has no business carrying subtitle data it never reads.
             self._write_cues(out_path, cues, raw_seconds, seconds)
-            rel_path = str(out_path.relative_to(project_path))
+            rel_path = out_path.relative_to(project_path).as_posix()
             return _AudioResult(
                 chapter.index, title, "ok", rel_path, seconds, chapter.audio_path or ""
             )
@@ -1190,7 +1195,11 @@ class VideoWorker(PausableWorker):
         sidecar(".txt").write_text(desc, encoding="utf-8")  # richer than render_video's
 
         if self.tags.strip():
-            sidecar(".tags.txt").write_text(self.tags.strip() + "\n", encoding="utf-8")
+            from noveltrans.tts.tags import format_tags, parse_tags
+
+            capped = format_tags(parse_tags(self.tags))
+            if capped:
+                sidecar(".tags.txt").write_text(capped + "\n", encoding="utf-8")
 
         try:
             font_file = video_font(self.thumb_font_key or self.font_key)["file"]

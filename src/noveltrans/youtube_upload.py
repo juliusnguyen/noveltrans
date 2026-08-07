@@ -108,6 +108,15 @@ _PLAYLIST_NEW_SEL = "ytcp-playlist-dialog #create-playlist-button, #create-playl
 _PLAYLIST_NEW_TITLE_SEL = "#create-playlist-form #title-input textarea, #playlist-title-input textarea"
 _PLAYLIST_NEW_CREATE_TEXTS = ("Tạo", "Create")
 _PLAYLIST_DONE_TEXTS = ("Xong", "Done")
+# `_set_playlist` is best-effort (see its docstring) and each of its lookups used to wait
+# the full `_STEP_WAIT_MS` (30s). Stacked across several sequential lookups (trigger,
+# search box, new-playlist button, title box), a picker whose DOM has drifted could sit
+# for well over a minute before silently giving up — which is what a human watching the
+# run sees as it "freezing" on the playlist step. A shorter, dedicated timeout here fails
+# fast instead; the trade is only relevant when Studio itself is unusually slow to render,
+# and this feature is expendable (a video with no playlist) if that costs an occasional
+# false skip.
+_PLAYLIST_STEP_WAIT_MS = 10_000
 
 # step 1 — audience + the "Hiện thêm" panel (tags, language)
 _MADE_FOR_KIDS_NO_SEL = "tp-yt-paper-radio-button[name='VIDEO_MADE_FOR_KIDS_NOT_MFK']"
@@ -145,6 +154,17 @@ _PUBLISH_TEXTS = ("Xuất bản", "Lên lịch", "Lưu", "Publish", "Schedule", 
 _CONFIRM_DIALOG_SEL = (
     "ytcp-video-share-dialog, ytcp-uploads-still-processing-dialog, "
     "ytcp-uploads-video-processed-dialog"
+)
+# A different gate, BEFORE publish even takes: if YouTube's automatic copyright/policy
+# scan hasn't cleared yet, clicking Xuất bản/Publish puts up "We're still checking your
+# content" with "Publish anyway" / "Go back" instead of committing. Left unhandled, the
+# upload dialog just sits there until _finish's wait loop times out — which is what a
+# human watching sees as the run "freezing" on the publish step. Matched loosely by label
+# (like `_click_text_anywhere`) rather than a component selector, since this dialog's
+# generic-looking markup isn't worth pinning to a fragile Studio class name — one combined
+# `:text()` selector so the poll inside _finish's loop costs one query, not several.
+_STILL_CHECKING_PUBLISH_ANYWAY_SEL = (
+    ':text("Publish anyway"), :text("Vẫn xuất bản"), :text("Cứ xuất bản")'
 )
 
 # the draft's public link, available minutes before processing finishes
@@ -1198,23 +1218,31 @@ def _wait_for_bytes_uploaded(page, *, on_progress, should_cancel, video_id: str)
     )
 
 
-def _set_playlist(page, name: str, *, created_playlists: set | None = None) -> None:
+def _set_playlist(
+    page, name: str, *, created_playlists: set | None = None, on_progress=None
+) -> None:
     """Tick `name` in the playlist picker, creating the playlist if it doesn't exist.
 
     Best-effort by design: a playlist is organisational, and failing the whole upload
     over it would be a bad trade. Anything unexpected leaves the picker closed and the
-    video in no playlist.
+    video in no playlist — but it's reported via `on_progress` rather than swallowed
+    silently, so a run that skipped the playlist says so instead of just looking stuck.
+
+    Each lookup uses `_PLAYLIST_STEP_WAIT_MS` (shorter than the usual `_STEP_WAIT_MS`):
+    if Studio's picker DOM has drifted, failing fast beats stacking several 30s waits
+    back to back, which is what reads as the whole run "freezing" on this step.
 
     `created_playlists` carries the names this *session* already created. If one of them
     isn't found on a later part, that's a flaky search, not a missing playlist — and
     creating it again would leave two identically-named playlists on the channel. We
     skip instead, which costs one part its playlist entry and nothing else.
     """
-    if not _click_any(page, _PLAYLIST_TRIGGER_SEL):
+    if not _click_any(page, _PLAYLIST_TRIGGER_SEL, timeout_ms=_PLAYLIST_STEP_WAIT_MS):
+        _report(on_progress, f"⚠️ Không mở được bảng chọn danh sách phát — bỏ qua “{name}”.")
         return
     page.wait_for_timeout(_SETTLE_MS)
 
-    search = _first_present(page, _PLAYLIST_SEARCH_SEL, timeout_ms=_STEP_WAIT_MS)
+    search = _first_present(page, _PLAYLIST_SEARCH_SEL, timeout_ms=_PLAYLIST_STEP_WAIT_MS)
     if search is not None:
         search.click()
         page.keyboard.type(name, delay=_TYPE_DELAY_MS)
@@ -1234,10 +1262,17 @@ def _set_playlist(page, name: str, *, created_playlists: set | None = None) -> N
         matched = False
 
     already_created = created_playlists is not None and name in created_playlists
-    if not matched and not already_created:
-        if _click_any(page, _PLAYLIST_NEW_SEL):
+    if not matched and already_created:
+        _report(
+            on_progress,
+            f"⚠️ Không thấy danh sách phát “{name}” (đã tạo trong phiên này) — bỏ qua.",
+        )
+    elif not matched:
+        if _click_any(page, _PLAYLIST_NEW_SEL, timeout_ms=_PLAYLIST_STEP_WAIT_MS):
             page.wait_for_timeout(_SETTLE_MS)
-            title_box = _first_present(page, _PLAYLIST_NEW_TITLE_SEL, timeout_ms=_STEP_WAIT_MS)
+            title_box = _first_present(
+                page, _PLAYLIST_NEW_TITLE_SEL, timeout_ms=_PLAYLIST_STEP_WAIT_MS
+            )
             if title_box is not None:
                 title_box.click()
                 page.keyboard.type(name, delay=_TYPE_DELAY_MS)
@@ -1245,6 +1280,16 @@ def _set_playlist(page, name: str, *, created_playlists: set | None = None) -> N
                 page.wait_for_timeout(_SETTLE_MS)
                 if created_playlists is not None:
                     created_playlists.add(name)
+            else:
+                _report(
+                    on_progress, f"⚠️ Không tạo được danh sách phát mới “{name}” — bỏ qua."
+                )
+        else:
+            _report(
+                on_progress,
+                f"⚠️ Không tìm thấy danh sách phát “{name}” và không mở được nút tạo mới "
+                "— bỏ qua.",
+            )
 
     _click_by_text(page, _PLAYLIST_DONE_TEXTS)
     page.wait_for_timeout(_SETTLE_MS)
@@ -1292,7 +1337,9 @@ def _set_details(page, request: UploadRequest, *, on_progress, created_playlists
 
     if request.playlist:
         _report(on_progress, "Thêm vào danh sách phát…")
-        _set_playlist(page, request.playlist, created_playlists=created_playlists)
+        _set_playlist(
+            page, request.playlist, created_playlists=created_playlists, on_progress=on_progress
+        )
 
     # Mandatory: Studio refuses to publish until the made-for-kids question is answered.
     _report(on_progress, "Chọn “không dành cho trẻ em”…")
@@ -1390,6 +1437,18 @@ def _finish(page, *, video_id: str) -> None:
     # passed instantly and would have reported every publish a success without looking.
     waited = 0
     while waited < _STEP_WAIT_MS:
+        # "We're still checking your content" gates the publish itself (see the constant's
+        # docstring above) — click through it and keep waiting for the real confirmation,
+        # rather than let it sit there until the loop below times out. Mirrors
+        # `_click_text_anywhere`'s `.last` choice (smallest-matching-element semantics).
+        try:
+            still_checking = page.locator(_STILL_CHECKING_PUBLISH_ANYWAY_SEL).last
+            if still_checking.is_visible(timeout=500):
+                still_checking.click()
+                page.wait_for_timeout(_SETTLE_MS)
+                continue
+        except Exception:
+            pass
         if _first_present(page, _DIALOG_SEL, timeout_ms=1_000, state="detached") is not None:
             return
         if _first_present(page, _CONFIRM_DIALOG_SEL, timeout_ms=1_000, state="attached") is not None:
@@ -1976,14 +2035,14 @@ def _playlist_is_empty(page) -> bool:
         return False
 
 
-def _add_to_playlist(page, video_id: str, playlist: str) -> None:
+def _add_to_playlist(page, video_id: str, playlist: str, *, on_progress=None) -> None:
     """Add one already-uploaded video to `playlist` via its edit page.
 
     The same surface 034 uses to replace a thumbnail — proven navigation and save
     confirmation — driving the picker DOM `_set_playlist` already knows.
     """
     _open_edit_page(page, video_id)
-    _set_playlist(page, playlist)
+    _set_playlist(page, playlist, on_progress=on_progress)
     page.wait_for_timeout(_SETTLE_MS)
     _save_edits(page, video_id=video_id)
 
@@ -2048,7 +2107,7 @@ def sync_playlist_batch(
                 page.wait_for_timeout(_BETWEEN_PLAYLIST_OPS_MS)
             _report(on_progress, f"{label}: thêm vào danh sách phát…")
             try:
-                _add_to_playlist(page, request.resolve(), playlist)
+                _add_to_playlist(page, request.resolve(), playlist, on_progress=on_progress)
             except UploadCancelled:
                 raise
             except YouTubeUploadError as exc:
