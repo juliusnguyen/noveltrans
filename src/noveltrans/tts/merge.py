@@ -86,6 +86,31 @@ def plan_merge_windows(
     return [window(avail)]
 
 
+def part_number(first_num: int, batch: int | None) -> int:
+    """Which part a window is, derived from the chapter it starts at.
+
+    **Not** the window's position in the list being rendered. That was the old rule and it
+    was wrong twice over:
+
+    * Re-rendering one part on its own gave it a one-item list, so `i + 1` made it "Phần 1"
+      while its filename kept the real chapter range — a part covering chapters 1381-1400
+      was uploaded titled "Phần 1", cover and all.
+    * `plan_merge_windows` omits a batch whose chapters have no audio, so a single gap
+      shifted every later part's number down by one, no re-render needed.
+
+    Batches sit on a fixed grid starting at chapter 1, so the slot a window *starts* in is
+    its part number no matter what else is selected or missing. A window never spans a slot
+    boundary (its chapters are picked within one), so the start alone decides it.
+
+    `batch` under 1 (or None) means the caller has no batch grid — a custom range, where
+    there is no meaningful part number — and falls back to 1 rather than raising.
+    """
+    size = int(batch or 0)
+    if size < 1:
+        return 1
+    return (int(first_num) - 1) // size + 1
+
+
 def chapter_marker_title(chapter: Chapter) -> str:
     """Bookmark label for a chapter — matches the text its audio was voiced from."""
     if chapter.audio_source == "original":

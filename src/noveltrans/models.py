@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 # A novel the user wrote themselves — no source website, nothing to scrape.
 LOCAL_SITE = "local"
@@ -57,6 +57,14 @@ class NovelMeta:
     # tab — see VideoTab._on_project_selected. "" means "nothing chosen for this novel yet".
     video_image_path: str = ""
     upload_playlist: str = ""
+    # Every other video-export setting for this novel, keyed by AppConfig property name —
+    # background colour, cover image, credit, tagline, fonts, cover layout, plus the
+    # workflow choices (quality, mode, batch size, ...). See `noveltrans.video_settings`
+    # for which keys are inherited from the user's last-used value and which are not.
+    # Empty means "this novel has never saved any"; it adopts a snapshot on first open.
+    # `video_image_path` above predates this and stays its own field so existing
+    # meta.json files keep working — video_settings mirrors it, and the mirror wins.
+    video_settings: dict = field(default_factory=dict)
     # Last-chosen YouTube visibility ("private"/"unlisted"/"public"/"schedule"). "" means
     # "never chosen for this novel" — VideoTab falls back to "private" (the safe default)
     # rather than to whatever some OTHER novel happened to have selected last.

@@ -215,16 +215,35 @@ class TestVideoTab:
         assert calls == [1]
         tab._preview_dialog.close()
 
-    def test_bg_color_loads_from_config_and_resets(self, qapp, tmp_path):
+    def test_bg_color_starts_at_the_default_with_no_novel_open(self, qapp, tmp_path):
+        """màu nền is per-novel: with nothing open there is no novel to take it from, so
+        the box must NOT show whatever colour was last used elsewhere."""
         config = _config(tmp_path)
         config.video_bg_color = "#1e785a"
         tab = VideoTab(config)
+        assert tab.bg_color == ""
+        assert tab.bg_color_button.text() == "Chọn màu…"
+        tab.shutdown()
+
+    def test_bg_color_loads_from_the_open_novel_and_resets(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_video_settings({"video_bg_color": "#1e785a"})
+        path = project.path
+        project.close()
+
+        tab = VideoTab(_config(tmp_path))
+        tab._on_project_selected(str(path))
         assert tab.bg_color == "#1e785a"
         assert "#1e785a" in tab.bg_color_button.styleSheet()
         tab._reset_bg_color()
         assert tab.bg_color == ""
-        assert config.video_bg_color == ""
         assert tab.bg_color_button.text() == "Chọn màu…"
+        # and the reset is remembered against that novel, not globally
+        reopened = NovelProject.open(str(path))
+        assert reopened.meta.video_settings["video_bg_color"] == ""
+        reopened.close()
         tab.shutdown()
 
     def test_mode_and_batch_size_persist_to_config(self, qapp, tmp_path):
@@ -242,13 +261,22 @@ class TestVideoTab:
         assert config.video_batch_size == 7
         tab.shutdown()
 
-    def test_thumbnail_font_loads_from_config_and_persists(self, qapp, tmp_path):
-        config = _config(tmp_path)
-        config.video_thumbnail_font = "be_vietnam"
-        tab = VideoTab(config)
+    def test_thumbnail_font_loads_from_the_open_novel_and_persists(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """The cover font is part of how a novel looks, so it is stored on the novel."""
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_video_settings({"video_thumbnail_font": "be_vietnam"})
+        path = project.path
+        project.close()
+
+        tab = VideoTab(_config(tmp_path))
+        tab._on_project_selected(str(path))
         assert tab.thumb_font.currentData() == "be_vietnam"
         tab.thumb_font.setCurrentIndex(tab.thumb_font.findData("montserrat"))
-        assert config.video_thumbnail_font == "montserrat"
+        reopened = NovelProject.open(str(path))
+        assert reopened.meta.video_settings["video_thumbnail_font"] == "montserrat"
+        reopened.close()
         tab.shutdown()
 
 
@@ -1985,9 +2013,15 @@ class TestDisplayTitleUi:
         from noveltrans.tts.video import font_dir_context
 
         tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
-        tab.config.video_thumbnail_title_scale = 1.5
-        tab.config.video_thumbnail_part_scale = 0.8
-        tab.config.video_thumbnail_tagline_scale = 1.2
+        # Per-novel now: the cover layout belongs to the novel, not the app config.
+        tab._apply_video_settings(
+            {
+                **tab._video_settings,
+                "video_thumbnail_title_scale": 1.5,
+                "video_thumbnail_part_scale": 0.8,
+                "video_thumbnail_tagline_scale": 1.2,
+            }
+        )
 
         seen = {}
         monkeypatch.setattr(
@@ -2012,9 +2046,15 @@ class TestDisplayTitleUi:
         from noveltrans.gui import tab_video as tab_module
 
         tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
-        tab.config.video_thumbnail_title_scale = 1.5
-        tab.config.video_thumbnail_part_scale = 0.8
-        tab.config.video_thumbnail_tagline_scale = 1.2
+        # Per-novel now: the cover layout belongs to the novel, not the app config.
+        tab._apply_video_settings(
+            {
+                **tab._video_settings,
+                "video_thumbnail_title_scale": 1.5,
+                "video_thumbnail_part_scale": 0.8,
+                "video_thumbnail_tagline_scale": 1.2,
+            }
+        )
         tab.video_image_edit.setText(str(tmp_path / "bg.png"))
         (tmp_path / "bg.png").write_bytes(b"x")
 
@@ -2054,7 +2094,10 @@ class TestDisplayTitleUi:
         from noveltrans.tts.video import font_dir_context
 
         tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
-        tab.config.video_thumbnail_title_align = "right"
+        # Per-novel now: the cover layout belongs to the novel, not the app config.
+        tab._apply_video_settings(
+            {**tab._video_settings, "video_thumbnail_title_align": "right"}
+        )
 
         # path 1: the cover-only render
         seen = {}
@@ -2926,3 +2969,154 @@ class _StubWorker(QObject):
 
     def resume(self) -> None:
         pass
+
+
+class TestPerNovelVideoSettings:
+    """The reported bug: picking `ảnh nền` for one novel put it on the next novel's video.
+
+    The settings split in two (see noveltrans.video_settings) — what a novel *looks like*
+    is never inherited, how the *user* likes to work still is — so both halves are pinned
+    down here.
+    """
+
+    def _project(self, library_dir, meta, refs):
+        project = NovelProject.create(library_dir, meta, refs)
+        path = project.path
+        project.close()
+        return path
+
+    def _two_projects(self, library_dir, sample_meta, sample_refs):
+        from dataclasses import replace
+
+        first = self._project(library_dir, sample_meta, sample_refs)
+        other = replace(sample_meta, url=sample_meta.url + "-two", title="Truyện Hai")
+        second = self._project(library_dir, other, sample_refs)
+        return first, second
+
+    def test_an_image_picked_for_one_novel_does_not_reach_another(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        first, second = self._two_projects(library_dir, sample_meta, sample_refs)
+        tab = VideoTab(_config(tmp_path))
+
+        tab._on_project_selected(str(first))
+        tab._save_video_setting("video_image_path", "/covers/first.png")
+
+        tab._on_project_selected(str(second))
+        assert tab._video_settings["video_image_path"] == ""
+        assert tab.video_image_edit.text() == ""
+
+        # and going back shows the first novel's image again
+        tab._on_project_selected(str(first))
+        assert tab._video_settings["video_image_path"] == "/covers/first.png"
+        assert tab.video_image_edit.text() == "/covers/first.png"
+        tab.shutdown()
+
+    def test_bg_color_is_likewise_not_inherited(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        first, second = self._two_projects(library_dir, sample_meta, sample_refs)
+        tab = VideoTab(_config(tmp_path))
+        tab._on_project_selected(str(first))
+        tab._save_video_setting("video_bg_color", "#1e785a")
+
+        tab._on_project_selected(str(second))
+        assert tab.bg_color == ""  # the default gradient, not the first novel's colour
+        tab.shutdown()
+
+    def test_workflow_choices_still_carry_to_a_new_novel(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """The other half of the split: quality is a habit, not a property of a novel."""
+        first, second = self._two_projects(library_dir, sample_meta, sample_refs)
+        tab = VideoTab(_config(tmp_path))
+        tab._on_project_selected(str(first))
+        tab._save_video_setting("video_quality", "fastest")
+        assert tab.config.video_quality == "fastest"  # mirrored as the user's habit
+
+        tab._on_project_selected(str(second))
+        assert tab._video_settings["video_quality"] == "fastest"
+        tab.shutdown()
+
+    def test_a_novel_that_diverges_keeps_its_own_workflow_choice(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        first, second = self._two_projects(library_dir, sample_meta, sample_refs)
+        tab = VideoTab(_config(tmp_path))
+        tab._on_project_selected(str(first))
+        tab._save_video_setting("video_quality", "fast")
+        tab._on_project_selected(str(second))
+        tab._save_video_setting("video_quality", "high")
+
+        tab._on_project_selected(str(first))
+        assert tab._video_settings["video_quality"] == "fast"  # not the newer choice
+        tab.shutdown()
+
+    def test_settings_survive_reopening_the_app(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        path = self._project(library_dir, sample_meta, sample_refs)
+        tab = VideoTab(_config(tmp_path))
+        tab._on_project_selected(str(path))
+        tab._save_video_setting("video_image_path", "/covers/a.png")
+        tab._save_video_setting("video_tagline", "một dòng")
+        tab.shutdown()
+
+        fresh = VideoTab(_config(tmp_path))
+        fresh._on_project_selected(str(path))
+        assert fresh._video_settings["video_image_path"] == "/covers/a.png"
+        assert fresh.tagline_edit.text() == "một dòng"
+        fresh.shutdown()
+
+    def test_an_existing_novel_adopts_todays_globals_once(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """Migration: a novel set up before settings went per-novel must keep rendering
+        the same, so on first open it takes a snapshot of the current globals."""
+        path = self._project(library_dir, sample_meta, sample_refs)
+        config = _config(tmp_path)
+        config.video_bg_color = "#123456"
+        config.video_tagline = "cũ"
+
+        tab = VideoTab(config)
+        tab._on_project_selected(str(path))
+        assert tab.bg_color == "#123456"  # unchanged output, now owned by this novel
+
+        stored = NovelProject.open(str(path))
+        assert stored.meta.video_settings["video_bg_color"] == "#123456"
+        assert stored.meta.video_settings["video_tagline"] == "cũ"
+        stored.close()
+        tab.shutdown()
+
+    def test_a_novels_own_image_survives_the_migration(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """The pre-existing `video_image_path` field wins over the adopted globals — a
+        novel that already had its own image must not take the global one instead."""
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_video_image_path("/covers/mine.png")
+        path = project.path
+        project.close()
+
+        config = _config(tmp_path)
+        config.video_image_path = "/covers/someone-elses.png"
+        tab = VideoTab(config)
+        tab._on_project_selected(str(path))
+        assert tab._video_settings["video_image_path"] == "/covers/mine.png"
+        tab.shutdown()
+
+    def test_nothing_is_saved_onto_a_novel_while_settings_are_loading(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """Applying novel B's values fires the widgets' change handlers. If those wrote
+        through, switching novels would rewrite whichever novel was open."""
+        first, second = self._two_projects(library_dir, sample_meta, sample_refs)
+        tab = VideoTab(_config(tmp_path))
+        tab._on_project_selected(str(first))
+        tab._save_video_setting("video_tagline", "của truyện một")
+
+        tab._on_project_selected(str(second))  # applying B must not touch A
+        stored = NovelProject.open(str(first))
+        assert stored.meta.video_settings["video_tagline"] == "của truyện một"
+        stored.close()
+        tab.shutdown()

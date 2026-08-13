@@ -666,6 +666,28 @@ class NovelProject:
             json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
+    def save_video_settings(self, values: dict) -> None:
+        """Merge `values` into this novel's video settings and persist them.
+
+        A merge, not a replace: the Video tab saves one key as you change it, and a
+        replace would wipe every other setting the novel had. Same per-novel reasoning
+        as `save_video_image_path` — see `noveltrans.video_settings` for why some keys
+        are inherited from the user's last-used value and some are deliberately not.
+        """
+        merged = {**self.meta.video_settings, **values}
+        self.meta.video_settings = merged
+        # Keep the standalone field in step: it predates video_settings and is still what
+        # older builds (and `save_video_image_path`) read, so letting the two disagree
+        # would resurrect the very bug this exists to fix.
+        if "video_image_path" in merged:
+            self.meta.video_image_path = str(merged["video_image_path"] or "")
+        meta_path = self.path / META_FILE
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+        data.update(video_settings=merged, video_image_path=self.meta.video_image_path)
+        meta_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
     def save_upload_playlist(self, name: str) -> None:
         """Persist this novel's chosen YouTube playlist into meta.json. Same reasoning as
         `save_video_image_path` — one novel's playlist choice must not leak into another's."""
