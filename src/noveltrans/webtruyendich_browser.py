@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from noveltrans.browser import close as _close_browser
@@ -57,6 +58,11 @@ _BLOCKED_TYPES = {"image", "font", "media", "stylesheet"}
 # Serialises browser launches: two threads launching Chromium on one profile dir
 # corrupts it.
 _LAUNCH_LOCK = threading.Lock()
+
+# How far down the ranked model list to fall before giving up on a chapter. Each
+# rejected model costs a full content wait, and if three in a row refuse, the site
+# is having a bad time and the next chapter's retry is the better move.
+_MAX_MODELS_TRIED = 3
 
 
 def profile_dir() -> Path:
@@ -245,13 +251,24 @@ class WtdBrowserSession:
         url: str,
         *,
         translator_select: str,
-        translator_value: str,
+        rank_translators: Callable[[list[str]], list[str]],
+        is_usable_output: Callable[[str], bool],
         retranslate_button: str,
         content_selector: str,
         paragraph_selector: str,
-    ) -> str:
-        """Navigate, pick the AI model, trigger it, wait hands-off for the streamed
-        paragraphs to stabilise, and return the content container's innerHTML.
+    ) -> tuple[str, str]:
+        """Navigate, drive the on-page AI, wait hands-off for the streamed paragraphs
+        to stabilise, and return (content container innerHTML, model that produced it).
+
+        Both callbacks keep site judgement out of this module: `rank_translators`
+        turns the dropdown's live option values into models to try (best first) and
+        `is_usable_output` says whether rendered text is a real translation rather
+        than a provider error body. Anything they raise propagates untouched.
+
+        Models are tried in order because one being *listed* does not mean it is
+        *answering* — an overloaded model streams an error payload instead of a
+        translation, and the next one down usually works. Switching models re-uses
+        the loaded page; only a stall costs a reload.
 
         Never interacts with the Turnstile widget: it only observes whether the
         translated text arrives. If it doesn't within `content_timeout_ms`, raises
@@ -259,30 +276,74 @@ class WtdBrowserSession:
 
         A first-ever (un-cached) chapter is generated live and can occasionally
         stall on the first attempt; a plain reload + re-trigger clears it (measured
-        — see changes/029). So one retry is built in before giving up.
+        — see changes/029). So one retry per model is built in before moving on.
         """
+        self._goto(url)
+        self._content_after_challenge(url)  # wait out a managed challenge; raises if it persists
+        options = self._read_translator_options(self._page, translator_select)
+        # Outside the try blocks below on purpose: "no usable model" is the caller's
+        # error to phrase, and it must not be swallowed into a retry.
+        candidates = rank_translators(options)
+
         last_exc: WtdBrowserSessionError | None = None
-        for _attempt in range(2):
-            self._goto(url)
-            self._content_after_challenge(url)  # wait out a managed challenge; raises if it persists
-            page = self._page
-            try:
-                self._trigger_translation(
-                    page, translator_select, translator_value, retranslate_button
+        for position, model in enumerate(candidates[:_MAX_MODELS_TRIED]):
+            # The stall retry exists for the first-ever generation of a chapter, so
+            # only the first model gets it; fallbacks get one shot each. That keeps
+            # the worst case (site down, every generation timing out) at four
+            # content waits per chapter instead of two per model on offer.
+            for attempt in range(2 if position == 0 else 1):
+                if position or attempt:
+                    # Clear the container first: a previous model may have left >400
+                    # chars behind, which the stability wait would read as this
+                    # model's finished output.
+                    self._reset_for_retry(url, content_selector, reload_page=bool(attempt))
+                page = self._page
+                try:
+                    self._trigger_translation(page, translator_select, model, retranslate_button)
+                    self._wait_for_stable_content(paragraph_selector, content_selector)
+                    markup = page.eval_on_selector(content_selector, "el => el.innerHTML")
+                    text = page.eval_on_selector(content_selector, "el => el.innerText")
+                except WtdBrowserSessionError as exc:
+                    last_exc = exc  # transient first-generation stall → reload and retry once
+                    continue
+                if is_usable_output(text):
+                    return markup, model
+                # A provider error is not transient within one model — retrying the
+                # same one just burns another generation. Fall through to the next.
+                last_exc = WtdBrowserSessionError(
+                    f"{model} returned a provider error instead of a translation"
                 )
-                self._wait_for_stable_content(paragraph_selector, content_selector)
-                return page.eval_on_selector(content_selector, "el => el.innerHTML")
-            except WtdBrowserSessionError as exc:
-                last_exc = exc  # transient first-generation stall → reload and retry once
-        raise last_exc
+                break
+        raise last_exc or WtdBrowserSessionError("No AI model produced a translation")
+
+    def _read_translator_options(self, page, translator_select: str) -> list[str]:
+        try:
+            page.wait_for_selector(translator_select, timeout=self.timeout_ms)
+            return page.eval_on_selector_all(
+                f"{translator_select} option", "els => els.map(el => el.value)"
+            )
+        except Exception as exc:
+            raise WtdBrowserSessionError(f"Could not read the AI model list: {exc}") from exc
+
+    def _reset_for_retry(self, url: str, content_selector: str, *, reload_page: bool) -> None:
+        """Blank the content container, reloading first when a stall needs clearing."""
+        if reload_page:
+            self._goto(url)
+            self._content_after_challenge(url)
+        try:
+            self._page.eval_on_selector(content_selector, "el => { el.innerHTML = ''; }")
+        except Exception:
+            pass  # container not there yet; the stability wait will do the complaining
 
     def _trigger_translation(
         self, page, translator_select: str, translator_value: str, retranslate_button: str
     ) -> None:
-        """Pick the AI model and click 'Dịch lại' to start generation."""
+        """Pick the given AI model and click 'Dịch lại' to start generation."""
         try:
             page.wait_for_selector(translator_select, timeout=self.timeout_ms)
-            page.select_option(translator_select, translator_value)
+            # The option list was read from this same page, so an exact match resolves
+            # immediately; the timeout stops a vanished option blocking for a minute.
+            page.select_option(translator_select, translator_value, timeout=self.timeout_ms)
             # Dispatch change (some handlers listen for it) and click "Dịch lại".
             page.evaluate(
                 "(sel) => {"

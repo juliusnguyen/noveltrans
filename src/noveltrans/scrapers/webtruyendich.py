@@ -9,11 +9,16 @@ Two things make this adapter unlike the plain `requests` scrapers:
   * The whole site sits behind a Cloudflare challenge, so every page comes through
     a real browser (`webtruyendich_browser.WtdBrowserSession`), like 69shuba.
   * The chapter text is produced on-page by an AI translation the reader selects
-    from a dropdown. This adapter drives that: it picks the
-    "AI Gemini FLASH 3.5 - Memory - No Apikey" model, clicks "Dịch lại", and reads
-    the rendered Vietnamese. Because that text is already the translation, the
+    from a dropdown. This adapter drives that: it ranks the models the dropdown
+    actually offers (rank_translator_models), clicks "Dịch lại", and reads the
+    rendered Vietnamese, falling to the next model when one answers with an error
+    instead of a translation. Because that text is already the translation, the
     adapter is flagged `content_is_translated` — the download worker stores it as
     the chapter's `translated` text and skips NovelTrans's own translators.
+
+    The model is never pinned by name: the site rotates its lineup (it retired
+    "AI Gemini FLASH 3.5 - Memory - No Apikey" for 3.6/3.7), and a pinned name
+    fails as a select_option timeout blamed on Cloudflare.
 
 As with 69shuba, fetching is split from parsing: everything above the adapter
 class is pure and takes markup, so the whole parsing surface is tested against
@@ -27,6 +32,7 @@ from __future__ import annotations
 
 import html
 import re
+from collections.abc import Sequence
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
@@ -40,11 +46,29 @@ from noveltrans.webtruyendich_browser import WtdBrowserSession, WtdBrowserSessio
 
 _ORIGIN = "https://webtruyendich.com"
 
-# The on-page AI model to select for every chapter. The <option> value equals its
-# visible label, so this literal string is what select_option() receives.
-TRANSLATOR_MODEL = "AI Gemini FLASH 3.5 - Memory - No Apikey"
-# Recorded in Chapter.translator so the user can see how a chapter was produced.
-TRANSLATOR_LABEL = "webtruyendich (Gemini Flash 3.5)"
+# The on-page AI model is *chosen from the live dropdown*, never pinned to a name.
+# The site rotates its lineup — it shipped "AI Gemini FLASH 3.5 - Memory - No
+# Apikey", then dropped it for 3.6/3.7 — and a pinned name turns into a 60s
+# select_option timeout with a misleading "Cloudflare/quota" message the moment it
+# is retired. choose_translator_model() ranks whatever is actually on offer.
+#
+# A model qualifies only if its label carries both markers:
+#   * "No Apikey" — the reader supplies no Gemini key, so keyed models never run.
+#   * "Memory"    — carries context across the chapter, which keeps names stable.
+# That also excludes "Vietphrase", the site's non-AI dictionary default.
+MODEL_REQUIRED_MARKERS = ("no apikey", "memory")
+# Recorded in Chapter.translator until a chapter picks a concrete model.
+TRANSLATOR_LABEL = "webtruyendich (Gemini Flash)"
+
+_MODEL_VERSION_RE = re.compile(r"(\d+(?:\.\d+)?)")
+_LITE_RE = re.compile(r"\blite\b", re.IGNORECASE)
+# "AI Gemini FLASH 3.7 - Memory - No Apikey" -> "Gemini FLASH 3.7" for the label.
+_MODEL_AI_PREFIX_RE = re.compile(r"^\s*AI\s+", re.IGNORECASE)
+_MODEL_FLAGS_RE = re.compile(r"\s*-\s*(?:Memory|No\s*Apikey|Custom\s*Prompt)\s*", re.IGNORECASE)
+# A provider error body streamed into the chapter instead of a translation. Both
+# halves are JSON shapes that Vietnamese prose never contains, so a false positive
+# would take a chapter literally quoting an API response.
+_API_ERROR_RE = re.compile(r'"error"\s*:\s*\{|"status"\s*:\s*"[A-Z][A-Z_]+"')
 
 SEL_TRANSLATOR = "#translator"
 SEL_CONTENT = "#chapter-content-body"
@@ -123,6 +147,62 @@ def parse_metadata(markup: str, url: str, site: str) -> NovelMeta:
     )
 
 
+def rank_translator_models(options: Sequence[str], url: str = "") -> list[str]:
+    """Rank the chapter page's live <select> into models to try, best first.
+
+    Qualifying options (see MODEL_REQUIRED_MARKERS) are ordered: full models before
+    LITE ones, then the highest version number, ties broken by the site's own
+    order. So a lineup of 3.6/3.7/3.5-LITE tries 3.7 first, and the ranking keeps
+    working when the site renumbers again.
+
+    A *list* rather than one pick because a model can be up but overloaded: the
+    site hands back Gemini's 503 "high demand" body mid-stream (see
+    looks_like_api_error), and the next model down usually answers fine — measured,
+    3.7 was refusing while 3.6 translated the same chapter in full.
+
+    Raises ScrapeError naming what *was* on offer if nothing qualifies — the
+    alternative is select_option blocking for its full timeout and reporting a
+    Cloudflare problem that isn't happening.
+    """
+    usable = [
+        option
+        for option in options
+        if all(marker in option.lower() for marker in MODEL_REQUIRED_MARKERS)
+    ]
+    if not usable:
+        offered = ", ".join(options) or "(none)"
+        raise ScrapeError(
+            "Trang webtruyendich không còn mô hình AI nào dùng được (cần loại "
+            f"'Memory' + 'No Apikey'). Các lựa chọn hiện có: {offered}",
+            url,
+        )
+    # Stable sort on the negated rank keeps equal-ranked models in the site's order.
+    return sorted(usable, key=lambda option: tuple(-part for part in _model_rank(option)))
+
+
+def looks_like_api_error(text: str) -> bool:
+    """True if the rendered "translation" is really a provider error body.
+
+    When the upstream model is overloaded or out of quota, the site streams the raw
+    JSON straight into the chapter — e.g. a paragraph that breaks off mid-sentence
+    and continues `{"error": {"code": 503, ... "status": "UNAVAILABLE"}}`. It looks
+    like ordinary content to a length check, so without this guard a truncated
+    chapter with an error blob glued to it gets saved as the finished translation.
+    """
+    return bool(_API_ERROR_RE.search(text))
+
+
+def _model_rank(option: str) -> tuple[int, float]:
+    version = _MODEL_VERSION_RE.search(option)
+    return (0 if _LITE_RE.search(option) else 1, float(version.group(1)) if version else 0.0)
+
+
+def translator_label_for(model: str) -> str:
+    """Chapter.translator text for a chosen model, e.g. 'webtruyendich (Gemini FLASH 3.7)'."""
+    name = _WS_RE.sub(" ", _MODEL_FLAGS_RE.sub(" ", _MODEL_AI_PREFIX_RE.sub("", model))).strip()
+    return f"webtruyendich ({name})" if name else TRANSLATOR_LABEL
+
+
 def parse_chapter_list(markup: str, base_url: str) -> list[ChapterRef]:
     """Read the full TOC. Links are newest-first and a chapter number can
     occasionally carry two different title-slugs, so dedup by URL and order by
@@ -172,7 +252,15 @@ def parse_chapter(container_html: str, url: str) -> str:
             lines.append(text)
     if not lines:
         raise ScrapeError("Chapter content is empty", url)
-    return "\n\n".join(lines)
+    text = "\n\n".join(lines)
+    # Last gate before the worker stores this as the finished translation.
+    if looks_like_api_error(text):
+        raise ScrapeError(
+            "Mô hình AI của webtruyendich trả về lỗi thay vì bản dịch (quá tải hoặc "
+            "hết hạn mức) — chương chưa được dịch xong. Thử lại sau.",
+            url,
+        )
+    return text
 
 
 @register
@@ -256,14 +344,18 @@ class WebtruyendichAdapter(SiteAdapter):
 
     def fetch_chapter(self, ref: ChapterRef) -> str:
         try:
-            container_html = self._ensure_session().read_translated_chapter(
+            container_html, model = self._ensure_session().read_translated_chapter(
                 ref.url,
                 translator_select=SEL_TRANSLATOR,
-                translator_value=TRANSLATOR_MODEL,
+                rank_translators=lambda options: rank_translator_models(options, ref.url),
+                is_usable_output=lambda text: not looks_like_api_error(text),
                 retranslate_button=RETRANSLATE_BUTTON,
                 content_selector=SEL_CONTENT,
                 paragraph_selector=SEL_PARAGRAPH,
             )
+            # Shadow the class default so Chapter.translator records the model that
+            # actually produced this text, not whichever one the site offered first.
+            self.translator_label = translator_label_for(model)
         except BrowserUnavailableError as exc:
             raise self._browser_needed_error(ref.url) from exc
         except WtdBrowserSessionError as exc:

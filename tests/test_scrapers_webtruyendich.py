@@ -16,14 +16,16 @@ from noveltrans.scrapers import adapter_for_url
 from noveltrans.scrapers.base import HttpClient
 from noveltrans.scrapers.webtruyendich import (
     TRANSLATOR_LABEL,
-    TRANSLATOR_MODEL,
     WebtruyendichAdapter,
     landing_url,
+    looks_like_api_error,
     parse_chapter,
     parse_chapter_list,
     parse_metadata,
+    rank_translator_models,
     slug,
     toc_url,
+    translator_label_for,
 )
 
 from conftest import load_fixture
@@ -31,6 +33,115 @@ from conftest import load_fixture
 NOVEL_URL = "https://webtruyendich.com/truyen/ta-manh-nhat-doc-si-nu-de-goi-thang-nguoi-gian-ac"
 TOC_URL = NOVEL_URL + "/danh-sach-chuong-day-du"
 CHAPTER_URL = NOVEL_URL + "/fanqie/chuong-5-nu-de-danh-gia"
+
+# The #translator dropdown as the live site served it (captured Aug 2026). Kept
+# verbatim because the ranking is the whole point: the adapter used to pin
+# "AI Gemini FLASH 3.5 - Memory - No Apikey", which this lineup no longer offers.
+LIVE_MODEL_OPTIONS = [
+    "Vietphrase",
+    "AI Gemini FLASH 3.6 - Memory - No Apikey",
+    "AI Gemini FLASH 3.7 - Memory - No Apikey",
+    "AI Gemini FLASH 3.5 LITE - Memory - No Apikey",
+    "AI Gemini FLASH 3.1 LITE - Memory - No Apikey",
+    "AI Gemini FLASH 3.6 - Custom Prompt",
+    "AI Gemini FLASH 3.6 - Memory",
+    "AI Gemini FLASH 3.7 - Memory",
+    "AI Gemini FLASH 3.5 LITE - Memory",
+    "AI Gemini FLASH 3.1 LITE - Memory",
+    "AI Gemini Gemma 4 31B - Memory",
+]
+
+
+class TestTranslatorModelRanking:
+    def test_tries_the_newest_full_no_apikey_model_first(self):
+        assert rank_translator_models(LIVE_MODEL_OPTIONS)[0] == (
+            "AI Gemini FLASH 3.7 - Memory - No Apikey"
+        )
+
+    def test_offers_every_usable_model_as_a_fallback_best_first(self):
+        # A listed model can still be overloaded, so the ranking is a queue, not a pick.
+        assert rank_translator_models(LIVE_MODEL_OPTIONS) == [
+            "AI Gemini FLASH 3.7 - Memory - No Apikey",
+            "AI Gemini FLASH 3.6 - Memory - No Apikey",
+            "AI Gemini FLASH 3.5 LITE - Memory - No Apikey",
+            "AI Gemini FLASH 3.1 LITE - Memory - No Apikey",
+        ]
+
+    def test_still_leads_with_the_previously_pinned_model_on_the_old_lineup(self):
+        # Ranking must not regress the lineup the adapter was originally built for.
+        assert rank_translator_models(
+            [
+                "Vietphrase",
+                "AI Gemini FLASH 3.5 - Memory - No Apikey",
+                "AI Gemini FLASH 3.1 LITE - Memory - No Apikey",
+            ]
+        )[0] == "AI Gemini FLASH 3.5 - Memory - No Apikey"
+
+    def test_prefers_a_full_model_over_a_higher_numbered_lite_one(self):
+        assert rank_translator_models(
+            [
+                "AI Gemini FLASH 9.9 LITE - Memory - No Apikey",
+                "AI Gemini FLASH 3.1 - Memory - No Apikey",
+            ]
+        )[0] == "AI Gemini FLASH 3.1 - Memory - No Apikey"
+
+    def test_falls_back_to_lite_when_that_is_all_there_is(self):
+        assert rank_translator_models(
+            ["Vietphrase", "AI Gemini FLASH 3.5 LITE - Memory - No Apikey"]
+        ) == ["AI Gemini FLASH 3.5 LITE - Memory - No Apikey"]
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            ["Vietphrase"],  # non-AI dictionary default only
+            ["AI Gemini FLASH 3.6 - Custom Prompt"],  # no Memory
+            ["AI Gemini FLASH 3.6 - Memory"],  # needs the reader's own API key
+            [],
+        ],
+    )
+    def test_rejects_models_we_cannot_drive(self, options):
+        with pytest.raises(ScrapeError):
+            rank_translator_models(options, CHAPTER_URL)
+
+    def test_error_names_what_the_site_offered(self):
+        # Without this the next rename looks like a Cloudflare failure again.
+        with pytest.raises(ScrapeError) as excinfo:
+            rank_translator_models(["Vietphrase", "AI Gemini FLASH 3.6 - Custom Prompt"])
+        assert "Vietphrase" in str(excinfo.value)
+        assert "Custom Prompt" in str(excinfo.value)
+
+    def test_label_names_the_model_without_its_flags(self):
+        assert (
+            translator_label_for("AI Gemini FLASH 3.7 - Memory - No Apikey")
+            == "webtruyendich (Gemini FLASH 3.7)"
+        )
+
+
+class TestApiErrorDetection:
+    # Verbatim shape the live site streamed into the chapter when 3.7 was overloaded.
+    OVERLOADED = (
+        'Anya ngã gục xuống đất, tuyết lớn nhanh chóng phủ kín thân hình cô{"error": '
+        '{"code": 503,"message": "This model is currently experiencing high demand. '
+        'Spikes in demand are usually temporary. Please try again later.",'
+        '"status": "UNAVAILABLE"}}'
+    )
+
+    def test_spots_an_error_body_glued_onto_a_partial_translation(self):
+        assert looks_like_api_error(self.OVERLOADED)
+
+    def test_spots_a_quota_error(self):
+        assert looks_like_api_error('{"error": {"code": 429, "status": "RESOURCE_EXHAUSTED"}}')
+
+    def test_leaves_ordinary_translated_prose_alone(self):
+        prose = load_fixture("webtruyendich", "chapter_body.html")
+        assert not looks_like_api_error(parse_chapter(prose, CHAPTER_URL))
+
+    def test_parse_chapter_refuses_to_hand_back_an_error_body(self):
+        # The worker stores whatever parse_chapter returns as the finished
+        # translation, so this is the last gate before a corrupt chapter lands.
+        markup = f'<div><p class="fade-in-paragraph">{self.OVERLOADED}</p></div>'
+        with pytest.raises(ScrapeError):
+            parse_chapter(markup, CHAPTER_URL)
 
 
 class TestUrlDerivation:
@@ -71,7 +182,7 @@ class TestRegistry:
     def test_flags_mark_content_as_pre_translated(self):
         assert WebtruyendichAdapter.content_is_translated is True
         assert WebtruyendichAdapter.translated_lang == "vi"
-        assert WebtruyendichAdapter.translator_label == TRANSLATOR_LABEL == "webtruyendich (Gemini Flash 3.5)"
+        assert WebtruyendichAdapter.translator_label == TRANSLATOR_LABEL == "webtruyendich (Gemini Flash)"
 
 
 class TestMetadata:
@@ -169,9 +280,16 @@ class TestChapterContent:
 class _FakeSession:
     """Stands in for WtdBrowserSession: serves fixtures, records what was asked."""
 
-    def __init__(self, pages: dict[str, str], chapter_html: str = ""):
+    def __init__(
+        self,
+        pages: dict[str, str],
+        chapter_html: str = "",
+        failing_models: dict[str, str] | None = None,
+    ):
         self.pages = pages
         self.chapter_html = chapter_html
+        # model -> the markup it "returns" instead of a translation (an error body)
+        self.failing_models = failing_models or {}
         self.requested: list[str] = []
         self.scrolled: list[str | None] = []  # scroll_item_selector per get_html call
         self.prefer_document: list[bool] = []  # prefer_document per get_html call
@@ -192,15 +310,25 @@ class _FakeSession:
             raise AssertionError(f"adapter fetched an unexpected URL: {url}")
         return self.pages[url]
 
-    def read_translated_chapter(self, url, *, translator_value, **_kw) -> str:
-        self.translated.append((url, translator_value))
-        return self.chapter_html
+    def read_translated_chapter(
+        self, url, *, rank_translators, is_usable_output, **_kw
+    ) -> tuple[str, str]:
+        # Mirrors the real session: walk the ranked models, skipping any whose output
+        # the caller rejects, so the adapter's fallback wiring is actually exercised.
+        for model in rank_translators(LIVE_MODEL_OPTIONS):
+            markup = self.failing_models.get(model, self.chapter_html)
+            self.translated.append((url, model))
+            if is_usable_output(markup):
+                return markup, model
+        raise AssertionError("no model produced usable output")
 
     def close(self) -> None:
         self.closed = True
 
 
-def make_adapter() -> tuple[WebtruyendichAdapter, _FakeSession]:
+def make_adapter(
+    failing_models: dict[str, str] | None = None,
+) -> tuple[WebtruyendichAdapter, _FakeSession]:
     adapter = WebtruyendichAdapter(HttpClient(delay_seconds=0))
     session = _FakeSession(
         {
@@ -208,6 +336,7 @@ def make_adapter() -> tuple[WebtruyendichAdapter, _FakeSession]:
             TOC_URL: load_fixture("webtruyendich", "toc.html"),
         },
         chapter_html=load_fixture("webtruyendich", "chapter_body.html"),
+        failing_models=failing_models,
     )
     adapter._session = session  # never launches a browser
     return adapter, session
@@ -241,8 +370,33 @@ class TestAdapterWiring:
         adapter, session = make_adapter()
         ref = ChapterRef(index=0, title="Chương 5", url=CHAPTER_URL)
         text = adapter.fetch_chapter(ref)
-        assert session.translated == [(CHAPTER_URL, TRANSLATOR_MODEL)]
+        assert session.translated == [(CHAPTER_URL, "AI Gemini FLASH 3.7 - Memory - No Apikey")]
         assert len(text) > 400 and "\n\n" in text
+
+    def test_fetch_chapter_falls_back_when_the_top_model_is_overloaded(self):
+        # Measured on the live site: 3.7 answered with a 503 body while 3.6
+        # translated the same chapter in full.
+        overloaded = (
+            '<div><p class="fade-in-paragraph">Anya ngã gục xuống đất{"error": '
+            '{"code": 503, "status": "UNAVAILABLE"}}</p></div>'
+        )
+        adapter, session = make_adapter(
+            failing_models={"AI Gemini FLASH 3.7 - Memory - No Apikey": overloaded}
+        )
+        text = adapter.fetch_chapter(ChapterRef(index=0, title="Chương 5", url=CHAPTER_URL))
+        assert [model for _url, model in session.translated] == [
+            "AI Gemini FLASH 3.7 - Memory - No Apikey",
+            "AI Gemini FLASH 3.6 - Memory - No Apikey",
+        ]
+        assert "error" not in text and len(text) > 400
+        assert adapter.translator_label == "webtruyendich (Gemini FLASH 3.6)"
+
+    def test_fetch_chapter_records_the_model_it_actually_used(self):
+        # Chapter.translator must name the model that produced the text, since the
+        # site's lineup rotates between runs.
+        adapter, _session = make_adapter()
+        adapter.fetch_chapter(ChapterRef(index=0, title="Chương 5", url=CHAPTER_URL))
+        assert adapter.translator_label == "webtruyendich (Gemini FLASH 3.7)"
 
     def test_one_session_is_reused_across_fetches(self):
         adapter, session = make_adapter()
