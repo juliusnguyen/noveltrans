@@ -17,6 +17,7 @@ from noveltrans.tts.merge import (
     build_concat_list,
     chapter_marker_title,
     merge_chapters,
+    part_number,
     plan_merge_windows,
 )
 
@@ -34,6 +35,48 @@ def _ch(index, voice="Ngọc Lan", audio=True, source="translated", seconds=10.0
         audio_source=source,
         audio_seconds=seconds,
     )
+
+
+class TestPartNumber:
+    """A part's number comes from its chapter range, never from its position in the list
+    being rendered. Numbering by position uploaded chapters 1381-1400 as "Phần 1"."""
+
+    def test_numbers_by_the_batch_slot_the_window_starts_in(self):
+        assert part_number(1, 20) == 1
+        assert part_number(21, 20) == 2
+        assert part_number(1381, 20) == 70
+
+    def test_the_reported_case(self):
+        # chapters 1381-1400 at batch 20 is part 70, and 661-680 is part 34 — both were
+        # titled "Phần 1" because each was re-rendered on its own.
+        assert part_number(1381, 20) == 70
+        assert part_number(661, 20) == 34
+
+    def test_is_independent_of_how_many_parts_are_being_rendered(self):
+        """The whole bug: the same window must keep its number when rendered alone."""
+        windows = plan_merge_windows([_ch(i) for i in range(100)], "Ngọc Lan", "batch", batch=20)
+        alone = plan_merge_windows(
+            [_ch(i) for i in range(100)], "Ngọc Lan", "range", start=81, end=100
+        )
+        assert part_number(windows[4].first_num, 20) == 5
+        assert part_number(alone[0].first_num, 20) == 5  # not 1
+
+    def test_a_gap_does_not_shift_later_parts(self):
+        """`plan_merge_windows` omits a batch with no audio; the parts after it must keep
+        their numbers rather than each sliding down one."""
+        chapters = [_ch(i, audio=not (20 <= i < 40)) for i in range(100)]
+        windows = plan_merge_windows(chapters, "Ngọc Lan", "batch", batch=20)
+        numbers = [part_number(w.first_num, 20) for w in windows]
+        assert numbers == [1, 3, 4, 5]  # part 2 is missing, not renumbered away
+
+    def test_a_partly_missing_batch_still_numbers_by_its_slot(self):
+        """A window starts at its first *available* chapter, which can be past the slot
+        boundary — the slot still decides the number."""
+        assert part_number(1385, 20) == 70  # slot 1381-1400, audio starts late
+
+    def test_falls_back_to_one_without_a_batch_grid(self):
+        assert part_number(500, None) == 1
+        assert part_number(500, 0) == 1
 
 
 class TestPlanMergeWindows:

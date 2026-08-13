@@ -79,6 +79,7 @@ class ThumbnailEditorDialog(QDialog):
         novel_title: str,
         part_num: int = 1,
         tagline: str = "",
+        settings: dict | None = None,
         on_apply_all: Callable[[], None] | None = None,
         parent=None,
     ):
@@ -90,14 +91,25 @@ class ThumbnailEditorDialog(QDialog):
         self.tagline = tagline or ""
         self._on_apply_all = on_apply_all
 
-        # editable state, seeded from the saved config
-        self.title_pos = list(config.video_thumbnail_title_pos)
-        self.part_pos = list(config.video_thumbnail_part_pos)
-        self.title_scale = config.video_thumbnail_title_scale
-        self.part_scale = config.video_thumbnail_part_scale
-        self.tagline_scale = config.video_thumbnail_tagline_scale
-        self.title_align = config.video_thumbnail_title_align
-        self.font_key = config.video_thumbnail_font
+        # Editable state, seeded from the open novel's own cover layout when the caller
+        # passes one (`settings`, keyed like AppConfig properties — see
+        # noveltrans.video_settings) and from the saved config otherwise. The caller reads
+        # these attributes back after exec() to persist them against that novel; the
+        # config write in `_save_to_config` only records the user's last-used layout.
+        seed = settings or {}
+
+        def seeded(key, fallback):
+            return seed[key] if key in seed else fallback
+
+        self.title_pos = list(seeded("video_thumbnail_title_pos", config.video_thumbnail_title_pos))
+        self.part_pos = list(seeded("video_thumbnail_part_pos", config.video_thumbnail_part_pos))
+        self.title_scale = seeded("video_thumbnail_title_scale", config.video_thumbnail_title_scale)
+        self.part_scale = seeded("video_thumbnail_part_scale", config.video_thumbnail_part_scale)
+        self.tagline_scale = seeded(
+            "video_thumbnail_tagline_scale", config.video_thumbnail_tagline_scale
+        )
+        self.title_align = seeded("video_thumbnail_title_align", config.video_thumbnail_title_align)
+        self.font_key = seeded("video_thumbnail_font", config.video_thumbnail_font)
         self._active = "title"  # which block a drag moves
 
         self.setWindowTitle("Tùy chỉnh ảnh bìa — kéo để đặt vị trí, đổi phông trực tiếp")

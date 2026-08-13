@@ -1064,6 +1064,7 @@ class VideoWorker(PausableWorker):
             MergeCancelled,
             MergeSegment,
             chapter_marker_title,
+            part_number,
             plan_merge_windows,
         )
         from noveltrans.tts.player_skin import hex_to_rgb
@@ -1128,7 +1129,11 @@ class VideoWorker(PausableWorker):
                         self.progress.emit(i + 1, total, "")  # already made — skip
                         continue
                     self.progress.emit(i, total, name)
-                    part_num = None if whole_novel else (i + 1)
+                    # From the chapter range, not `i`: rendering one part on its own used
+                    # to title it "Phần 1" while its file kept the real range.
+                    part_num = (
+                        None if whole_novel else part_number(window.first_num, self.batch_size)
+                    )
                     try:
                         render_video(
                             segments, self.image_path, out_path, font_dir, novel_title,
@@ -1359,6 +1364,7 @@ class SubtitleWorker(PausableWorker):
         from noveltrans.tts.merge import (
             MergeSegment,
             chapter_marker_title,
+            part_number,
             plan_merge_windows,
         )
         from noveltrans.tts.subtitles import part_srt
@@ -1384,7 +1390,11 @@ class SubtitleWorker(PausableWorker):
             for i, window in enumerate(windows):
                 if self._checkpoint():
                     break
-                label = "Toàn bộ" if (total == 1 and self.mode == "all") else f"Phần {i + 1}"
+                label = (
+                    "Toàn bộ"
+                    if (total == 1 and self.mode == "all")
+                    else f"Phần {part_number(window.first_num, self.batch_size)}"
+                )
                 self.progress.emit(i, total, f"{label}: dò mốc thời gian…")
                 for chapter in window.chapters:
                     if self._checkpoint():

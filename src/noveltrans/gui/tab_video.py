@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from noveltrans import video_settings
 from noveltrans.config import AppConfig, translator_labels
 from noveltrans.gui.job_popup import BROWSER_PAUSE_HINT
 from noveltrans.gui.jobs import job_registry
@@ -95,6 +96,16 @@ class VideoTab(QWidget):
         self._preview_status: QLabel | None = None
         self._preview_color_button: QPushButton | None = None
         self._preview_controls: list = []
+        # The open novel's effective video settings (see noveltrans.video_settings).
+        # Every render/preview reads from here rather than from `config`, so one novel's
+        # background image can never reach another novel's video. Seeded from the global
+        # values so the widgets built below still have something to show before any novel
+        # is picked.
+        self._video_settings: dict = video_settings.effective({}, config)
+        # Set while pushing settings into widgets, so the change handlers those widgets
+        # emit don't write the values straight back out (and, worse, onto whichever novel
+        # happens to be open).
+        self._loading_video_settings = False
 
         # --- top row: novel + voice
         self.picker = ProjectPicker()
@@ -150,6 +161,11 @@ class VideoTab(QWidget):
         outer.addWidget(self.progress)
         outer.addWidget(self.status_label)
 
+        # The boxes above seed their widgets from `config` as they are built, which for
+        # identity settings means the last-used values. Now that every widget exists,
+        # resolve them properly: no novel is open yet, so identity resets to defaults.
+        self._load_video_settings_for_project()
+
     # ---------------------------------------------------------------- boxes
 
     def _build_video_box(self) -> QGroupBox:
@@ -197,7 +213,7 @@ class VideoTab(QWidget):
         self.video_batch_size.setRange(1, 999999)
         self.video_batch_size.setValue(self.config.video_batch_size)  # remembered between sessions
         self.video_batch_size.valueChanged.connect(
-            lambda v: setattr(self.config, "video_batch_size", v)
+            lambda v: self._save_video_setting("video_batch_size", v)
         )
         self.video_batch_label = QLabel("chương/video")
 
@@ -227,7 +243,7 @@ class VideoTab(QWidget):
             "tạo lại video. Chỉ áp dụng cho phần có audio tạo sau bản 040."
         )
         self.burn_subs_check.toggled.connect(
-            lambda on: setattr(self.config, "video_burn_subtitles", on)
+            lambda on: self._save_video_setting("video_burn_subtitles", on)
         )
 
         self.video_button = QPushButton("Tạo video")
@@ -568,6 +584,17 @@ class VideoTab(QWidget):
             self.project.chapters(), voice, mode, start=start, end=end, batch=batch
         )
 
+    def _part_number(self, window) -> int:
+        """This window's real part number, from its chapter range — see merge.part_number.
+
+        Never the row's index: the parts list, the covers and the upload rows are all built
+        from the *current selection*, so numbering by position renamed a part the moment it
+        was viewed or re-rendered on its own.
+        """
+        from noveltrans.tts.merge import part_number
+
+        return part_number(window.first_num, self.video_batch_size.value())
+
     def _part_output_path(self, window, *, whole_novel: bool):
         """The .mp4 path a given window would render to (for the exists check).
 
@@ -734,9 +761,9 @@ class VideoTab(QWidget):
         self.video_list.setRowCount(total)
         for i, window in enumerate(windows):
             whole_novel = total == 1 and mode == "all"
-            part_num = None if whole_novel else (i + 1)
+            part_num = None if whole_novel else self._part_number(window)
             exists = self._part_output_path(window, whole_novel=whole_novel).is_file()
-            label = "Toàn bộ" if whole_novel else f"Phần {i + 1}"
+            label = "Toàn bộ" if whole_novel else f"Phần {part_num}"
             self.video_list.setItem(i, 0, QTableWidgetItem(label))
             self.video_list.setItem(
                 i, 1,
@@ -1132,7 +1159,7 @@ class VideoTab(QWidget):
         from noveltrans.tts.video import video_font
 
         novel_title = self.project.meta.display_name()
-        font_file = video_font(self.config.video_thumbnail_font)["file"]
+        font_file = video_font(self._video_settings["video_thumbnail_font"])["file"]
         render_thumbnail(
             base,
             self._part_sidecar(window, whole_novel, ".jpg"),
@@ -1141,12 +1168,12 @@ class VideoTab(QWidget):
             tagline=self.tagline_edit.text().strip(),
             font_path=font_dir / font_file,
             width=1280, height=720,
-            title_pos=self.config.video_thumbnail_title_pos,
-            part_pos=self.config.video_thumbnail_part_pos,
-            title_scale=self.config.video_thumbnail_title_scale,
-            part_scale=self.config.video_thumbnail_part_scale,
-            tagline_scale=self.config.video_thumbnail_tagline_scale,
-            title_align=self.config.video_thumbnail_title_align,
+            title_pos=self._video_settings["video_thumbnail_title_pos"],
+            part_pos=self._video_settings["video_thumbnail_part_pos"],
+            title_scale=self._video_settings["video_thumbnail_title_scale"],
+            part_scale=self._video_settings["video_thumbnail_part_scale"],
+            tagline_scale=self._video_settings["video_thumbnail_tagline_scale"],
+            title_align=self._video_settings["video_thumbnail_title_align"],
         )
 
     def _regen_part_thumbnail(self, window, part_num, whole_novel) -> bool:
@@ -1196,7 +1223,7 @@ class VideoTab(QWidget):
             with font_dir_context() as font_dir:
                 for i, window in enumerate(windows):
                     whole_novel = total == 1 and mode == "all"
-                    part_num = None if whole_novel else (i + 1)
+                    part_num = None if whole_novel else self._part_number(window)
                     self.status_label.setText(f"🖼️ Đang tạo lại ảnh bìa ({i + 1}/{total})…")
                     QApplication.processEvents()
                     try:
@@ -1231,18 +1258,43 @@ class VideoTab(QWidget):
 
         base = self.thumb_image_edit.text().strip() or self.video_image_edit.text().strip()
         novel_title = self.project.meta.display_name()
+
+        def adopt_editor_layout() -> None:
+            """Copy the editor's current layout onto this novel. The cover layout belongs
+            to the novel, so it is stored here rather than left in the config the editor
+            also writes (which is now only the user's last-used layout)."""
+            for key, value in (
+                ("video_thumbnail_title_pos", tuple(dialog.title_pos)),
+                ("video_thumbnail_part_pos", tuple(dialog.part_pos)),
+                ("video_thumbnail_title_scale", dialog.title_scale),
+                ("video_thumbnail_part_scale", dialog.part_scale),
+                ("video_thumbnail_tagline_scale", dialog.tagline_scale),
+                ("video_thumbnail_title_align", dialog.title_align),
+                ("video_thumbnail_font", dialog.font_key),
+            ):
+                self._save_video_setting(key, value)
+
+        def apply_all() -> None:
+            # "Áp dụng cho tất cả" fires while the dialog is still open, and the regen
+            # reads `_video_settings` — so adopt the edits BEFORE regenerating, or every
+            # cover would be rebuilt with the layout the editor started from.
+            adopt_editor_layout()
+            self._regen_all_thumbnails()
+
         dialog = ThumbnailEditorDialog(
             self.config,
             base_image=base,
             novel_title=novel_title,
             part_num=1,
             tagline=self.tagline_edit.text().strip(),
-            on_apply_all=self._regen_all_thumbnails,
+            settings=self._video_settings,  # start from THIS novel's cover layout
+            on_apply_all=apply_all,
             parent=self,
         )
         dialog.exec()
+        adopt_editor_layout()
         # reflect any font change made in the editor back into the box's font combo
-        fidx = self.thumb_font.findData(self.config.video_thumbnail_font)
+        fidx = self.thumb_font.findData(dialog.font_key)
         if fidx >= 0 and fidx != self.thumb_font.currentIndex():
             self.thumb_font.blockSignals(True)
             self.thumb_font.setCurrentIndex(fidx)
@@ -1271,7 +1323,7 @@ class VideoTab(QWidget):
             "hỗ trợ tiếng Việt (mặc định Nunito bo tròn)."
         )
         self.thumb_font.currentIndexChanged.connect(
-            lambda: setattr(self.config, "video_thumbnail_font", self.thumb_font.currentData())
+            lambda: self._save_video_setting("video_thumbnail_font", self.thumb_font.currentData())
         )
 
         # Per-NOVEL, unlike everything else in this box: it lives in meta.json, because
@@ -1287,14 +1339,16 @@ class VideoTab(QWidget):
         self.tagline_edit = QLineEdit(self.config.video_tagline)
         self.tagline_edit.setPlaceholderText("Câu tagline dưới 'PHẦN N' (tuỳ chọn)…")
         self.tagline_edit.editingFinished.connect(
-            lambda: setattr(self.config, "video_tagline", self.tagline_edit.text())
+            lambda: self._save_video_setting("video_tagline", self.tagline_edit.text())
         )
 
         self.credit_edit = QLineEdit(self.config.video_credit)
         self.credit_edit.setPlaceholderText("Fox Novel")
         self.credit_edit.setMaximumWidth(140)
         self.credit_edit.editingFinished.connect(
-            lambda: setattr(self.config, "video_credit", self.credit_edit.text().strip() or "Fox Novel")
+            lambda: self._save_video_setting(
+                "video_credit", self.credit_edit.text().strip() or "Fox Novel"
+            )
         )
 
         # Live cover editor: drag the title / PHẦN N, try fonts with a preview, then save +
@@ -1356,14 +1410,14 @@ class VideoTab(QWidget):
             "giống “2. Dịch”. Google chỉ dịch nên không dùng được ở đây."
         )
         self.ai_engine_combo.currentIndexChanged.connect(
-            lambda: setattr(self.config, "video_ai_engine", self.ai_engine_combo.currentData())
+            lambda: self._save_video_setting("video_ai_engine", self.ai_engine_combo.currentData())
         )
 
         self.ai_model_edit = QLineEdit(self.config.video_ai_model)
         self.ai_model_edit.setPlaceholderText("model (để trống = mặc định)")
         self.ai_model_edit.setMaximumWidth(220)
         self.ai_model_edit.editingFinished.connect(
-            lambda: setattr(self.config, "video_ai_model", self.ai_model_edit.text().strip())
+            lambda: self._save_video_setting("video_ai_model", self.ai_model_edit.text().strip())
         )
 
         row = QHBoxLayout()
@@ -1433,31 +1487,115 @@ class VideoTab(QWidget):
         box.setLayout(inner)
         return box
 
+    # ------------------------------------------------- per-novel video settings
+
+    def _save_video_setting(self, key: str, value) -> None:
+        """Record one video setting for the open novel (and as the user's habit, if it is one).
+
+        Called from every widget's change handler. A no-op while `_apply_video_settings`
+        is pushing values in, otherwise loading novel B would immediately save B's freshly
+        shown values over whatever the user had — or worse, save them onto novel A.
+
+        Workflow keys are mirrored into the global config so the *next* new novel inherits
+        them; identity keys deliberately are not, because that mirror is exactly how one
+        novel's `ảnh nền` used to end up on another's video.
+        """
+        if self._loading_video_settings:
+            return
+        self._video_settings[key] = value
+        if key in video_settings.WORKFLOW_KEYS:
+            setattr(self.config, key, value)
+        if self.project is not None:
+            self.project.save_video_settings({key: value})
+
+    def _apply_video_settings(self, values: dict) -> None:
+        """Push a resolved settings dict into every widget that shows one.
+
+        Signals stay connected but are ignored (see `_loading_video_settings`) rather than
+        blocked per-widget: the handlers do more than save — `_on_video_mode_changed` also
+        shows/hides the range and batch controls — and that work still needs to happen.
+        """
+        self._video_settings = dict(values)
+        self._loading_video_settings = True
+        try:
+            self._set_combo(self.video_mode, values["video_mode"], fallback="batch")
+            self._set_combo(self.video_quality, values["video_quality"])
+            self._set_combo(self.video_font, values["video_font"])
+            self._set_combo(self.thumb_font, values["video_thumbnail_font"])
+            self.video_batch_size.setValue(int(values["video_batch_size"]))
+            self.burn_subs_check.setChecked(bool(values["video_burn_subtitles"]))
+            self.video_image_edit.setText(values["video_image_path"])
+            self.thumb_image_edit.setText(values["video_thumbnail_image"])
+            self.tagline_edit.setText(values["video_tagline"])
+            self.credit_edit.setText(values["video_credit"])
+            self._set_combo(self.ai_engine_combo, values["video_ai_engine"])
+            self.ai_model_edit.setText(values["video_ai_model"])
+            self.bg_color = values["video_bg_color"]
+        finally:
+            self._loading_video_settings = False
+        # Outside the guard: these only read state, and the mode handler owns the
+        # show/hide of the range and batch rows, which must reflect the novel just loaded.
+        self._update_bg_swatch()
+        self._on_video_mode_changed()
+
+    @staticmethod
+    def _set_combo(combo, value, *, fallback=None) -> None:
+        """Select `value` in `combo`, falling back rather than leaving index -1 (blank)."""
+        index = combo.findData(value)
+        if index < 0 and fallback is not None:
+            index = combo.findData(fallback)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+
+    def _load_video_settings_for_project(self) -> None:
+        """Resolve and show the open novel's settings, adopting today's globals if it has none.
+
+        The adoption is the migration: a novel set up and rendered before settings went
+        per-novel has nothing saved, and starting it at defaults would silently change what
+        its next part looks like. Taking a snapshot keeps its output identical and makes it
+        independent from that point on.
+        """
+        if self.project is None:
+            # Workflow habits from config, identity at app defaults — never the last
+            # novel's image sitting in the box with no novel open to own it.
+            self._apply_video_settings(video_settings.effective({}, self.config))
+            return
+        stored = self.project.meta.video_settings
+        if not stored:
+            stored = video_settings.snapshot(self.config)
+            # The pre-existing standalone field wins: a novel that had its own image
+            # chosen must keep it, not adopt whichever image the globals happen to hold.
+            if self.project.meta.video_image_path:
+                stored["video_image_path"] = self.project.meta.video_image_path
+            self.project.save_video_settings(stored)
+        self._apply_video_settings(video_settings.effective(stored, self.config))
+
     # ---------------------------------------------------------- mode/config
 
     def _on_video_mode_changed(self) -> None:
         mode = self.video_mode.currentData()
-        self.config.video_mode = mode  # remember the choice between sessions
+        self._save_video_setting("video_mode", mode)
         for w in (self.video_range_from, self.video_range_label, self.video_range_to):
             w.setVisible(mode == "range")
         for w in (self.video_batch_size, self.video_batch_label):
             w.setVisible(mode == "batch")
 
     def _on_video_quality_changed(self) -> None:
-        self.config.video_quality = self.video_quality.currentData()
+        self._save_video_setting("video_quality", self.video_quality.currentData())
 
     def _on_video_font_changed(self) -> None:
-        self.config.video_font = self.video_font.currentData()
+        self._save_video_setting("video_font", self.video_font.currentData())
 
     def _pick_video_image(self) -> None:
+        # Opens where this novel's image lives, not where some other novel's did.
         path, _ = QFileDialog.getOpenFileName(
-            self, "Chọn ảnh nền", self.config.video_image_path or "", _IMAGE_FILTER
+            self, "Chọn ảnh nền", self._video_settings.get("video_image_path") or "", _IMAGE_FILTER
         )
         if path:
             self.video_image_edit.setText(path)
-            self.config.video_image_path = path  # last-picked default, for a new novel
-            if self.project is not None:
-                self.project.save_video_image_path(path)  # THIS novel's own choice
+            # Per-novel only — deliberately NOT mirrored into the global config, which is
+            # what used to carry this image onto the next novel's video.
+            self._save_video_setting("video_image_path", path)
+            self._maybe_refresh_preview()
 
     def _save_upload_playlist_choice(self, text: str) -> None:
         """Persist the playlist box's current text onto the open novel, if any.
@@ -1474,13 +1612,13 @@ class VideoTab(QWidget):
         color = QColorDialog.getColor(initial, self, "Chọn màu nền video")
         if color.isValid():
             self.bg_color = color.name()  # "#rrggbb"
-            self.config.video_bg_color = self.bg_color
+            self._save_video_setting("video_bg_color", self.bg_color)
             self._update_bg_swatch()
             self._maybe_refresh_preview()  # live-update the open preview, if any
 
     def _reset_bg_color(self) -> None:
         self.bg_color = ""
-        self.config.video_bg_color = ""
+        self._save_video_setting("video_bg_color", "")
         self._update_bg_swatch()
         self._maybe_refresh_preview()
 
@@ -1507,11 +1645,15 @@ class VideoTab(QWidget):
             self._start_preview()
 
     def _pick_thumb_image(self) -> None:
-        start = self.config.video_thumbnail_image or self.config.video_image_path or ""
+        start = (
+            self._video_settings.get("video_thumbnail_image")
+            or self._video_settings.get("video_image_path")
+            or ""
+        )
         path, _ = QFileDialog.getOpenFileName(self, "Chọn ảnh bìa", start, _IMAGE_FILTER)
         if path:
             self.thumb_image_edit.setText(path)
-            self.config.video_thumbnail_image = path
+            self._save_video_setting("video_thumbnail_image", path)
 
     # ---------------------------------------------------------------- voices
 
@@ -1552,12 +1694,12 @@ class VideoTab(QWidget):
             self.video_range_from.setValue(1)
             self.tags_edit.setPlainText(self.project.meta.tags)
             self.image_prompt_edit.setPlainText(self.project.meta.thumbnail_prompt)
-            # Per-novel — falls back to the last-picked image (the old global default) so
-            # a brand new novel that never had one chosen isn't left blank, but a novel
-            # that HAS its own choice never shows another novel's leftover selection.
-            self.video_image_edit.setText(
-                self.project.meta.video_image_path or self.config.video_image_path
-            )
+            # Loads this novel's own image, colour, fonts and cover layout. There is
+            # deliberately no global fallback for those: falling back is how one novel's
+            # `ảnh nền` used to arrive pre-filled on the next novel and render into its
+            # video. Workflow choices (quality, mode, ...) still inherit — see
+            # noveltrans.video_settings.
+            self._load_video_settings_for_project()
             self.upload_playlist.setCurrentText(self.project.meta.upload_playlist)
             # No global fallback here, unlike the image: an unset/unknown key must land
             # on "private" (index 0), the deliberately-safe default — never on whatever
@@ -1571,7 +1713,9 @@ class VideoTab(QWidget):
         else:
             self.tags_edit.setPlainText("")
             self.image_prompt_edit.setPlainText("")
-            self.video_image_edit.setText(self.config.video_image_path)
+            # No novel open: show the user's workflow habits, but no novel's identity —
+            # an image left in the box here is one a later render could pick up.
+            self._load_video_settings_for_project()
             self.upload_playlist.setCurrentText("")
             self.upload_visibility.setCurrentIndex(0)  # back to Riêng tư, no novel open
             self.display_title_edit.clear()
@@ -2060,13 +2204,13 @@ class VideoTab(QWidget):
             start=start, end=end, batch=batch,
             width=preset["width"], height=preset["height"], fps=preset["fps"],
             spin_vinyl=preset["spin_vinyl"], font=font_family, font_key=font_key,
-            thumb_font_key=self.config.video_thumbnail_font,
-            thumb_title_pos=self.config.video_thumbnail_title_pos,
-            thumb_part_pos=self.config.video_thumbnail_part_pos,
-            thumb_title_scale=self.config.video_thumbnail_title_scale,
-            thumb_part_scale=self.config.video_thumbnail_part_scale,
-            thumb_tagline_scale=self.config.video_thumbnail_tagline_scale,
-            thumb_title_align=self.config.video_thumbnail_title_align,
+            thumb_font_key=self._video_settings["video_thumbnail_font"],
+            thumb_title_pos=self._video_settings["video_thumbnail_title_pos"],
+            thumb_part_pos=self._video_settings["video_thumbnail_part_pos"],
+            thumb_title_scale=self._video_settings["video_thumbnail_title_scale"],
+            thumb_part_scale=self._video_settings["video_thumbnail_part_scale"],
+            thumb_tagline_scale=self._video_settings["video_thumbnail_tagline_scale"],
+            thumb_title_align=self._video_settings["video_thumbnail_title_align"],
             burn_subtitles=self.burn_subs_check.isChecked(),
             bg_color=self.bg_color, skip_existing=skip_existing,
             credit=self.credit_edit.text().strip() or "Fox Novel",
@@ -2165,13 +2309,13 @@ class VideoTab(QWidget):
         rows = []
         for i, window in enumerate(windows):
             whole_novel = total == 1 and mode == "all"
-            part_num = None if whole_novel else (i + 1)
+            part_num = None if whole_novel else self._part_number(window)
             path = self._part_output_path(window, whole_novel=whole_novel)
             if not path.is_file():
                 continue
             if self._part_uploaded(window, whole_novel) or needs_attention(path):
                 continue
-            label = "Toàn bộ" if whole_novel else f"Phần {i + 1}"
+            label = "Toàn bộ" if whole_novel else f"Phần {part_num}"
             rows.append((window, label, part_num, whole_novel))
         return rows
 
@@ -2296,7 +2440,7 @@ class VideoTab(QWidget):
         published: list = []
         for i, window in enumerate(windows):
             path = self._part_output_path(window, whole_novel=whole)
-            label = "Toàn bộ" if whole else f"Phần {i + 1}"
+            label = "Toàn bộ" if whole else f"Phần {self._part_number(window)}"
             if needs_attention(path):
                 stuck.append((label, path))
             elif is_published(path):
@@ -2536,7 +2680,9 @@ class VideoTab(QWidget):
             srt = path.with_suffix(".srt")
             if not uploaded_video_id(path) or not srt.is_file():
                 continue
-            rows.append((path, srt, "Toàn bộ" if whole_novel else f"Phần {i + 1}"))
+            rows.append(
+                (path, srt, "Toàn bộ" if whole_novel else f"Phần {self._part_number(window)}")
+            )
         return rows
 
     def _start_subtitle_upload(self) -> None:
@@ -2764,7 +2910,7 @@ class VideoTab(QWidget):
             path = self._part_output_path(window, whole_novel=whole_novel)
             if not uploaded_video_id(path):
                 continue
-            rows.append((path, "Toàn bộ" if whole_novel else f"Phần {i + 1}"))
+            rows.append((path, "Toàn bộ" if whole_novel else f"Phần {self._part_number(window)}"))
         return rows
 
     def _start_playlist_sync(self) -> None:
@@ -2899,7 +3045,7 @@ class VideoTab(QWidget):
                 continue
             if not self._part_sidecar(window, whole_novel, ".jpg").is_file():
                 continue
-            label = "Toàn bộ" if whole_novel else f"Phần {i + 1}"
+            label = "Toàn bộ" if whole_novel else f"Phần {self._part_number(window)}"
             rows.append((window, label, whole_novel))
         return rows
 
