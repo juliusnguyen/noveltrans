@@ -234,6 +234,41 @@ class TestChapterList:
         refs = parse_chapter_list(load_fixture("webtruyendich", "toc.html"), NOVEL_URL)
         assert all(r.url.startswith("https://webtruyendich.com/") for r in refs)
 
+    def test_reads_a_novel_whose_upstream_source_is_not_fanqie(self):
+        # The path segment after the slug names the upstream site and varies per
+        # novel; pinning it to "fanqie" broke every other source (measured on
+        # /truyen/dong-kinh-y-do, source "sudugu").
+        markup = (
+            '<a href="/truyen/dong-kinh-y-do/sudugu/chuong-454-muon-vao-bo">Chương 454</a>'
+            '<a href="/truyen/dong-kinh-y-do/sudugu/chuong-453-bao-quan-part-2">Chương 453</a>'
+        )
+        refs = parse_chapter_list(markup, "https://webtruyendich.com/truyen/dong-kinh-y-do")
+        assert [r.url.rsplit("/", 1)[1] for r in refs] == [
+            "chuong-453-bao-quan-part-2",
+            "chuong-454-muon-vao-bo",
+        ]
+
+    def test_keeps_a_chapter_whose_slug_does_not_lead_with_its_number(self):
+        # "chương lậu đơn" fill-ins are named chuong-lau-don-chuong-<N>; they used
+        # to be dropped silently. Sorted by the trailing number, next to ch. 1715.
+        markup = (
+            '<a href="/truyen/dong-kinh-y-do/sudugu/chuong-1716-a">Chương 1716</a>'
+            '<a href="/truyen/dong-kinh-y-do/sudugu/chuong-lau-don-chuong-1715">Lậu đơn</a>'
+            '<a href="/truyen/dong-kinh-y-do/sudugu/chuong-1715-b">Chương 1715</a>'
+        )
+        refs = parse_chapter_list(markup, "https://webtruyendich.com/truyen/dong-kinh-y-do")
+        # Both 1715s tie on number, so site order decides between them; what matters
+        # is the fill-in survives and lands with 1715 rather than after 1716.
+        assert [r.title for r in refs] == ["Lậu đơn", "Chương 1715", "Chương 1716"]
+
+    def test_ignores_links_that_are_not_chapters(self):
+        markup = (
+            '<a href="/truyen/dong-kinh-y-do/danh-sach-chuong-day-du">Danh sách chương</a>'
+            '<a href="/tac-gia/ai-do">Tác giả</a>'
+        )
+        with pytest.raises(ScrapeError, match="Chapter list not found"):
+            parse_chapter_list(markup, NOVEL_URL)
+
     def test_raises_when_no_links(self):
         with pytest.raises(ScrapeError, match="Chapter list not found"):
             parse_chapter_list("<html><body>no links</body></html>", NOVEL_URL)
@@ -364,7 +399,7 @@ class TestAdapterWiring:
         adapter.fetch_metadata(NOVEL_URL)
         adapter.fetch_chapter_list(NOVEL_URL)
         assert session.prefer_document == [False, True]
-        assert session.scrolled == [None, 'a[href*="/fanqie/chuong-"]']
+        assert session.scrolled == [None, 'a[href*="/chuong-"]']
 
     def test_fetch_chapter_selects_the_gemini_model_and_parses(self):
         adapter, session = make_adapter()
