@@ -2,7 +2,8 @@
 
 Landing page: https://webtruyendich.com/truyen/<slug>              — metadata (open)
 Chapter list: https://webtruyendich.com/truyen/<slug>/danh-sach-chuong-day-du
-Chapter page: https://webtruyendich.com/truyen/<slug>/fanqie/chuong-<N>-<title>
+Chapter page: https://webtruyendich.com/truyen/<slug>/<source>/chuong-<N>-<title>
+              (<source> is the upstream site — "fanqie", "sudugu", … — per novel)
 
 Two things make this adapter unlike the plain `requests` scrapers:
 
@@ -75,13 +76,21 @@ SEL_CONTENT = "#chapter-content-body"
 SEL_PARAGRAPH = "p.fade-in-paragraph"
 RETRANSLATE_BUTTON = "Dịch lại"
 
-SEL_TOC_LINKS = 'a[href*="/fanqie/chuong-"]'
-_CH_NUM_RE = re.compile(r"/chuong-(\d+)(?:[-/]|$)")
+# Chapter URLs are /truyen/<slug>/<source>/chuong-<N>-<title-slug>, where <source>
+# names the upstream site the novel was ripped from — "fanqie" for some, "sudugu"
+# for others. It is NOT fixed: pinning it to "fanqie" made every non-fanqie novel
+# fail as "Chapter list not found" (measured on /truyen/dong-kinh-y-do, source
+# "sudugu"), so match any single segment there.
+SEL_TOC_LINKS = 'a[href*="/chuong-"]'
+_CH_HREF_RE = r'[^"]*/truyen/[^"/]+/[^"/]+/chuong-[^"]*'
+# Leading chapter number, the normal shape: "chuong-454-muon-vao-bo".
+_CH_LEAD_NUM_RE = re.compile(r"(\d+)(?:[-/]|$)")
+_ANY_NUM_RE = re.compile(r"\d+")
 # Chapter anchor: href + inner title. Parsed by regex, not an HTML parser — the
 # raw TOC document is malformed enough that lxml/html.parser drop the title text
 # of all but the first ~135 chapters (see parse_chapter_list).
 _CH_ANCHOR_RE = re.compile(
-    r'<a\b[^>]*?\bhref="([^"]*/fanqie/chuong-\d+[^"]*)"[^>]*>(.*?)</a>',
+    rf'<a\b[^>]*?\bhref="({_CH_HREF_RE})"[^>]*>(.*?)</a>',
     re.IGNORECASE | re.DOTALL,
 )
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -203,6 +212,23 @@ def translator_label_for(model: str) -> str:
     return f"webtruyendich ({name})" if name else TRANSLATOR_LABEL
 
 
+def chapter_number(href: str) -> int | None:
+    """Chapter number out of a chapter href, or None if it carries no digits.
+
+    Normally the number leads the slug ("chuong-454-muon-vao-bo"), but a few are
+    named without one — "chuong-lau-don-chuong-1715" (a chương lậu đơn, i.e. a
+    fill-in for a missed chapter) — so fall back to the last number in the slug.
+    Sorting such a chapter next to its namesake beats dropping it from the list."""
+    _, _, chapter_slug = href.rpartition("/chuong-")
+    if not chapter_slug:
+        return None
+    lead = _CH_LEAD_NUM_RE.match(chapter_slug)
+    if lead:
+        return int(lead.group(1))
+    numbers = _ANY_NUM_RE.findall(chapter_slug)
+    return int(numbers[-1]) if numbers else None
+
+
 def parse_chapter_list(markup: str, base_url: str) -> list[ChapterRef]:
     """Read the full TOC. Links are newest-first and a chapter number can
     occasionally carry two different title-slugs, so dedup by URL and order by
@@ -217,15 +243,15 @@ def parse_chapter_list(markup: str, base_url: str) -> list[ChapterRef]:
     entries: list[tuple[int, int, str, str]] = []  # (num, order, title, url)
     for match in _CH_ANCHOR_RE.finditer(markup):
         href = match.group(1)
-        num = _CH_NUM_RE.search(href)
-        if not num:
+        num = chapter_number(href)
+        if num is None:
             continue
         absolute = urljoin(base_url, href)
         if absolute in seen:
             continue
         seen.add(absolute)
         title = _WS_RE.sub(" ", html.unescape(_TAG_RE.sub(" ", match.group(2)))).strip()
-        entries.append((int(num.group(1)), len(entries), title, absolute))
+        entries.append((num, len(entries), title, absolute))
 
     if not entries:
         raise ScrapeError("Chapter list not found — page layout may have changed", base_url)
