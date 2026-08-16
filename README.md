@@ -51,13 +51,26 @@ menu/khay hệ thống thì ✕ vẫn thoát như cũ và icon Dock (macOS) khô
 
 ## Trang web được hỗ trợ
 
+Nguồn tiếng Trung (tải về rồi dịch ở tab 2):
+
 | Site | URL mẫu |
 |---|---|
-| 半夏小說 (xbanxia.cc) | `https://www.xbanxia.cc/books/331303.html` |
-| 爱下电子书 (ixdzs8.com) | `https://ixdzs8.com/read/620438/` |
-| 69书吧 (69shuba.com) | `https://www.69shuba.com/book/59024/` (có kiểm tra Cloudflare — app tự mở trình duyệt để vượt qua; cần Google Chrome hoặc `playwright install chromium`) |
-| Mê Đọc Truyện (medoctruyen.vn) | `https://medoctruyen.vn/tu-bao-tien-bon` (nội dung tiếng Việt; cần dán cookie đăng nhập trong Cài đặt để tải chương) |
-| Tiểu Thuyết Mạng (tieuthuyetmang.com) | `https://tieuthuyetmang.com/truyen/<slug>` (nội dung tiếng Việt; **phần lớn chương là trả phí** — cần dán cookie đăng nhập trong Cài đặt, và chỉ tải được những chương tài khoản của bạn đã mở khoá) |
+| 半夏小說 (xbanxia.cc) | `https://www.xbanxia.cc/books/331303.html` (nhận cả `xbanxia.com`) |
+| 爱下电子书 (ixdzs8.com) | `https://ixdzs8.com/read/620438/` (nhận cả `ixdzs8.tw`) |
+| 69书吧 (69shuba.com) | `https://www.69shuba.com/book/59024/` (có kiểm tra Cloudflare — app tự mở trình duyệt để vượt qua; cần Google Chrome hoặc `playwright install chromium`; nhận cả `69shuba.cx`) |
+
+Nguồn đã là tiếng Việt (tải xong đọc/nghe được ngay, không cần qua tab 2):
+
+| Site | URL mẫu |
+|---|---|
+| Mê Đọc Truyện (medoctruyen.vn) | `https://medoctruyen.vn/tu-bao-tien-bon` — cần dán cookie đăng nhập trong Cài đặt để tải chương |
+| Tiểu Thuyết Mạng (tieuthuyetmang.com) | `https://tieuthuyetmang.com/truyen/<slug>` — **phần lớn chương là trả phí**: cần dán cookie đăng nhập trong Cài đặt, và chỉ tải được những chương tài khoản của bạn đã mở khoá |
+| Gia Tộc Vương Tài (giatocvuongtai.com) | `https://giatocvuongtai.com/stories/<slug>` — đọc qua JSON API công khai của site, **không cần đăng nhập hay cookie** |
+| Web Truyện Dịch (webtruyendich.com) | `https://webtruyendich.com/truyen/dong-kinh-y-do` — bản dịch AI do chính trang tạo ra: app mở trình duyệt (Cloudflare), tự chọn model Gemini "Memory / No Apikey" mà trang đang có rồi bấm **Dịch lại**, và lưu thẳng kết quả làm bản dịch. Cần Google Chrome hoặc `playwright install chromium`. **Không tải song song nhiều luồng** — site bị giới hạn Cloudflare + quota AI |
+
+Truyện lấy từ nhóm thứ hai đã có sẵn bản dịch tiếng Việt nên tab **2. Dịch** chỉ dùng để
+sửa tay (hoặc dịch lại nếu muốn); riêng webtruyendich thì bản dịch được ghi luôn vào ô
+**Bản dịch** khi tải, không chạy engine dịch của NovelTrans.
 
 Thêm site mới = thêm 1 file adapter trong `src/noveltrans/scrapers/` (kế thừa `SiteAdapter`, đăng ký bằng `@register`).
 
