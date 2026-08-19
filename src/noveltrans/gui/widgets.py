@@ -4,7 +4,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractTableModel, QEvent, QModelIndex, QPoint, QRect, Qt, Signal
+from PySide6.QtCore import (
+    QAbstractTableModel,
+    QEvent,
+    QItemSelectionModel,
+    QModelIndex,
+    QPoint,
+    QRect,
+    Qt,
+    Signal,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -229,6 +238,11 @@ class RowButtonDelegate(QStyledItemDelegate):
     def editorEvent(self, event, model, option, index) -> bool:
         if (
             event.type() == QEvent.Type.MouseButtonRelease
+            # Left button only: without this a right-click on the button cell both fired
+            # the row's action and opened the context menu — so right-clicking a
+            # multi-row selection in the button column started a one-chapter job and
+            # then offered a greyed-out "Tạo lại N chương".
+            and event.button() == Qt.MouseButton.LeftButton
             and index.data(Qt.ItemDataRole.UserRole)
             and option.rect.contains(event.position().toPoint())
         ):
@@ -524,6 +538,28 @@ def _copy_index_text(index) -> None:
         QApplication.clipboard().setText(str(text))
 
 
+def focus_index_keeping_selection(table: QTableView, index) -> None:
+    """Make `index` the current cell without throwing away a multi-row selection.
+
+    QAbstractItemView.setCurrentIndex issues ClearAndSelect, so calling it from a
+    context-menu handler collapses the selection to the row under the cursor. Qt's own
+    mousePressEvent already leaves an already-selected row alone — but
+    customContextMenuRequested fires from contextMenuEvent, *after* the press, so the
+    naive call undoes what Qt preserved. That broke "Tạo lại N chương", which reads the
+    selection out of the very menu the right-click opens.
+
+    Right-clicking outside the selection still collapses to that row, like every desktop
+    table. The NoUpdate branch still moves the *current* index, so Ctrl+C and anything
+    reading currentIndex() (e.g. the audio tab's "Xem trước văn bản") follow the cell you
+    actually clicked instead of wherever a drag happened to end.
+    """
+    selection = table.selectionModel()
+    if selection is not None and selection.isSelected(index):
+        selection.setCurrentIndex(index, QItemSelectionModel.SelectionFlag.NoUpdate)
+    else:
+        table.setCurrentIndex(index)
+
+
 def enable_cell_copy(table: QTableView, extra_actions=None) -> None:
     """Let the user copy a table cell (e.g. a long error message) via Ctrl+C or a
     right-click "Sao chép" menu, so it's easy to paste elsewhere.
@@ -542,7 +578,7 @@ def enable_cell_copy(table: QTableView, extra_actions=None) -> None:
         index = table.indexAt(pos)
         if not index.isValid():
             return
-        table.setCurrentIndex(index)
+        focus_index_keeping_selection(table, index)
         menu = QMenu(table)
         menu.addAction("Sao chép", lambda: _copy_index_text(index))
         if extra_actions is not None:

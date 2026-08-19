@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
@@ -42,6 +43,11 @@ from noveltrans.gui.workers import (
     TtsVoicesWorker,
 )
 from noveltrans.storage import NovelProject
+
+
+# Re-voicing is slow (minutes per chapter), so a big batch asks first. One chapter
+# never does — that is the per-row 🔊 button's long-standing behaviour.
+REGENERATE_CONFIRM_FROM = 5
 
 
 class AudioTab(QWidget):
@@ -124,9 +130,16 @@ class AudioTab(QWidget):
         )
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
+        # Stated here, not inherited from enable_cell_copy: the right-click
+        # "Tạo lại N chương" below depends on a multi-row selection being possible.
+        self.table.setSelectionMode(QTableView.SelectionMode.ExtendedSelection)
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
-        enable_cell_copy(self.table)  # Ctrl+C / right-click to copy a cell (e.g. errors)
+        # Ctrl+C / right-click to copy a cell (e.g. errors); the same menu also carries
+        # "Tạo lại" for every selected chapter via the extra_actions hook — the table
+        # owns one context-menu signal and enable_cell_copy holds it (same arrangement
+        # as the Tải truyện tab). See _add_regenerate_actions.
+        enable_cell_copy(self.table, extra_actions=self._add_regenerate_actions)
         self.table.setMouseTracking(True)
         self._row_button_delegate = RowButtonDelegate("🔊 Tạo lại", self.table)
         self._row_button_delegate.clicked.connect(self._regenerate_row)
@@ -397,16 +410,112 @@ class AudioTab(QWidget):
         self.pause_button.set_job(self._job.id if self._job else None)
         self._worker.start()
 
+    def _add_regenerate_actions(self, menu: QMenu, index) -> None:
+        """Append "Tạo lại" for the whole selection to the table's right-click menu.
+
+        Built from the *selection*, not from the row under the cursor, so one right-click
+        can re-voice every chapter the user highlighted. enable_cell_copy keeps a
+        multi-row selection alive when the click lands inside it, which is what makes
+        this reachable at all.
+        """
+        rows = self._selected_rows()
+        if index.isValid() and index.row() not in rows:
+            rows = [index.row()]  # right-clicked away from the selection → act on that row
+        indices, skipped = self._regenerable_indices(rows)
+        if not indices:
+            return  # nothing with source text to read — offering it would only mislead
+        menu.addSeparator()
+        label = (
+            "🔊 Tạo lại chương này" if len(indices) == 1 else f"🔊 Tạo lại {len(indices)} chương"
+        )
+        action = menu.addAction(label)
+        running = self._worker is not None and self._worker.isRunning()
+        action.setEnabled(not running)
+        hints = []
+        if running:
+            hints.append("Đang có phiên tạo audio chạy — chờ xong rồi thử lại.")
+        if skipped:
+            hints.append(f"Bỏ qua {skipped} chương chưa có nội dung.")
+        if hints:
+            menu.setToolTipsVisible(True)  # QMenu hides action tooltips unless asked
+            action.setToolTip(" ".join(hints))
+        # Snapshot the rows and re-resolve chapter indices at trigger time, so
+        # _regenerable_indices stays the only authority on what is eligible.
+        rows_snapshot = list(rows)
+        action.triggered.connect(lambda: self._regenerate_rows(rows_snapshot))
+
+    def _selected_rows(self) -> list[int]:
+        """The rows the user has highlighted, in table order and without duplicates.
+
+        selectedIndexes() yields one index per selected *cell*; with SelectRows that is
+        every column of every row, hence the dedup.
+        """
+        selection = self.table.selectionModel()
+        if selection is None:
+            return []
+        return sorted({index.row() for index in selection.selectedIndexes()})
+
+    def _regenerable_indices(self, rows: list[int]) -> tuple[list[int], int]:
+        """(chapter indices to re-voice, rows dropped) for `rows`, in chapter order.
+
+        Rows are table positions; AudioWorker wants chapter.index — not the same number
+        once a novel has gaps, so this is the one place that converts. A row is dropped
+        when its source (translation or original, per the radio) is empty: the worker
+        filters those out anyway, so counting them would overstate the job and leave the
+        progress bar's maximum lying. Sorted because AudioWorker reads `indices` in order.
+        """
+        if self.project is None:
+            return [], 0
+        use_translation = self._use_translation()
+        indices: list[int] = []
+        skipped = 0
+        for row in rows:
+            chapter = self.model.chapter_at(row)
+            if chapter is None:
+                continue
+            if not (chapter.translated if use_translation else chapter.content):
+                skipped += 1
+                continue
+            indices.append(chapter.index)
+        return sorted(dict.fromkeys(indices)), skipped
+
     def _regenerate_row(self, row: int) -> None:
-        chapter = self.model.chapter_at(row)
-        if chapter is None or self.project is None:
-            return
-        if not (chapter.translated if self._use_translation() else chapter.content):
+        """The per-row 🔊 button — one chapter, no confirmation, as before."""
+        self._regenerate_rows([row])
+
+    def _regenerate_rows(self, rows: list[int]) -> None:
+        """Re-voice exactly the given rows, whether that is one or a hundred.
+
+        Shared by the per-row button and the context menu so both paths agree on the
+        guards. No clear_audio() call is needed: AudioWorker with an explicit `indices`
+        list regenerates those chapters regardless of existing audio (unlike the
+        pending-only pass it makes when indices is None).
+        """
+        if self.project is None:
+            QMessageBox.information(self, "Chưa chọn truyện", "Hãy tải một truyện ở Tab 1 trước.")
             return
         if self._worker is not None and self._worker.isRunning():
             self.status_label.setText("Đang có phiên tạo audio chạy — chờ xong rồi thử lại.")
             return
-        self._start_generate(indices=[chapter.index])
+        indices, skipped = self._regenerable_indices(rows)
+        if not indices:
+            nguon = "bản dịch" if self._use_translation() else "bản gốc"
+            self.status_label.setText(
+                f"Chương đã chọn chưa có {nguon} để đọc — hãy dịch/tải trước."
+            )
+            return
+        if len(indices) >= REGENERATE_CONFIRM_FROM:
+            answer = QMessageBox.question(
+                self,
+                "Tạo lại audio?",
+                f"Sẽ tạo lại audio cho {len(indices)} chương đã chọn "
+                "(ghi đè audio hiện có của những chương này). Tiếp tục chứ?",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        if skipped:
+            self.status_label.setText(f"Bỏ qua {skipped} chương chưa có nội dung.")
+        self._start_generate(indices=indices)
 
     def _regenerate_all(self) -> None:
         if self.project is None:
