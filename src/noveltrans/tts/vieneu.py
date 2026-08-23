@@ -33,6 +33,13 @@ PRESET_VOICES = [
     ("Thùy Dung — Nữ · Nam · Phong cách tin tức", "Thùy Dung"),
     ("Quang Sơn — Nam · Trung · Phong cách tự nhiên", "Quang Sơn"),
     ("Ngọc Trân — Nữ · Trung · Phong cách tự nhiên", "Ngọc Trân"),
+    # Added by vieneu 3.3.0.
+    ("Mỹ Duyên — Nữ · Nam · Phong cách đọc truyện", "Mỹ Duyên"),
+    ("Quỳnh Anh — Nữ · Bắc · Phong cách đọc truyện", "Quỳnh Anh"),
+    ("Đức Trí — Nam · Nam · Phong cách đọc truyện", "Đức Trí"),
+    ("Kim Thanh — Nữ · Nam · Phong cách đọc truyện", "Kim Thanh"),
+    ("Ngọc Huyền — Nữ · Bắc · Giọng đọc tự nhiên", "Ngọc Huyền"),
+    ("Adam — Nam · Nam · Giọng đọc tự nhiên", "Adam"),
 ]
 
 INSTALL_HINT = (
@@ -61,7 +68,11 @@ class VieneuEngine(TtsEngine):
         # larger one-time download). Set at model construction, not per-chunk.
         self.precision = precision
         # Reading style (tu_nhien / doc_truyen / tin_tuc), independent of voice. Empty =
-        # pass nothing → the model's own default (tu_nhien), i.e. today's behaviour.
+        # pass nothing → the model's own default (tu_nhien).
+        # NOTE: vieneu 3.3.0 deprecated `style` on the v3turbo build — it is still
+        # accepted by infer() but ignored, because the style now comes from the
+        # reference voice itself (see the "Phong cách đọc truyện" presets added in
+        # 3.3.0). Kept here so older builds and other modes still honour it.
         self.style = (style or "").strip()
         # Set by load() when the requested voice was substituted; a human-readable
         # notice the caller can surface (empty means the voice was used as-is).

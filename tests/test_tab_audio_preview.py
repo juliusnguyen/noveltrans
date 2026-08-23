@@ -67,18 +67,19 @@ def test_preview_applies_extra_remove_from_settings(qapp, tmp_path):
     assert "một" in text and text.rstrip().endswith("!")  # rest intact, ！ normalised
 
 
-def test_style_combo_lists_three_styles_and_loads_config(qapp, tmp_path):
+def test_no_style_combo(qapp, tmp_path):
+    # vieneu 3.3.0 ignores `style` on the v3-Turbo build, so the dropdown is gone —
+    # a control that silently does nothing is worse than no control.
     config = _config(tmp_path, use_translation=True, clean=True)
     config.tts_style = "tin_tuc"
     tab = AudioTab(config)
-    styles = [tab.style_combo.itemData(i) for i in range(tab.style_combo.count())]
-    assert styles == ["tu_nhien", "doc_truyen", "tin_tuc"]
-    assert tab.style_combo.currentData() == "tin_tuc"  # loaded from config
+    assert not hasattr(tab, "style_combo")
+    assert config.tts_style == "tin_tuc"  # saved value untouched, still fed to the engine
 
 
-def test_voice_labels_drop_the_style_suffix(qapp, tmp_path):
-    # Style is its own dropdown now — the voice label shouldn't repeat it.
+def test_voice_labels_keep_the_style_suffix(qapp, tmp_path):
+    # The style now comes from the voice, so the label is the only place it shows.
     tab = AudioTab(_config(tmp_path, use_translation=True, clean=True))
     tab._on_voices_listed([("Ngọc Linh — Nữ · Bắc · Phong cách kể chuyện", "Ngọc Linh")])
-    assert tab.voice_combo.itemText(0) == "Ngọc Linh — Nữ · Bắc"
+    assert tab.voice_combo.itemText(0) == "Ngọc Linh — Nữ · Bắc · Phong cách kể chuyện"
     assert tab.voice_combo.itemData(0) == "Ngọc Linh"  # voice id unchanged

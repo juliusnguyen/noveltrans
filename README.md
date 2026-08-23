@@ -7,7 +7,7 @@
 | **1. Tải truyện** | Dán URL truyện → Quét metadata (tên, tác giả, mô tả, mục lục) → Tải toàn bộ chương về máy. Sau khi dịch, tên dịch hiện kế bên tên gốc và mô tả hiển thị bản dịch (rê chuột xem bản gốc). Có progress bar, nút Dừng, và tự resume (chạy lại chỉ tải chương còn thiếu). Hoặc bấm **✍️ Truyện tự viết** để tạo truyện của chính bạn (không cần link nguồn): thêm chương bằng tên (mỗi dòng một tên), đổi tên chương, chuột phải để xoá chương. Có nút **⏸ Tạm dừng** cạnh nút Dừng. |
 | **2. Dịch** | Dịch Trung → Việt/Anh bằng **Google Translate (miễn phí)**, **Claude API**, **CLI Agent** (agy/claude) hoặc **LM Studio** (model local). Xem song song bản gốc/bản dịch. Resume + retry chương lỗi, dịch lại từng chương. Sửa tay cả hai ô: bấm vào ô **Bản gốc** để dán/sửa nội dung gốc (đây cũng là chỗ nhập nội dung cho truyện tự viết), bấm vào ô **Bản dịch** để sửa bản dịch — cả hai tự lưu khi rời ô, dòng đầu là tên chương. Nháy đúp cột "Tên dịch" để đổi tên chương dịch. **Tìm & thay thế** hàng loạt (một chương hoặc cả truyện) — xem trước số khớp rồi mới áp dụng. Có nút **⏸ Tạm dừng** cạnh nút Dừng. |
 | **3. Xuất file** | Xuất bản dịch (hoặc bản gốc) ra **DOCX**, **Markdown**, **EPUB**. Tên file mặc định lấy theo tên truyện đã dịch. Cũng là nơi **sao lưu cả truyện lên OneDrive** (xem bên dưới). |
-| **4. Nghe audio** | Đọc bản dịch thành audio bằng **VieNeu-TTS** (chạy local, 14 giọng tiếng Việt × 3 phong cách). MP3/WAV từng chương, resume, tạo lại từng chương, double-click để nghe. Chọn **giọng** và **phong cách** riêng, xem trước văn bản engine sẽ đọc, và tinh chỉnh **tốc độ / âm lượng / khoảng lặng / độ biểu cảm / chất lượng** trong Cài đặt. Truyện tự viết bằng tiếng Việt thì chọn nguồn **Bản gốc** để đọc thẳng nội dung (không cần dịch). Có nút **⏸ Tạm dừng** cạnh nút Dừng. |
+| **4. Nghe audio** | Đọc bản dịch thành audio bằng **VieNeu-TTS** (chạy local, 20 giọng tiếng Việt). MP3/WAV từng chương, resume, tạo lại từng chương, double-click để nghe. Chọn **giọng** (mỗi giọng mang sẵn phong cách tự nhiên / kể chuyện / tin tức), xem trước văn bản engine sẽ đọc, và tinh chỉnh **tốc độ / âm lượng / khoảng lặng / độ biểu cảm / chất lượng** trong Cài đặt. Truyện tự viết bằng tiếng Việt thì chọn nguồn **Bản gốc** để đọc thẳng nội dung (không cần dịch). Có nút **⏸ Tạm dừng** cạnh nút Dừng. |
 
 ## Chạy nền ở thanh menu
 
@@ -170,8 +170,8 @@ uv pip install -e ".[tts]"    # cài vieneu (ONNX, không cần PyTorch)
 ```
 
 - Lần chạy đầu tự tải model **~330 MB** (build v3-Turbo) từ HuggingFace (chờ hơi lâu, có thông báo).
-- 14 giọng đọc có sẵn (Ngọc Linh, Minh Đức, Phạm Tuyên, Thái Sơn…); tốc độ ~4× real-time trên Apple Silicon (chương ~7 phút audio tạo trong ~2 phút).
-- **Giọng** (người đọc) và **phong cách** (Tự nhiên / Kể chuyện / Tin tức) chọn riêng — kết hợp giọng bất kỳ với phong cách bất kỳ.
+- 20 giọng đọc có sẵn (Ngọc Linh, Minh Đức, Phạm Tuyên, Thái Sơn, Quỳnh Anh, Kim Thanh…); tốc độ ~4× real-time trên Apple Silicon (chương ~7 phút audio tạo trong ~2 phút).
+- **Giọng** chọn ngay trên tab 4; mỗi giọng đã mang sẵn phong cách riêng, ghi ngay trong nhãn (ví dụ “Ngọc Linh — Nữ · Bắc · Phong cách kể chuyện”). Từ vieneu 3.3.0, phong cách nằm trong chính giọng mẫu chứ không còn là một tuỳ chọn tách rời, nên ô **Phong cách** cũ đã được bỏ — muốn giọng kể chuyện thì chọn giọng có nhãn “Phong cách đọc truyện” hoặc “kể chuyện”.
 - **Làm sạch ký tự đặc biệt** trước khi đọc (emoji, ký hiệu, chữ Hán sót, markdown) để audio mượt hơn — giữ nguyên tiếng Việt và dấu câu; có ô "bỏ thêm ký tự" tuỳ chọn. Nút **Xem trước văn bản** cho thấy đúng những gì engine sẽ đọc.
 - **Tinh chỉnh trong Cài đặt**: khoảng lặng giữa đoạn, tốc độ đọc (cần ffmpeg), âm lượng, độ biểu cảm (temperature), và chất lượng model (int8 nhanh / fp32 chất lượng cao hơn). Mặc định giữ nguyên như cũ.
 - MP3 và **đổi tốc độ** cần `ffmpeg` (`brew install ffmpeg` trên macOS, `winget install ffmpeg`
