@@ -31,8 +31,10 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
@@ -88,8 +90,16 @@ class VideoTab(QWidget):
         self._tags_worker: TagsWorker | None = None
         self._image_prompt_worker: CompletionWorker | None = None
         self._render_after_tags = False  # auto-generate tags, then start the render
-        # guards the "Đã tải lên" checkbox handler while the table is being repopulated
-        self._suppress_upload_toggle = False
+        # guards the "Trạng thái" / "Đã tải lên" checkbox handlers while the table is
+        # being repopulated
+        self._suppress_status_toggle = False
+        # Populated by `_locked_batch_windows` (batch mode only), consumed by
+        # `_part_number` / `_chapter_range_item` so they don't each re-scan the video
+        # directory — see `plan_locked_video_windows` for why part numbers can't be pure
+        # grid arithmetic once a window is locked.
+        self._locked_part_numbers: dict[int, int] = {}
+        self._locked_committed: dict[int, int] = {}
+        self._locked_manual: dict[int, int] = {}
         # a persistent, non-modal preview window so the color can be tuned live
         self._preview_dialog: QDialog | None = None
         self._preview_label: QLabel | None = None
@@ -325,8 +335,13 @@ class VideoTab(QWidget):
         )
         self.video_list.verticalHeader().setVisible(False)
         self.video_list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.video_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        # Row selection exists only to drive the split/merge context menu below — select
+        # one row to split it, two adjacent rows to merge them.
+        self.video_list.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.video_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.video_list.setAlternatingRowColors(True)
+        self.video_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.video_list.customContextMenuRequested.connect(self._on_video_list_context_menu)
         # A check-all indicator in the "Đã tải lên" header. Installed before the resize
         # modes below, since setting a header view resets them.
         self.upload_header = CheckableHeaderView(5, self.video_list)
@@ -350,8 +365,12 @@ class VideoTab(QWidget):
         # 75 parts, so a wheel gesture over the table never fights the page's scroll.
         self.video_list.setMinimumHeight(240)
 
-        # the "Đã tải lên" tick is a control, not just a status — see _on_upload_toggled
-        self.video_list.itemChanged.connect(self._on_upload_toggled)
+        # Both "Trạng thái" and "Đã tải lên" ticks are controls, not just status — see
+        # _on_status_toggled. A SINGLE dispatching slot, not one connection per column:
+        # either handler may rebuild the table (deleting every QTableWidgetItem) via
+        # _refresh_video_list, so a second independent slot touching the same now-stale
+        # `item` afterward would be a use-after-free.
+        self.video_list.itemChanged.connect(self._on_status_toggled)
 
         # refresh the list whenever the selection that defines the parts changes
         self.voice_combo.currentIndexChanged.connect(self._refresh_video_list)
@@ -580,9 +599,47 @@ class VideoTab(QWidget):
         batch = self.video_batch_size.value() if mode == "batch" else None
         if mode == "range" and start and end and start > end:
             return []
+        if mode == "batch":
+            return self._locked_batch_windows(voice, batch)
         return plan_merge_windows(
             self.project.chapters(), voice, mode, start=start, end=end, batch=batch
         )
+
+    def _locked_batch_windows(self, voice: str, batch: int) -> list:
+        """Batch windows, honoring already-"đã tạo" commits AND manual split/merge
+        boundaries — see `noveltrans.tts.video.plan_locked_video_windows`.
+
+        A part rendered (or manually marked "đã tạo") before translation caught up keeps
+        its original, shorter chapter span — new chapters start the *next* part instead of
+        silently growing an already-"đã tạo" one out from under an already-uploaded video.
+        A part the user split or merged by hand (see `noveltrans.video_windows`) keeps that
+        exact boundary too — manual entries win over an auto-discovered commit at the same
+        starting chapter, since the user's explicit choice is more authoritative than
+        whatever happens to be sitting on disk.
+
+        Caches each window's true part number (`_locked_part_numbers`), the raw commit map
+        (`_locked_committed`) and the manual map (`_locked_manual`) so `_part_number` /
+        `_chapter_range_item` / the split-merge context menu don't each re-derive them —
+        see `plan_locked_video_windows` for why a locked window's part number can deviate
+        from plain grid arithmetic.
+        """
+        from noveltrans.storage.project import slugify
+        from noveltrans.tts.video import (
+            discover_committed_video_windows,
+            plan_locked_video_windows,
+        )
+        from noveltrans.video_windows import read_manual_windows
+
+        slug = slugify(self.project.meta.translated_title or self.project.meta.title)
+        committed = discover_committed_video_windows(self.project.video_dir, slug)
+        manual = read_manual_windows(self.project.path)
+        plan = plan_locked_video_windows(
+            self.project.chapters(), voice, batch, {**committed, **manual}
+        )
+        self._locked_part_numbers = {w.first_num: part_num for part_num, w in plan}
+        self._locked_committed = committed
+        self._locked_manual = manual
+        return [w for _, w in plan]
 
     def _part_number(self, window) -> int:
         """This window's real part number, from its chapter range — see merge.part_number.
@@ -590,7 +647,17 @@ class VideoTab(QWidget):
         Never the row's index: the parts list, the covers and the upload rows are all built
         from the *current selection*, so numbering by position renamed a part the moment it
         was viewed or re-rendered on its own.
+
+        Batch mode looks this up from `_locked_part_numbers` (populated by the most recent
+        `_locked_batch_windows` call — always freshly recomputed before this is consulted,
+        since every caller of `_part_number` first calls `_windows_for_current_selection`
+        in the same method). Range/whole-novel mode has no batch grid to lock, so it keeps
+        the plain arithmetic.
         """
+        if self.video_mode.currentData() == "batch":
+            cached = self._locked_part_numbers.get(window.first_num)
+            if cached is not None:
+                return cached
         from noveltrans.tts.merge import part_number
 
         return part_number(window.first_num, self.video_batch_size.value())
@@ -626,6 +693,180 @@ class VideoTab(QWidget):
         out = self._part_output_path(window, whole_novel=whole_novel)
         return out.parent / (out.stem + ext)
 
+    # ------------------------------------------------------------ split / merge parts
+
+    def _on_video_list_context_menu(self, pos) -> None:
+        """Right-click 1+ part rows: render just the selection, split one row, merge 2
+        adjacent rows, or bulk-set "Trạng thái" / "Đã tải lên" for every selected row.
+
+        Split/merge are batch-mode only — "range"/"all" has no fixed grid of parts to
+        split a boundary out of or merge a boundary away (and never has more than one row
+        to select from in the first place). "Tạo video" and the bulk status actions apply
+        in any mode, same as each row's own button/checkbox.
+        """
+        row = self.video_list.rowAt(pos.y())
+        if row < 0 or self.project is None:
+            return
+        selection = self.video_list.selectionModel()
+        selected_rows = sorted({idx.row() for idx in selection.selectedRows()})
+        # Right-clicking outside the current multi-selection starts a fresh single one —
+        # the usual behavior, and what lets a lone right-click always mean "this row".
+        if row not in selected_rows:
+            self.video_list.selectRow(row)
+            selected_rows = [row]
+
+        windows = self._windows_for_current_selection()
+        if not selected_rows or any(r >= len(windows) for r in selected_rows):
+            return
+        selected_windows = [windows[r] for r in selected_rows]
+        mode = self.video_mode.currentData()
+        whole_novel = mode == "all" and len(windows) == 1
+        paths = [self._part_output_path(w, whole_novel=whole_novel) for w in selected_windows]
+
+        menu = QMenu(self)
+        render_action = menu.addAction("Tạo video")
+        render_action.triggered.connect(lambda: self._render_selected_parts(selected_windows))
+        menu.addSeparator()
+        if mode == "batch" and len(selected_windows) == 1:
+            window = selected_windows[0]
+            action = menu.addAction("Tách phần…")
+            action.setEnabled(len(window.chapters) >= 2)
+            action.triggered.connect(lambda: self._split_part(window))
+            menu.addSeparator()
+        elif mode == "batch" and len(selected_windows) == 2:
+            window_a, window_b = selected_windows
+            adjacent = window_a.last_num + 1 == window_b.first_num
+            action = menu.addAction("Gộp 2 phần liền kề")
+            action.setEnabled(adjacent)
+            if not adjacent:
+                action.setToolTip("Chỉ gộp được 2 phần liền kề nhau (không có khoảng trống).")
+            action.triggered.connect(lambda: self._merge_parts(window_a, window_b))
+            menu.addSeparator()
+
+        created_on = menu.addAction("Đánh dấu \"Đã tạo\"")
+        created_on.triggered.connect(lambda: self._bulk_set_created(paths, True))
+        created_off = menu.addAction("Đánh dấu \"Chưa tạo\"")
+        created_off.triggered.connect(lambda: self._bulk_set_created(paths, False))
+        menu.addSeparator()
+        upload_on = menu.addAction("Đánh dấu \"Đã tải lên\"")
+        upload_on.triggered.connect(lambda: self._bulk_set_uploaded(paths, True))
+        upload_off = menu.addAction("Đánh dấu \"Chưa tải lên\"")
+        upload_off.triggered.connect(lambda: self._bulk_set_uploaded(paths, False))
+
+        menu.exec(self.video_list.viewport().mapToGlobal(pos))
+
+    def _split_part(self, window) -> None:
+        """Split one part into two, the last N chapters becoming a new part.
+
+        The boundary is remembered for this novel (`noveltrans.video_windows`) — every
+        future "Tạo video" (and even "Tạo lại tất cả video") keeps honoring it, since a
+        split typically exists to stay under YouTube's 12h cap and that constraint doesn't
+        go away.
+        """
+        total = len(window.chapters)
+        if total < 2:
+            QMessageBox.information(
+                self, "Tách phần", "Phần này chỉ có 1 chương — không thể tách."
+            )
+            return
+        default = min(5, total - 1)
+        tail, ok = QInputDialog.getInt(
+            self, "Tách phần",
+            f"Phần này có {total} chương (chương {window.first_num}–{window.last_num}).\n"
+            "Số chương CUỐI muốn cắt ra thành phần mới:",
+            default, 1, total - 1,
+        )
+        if not ok:
+            return
+
+        if not self._confirm_restructure(
+            [window], title="Tách phần",
+            action_desc=f"tách thành 2 phần (chương {window.first_num}–"
+            f"{window.last_num - tail} và {window.last_num - tail + 1}–{window.last_num})",
+        ):
+            return
+
+        from noveltrans.video_windows import split_window
+
+        split_window(self.project.path, window.first_num, window.last_num, tail)
+        self._delete_rendered_part(window)
+        self._refresh_video_list()
+        self.status_label.setText(
+            f"Đã tách phần chương {window.first_num}–{window.last_num} thành 2 phần."
+        )
+
+    def _merge_parts(self, window_a, window_b) -> None:
+        """Merge two adjacent parts into one — the inverse of `_split_part`.
+
+        Also how an earlier split gets undone: merging its two halves back together.
+        """
+        if not self._confirm_restructure(
+            [window_a, window_b], title="Gộp phần",
+            action_desc=f"gộp thành 1 phần (chương {window_a.first_num}–{window_b.last_num})",
+        ):
+            return
+
+        from noveltrans.video_windows import merge_windows
+
+        merge_windows(
+            self.project.path,
+            window_a.first_num, window_a.last_num,
+            window_b.first_num, window_b.last_num,
+        )
+        self._delete_rendered_part(window_a)
+        self._delete_rendered_part(window_b)
+        self._refresh_video_list()
+        self.status_label.setText(
+            f"Đã gộp chương {window_a.first_num}–{window_a.last_num} và "
+            f"{window_b.first_num}–{window_b.last_num} thành 1 phần."
+        )
+
+    def _confirm_restructure(self, windows: list, *, title: str, action_desc: str) -> bool:
+        """One confirmation covering every affected part, warning louder if any is
+        already uploaded — splitting/merging changes each part's file name, so an
+        already-published video on YouTube does NOT update; the old upload just orphans."""
+        from noveltrans.youtube_upload import is_published
+
+        rendered = [
+            w for w in windows
+            if self._part_output_path(w, whole_novel=False).is_file()
+        ]
+        uploaded = [
+            w for w in windows
+            if is_published(self._part_output_path(w, whole_novel=False))
+        ]
+        message = f"Sẽ {action_desc}."
+        if rendered:
+            message += (
+                f"\n\n{len(rendered)} phần trong đó đã có video — file cũ sẽ bị XOÁ, "
+                "cần tạo lại video cho (các) phần mới."
+            )
+        if uploaded:
+            message += (
+                f"\n\n⚠️ {len(uploaded)} phần đã tải lên YouTube. Video cũ trên kênh sẽ "
+                "KHÔNG tự cập nhật theo ranh giới mới — bạn cần tự xử lý (xoá/thay) trên "
+                "YouTube nếu muốn."
+            )
+        message += "\n\nTiếp tục?"
+        return QMessageBox.question(self, title, message) == QMessageBox.StandardButton.Yes
+
+    def _delete_rendered_part(self, window, *, whole_novel: bool = False) -> None:
+        """Remove a part's rendered file + every sidecar, after its boundary changed.
+
+        The whole per-part subfolder is removed in one go (video + title/description/tags/
+        thumbnail/upload/created sidecars all live there — see feature 026). A legacy flat
+        render (predates the per-folder layout) has no dedicated folder to remove; only its
+        .mp4 is deleted and its sidecars are left, matching how legacy renders are already
+        treated as a read-only compatibility case elsewhere (`discover_committed_video_windows`).
+        """
+        import shutil
+
+        out = self._part_output_path(window, whole_novel=whole_novel)
+        if out.parent.name == out.stem and out.parent.is_dir():
+            shutil.rmtree(out.parent)
+        elif out.is_file():
+            out.unlink()
+
     def _part_title(self, part_num) -> str:
         from noveltrans.tts.video import build_upload_title
 
@@ -643,6 +884,40 @@ class VideoTab(QWidget):
     # YouTube caps a single video at 12 hours.
     _YOUTUBE_MAX_SECONDS = 12 * 3600
 
+    def _chapter_range_item(self, window, mode: str) -> QTableWidgetItem:
+        """The "Chương" cell — flagged when this batch window is locked short.
+
+        A window counts as locked once `_locked_batch_windows` found it either already
+        "đã tạo" (rendered, or manually ticked) on disk, or manually split/merged by hand
+        — see `noveltrans.tts.video.plan_locked_video_windows`. If it also has fewer
+        chapters than the configured batch size, it's frozen there permanently: new
+        chapters will never grow it, they start the next part instead. Worth calling out,
+        since without this a stuck-at-8-of-10 part looks identical to one that's simply
+        still waiting for its 9th and 10th chapters to get audio.
+        """
+        text = f"chương {window.first_num}–{window.last_num} ({len(window.chapters)} chương)"
+        item = QTableWidgetItem(text)
+        batch_size = self.video_batch_size.value()
+        manual = window.first_num in self._locked_manual
+        locked = (
+            mode == "batch"
+            and (manual or window.first_num in self._locked_committed)
+            and len(window.chapters) < batch_size
+        )
+        if locked:
+            item.setForeground(QColor("#e5c07b"))
+            item.setText("⚠️ " + text)
+            reason = (
+                "bị khoá ở mức này vì đã tách/gộp thủ công."
+                if manual
+                else "bị khoá ở mức này vì đã tạo trước khi đủ chương."
+            )
+            item.setToolTip(
+                f"Phần này có {len(window.chapters)}/{batch_size} chương — {reason} "
+                "Chương mới sẽ vào phần kế tiếp, không tự thêm vào đây."
+            )
+        return item
+
     def _duration_item(self, window) -> QTableWidgetItem:
         """A table item with the part's total audio duration, flagged red past YouTube's 12h."""
         seconds = sum(c.audio_seconds for c in window.chapters)
@@ -659,11 +934,11 @@ class VideoTab(QWidget):
             return
         # Populating the table sets check states, which would re-enter the toggle handler
         # and pop a confirmation for a change the user never made.
-        self._suppress_upload_toggle = True
+        self._suppress_status_toggle = True
         try:
             self._rebuild_video_rows()
         finally:
-            self._suppress_upload_toggle = False
+            self._suppress_status_toggle = False
         self._sync_upload_header()
 
     def _upload_rows(self) -> list:
@@ -697,10 +972,18 @@ class VideoTab(QWidget):
         self.upload_header.set_state(state)
 
     def _on_upload_header_toggled(self, check_all: bool) -> None:
-        """Mark every listed part uploaded / not-uploaded, from the header indicator.
+        """Mark every listed part uploaded / not-uploaded, from the header indicator."""
+        if not self._upload_rows():
+            QMessageBox.information(self, "Đã tải lên", "Chưa có phần nào đã tạo video.")
+            return
+        self._bulk_set_uploaded([path for _row, path in self._upload_rows()], check_all)
 
-        Toggling one row is consequential; toggling thirty is more so, so this confirms
-        once with the count and only touches rows that would actually change.
+    def _bulk_set_uploaded(self, paths: list, wanted: bool) -> None:
+        """Mark every given part's video uploaded / not-uploaded — the header "check all"
+        indicator and the right-click multi-select menu both funnel through here.
+
+        Toggling one row is consequential; toggling many is more so, so this confirms once
+        with the count and only touches paths that would actually change.
         """
         from noveltrans.youtube_upload import (
             clear_upload_state,
@@ -708,20 +991,14 @@ class VideoTab(QWidget):
             mark_uploaded_by_hand,
         )
 
-        targets = [
-            path for _row, path in self._upload_rows() if is_published(path) != check_all
-        ]
+        targets = [path for path in paths if is_published(path) != wanted]
         if not targets:
             QMessageBox.information(
-                self,
-                "Đã tải lên",
-                "Tất cả các phần đã ở đúng trạng thái rồi."
-                if self._upload_rows()
-                else "Chưa có phần nào đã tạo video.",
+                self, "Đã tải lên", "Tất cả các phần đã chọn đã ở đúng trạng thái rồi."
             )
             return
 
-        if check_all:
+        if wanted:
             message = (
                 f"Đánh dấu {len(targets)} phần là ĐÃ TẢI LÊN?\n\n"
                 "Dùng khi bạn đã tự tải chúng lên YouTube. Ứng dụng sẽ bỏ qua các phần "
@@ -740,15 +1017,63 @@ class VideoTab(QWidget):
             return
 
         for path in targets:
-            if check_all:
+            if wanted:
                 mark_uploaded_by_hand(path)
             else:
                 clear_upload_state(path)
         self._refresh_video_list()
         self.status_label.setText(
             f"Đã đánh dấu {len(targets)} phần là đã tải lên."
-            if check_all
+            if wanted
             else f"Đã bỏ đánh dấu {len(targets)} phần — có thể tải lên lại."
+        )
+
+    def _bulk_set_created(self, paths: list, wanted: bool) -> None:
+        """Mark every given part's "Trạng thái" tick đã tạo / chưa tạo — the right-click
+        multi-select menu's version of ticking each row's checkbox one at a time.
+
+        Mirrors `_on_created_toggled`'s messaging, but confirms once for the whole
+        selection and only touches paths that would actually change.
+        """
+        from noveltrans.video_state import created_override, set_created_override
+
+        targets = []
+        for path in paths:
+            exists = path.is_file()
+            override = created_override(path)
+            current = exists if override is None else override
+            if current != wanted:
+                targets.append((path, exists))
+        if not targets:
+            QMessageBox.information(
+                self, "Trạng thái", "Tất cả các phần đã chọn đã ở đúng trạng thái rồi."
+            )
+            return
+
+        if wanted:
+            message = (
+                f"Đánh dấu {len(targets)} phần là ĐÃ TẠO?\n\n"
+                "Dùng khi các phần này được quản lý ở nơi khác. Ứng dụng sẽ không tự sửa "
+                "lại trạng thái cho tới khi bạn tạo video hoặc bỏ tick."
+            )
+        else:
+            message = (
+                f"Bỏ đánh dấu {len(targets)} phần đang ĐÃ TẠO?\n\n"
+                "Dùng khi muốn coi các phần này là chưa hoàn tất (ví dụ cần tạo lại). "
+                "File .mp4 (nếu có) sẽ KHÔNG bị xoá."
+            )
+        if QMessageBox.question(self, "Trạng thái", message) != (
+            QMessageBox.StandardButton.Yes
+        ):
+            return
+
+        for path, exists in targets:
+            set_created_override(path, wanted, file_exists=exists)
+        self._refresh_video_list()
+        self.status_label.setText(
+            f"Đã đánh dấu {len(targets)} phần là đã tạo."
+            if wanted
+            else f"Đã bỏ đánh dấu {len(targets)} phần."
         )
 
     def _rebuild_video_rows(self) -> None:
@@ -765,22 +1090,116 @@ class VideoTab(QWidget):
             exists = self._part_output_path(window, whole_novel=whole_novel).is_file()
             label = "Toàn bộ" if whole_novel else f"Phần {part_num}"
             self.video_list.setItem(i, 0, QTableWidgetItem(label))
-            self.video_list.setItem(
-                i, 1,
-                QTableWidgetItem(
-                    f"chương {window.first_num}–{window.last_num} "
-                    f"({len(window.chapters)} chương)"
-                ),
-            )
+            self.video_list.setItem(i, 1, self._chapter_range_item(window, mode))
             self.video_list.setItem(i, 2, self._duration_item(window))
             self.video_list.setItem(i, 3, QTableWidgetItem(self._part_title(part_num)))
-            self.video_list.setItem(
-                i, 4, QTableWidgetItem("✅ Đã tạo" if exists else "⬜ Chưa tạo")
-            )
+            self.video_list.setItem(i, 4, self._created_item(window, whole_novel))
             self.video_list.setItem(i, 5, self._upload_item(window, whole_novel))
             self.video_list.setCellWidget(
                 i, 6, self._build_row_actions(window, part_num, whole_novel, exists)
             )
+
+    def _created_item(self, window, whole_novel: bool) -> QTableWidgetItem:
+        """The "Trạng thái" cell: normally just the .mp4's existence, but tickable.
+
+        The tick lets the user override the automatic status — mark a part "đã tạo" that
+        was rendered/managed outside this app, or flag one that exists on disk as not
+        actually finished. The override only sticks while it disagrees with disk; the
+        moment it agrees again (a real render finished, or the file got deleted) it's
+        cleared automatically, so it can never permanently fight reality.
+        """
+        from noveltrans.video_state import created_override
+
+        path = self._part_output_path(window, whole_novel=whole_novel)
+        exists = path.is_file()
+        override = created_override(path)
+        effective = exists if override is None else override
+
+        item = QTableWidgetItem("✅ Đã tạo" if effective else "⬜ Chưa tạo")
+        if override is not None and override != exists:
+            item.setToolTip("Đánh dấu thủ công — không khớp với file trên đĩa.")
+        else:
+            item.setToolTip("Tick để đánh dấu thủ công phần này là đã/chưa tạo.")
+
+        item.setFlags(
+            (item.flags() | Qt.ItemFlag.ItemIsUserCheckable) & ~Qt.ItemFlag.ItemIsEditable
+        )
+        item.setCheckState(
+            Qt.CheckState.Checked if effective else Qt.CheckState.Unchecked
+        )
+        # The path travels with the cell so the handler never has to re-derive which part
+        # a row is — the row→window mapping shifts whenever the batch size changes.
+        item.setData(Qt.ItemDataRole.UserRole, str(path))
+        return item
+
+    def _on_status_toggled(self, item: QTableWidgetItem) -> None:
+        """Dispatch a tick on "Trạng thái" or "Đã tải lên" to its handler.
+
+        A single slot for both checkable columns: either handler below may rebuild the
+        whole table (deleting every `QTableWidgetItem`) via `_refresh_video_list`, so two
+        independent slots connected to the same `itemChanged` signal would leave the
+        second one running against an already-deleted `item` — a crash, not just a bug.
+        """
+        if self._suppress_status_toggle:
+            return
+        column = item.column()
+        if column == 4:
+            self._on_created_toggled(item)
+        elif column == 5:
+            self._on_upload_toggled(item)
+
+    def _on_created_toggled(self, item: QTableWidgetItem) -> None:
+        """Handle the user ticking / unticking "Trạng thái" on a row.
+
+        Both directions are consequential enough to confirm when they'd disagree with
+        disk — ticking a part that has no file hides it from "còn thiếu" bookkeeping,
+        unticking one that has a file makes a finished part look unfinished. Reverting to
+        agreement with disk needs no confirmation: it's just clearing the override.
+        """
+        from pathlib import Path
+
+        from noveltrans.video_state import created_override, set_created_override
+
+        path = Path(item.data(Qt.ItemDataRole.UserRole) or "")
+        if not path.name:
+            return
+        exists = path.is_file()
+        override = created_override(path)
+        current = exists if override is None else override
+        wanted = item.checkState() == Qt.CheckState.Checked
+        if wanted == current:
+            return  # nothing actually changed
+
+        if wanted == exists:
+            # Reverting to what disk already says — no confirmation, just clear it.
+            set_created_override(path, wanted, file_exists=exists)
+            self._refresh_video_list()
+            self.status_label.setText("Đã bỏ đánh dấu thủ công — theo trạng thái file.")
+            return
+
+        if wanted:
+            message = (
+                "Đánh dấu phần này là ĐÃ TẠO dù chưa có file video?\n\n"
+                "Dùng khi bạn tự quản lý video này ở nơi khác. Ứng dụng sẽ không tự sửa "
+                "lại trạng thái này cho tới khi bạn tạo video hoặc bỏ tick."
+            )
+        else:
+            message = (
+                "Bỏ đánh dấu ĐÃ TẠO dù file video vẫn còn trên đĩa?\n\n"
+                "Chỉ làm vậy nếu bạn muốn coi phần này là chưa hoàn tất (ví dụ cần tạo "
+                "lại). File .mp4 sẽ KHÔNG bị xoá."
+            )
+        if QMessageBox.question(self, "Trạng thái", message) != (
+            QMessageBox.StandardButton.Yes
+        ):
+            self._set_check_silently(item, current)
+            return
+
+        set_created_override(path, wanted, file_exists=exists)
+        self._refresh_video_list()
+        self.status_label.setText(
+            "Đã đánh dấu thủ công là đã tạo." if wanted else "Đã bỏ đánh dấu là đã tạo."
+        )
 
     def _upload_item(self, window, whole_novel: bool) -> QTableWidgetItem:
         """The "Đã tải lên" cell: a tick the user can toggle, plus a short status.
@@ -857,8 +1276,6 @@ class VideoTab(QWidget):
             read_upload_state,
         )
 
-        if item.column() != 5 or self._suppress_upload_toggle:
-            return
         path = Path(item.data(Qt.ItemDataRole.UserRole) or "")
         if not path.name:
             return
@@ -907,14 +1324,14 @@ class VideoTab(QWidget):
         )
 
     def _set_check_silently(self, item: QTableWidgetItem, checked: bool) -> None:
-        """Set a check state without re-entering `_on_upload_toggled`."""
-        self._suppress_upload_toggle = True
+        """Set a check state without re-entering `_on_upload_toggled`/`_on_created_toggled`."""
+        self._suppress_status_toggle = True
         try:
             item.setCheckState(
                 Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
             )
         finally:
-            self._suppress_upload_toggle = False
+            self._suppress_status_toggle = False
 
     def _build_row_actions(self, window, part_num, whole_novel, exists):
         """Per-row actions: (re)render, copyable detail, open thumbnail, upload."""
@@ -940,9 +1357,17 @@ class VideoTab(QWidget):
         # be retried, otherwise "Tải lên". Un-marking a *published* part is the tick in
         # the "Đã tải lên" column rather than a button here — the checkbox already shows
         # that state, so toggling it is the obvious way to change it.
+        from noveltrans.video_state import created_override
         from noveltrans.youtube_upload import is_published, needs_attention
 
         path = self._part_output_path(window, whole_novel=whole_novel)
+        override = created_override(path)
+        if override is not None and override != exists:
+            make.setToolTip(
+                "Đang đánh dấu thủ công là đã tạo — bấm để tạo file video thật."
+                if override
+                else "Đang đánh dấu thủ công là chưa tạo dù file đã có trên đĩa."
+            )
         if exists and needs_attention(path):
             upload = QPushButton("Đặt lại")
             upload.setToolTip(
@@ -2003,7 +2428,6 @@ class VideoTab(QWidget):
     def _start_video(self) -> None:
         from pathlib import Path
 
-        from noveltrans.tts.merge import plan_merge_windows
         from noveltrans.tts.video import video_preset
 
         if self.project is None:
@@ -2022,11 +2446,11 @@ class VideoTab(QWidget):
         if mode == "range" and start > end:
             QMessageBox.warning(self, "Phạm vi sai", "Chương bắt đầu phải ≤ chương kết thúc.")
             return
-        batch = self.video_batch_size.value() if mode == "batch" else None
 
-        windows = plan_merge_windows(
-            self.project.chapters(), voice, mode, start=start, end=end, batch=batch
-        )
+        # Batch mode: the same locked/"đã tạo"-aware windows the table shows — so a part
+        # already committed with fewer than a full batch of chapters isn't retroactively
+        # grown here, and the render below (also `skip_existing=True`) matches exactly.
+        windows = self._windows_for_current_selection()
         if not windows:
             QMessageBox.information(
                 self, "Chưa có audio",
@@ -2034,11 +2458,14 @@ class VideoTab(QWidget):
             )
             return
 
-        # skip parts whose .mp4 already exists — only render the missing ones
+        # skip parts already "đã tạo" — either really rendered, or manually ticked so —
+        # matching VideoWorker's own skip_existing check so this count/estimate is accurate
+        from noveltrans.video_state import effective_created
+
         whole = len(windows) == 1 and mode == "all"
         pending = [
             w for w in windows
-            if not self._part_output_path(w, whole_novel=whole).is_file()
+            if not effective_created(self._part_output_path(w, whole_novel=whole))
         ]
         existing = len(windows) - len(pending)
         if not pending:
@@ -2158,13 +2585,84 @@ class VideoTab(QWidget):
                 self, "Đang bận", "Đang tạo một video khác — hãy đợi hoặc bấm “Dừng”."
             )
             return
+        # A range-mode worker has no batch grid to derive a part number from — pass the
+        # tab's own answer explicitly, or a re-render titles/thumbnails the video "Phần 1"
+        # (`merge.part_number` falls back to 1 with no batch size) regardless of which row
+        # was actually clicked. This is what makes a locked window's re-render keep its
+        # true number too, since that number can no longer be grid arithmetic either.
         self._launch_video(
-            mode="range", start=window.first_num, end=window.last_num, skip_existing=False
+            mode="range", start=window.first_num, end=window.last_num, skip_existing=False,
+            part_num=self._part_number(window),
+        )
+
+    def _render_selected_parts(self, windows: list) -> None:
+        """Right-click multi-select "Tạo video": render exactly the selected parts.
+
+        Unlike `_render_one` (always redo, one part), this fills in what's missing among
+        the selection — parts already "đã tạo" are skipped, same as the global "Tạo video"
+        button — but only within the rows the user actually picked, not the whole current
+        range/batch. Useful for rendering a handful of specific pending parts without
+        waiting on everything else that's also pending.
+        """
+        from pathlib import Path
+
+        from noveltrans.tts.video import video_preset
+        from noveltrans.video_state import effective_created
+
+        if self.project is None:
+            return
+        if self._video_worker is not None and self._video_worker.isRunning():
+            QMessageBox.information(
+                self, "Đang bận", "Đang tạo một video khác — hãy đợi hoặc bấm “Dừng”."
+            )
+            return
+        image = self.video_image_edit.text().strip()
+        if not image or not Path(image).is_file():
+            QMessageBox.warning(self, "Chưa chọn ảnh", "Hãy chọn một ảnh nền hợp lệ cho video.")
+            return
+
+        pending = [
+            w for w in windows
+            if not effective_created(self._part_output_path(w, whole_novel=False))
+        ]
+        existing = len(windows) - len(pending)
+        if not pending:
+            QMessageBox.information(
+                self, "Đã tạo hết",
+                "Tất cả các phần đã chọn đã có video. Dùng “Tạo lại” ở từng dòng nếu "
+                "muốn làm lại.",
+            )
+            return
+
+        preset = video_preset(self.video_quality.currentData())
+        n_chapters = sum(len(w.chapters) for w in pending)
+        total_secs = sum(c.audio_seconds for w in pending for c in w.chapters)
+        hours = total_secs / 3600
+        render_hours = hours / preset["speed"]
+        est = f"~{render_hours * 60:.0f} phút" if render_hours < 1 else f"~{render_hours:.1f} giờ"
+        skip_note = f" (bỏ qua {existing} phần đã có)" if existing else ""
+        answer = QMessageBox.question(
+            self, "Tạo video",
+            f"Sẽ tạo {len(pending)} phần đã chọn{skip_note} từ {n_chapters} chương, "
+            f"tổng ~{hours:.1f} giờ audio.\n\n"
+            f"Chất lượng: {self.video_quality.currentText()} "
+            f"({preset['width']}×{preset['height']}).\n"
+            f"Ước tính thời gian render: {est} (chưa tính máy nóng/tải khác).\n\n"
+            f"Tiếp tục?",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        part_numbers = {w.first_num: self._part_number(w) for w in pending}
+        self._launch_video(
+            mode="batch", skip_existing=True,
+            explicit_windows=pending, explicit_part_numbers=part_numbers,
         )
 
     def _launch_video(
         self, *, mode: str | None = None, start=None, end=None, batch=None,
-        skip_existing: bool = False,
+        skip_existing: bool = False, part_num: int | None = None,
+        explicit_windows: list | None = None, explicit_part_numbers: dict | None = None,
     ) -> None:
         from pathlib import Path
 
@@ -2212,7 +2710,8 @@ class VideoTab(QWidget):
             thumb_tagline_scale=self._video_settings["video_thumbnail_tagline_scale"],
             thumb_title_align=self._video_settings["video_thumbnail_title_align"],
             burn_subtitles=self.burn_subs_check.isChecked(),
-            bg_color=self.bg_color, skip_existing=skip_existing,
+            bg_color=self.bg_color, skip_existing=skip_existing, part_num=part_num,
+            explicit_windows=explicit_windows, explicit_part_numbers=explicit_part_numbers,
             credit=self.credit_edit.text().strip() or "Fox Novel",
             tagline=self.tagline_edit.text().strip(),
             thumb_image_path=self.thumb_image_edit.text().strip(),
@@ -2236,7 +2735,14 @@ class VideoTab(QWidget):
             self.status_label.setText(f"🎬 Đang tạo video ({done + 1}/{total}): {name}")
 
     def _on_video_file_done(self, path: str) -> None:
+        from pathlib import Path
+
+        from noveltrans.video_state import set_created_override
+
         self.progress.setValue(self.progress.value() + 1)
+        # A real render just produced this exact file — any manual override (in either
+        # direction) has nothing left to say, so let the automatic status take back over.
+        set_created_override(Path(path), True, file_exists=True)
 
     def _reset_video_ui(self) -> None:
         self.video_button.setEnabled(True)

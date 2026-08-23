@@ -494,7 +494,818 @@ class TestVideoPartsList:
             "start": windows[1].first_num,
             "end": windows[1].last_num,
             "skip_existing": False,
+            # the explicit part number a range-mode worker has no batch grid to derive on
+            # its own — windows[1] is chapters 3-4, part 2 (batch size 2)
+            "part_num": tab._part_number(windows[1]),
         }
+        tab.shutdown()
+
+
+class TestLockedBatchWindows:
+    """Feature 058 follow-up: a batch part committed with fewer than a full batch of
+    chapters must stay that size in the table too — new chapters get their own part."""
+
+    def _project(self, library_dir, sample_meta, n_chapters):
+        from noveltrans.models import ChapterRef
+
+        refs = [
+            ChapterRef(index=i, title=f"第{i + 1}章", url=f"https://x/{i + 1}")
+            for i in range(n_chapters)
+        ]
+        project = NovelProject.create(library_dir, sample_meta, refs)
+        for i in range(n_chapters):
+            project.save_audio(i, f"exports/audio/{i}.mp3", "V", 60.0)
+        path = project.path
+        project.close()
+        return path
+
+    def _tab_on_project(self, tmp_path, path, batch=2):
+        tab = VideoTab(_config(tmp_path))
+        tab.voice_combo.addItem("V", "V")
+        tab.voice_combo.setCurrentIndex(tab.voice_combo.findData("V"))
+        tab.video_mode.setCurrentIndex(tab.video_mode.findData("batch"))
+        tab.video_batch_size.setValue(batch)
+        tab._on_project_selected(str(path))
+        return tab
+
+    def _add_chapters(self, path, start, n):
+        from noveltrans.models import ChapterRef
+        from noveltrans.storage import NovelProject
+
+        project = NovelProject.open(path)
+        existing = project.chapters()
+        new_refs = [
+            ChapterRef(index=i, title=f"第{i + 1}章", url=f"https://x/{i + 1}")
+            for i in range(start, start + n)
+        ]
+        project.replace_toc(
+            [ChapterRef(index=c.index, title=c.title, url=c.url) for c in existing]
+            + new_refs
+        )
+        for i in range(start, start + n):
+            project.save_audio(i, f"exports/audio/{i}.mp3", "V", 60.0)
+        project.close()
+
+    def test_an_uncommitted_short_tail_is_not_flagged(
+        self, qapp, tmp_path, library_dir, sample_meta
+    ):
+        """3 chapters, batch 2 → part 2 (chương 3) is short but simply waiting for more
+        chapters — nothing has locked it yet, so no warning."""
+        path = self._project(library_dir, sample_meta, 3)
+        tab = self._tab_on_project(tmp_path, path)
+        assert tab.video_list.rowCount() == 2
+        assert "⚠️" not in tab.video_list.item(1, 1).text()
+        tab.shutdown()
+
+    def test_a_committed_short_part_is_flagged(
+        self, qapp, tmp_path, library_dir, sample_meta
+    ):
+        from noveltrans.video_state import set_created_override
+
+        path = self._project(library_dir, sample_meta, 3)
+        tab = self._tab_on_project(tmp_path, path)
+        window2 = tab._windows_for_current_selection()[1]
+        out2 = tab._part_output_path(window2, whole_novel=False)
+        set_created_override(out2, True, file_exists=False)
+        tab._refresh_video_list()
+
+        item = tab.video_list.item(1, 1)
+        assert "⚠️" in item.text()
+        assert "1/2" in item.toolTip()
+        tab.shutdown()
+
+    def test_new_chapters_get_their_own_part_not_absorbed_into_the_locked_one(
+        self, qapp, tmp_path, library_dir, sample_meta
+    ):
+        from noveltrans.video_state import set_created_override
+
+        path = self._project(library_dir, sample_meta, 3)
+        tab = self._tab_on_project(tmp_path, path)
+        window2 = tab._windows_for_current_selection()[1]
+        out2 = tab._part_output_path(window2, whole_novel=False)
+        set_created_override(out2, True, file_exists=False)  # part 2 (chương 3) committed
+
+        self._add_chapters(path, 3, 1)  # chương 4 arrives
+        tab._on_project_selected(str(path))  # reload to pick up the new chapter
+
+        windows = tab._windows_for_current_selection()
+        assert len(windows) == 3  # part 1 (1-2), part 2 (3, locked), part 3 (4)
+        assert (windows[1].first_num, windows[1].last_num) == (3, 3)
+        assert (windows[2].first_num, windows[2].last_num) == (4, 4)
+        assert tab._part_number(windows[1]) == 2
+        assert tab._part_number(windows[2]) == 3
+        assert "⚠️" in tab.video_list.item(1, 1).text()  # still locked/flagged
+        assert "⚠️" not in tab.video_list.item(2, 1).text()  # the new part is not
+        tab.shutdown()
+
+
+class TestSplitMergeParts:
+    """Feature 058 follow-up: right-click a part to split it (e.g. to stay under
+    YouTube's 12h cap) or merge two adjacent parts back together."""
+
+    def _project(self, library_dir, sample_meta, n_chapters):
+        from noveltrans.models import ChapterRef
+
+        refs = [
+            ChapterRef(index=i, title=f"第{i + 1}章", url=f"https://x/{i + 1}")
+            for i in range(n_chapters)
+        ]
+        project = NovelProject.create(library_dir, sample_meta, refs)
+        for i in range(n_chapters):
+            project.save_audio(i, f"exports/audio/{i}.mp3", "V", 60.0)
+        path = project.path
+        project.close()
+        return path
+
+    def _tab_on_project(self, tmp_path, path, batch=10):
+        tab = VideoTab(_config(tmp_path))
+        tab.voice_combo.addItem("V", "V")
+        tab.voice_combo.setCurrentIndex(tab.voice_combo.findData("V"))
+        tab.video_mode.setCurrentIndex(tab.video_mode.findData("batch"))
+        tab.video_batch_size.setValue(batch)
+        tab._on_project_selected(str(path))
+        return tab
+
+    def _yes(self, monkeypatch):
+        from PySide6.QtWidgets import QMessageBox
+
+        asked = []
+        monkeypatch.setattr(
+            QMessageBox, "question",
+            lambda *a, **k: (asked.append(a), QMessageBox.StandardButton.Yes)[1],
+        )
+        return asked
+
+    def _row_pos(self, tab, row):
+        from PySide6.QtCore import QPoint
+
+        return QPoint(10, tab.video_list.rowViewportPosition(row) + 5)
+
+    class _FakeAction:
+        def __init__(self, text):
+            self.text = text
+            self.enabled = True
+            self.tooltip = ""
+            self._callback = None
+
+        def setEnabled(self, value):
+            self.enabled = value
+
+        def setToolTip(self, text):
+            self.tooltip = text
+
+        @property
+        def triggered(self):
+            return self
+
+        def connect(self, callback):
+            self._callback = callback
+
+        def trigger(self):
+            self._callback()
+
+    class _FakeMenu:
+        instances: list = []
+
+        def __init__(self, parent=None):
+            self.actions = []
+            TestSplitMergeParts._FakeMenu.instances.append(self)
+
+        def addAction(self, text):
+            action = TestSplitMergeParts._FakeAction(text)
+            self.actions.append(action)
+            return action
+
+        def addSeparator(self):
+            pass
+
+        def exec(self, pos):
+            pass
+
+    def _menu_for(self, tab, monkeypatch, row):
+        self._FakeMenu.instances.clear()
+        monkeypatch.setattr("noveltrans.gui.tab_video.QMenu", self._FakeMenu)
+        tab._on_video_list_context_menu(self._row_pos(tab, row))
+        return self._FakeMenu.instances[-1] if self._FakeMenu.instances else None
+
+    def test_right_clicking_an_unselected_row_selects_just_that_row(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        path = self._project(library_dir, sample_meta, 20)  # batch 10 → 2 parts
+        tab = self._tab_on_project(tmp_path, path)
+        self._menu_for(tab, monkeypatch, 1)
+        selected = {idx.row() for idx in tab.video_list.selectionModel().selectedRows()}
+        assert selected == {1}
+        tab.shutdown()
+
+    def test_single_row_offers_split_plus_bulk_status_actions(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        menu = self._menu_for(tab, monkeypatch, 0)
+        assert [a.text for a in menu.actions] == [
+            "Tạo video", "Tách phần…",
+            "Đánh dấu \"Đã tạo\"", "Đánh dấu \"Chưa tạo\"",
+            "Đánh dấu \"Đã tải lên\"", "Đánh dấu \"Chưa tải lên\"",
+        ]
+        assert menu.actions[0].enabled and menu.actions[1].enabled
+        tab.shutdown()
+
+    def test_two_adjacent_rows_offer_an_enabled_merge(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        from PySide6.QtCore import QItemSelectionModel
+
+        path = self._project(library_dir, sample_meta, 30)  # batch 10 → 3 parts
+        tab = self._tab_on_project(tmp_path, path)
+        tab.video_list.selectRow(0)
+        tab.video_list.selectionModel().select(
+            tab.video_list.model().index(1, 0),
+            QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows,
+        )
+        menu = self._menu_for(tab, monkeypatch, 0)
+        assert [a.text for a in menu.actions] == [
+            "Tạo video", "Gộp 2 phần liền kề",
+            "Đánh dấu \"Đã tạo\"", "Đánh dấu \"Chưa tạo\"",
+            "Đánh dấu \"Đã tải lên\"", "Đánh dấu \"Chưa tải lên\"",
+        ]
+        assert menu.actions[0].enabled and menu.actions[1].enabled
+        tab.shutdown()
+
+    def test_split_off_the_last_n_chapters(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        from PySide6.QtWidgets import QInputDialog
+
+        from noveltrans.video_windows import read_manual_windows
+
+        path = self._project(library_dir, sample_meta, 10)  # batch 10 → 1 part
+        tab = self._tab_on_project(tmp_path, path)
+        window = tab._windows_for_current_selection()[0]
+        monkeypatch.setattr(QInputDialog, "getInt", lambda *a, **k: (3, True))
+        self._yes(monkeypatch)
+
+        tab._split_part(window)
+
+        assert read_manual_windows(path) == {1: 7, 8: 10}
+        windows = tab._windows_for_current_selection()
+        assert [(w.first_num, w.last_num) for w in windows] == [(1, 7), (8, 10)]
+        tab.shutdown()
+
+    def test_declining_the_split_confirmation_changes_nothing(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        from PySide6.QtWidgets import QInputDialog, QMessageBox
+
+        from noveltrans.video_windows import read_manual_windows
+
+        path = self._project(library_dir, sample_meta, 10)
+        tab = self._tab_on_project(tmp_path, path)
+        window = tab._windows_for_current_selection()[0]
+        monkeypatch.setattr(QInputDialog, "getInt", lambda *a, **k: (3, True))
+        monkeypatch.setattr(
+            QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.No
+        )
+
+        tab._split_part(window)
+
+        assert read_manual_windows(path) == {}
+        tab.shutdown()
+
+    def test_cancelling_the_split_dialog_changes_nothing(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        from PySide6.QtWidgets import QInputDialog
+
+        from noveltrans.video_windows import read_manual_windows
+
+        path = self._project(library_dir, sample_meta, 10)
+        tab = self._tab_on_project(tmp_path, path)
+        window = tab._windows_for_current_selection()[0]
+        monkeypatch.setattr(QInputDialog, "getInt", lambda *a, **k: (3, False))
+
+        tab._split_part(window)
+
+        assert read_manual_windows(path) == {}
+        tab.shutdown()
+
+    def test_split_deletes_the_old_rendered_folder(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        from PySide6.QtWidgets import QInputDialog
+
+        path = self._project(library_dir, sample_meta, 10)
+        tab = self._tab_on_project(tmp_path, path)
+        window = tab._windows_for_current_selection()[0]
+        out = tab._part_output_path(window, whole_novel=False)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"already rendered")
+        (out.parent / (out.stem + ".title.txt")).write_text("x", encoding="utf-8")
+
+        monkeypatch.setattr(QInputDialog, "getInt", lambda *a, **k: (3, True))
+        asked = self._yes(monkeypatch)
+
+        tab._split_part(window)
+
+        assert not out.parent.exists()  # whole per-part folder removed
+        assert "đã có video" in asked[0][2]  # confirmation warned about the deletion
+        tab.shutdown()
+
+    def test_split_warns_when_the_old_part_was_uploaded(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        from PySide6.QtWidgets import QInputDialog
+
+        from noveltrans.youtube_upload import mark_uploaded_by_hand
+
+        path = self._project(library_dir, sample_meta, 10)
+        tab = self._tab_on_project(tmp_path, path)
+        window = tab._windows_for_current_selection()[0]
+        out = tab._part_output_path(window, whole_novel=False)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"already rendered")
+        mark_uploaded_by_hand(out)
+
+        monkeypatch.setattr(QInputDialog, "getInt", lambda *a, **k: (3, True))
+        asked = self._yes(monkeypatch)
+
+        tab._split_part(window)
+
+        assert "YouTube" in asked[0][2]
+        tab.shutdown()
+
+    def test_merge_two_adjacent_parts(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        from noveltrans.video_windows import read_manual_windows
+
+        path = self._project(library_dir, sample_meta, 20)  # batch 10 → 2 parts
+        tab = self._tab_on_project(tmp_path, path)
+        window_a, window_b = tab._windows_for_current_selection()
+        self._yes(monkeypatch)
+
+        tab._merge_parts(window_a, window_b)
+
+        assert read_manual_windows(path) == {1: 20}
+        windows = tab._windows_for_current_selection()
+        assert len(windows) == 1
+        assert (windows[0].first_num, windows[0].last_num) == (1, 20)
+        tab.shutdown()
+
+    def test_merging_the_two_halves_of_a_split_undoes_it(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        from PySide6.QtWidgets import QInputDialog
+
+        from noveltrans.video_windows import read_manual_windows
+
+        path = self._project(library_dir, sample_meta, 10)
+        tab = self._tab_on_project(tmp_path, path)
+        window = tab._windows_for_current_selection()[0]
+        monkeypatch.setattr(QInputDialog, "getInt", lambda *a, **k: (3, True))
+        self._yes(monkeypatch)
+        tab._split_part(window)
+        assert read_manual_windows(path) == {1: 7, 8: 10}
+
+        window_a, window_b = tab._windows_for_current_selection()
+        tab._merge_parts(window_a, window_b)
+
+        assert read_manual_windows(path) == {1: 10}
+        tab.shutdown()
+
+    def test_bulk_mark_created_for_multiple_selected_rows(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        from noveltrans.video_state import created_override
+
+        path = self._project(library_dir, sample_meta, 30)  # batch 10 → 3 parts
+        tab = self._tab_on_project(tmp_path, path)
+        windows = tab._windows_for_current_selection()
+        paths = [tab._part_output_path(w, whole_novel=False) for w in windows[:2]]
+        asked = self._yes(monkeypatch)
+
+        tab._bulk_set_created(paths, True)
+
+        assert all(created_override(p) is True for p in paths)
+        assert created_override(tab._part_output_path(windows[2], whole_novel=False)) is None
+        assert "2 phần" in asked[0][2]
+        tab.shutdown()
+
+    def test_bulk_mark_created_skips_rows_already_correct_and_says_so(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        from PySide6.QtWidgets import QMessageBox
+
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        windows = tab._windows_for_current_selection()
+        paths = [tab._part_output_path(w, whole_novel=False) for w in windows]
+        informed = []
+        monkeypatch.setattr(
+            QMessageBox, "information", lambda *a, **k: informed.append(a)
+        )
+        asked = self._yes(monkeypatch)
+
+        tab._bulk_set_created(paths, False)  # already "chưa tạo" — nothing to do
+
+        assert asked == []  # no confirmation needed, nothing would change
+        assert informed  # but the user is told so
+        tab.shutdown()
+
+    def test_bulk_mark_uploaded_for_multiple_selected_rows(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        from noveltrans.youtube_upload import is_published
+
+        path = self._project(library_dir, sample_meta, 30)
+        tab = self._tab_on_project(tmp_path, path)
+        windows = tab._windows_for_current_selection()
+        paths = [tab._part_output_path(w, whole_novel=False) for w in windows[:2]]
+        asked = self._yes(monkeypatch)
+
+        tab._bulk_set_uploaded(paths, True)
+
+        assert all(is_published(p) for p in paths)
+        assert not is_published(tab._part_output_path(windows[2], whole_novel=False))
+        assert "2 phần" in asked[0][2]
+        tab.shutdown()
+
+    def test_declining_a_bulk_action_changes_nothing(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.video_state import created_override
+
+        path = self._project(library_dir, sample_meta, 10)
+        tab = self._tab_on_project(tmp_path, path)
+        windows = tab._windows_for_current_selection()
+        paths = [tab._part_output_path(w, whole_novel=False) for w in windows]
+        monkeypatch.setattr(
+            QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.No
+        )
+
+        tab._bulk_set_created(paths, True)
+
+        assert all(created_override(p) is None for p in paths)
+        tab.shutdown()
+
+    def test_context_menu_bulk_created_action_targets_the_selected_rows(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        """The menu action itself (not just the underlying method) hits exactly the
+        selected rows' paths — multi-select is the whole point of this feature."""
+        from PySide6.QtCore import QItemSelectionModel
+
+        from noveltrans.video_state import created_override
+
+        path = self._project(library_dir, sample_meta, 30)  # batch 10 → 3 parts
+        tab = self._tab_on_project(tmp_path, path)
+        tab.video_list.selectRow(0)
+        tab.video_list.selectionModel().select(
+            tab.video_list.model().index(2, 0),
+            QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows,
+        )
+        self._yes(monkeypatch)
+        menu = self._menu_for(tab, monkeypatch, 0)  # rows 0 and 2 selected, not adjacent
+
+        created_on = next(a for a in menu.actions if a.text == "Đánh dấu \"Đã tạo\"")
+        created_on.trigger()
+
+        windows = tab._windows_for_current_selection()
+        assert created_override(tab._part_output_path(windows[0], whole_novel=False)) is True
+        assert created_override(tab._part_output_path(windows[1], whole_novel=False)) is None
+        assert created_override(tab._part_output_path(windows[2], whole_novel=False)) is True
+        tab.shutdown()
+
+    def test_render_selected_parts_skips_already_created_ones(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        path = self._project(library_dir, sample_meta, 30)  # batch 10 → 3 parts
+        tab = self._tab_on_project(tmp_path, path)
+        image = tmp_path / "bg.png"
+        image.write_bytes(b"fake")
+        tab.video_image_edit.setText(str(image))
+        windows = tab._windows_for_current_selection()
+        out0 = tab._part_output_path(windows[0], whole_novel=False)
+        out0.parent.mkdir(parents=True, exist_ok=True)
+        out0.write_bytes(b"already rendered")  # part 1 already done
+
+        asked = self._yes(monkeypatch)
+        captured = {}
+        monkeypatch.setattr(tab, "_launch_video", lambda **kw: captured.update(kw))
+
+        tab._render_selected_parts(windows)  # all 3 rows "selected"
+
+        assert captured["explicit_windows"] == [windows[1], windows[2]]
+        assert captured["explicit_part_numbers"] == {
+            windows[1].first_num: tab._part_number(windows[1]),
+            windows[2].first_num: tab._part_number(windows[2]),
+        }
+        assert captured["mode"] == "batch" and captured["skip_existing"] is True
+        assert "bỏ qua 1 phần" in asked[0][2]
+        tab.shutdown()
+
+    def test_render_selected_parts_with_nothing_pending_says_so(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        from noveltrans.video_state import set_created_override
+
+        path = self._project(library_dir, sample_meta, 10)  # batch 10 → 1 part
+        tab = self._tab_on_project(tmp_path, path)
+        image = tmp_path / "bg.png"
+        image.write_bytes(b"fake")
+        tab.video_image_edit.setText(str(image))
+        windows = tab._windows_for_current_selection()
+        set_created_override(
+            tab._part_output_path(windows[0], whole_novel=False), True, file_exists=False
+        )
+
+        launched = []
+        monkeypatch.setattr(tab, "_launch_video", lambda **kw: launched.append(kw))
+        from PySide6.QtWidgets import QMessageBox
+        informed = []
+        monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: informed.append(a))
+
+        tab._render_selected_parts(windows)
+
+        assert launched == []
+        assert informed
+        tab.shutdown()
+
+    def test_context_menu_render_action_targets_the_selected_rows(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        from PySide6.QtCore import QItemSelectionModel
+
+        path = self._project(library_dir, sample_meta, 30)  # batch 10 → 3 parts
+        tab = self._tab_on_project(tmp_path, path)
+        image = tmp_path / "bg.png"
+        image.write_bytes(b"fake")
+        tab.video_image_edit.setText(str(image))
+        tab.video_list.selectRow(0)
+        tab.video_list.selectionModel().select(
+            tab.video_list.model().index(2, 0),
+            QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows,
+        )
+        self._yes(monkeypatch)
+        captured = {}
+        monkeypatch.setattr(tab, "_launch_video", lambda **kw: captured.update(kw))
+        menu = self._menu_for(tab, monkeypatch, 0)  # rows 0 and 2 selected, not adjacent
+
+        render_action = next(a for a in menu.actions if a.text == "Tạo video")
+        render_action.trigger()
+
+        windows = tab._windows_for_current_selection()
+        assert captured["explicit_windows"] == [windows[0], windows[2]]  # not windows[1]
+        tab.shutdown()
+
+
+class TestCreatedStatusToggle:
+    """Feature 058 — manually ticking/unticking the "Trạng thái" (đã tạo) column."""
+
+    def _project_with_audio(self, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)  # 5 chapters
+        for i in range(5):
+            project.save_audio(i, f"exports/audio/{i}.mp3", "V", 60.0)
+        path = project.path
+        project.close()
+        return path
+
+    def _tab_on_project(self, tmp_path, path):
+        tab = VideoTab(_config(tmp_path))
+        tab.voice_combo.addItem("V", "V")
+        tab.voice_combo.setCurrentIndex(tab.voice_combo.findData("V"))
+        tab.video_mode.setCurrentIndex(tab.video_mode.findData("batch"))
+        tab.video_batch_size.setValue(2)
+        tab._on_project_selected(str(path))
+        return tab
+
+    def _render_part(self, tab, index):
+        """Fake a rendered part: create its .mp4 so it exists on disk."""
+        window = tab._windows_for_current_selection()[index]
+        out = tab._part_output_path(window, whole_novel=False)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"fake mp4")
+        return window, out
+
+    def _answer(self, monkeypatch, button):
+        from PySide6.QtWidgets import QMessageBox
+
+        asked = []
+        monkeypatch.setattr(
+            QMessageBox, "question", lambda *a, **k: (asked.append(a), button)[1]
+        )
+        return asked
+
+    def test_column_is_checkable(self, qapp, tmp_path, library_dir, sample_meta, sample_refs):
+        from PySide6.QtCore import Qt
+
+        tab = self._tab_on_project(
+            tmp_path, self._project_with_audio(library_dir, sample_meta, sample_refs)
+        )
+        item = tab.video_list.item(0, 4)
+        assert item.flags() & Qt.ItemFlag.ItemIsUserCheckable
+        assert item.checkState() == Qt.CheckState.Unchecked
+        tab.shutdown()
+
+    def test_ticking_a_missing_part_marks_it_created(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.video_state import created_override
+
+        tab = self._tab_on_project(
+            tmp_path, self._project_with_audio(library_dir, sample_meta, sample_refs)
+        )
+        window = tab._windows_for_current_selection()[0]
+        out = tab._part_output_path(window, whole_novel=False)
+        self._answer(monkeypatch, QMessageBox.StandardButton.Yes)
+
+        tab.video_list.item(0, 4).setCheckState(Qt.CheckState.Checked)
+
+        assert created_override(out) is True
+        assert tab.video_list.item(0, 4).text() == "✅ Đã tạo"
+        tab.shutdown()
+
+    def test_declining_the_tick_leaves_it_unmarked(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.video_state import created_override
+
+        tab = self._tab_on_project(
+            tmp_path, self._project_with_audio(library_dir, sample_meta, sample_refs)
+        )
+        window = tab._windows_for_current_selection()[0]
+        out = tab._part_output_path(window, whole_novel=False)
+        self._answer(monkeypatch, QMessageBox.StandardButton.No)
+
+        tab.video_list.item(0, 4).setCheckState(Qt.CheckState.Checked)
+
+        assert created_override(out) is None
+        assert tab.video_list.item(0, 4).checkState() == Qt.CheckState.Unchecked
+        tab.shutdown()
+
+    def test_unticking_a_rendered_part_marks_it_not_created(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.video_state import created_override
+
+        tab = self._tab_on_project(
+            tmp_path, self._project_with_audio(library_dir, sample_meta, sample_refs)
+        )
+        _, out = self._render_part(tab, 0)
+        tab._refresh_video_list()
+        self._answer(monkeypatch, QMessageBox.StandardButton.Yes)
+
+        tab.video_list.item(0, 4).setCheckState(Qt.CheckState.Unchecked)
+
+        assert created_override(out) is False
+        assert tab.video_list.item(0, 4).text() == "⬜ Chưa tạo"
+        # the .mp4 itself is untouched — only the tick changed
+        assert out.is_file()
+        tab.shutdown()
+
+    def test_toggling_back_into_agreement_clears_the_override_without_asking(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.video_state import created_override, state_path
+
+        tab = self._tab_on_project(
+            tmp_path, self._project_with_audio(library_dir, sample_meta, sample_refs)
+        )
+        window = tab._windows_for_current_selection()[0]
+        out = tab._part_output_path(window, whole_novel=False)
+        self._answer(monkeypatch, QMessageBox.StandardButton.Yes)
+        tab.video_list.item(0, 4).setCheckState(Qt.CheckState.Checked)  # tick, file missing
+        assert created_override(out) is True
+
+        asked = self._answer(monkeypatch, QMessageBox.StandardButton.Yes)
+        tab.video_list.item(0, 4).setCheckState(Qt.CheckState.Unchecked)  # back to reality
+
+        assert created_override(out) is None
+        assert not state_path(out).is_file()
+        assert asked == []  # no confirmation for the safe/undo direction
+        tab.shutdown()
+
+    def test_a_real_render_clears_a_stale_not_created_override(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        """Untick a rendered part, then re-render it — the override must not survive.
+
+        `_on_video_file_done` fires once per part the render worker actually finishes —
+        this is the real "a render happened" signal, distinct from just refreshing the
+        table (which must NOT clear the override on its own).
+        """
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.video_state import created_override
+
+        tab = self._tab_on_project(
+            tmp_path, self._project_with_audio(library_dir, sample_meta, sample_refs)
+        )
+        _, out = self._render_part(tab, 0)
+        tab._refresh_video_list()
+        self._answer(monkeypatch, QMessageBox.StandardButton.Yes)
+        tab.video_list.item(0, 4).setCheckState(Qt.CheckState.Unchecked)
+        assert created_override(out) is False
+
+        # an innocuous refresh alone must not clear the override
+        tab._refresh_video_list()
+        assert created_override(out) is False
+
+        out.unlink()
+        out.write_bytes(b"freshly re-rendered")  # simulate a new render finishing
+        tab._on_video_file_done(str(out))
+        tab._refresh_video_list()
+
+        assert created_override(out) is None
+        assert tab.video_list.item(0, 4).text() == "✅ Đã tạo"
+        tab.shutdown()
+
+    def test_created_true_override_survives_a_refresh_while_file_still_missing(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.video_state import created_override
+
+        tab = self._tab_on_project(
+            tmp_path, self._project_with_audio(library_dir, sample_meta, sample_refs)
+        )
+        window = tab._windows_for_current_selection()[0]
+        out = tab._part_output_path(window, whole_novel=False)
+        self._answer(monkeypatch, QMessageBox.StandardButton.Yes)
+        tab.video_list.item(0, 4).setCheckState(Qt.CheckState.Checked)
+
+        tab._refresh_video_list()  # e.g. triggered by an unrelated selection change
+
+        assert created_override(out) is True
+        assert tab.video_list.item(0, 4).text() == "✅ Đã tạo"
+        assert not out.is_file()  # still nothing rendered
+        tab.shutdown()
+
+    def test_repopulating_the_table_does_not_fire_the_toggle_handler(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from PySide6.QtWidgets import QMessageBox
+
+        tab = self._tab_on_project(
+            tmp_path, self._project_with_audio(library_dir, sample_meta, sample_refs)
+        )
+        asked = self._answer(monkeypatch, QMessageBox.StandardButton.Yes)
+
+        tab._refresh_video_list()  # rebuilds every row, setting check states
+
+        assert asked == []
+        tab.shutdown()
+
+    def test_start_video_skips_a_manually_marked_created_part(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        """"Tạo video" only fills in what's missing — a part manually ticked "đã tạo"
+        must be skipped too, not just one whose .mp4 actually exists on disk (matches
+        VideoWorker's own skip_existing check, see test_video.py::TestVideoWorker)."""
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.video_state import created_override
+
+        tab = self._tab_on_project(
+            tmp_path, self._project_with_audio(library_dir, sample_meta, sample_refs)
+        )
+        image = tmp_path / "bg.png"
+        image.write_bytes(b"fake")
+        tab.video_image_edit.setText(str(image))
+        tab.tags_edit.setPlainText("a, b")  # skip the auto-tag-generation branch
+        window = tab._windows_for_current_selection()[0]
+        out = tab._part_output_path(window, whole_novel=False)
+        self._answer(monkeypatch, QMessageBox.StandardButton.Yes)
+        tab.video_list.item(0, 4).setCheckState(Qt.CheckState.Checked)  # tick, no file
+        assert created_override(out) is True
+
+        asked = self._answer(monkeypatch, QMessageBox.StandardButton.Yes)
+        captured = {}
+        monkeypatch.setattr(tab, "_launch_video", lambda **kw: captured.update(kw))
+
+        tab._start_video()
+
+        assert captured == {"skip_existing": True}
+        assert "bỏ qua 1 phần đã có" in asked[0][2]
         tab.shutdown()
 
 
@@ -615,6 +1426,43 @@ class TestRedoAllVideos:
         monkeypatch.setattr(tab, "_launch_video", lambda **kw: launched.append(kw))
         tab._redo_all_videos()
         assert shown and launched == []
+        tab.shutdown()
+
+    def test_redo_all_ignores_locked_windows_and_uses_the_fresh_grid(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        """Feature 058 follow-up: unlike "Tạo video", "Tạo lại tất cả video" is an explicit
+        full rebuild — it must use the current, full chapter grid (part 2 gets all 2
+        chapters if now available), not stay pinned to an earlier partial commit."""
+        from noveltrans.models import ChapterRef
+        from noveltrans.storage import NovelProject
+        from noveltrans.video_state import set_created_override
+
+        refs = [ChapterRef(index=i, title=f"第{i + 1}章", url=f"https://x/{i + 1}")
+                for i in range(3)]
+        project = NovelProject.create(library_dir, sample_meta, refs)
+        for i in range(3):
+            project.save_audio(i, f"exports/audio/{i}.mp3", "V", 60.0)
+        path = project.path
+        project.close()
+
+        tab = self._tab_on_project(tmp_path, path)  # batch 2 → part 1 (1-2), part 2 (3)
+        window2 = tab._windows_for_current_selection()[1]
+        out2 = tab._part_output_path(window2, whole_novel=False)
+        set_created_override(out2, True, file_exists=False)  # part 2 locked at chương 3
+
+        project = NovelProject.open(path)
+        project.replace_toc(refs + [ChapterRef(index=3, title="第4章", url="https://x/4")])
+        project.save_audio(3, "exports/audio/3.mp3", "V", 60.0)
+        project.close()
+        tab._on_project_selected(str(path))  # reload to pick up chương 4
+
+        self._yes(monkeypatch)
+        captured = {}
+        monkeypatch.setattr(tab, "_launch_video", lambda **kw: captured.update(kw))
+        tab._redo_all_videos()
+
+        assert captured == {"skip_existing": False}  # redo-all never locks anything
         tab.shutdown()
 
     def test_render_and_upload_buttons_lock_each_other_out(self, qapp, tmp_path):

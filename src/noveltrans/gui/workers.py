@@ -1020,6 +1020,13 @@ class VideoWorker(PausableWorker):
         burn_subtitles: bool = False,  # also burn the narration into the video
         bg_color: str = "",  # background hex "#rrggbb"; "" → the default pastel gradient
         skip_existing: bool = False,  # skip parts whose .mp4 already exists (batch "continue")
+        part_num: int | None = None,  # explicit part # for a single range-mode re-render;
+                                       # None → computed per-window (batch/whole-novel runs)
+        explicit_windows: list | None = None,  # render exactly these MergeWindows (a
+                                                # multi-select "Tạo video"), bypassing
+                                                # `mode`-based planning entirely
+        explicit_part_numbers: dict | None = None,  # {first_num: part_num} for
+                                                      # `explicit_windows` — see `_part_number`
         credit: str = "",  # "Tạo bởi: …" line; "" → the default (Fox Novel)
         tagline: str = "",  # thumbnail subtitle under "PHẦN N"
         thumb_image_path: Path | str = "",  # thumbnail base image; "" → reuse image_path
@@ -1051,6 +1058,9 @@ class VideoWorker(PausableWorker):
         self.burn_subtitles = burn_subtitles
         self.bg_color = bg_color
         self.skip_existing = skip_existing
+        self.part_num = part_num
+        self.explicit_windows = explicit_windows
+        self.explicit_part_numbers = explicit_part_numbers or {}
         self.credit = credit
         self.tagline = tagline
         self.thumb_image_path = str(thumb_image_path or "")
@@ -1074,32 +1084,71 @@ class VideoWorker(PausableWorker):
             _with_real_durations,
             build_upload_title,
             build_video_description,
+            discover_committed_video_windows,
             font_dir_context,
+            plan_locked_video_windows,
             render_video,
             video_font,
             video_part_name,
         )
+        from noveltrans.video_state import effective_created
+        from noveltrans.video_windows import read_manual_windows
 
         bg_rgb = hex_to_rgb(self.bg_color)
 
         project = NovelProject.open(self.project_path)
         try:
-            windows = plan_merge_windows(
-                project.chapters(),
-                self.voice,
-                self.mode,
-                start=self.start_num,
-                end=self.end_num,
-                batch=self.batch_size,
-            )
-            if not windows:
-                self.failed.emit("Không có chương nào có audio giọng này trong phạm vi đã chọn.")
-                return
             project.video_dir.mkdir(parents=True, exist_ok=True)
             # NOT display_name(): the slug keys <stem>.mp4 and its sidecars, so an
             # editable title must never move them. See NovelMeta.display_name().
             slug = slugify(project.meta.translated_title or project.meta.title)
             novel_title = project.meta.display_name()
+
+            # Batch mode always honors manual split/merge boundaries (see
+            # `noveltrans.video_windows`) — even "Tạo lại tất cả video". A manual split
+            # exists to solve a real constraint (a part over YouTube's 12h cap) that
+            # doesn't go away just because the background image or quality changed; silently
+            # re-merging it back together on redo-all would reintroduce the exact policy
+            # violation the split was for. Auto-discovered "đã tạo" commits are different —
+            # those are just a timing artifact and redo-all is free to blow past them.
+            #
+            # `skip_existing` batch runs ("Tạo video", never "Tạo lại tất cả") additionally
+            # honor those commits: a part already committed with fewer than a full batch of
+            # chapters stays that size; new chapters start the next part instead of
+            # retroactively growing it. Range/whole-novel mode has no batch grid at all, so
+            # neither kind of lock applies — see `plan_locked_video_windows`.
+            # `explicit_windows` (a multi-select "Tạo video" from the context menu) skips
+            # all of this planning — the caller already knows exactly which windows and
+            # part numbers it wants, computed from the same locked/manual-aware plan the
+            # table shows.
+            locked_part_numbers: dict[int, int] = {}
+            if self.explicit_windows is not None:
+                windows = self.explicit_windows
+                locked_part_numbers = dict(self.explicit_part_numbers)
+            elif self.mode == "batch":
+                manual = read_manual_windows(project.path)
+                committed = (
+                    discover_committed_video_windows(project.video_dir, slug)
+                    if self.skip_existing else {}
+                )
+                locked = plan_locked_video_windows(
+                    project.chapters(), self.voice, self.batch_size,
+                    {**committed, **manual},
+                )
+                windows = [w for _, w in locked]
+                locked_part_numbers = {w.first_num: pn for pn, w in locked}
+            else:
+                windows = plan_merge_windows(
+                    project.chapters(),
+                    self.voice,
+                    self.mode,
+                    start=self.start_num,
+                    end=self.end_num,
+                    batch=self.batch_size,
+                )
+            if not windows:
+                self.failed.emit("Không có chương nào có audio giọng này trong phạm vi đã chọn.")
+                return
             total = len(windows)
             written = 0
             with font_dir_context() as font_dir:
@@ -1125,15 +1174,31 @@ class VideoWorker(PausableWorker):
                     # uploaded on its own; legacy flat renders still count for skip_existing.
                     out_path = project.video_dir / Path(name).stem / name
                     legacy_path = project.video_dir / name
-                    if self.skip_existing and (out_path.is_file() or legacy_path.is_file()):
-                        self.progress.emit(i + 1, total, "")  # already made — skip
+                    # Same resolution `_part_output_path` uses in the tab: prefer the
+                    # per-folder path, fall back to a pre-existing legacy flat file. This
+                    # is the exact path the "Trạng thái" tick's sidecar sits beside, so a
+                    # part manually marked "đã tạo" is skipped here too — not just file
+                    # existence — even though no .mp4 has actually been rendered for it.
+                    resolved = legacy_path if not out_path.is_file() and legacy_path.is_file() else out_path
+                    if self.skip_existing and effective_created(resolved):
+                        self.progress.emit(i + 1, total, "")  # already made (or marked) — skip
                         continue
                     self.progress.emit(i, total, name)
                     # From the chapter range, not `i`: rendering one part on its own used
-                    # to title it "Phần 1" while its file kept the real range.
-                    part_num = (
-                        None if whole_novel else part_number(window.first_num, self.batch_size)
-                    )
+                    # to title it "Phần 1" while its file kept the real range. Precedence:
+                    # an explicit `self.part_num` (a single range-mode re-render, whose
+                    # caller already knows the true number — grid arithmetic can't derive
+                    # it once a batch window is locked), then the locked-plan's own number
+                    # (batch + skip_existing), then plain grid arithmetic for everything
+                    # else (redo-all, or a genuinely custom range with no batch grid).
+                    if whole_novel:
+                        part_num = None
+                    elif self.part_num is not None:
+                        part_num = self.part_num
+                    elif window.first_num in locked_part_numbers:
+                        part_num = locked_part_numbers[window.first_num]
+                    else:
+                        part_num = part_number(window.first_num, self.batch_size)
                     try:
                         render_video(
                             segments, self.image_path, out_path, font_dir, novel_title,

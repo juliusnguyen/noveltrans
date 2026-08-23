@@ -63,6 +63,28 @@ def _isolated_config(tmp_path) -> AppConfig:
     return config
 
 
+def test_form_is_wrapped_in_a_scroll_area(qapp, tmp_path):
+    """The form has too many rows to fit a small screen — it must scroll instead of
+    pushing the OK/Cancel buttons off-screen."""
+    from PySide6.QtWidgets import QScrollArea
+
+    dialog = SettingsDialog(_isolated_config(tmp_path))
+    assert isinstance(dialog.scroll, QScrollArea)
+    assert dialog.scroll.widgetResizable() is True
+    # a control deep in the form is reachable through the scroll area's inner widget
+    assert dialog.scroll.widget().isAncestorOf(dialog.tts_clean_check)
+
+
+def test_dialog_height_is_capped_to_the_screen(qapp, tmp_path):
+    from PySide6.QtWidgets import QApplication
+
+    dialog = SettingsDialog(_isolated_config(tmp_path))
+    screen = QApplication.primaryScreen()
+    if screen is None:
+        pytest.skip("no primary screen in this environment")
+    assert dialog.height() <= int(screen.availableGeometry().height() * 0.85) + 1
+
+
 def test_clean_checkbox_loads_the_saved_value(qapp, tmp_path):
     config = _isolated_config(tmp_path)
     config.tts_clean_text = False
