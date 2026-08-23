@@ -5,6 +5,7 @@ from __future__ import annotations
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -12,13 +13,16 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QVBoxLayout,
+    QWidget,
 )
 
 from noveltrans.config import (
@@ -469,9 +473,27 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
+        # This form has grown past what a small laptop screen fits in one window — without
+        # somewhere to overflow to, Qt just pushes the OK/Cancel row off the bottom of the
+        # screen. A scroll area gives the overflow a destination instead (same fix as the
+        # Video tab, feature 025).
+        form_widget = QWidget()
+        form_widget.setLayout(form)
+        self.scroll = QScrollArea()
+        self.scroll.setWidget(form_widget)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)  # no second border inside the dialog
+
         layout = QVBoxLayout(self)
-        layout.addLayout(form)
-        layout.addWidget(buttons)
+        layout.addWidget(self.scroll, stretch=1)
+        layout.addWidget(buttons)  # pinned outside the scroll — always reachable
+
+        # Cap the initial height to the screen instead of the full form's sizeHint, so the
+        # scroll area actually has something to do on a screen too short for every row.
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            max_height = int(screen.availableGeometry().height() * 0.85)
+            self.resize(self.sizeHint().width(), min(self.sizeHint().height(), max_height))
 
     def _show_cookie_help(self) -> None:
         box = QMessageBox(self)

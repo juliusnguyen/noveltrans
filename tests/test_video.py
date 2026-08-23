@@ -629,6 +629,117 @@ class TestVideoPartName:
         assert video_part_dir_name("my-slug", 1, 199, whole_novel=True) == "my-slug"
 
 
+def _chapter(i, *, voiced=True, voice="V"):
+    from noveltrans.models import Chapter
+
+    return Chapter(
+        index=i, title=f"Chương {i + 1}", url="u",
+        audio_path=f"{i}.mp3" if voiced else "", audio_voice=voice if voiced else "",
+    )
+
+
+class TestPlanLockedVideoWindows:
+    """Feature 058 follow-up: a batch part committed with fewer than a full batch of
+    chapters (rendered, or manually ticked "đã tạo") must stay that size — new chapters
+    start the *next* part instead of retroactively growing an already-"đã tạo" one."""
+
+    def test_matches_the_plain_grid_when_nothing_is_committed(self):
+        from noveltrans.tts.merge import part_number, plan_merge_windows
+        from noveltrans.tts.video import plan_locked_video_windows
+
+        chapters = [_chapter(i) for i in range(25)]
+        plain = plan_merge_windows(chapters, "V", "batch", batch=10)
+        locked = plan_locked_video_windows(chapters, "V", 10, {})
+
+        assert [w.first_num for w in plain] == [w.first_num for _, w in locked]
+        assert [w.last_num for w in plain] == [w.last_num for _, w in locked]
+        assert [pn for pn, _ in locked] == [
+            part_number(w.first_num, 10) for w in plain
+        ]
+
+    def test_a_committed_partial_window_stays_frozen(self):
+        from noveltrans.tts.video import plan_locked_video_windows
+
+        # 98 chapters; part 10 (chương 91-100) only has 8 voiced so far, and got committed
+        chapters = [_chapter(i) for i in range(98)]
+        locked = plan_locked_video_windows(chapters, "V", 10, {91: 98})
+        part10 = locked[-1]
+        assert part10 == (10, part10[1])
+        assert (part10[1].first_num, part10[1].last_num) == (91, 98)
+        assert len(part10[1].chapters) == 8
+
+    def test_new_chapters_start_the_next_part_not_fill_the_locked_one(self):
+        from noveltrans.tts.video import plan_locked_video_windows
+
+        # 2 more chapters arrive (99, 100) — part 10 must NOT grow to (91, 100)
+        chapters = [_chapter(i) for i in range(100)]
+        locked = plan_locked_video_windows(chapters, "V", 10, {91: 98})
+        part10, part11 = locked[-2], locked[-1]
+        assert (part10[0], part10[1].first_num, part10[1].last_num) == (10, 91, 98)
+        assert (part11[0], part11[1].first_num, part11[1].last_num) == (11, 99, 100)
+
+    def test_a_full_new_batch_after_the_lock_gets_its_own_part(self):
+        from noveltrans.tts.video import plan_locked_video_windows
+
+        chapters = [_chapter(i) for i in range(115)]
+        locked = plan_locked_video_windows(chapters, "V", 10, {91: 98})
+        numbered = {pn: (w.first_num, w.last_num, len(w.chapters)) for pn, w in locked}
+        assert numbered[10] == (91, 98, 8)  # still frozen
+        assert numbered[11] == (99, 108, 10)  # a fresh full batch, not chương 101-110
+        assert numbered[12] == (109, 115, 7)  # tail, not yet committed
+
+    def test_a_mid_sequence_gap_still_does_not_shift_later_numbers(self):
+        """Preserves merge.part_number's existing guarantee: a window with zero currently
+        available chapters is omitted from the result but still consumes its part number."""
+        from noveltrans.tts.video import plan_locked_video_windows
+
+        # chapters 11-20 (part 2) have no audio at all yet
+        chapters = [_chapter(i) for i in range(10)] + [
+            _chapter(i, voiced=False) for i in range(10, 20)
+        ] + [_chapter(i) for i in range(20, 30)]
+        locked = plan_locked_video_windows(chapters, "V", 10, {})
+        assert [pn for pn, _ in locked] == [1, 3]  # part 2 omitted, not renumbered to 2
+
+
+class TestDiscoverCommittedVideoWindows:
+    def test_empty_when_the_directory_does_not_exist(self, tmp_path):
+        from noveltrans.tts.video import discover_committed_video_windows
+
+        assert discover_committed_video_windows(tmp_path / "nope", "slug") == {}
+
+    def test_a_rendered_part_folder_is_committed(self, tmp_path):
+        from noveltrans.tts.video import discover_committed_video_windows
+
+        folder = tmp_path / "slug-0091-0098"
+        folder.mkdir()
+        (folder / "slug-0091-0098.mp4").write_bytes(b"fake mp4")
+        assert discover_committed_video_windows(tmp_path, "slug") == {91: 98}
+
+    def test_a_manual_override_with_no_file_is_also_committed(self, tmp_path):
+        from noveltrans.tts.video import discover_committed_video_windows
+        from noveltrans.video_state import set_created_override
+
+        folder = tmp_path / "slug-0091-0098"
+        folder.mkdir()
+        set_created_override(folder / "slug-0091-0098.mp4", True, file_exists=False)
+        assert discover_committed_video_windows(tmp_path, "slug") == {91: 98}
+
+    def test_an_untouched_folder_is_not_committed(self, tmp_path):
+        """No render, no manual tick — just a stray folder — must not lock anything."""
+        from noveltrans.tts.video import discover_committed_video_windows
+
+        (tmp_path / "slug-0091-0098").mkdir()
+        assert discover_committed_video_windows(tmp_path, "slug") == {}
+
+    def test_folders_from_a_different_slug_are_ignored(self, tmp_path):
+        from noveltrans.tts.video import discover_committed_video_windows
+
+        folder = tmp_path / "other-slug-0091-0098"
+        folder.mkdir()
+        (folder / "other-slug-0091-0098.mp4").write_bytes(b"fake mp4")
+        assert discover_committed_video_windows(tmp_path, "slug") == {}
+
+
 class TestVideoWorker:
     def test_skip_existing_param_is_carried(self, qapp):
         from noveltrans.gui.workers import VideoWorker
@@ -665,6 +776,318 @@ class TestVideoWorker:
         w.failed.connect(failures.append)
         w.run()  # synchronous
         assert failures and "Không có chương" in failures[0]
+
+    def test_skip_existing_also_skips_a_manually_marked_created_part(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        """Feature 058 follow-up: a part manually ticked "đã tạo" (no .mp4 yet) must be
+        skipped by `skip_existing`, the same as one whose file actually exists — not just
+        rendered files."""
+        from pathlib import Path
+
+        from noveltrans.gui.workers import VideoWorker
+        from noveltrans.storage import NovelProject
+        from noveltrans.storage.project import slugify
+        from noveltrans.tts.video import video_part_name
+        from noveltrans.video_state import set_created_override
+
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)  # 5 chapters
+        for i in range(4):
+            rel = f"exports/audio/{i}.mp3"
+            project.save_audio(i, rel, "V", 1.0)
+            (project.path / rel).parent.mkdir(parents=True, exist_ok=True)
+            (project.path / rel).write_bytes(b"fake audio")
+        path = project.path
+        project.close()
+
+        project = NovelProject.open(path)
+        slug = slugify(project.meta.translated_title or project.meta.title)
+        name1 = video_part_name(slug, 1, 2, whole_novel=False)  # first window: chương 1-2
+        out1 = project.video_dir / Path(name1).stem / name1
+        set_created_override(out1, True, file_exists=False)  # marked "đã tạo" by hand
+        project.close()
+
+        rendered = []
+
+        def _fake_render_video(segments, image_path, out_path, *a, **k):
+            out_path = Path(out_path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(b"fake mp4")
+            rendered.append(out_path)
+
+        monkeypatch.setattr("noveltrans.tts.video.render_video", _fake_render_video)
+
+        image = tmp_path / "bg.png"
+        image.write_bytes(b"fake")
+        w = VideoWorker(path, voice="V", mode="batch", image_path=str(image), batch=2,
+                        skip_existing=True)
+        finished = []
+        w.finished_ok.connect(finished.append)
+        w.run()  # synchronous
+
+        assert out1 not in rendered  # skipped: manually marked, even with no file on disk
+        assert len(rendered) == 1  # only the second window (chương 3-4) actually rendered
+        assert finished == [1]
+
+    def test_batch_run_locks_a_committed_partial_part_and_titles_the_next_one_correctly(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        """End-to-end version of feature 058's follow-up: part 10 was already rendered
+        with only 8/10 chapters; 2 more chapters arrive. A "Tạo video" batch run must skip
+        part 10 untouched and render exactly one new part — 11 (chương 99-100) — titled
+        "Phần 11", not silently absorbed into part 10 or mistitled "Phần 1"/"Phần 10"."""
+        from pathlib import Path
+
+        from noveltrans.gui.workers import VideoWorker
+        from noveltrans.models import ChapterRef
+        from noveltrans.storage import NovelProject
+        from noveltrans.storage.project import slugify
+        from noveltrans.tts.video import video_part_name
+        from noveltrans.video_state import set_created_override
+
+        refs = [
+            ChapterRef(index=i, title=f"第{i + 1}章", url=f"https://x/{i + 1}")
+            for i in range(98)
+        ]
+        project = NovelProject.create(library_dir, sample_meta, refs)
+        for i in range(98):
+            rel = f"exports/audio/{i}.mp3"
+            project.save_audio(i, rel, "V", 1.0)
+            (project.path / rel).parent.mkdir(parents=True, exist_ok=True)
+            (project.path / rel).write_bytes(b"fake audio")
+        path = project.path
+        slug = slugify(project.meta.translated_title or project.meta.title)
+
+        # parts 1-9 (chương 1-90) already committed — marked "đã tạo" by hand, no need for
+        # real files, since only their commit STATUS matters for this scenario
+        for first in range(1, 90, 10):
+            name = video_part_name(slug, first, first + 9, whole_novel=False)
+            out = project.video_dir / Path(name).stem / name
+            set_created_override(out, True, file_exists=False)
+        # part 10 (chương 91-98, 8 chapters) already committed by a real render
+        name10 = video_part_name(slug, 91, 98, whole_novel=False)
+        out10 = project.video_dir / Path(name10).stem / name10
+        out10.parent.mkdir(parents=True, exist_ok=True)
+        out10.write_bytes(b"already rendered")
+        (out10.parent / (out10.stem + ".title.txt")).write_text(
+            "Truyện - Phần 10\n", encoding="utf-8"
+        )
+
+        # 2 more chapters arrive and get voiced
+        project.replace_toc(
+            refs + [ChapterRef(index=i, title=f"第{i + 1}章", url=f"https://x/{i + 1}")
+                    for i in range(98, 100)]
+        )
+        for i in range(98, 100):
+            rel = f"exports/audio/{i}.mp3"
+            project.save_audio(i, rel, "V", 1.0)
+            (project.path / rel).parent.mkdir(parents=True, exist_ok=True)
+            (project.path / rel).write_bytes(b"fake audio")
+        project.close()
+
+        rendered = []
+
+        def _fake_render_video(segments, image_path, out_path, *a, **k):
+            out_path = Path(out_path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(b"fake mp4")
+            rendered.append(out_path)
+
+        monkeypatch.setattr("noveltrans.tts.video.render_video", _fake_render_video)
+
+        image = tmp_path / "bg.png"
+        image.write_bytes(b"fake")
+        w = VideoWorker(path, voice="V", mode="batch", image_path=str(image), batch=10,
+                        skip_existing=True)
+        finished = []
+        w.finished_ok.connect(finished.append)
+        w.run()  # synchronous
+
+        assert out10 not in rendered  # part 10 stays exactly as committed — untouched
+        assert len(rendered) == 1  # exactly one new part rendered: 99-100
+        name11 = video_part_name(slug, 99, 100, whole_novel=False)
+        out11 = project.video_dir / Path(name11).stem / name11
+        assert rendered == [out11]
+        title11 = (out11.parent / (out11.stem + ".title.txt")).read_text(encoding="utf-8")
+        assert "Phần 11" in title11  # not "Phần 1" (no batch grid) or "Phần 10" (collision)
+        assert finished == [1]
+
+    def test_skip_existing_false_ignores_locked_windows_and_uses_the_fresh_grid(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        """"Tạo lại tất cả video" (skip_existing=False) is an explicit full rebuild — it
+        must NOT stay pinned to an earlier partial commit like the incremental batch run
+        does; part 2 should render with all currently-available chapters."""
+        from pathlib import Path
+
+        from noveltrans.gui.workers import VideoWorker
+        from noveltrans.models import ChapterRef
+        from noveltrans.storage import NovelProject
+        from noveltrans.storage.project import slugify
+        from noveltrans.tts.video import video_part_name
+        from noveltrans.video_state import set_created_override
+
+        refs = [ChapterRef(index=i, title=f"第{i + 1}章", url=f"https://x/{i + 1}")
+                for i in range(3)]
+        project = NovelProject.create(library_dir, sample_meta, refs)
+        for i in range(3):
+            rel = f"exports/audio/{i}.mp3"
+            project.save_audio(i, rel, "V", 1.0)
+            (project.path / rel).parent.mkdir(parents=True, exist_ok=True)
+            (project.path / rel).write_bytes(b"fake audio")
+        path = project.path
+        slug = slugify(project.meta.translated_title or project.meta.title)
+
+        # part 2 (chương 3, 1/2 chapters) committed by hand
+        name2 = video_part_name(slug, 3, 3, whole_novel=False)
+        set_created_override(project.video_dir / Path(name2).stem / name2, True, file_exists=False)
+
+        # chương 4 arrives
+        project.replace_toc(refs + [ChapterRef(index=3, title="第4章", url="https://x/4")])
+        rel = "exports/audio/3.mp3"
+        project.save_audio(3, rel, "V", 1.0)
+        (project.path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (project.path / rel).write_bytes(b"fake audio")
+        project.close()
+
+        rendered = []
+
+        def _fake_render_video(segments, image_path, out_path, *a, **k):
+            out_path = Path(out_path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(b"fake mp4")
+            rendered.append(out_path)
+
+        monkeypatch.setattr("noveltrans.tts.video.render_video", _fake_render_video)
+
+        image = tmp_path / "bg.png"
+        image.write_bytes(b"fake")
+        w = VideoWorker(path, voice="V", mode="batch", image_path=str(image), batch=2,
+                        skip_existing=False)  # redo-all
+        finished = []
+        w.finished_ok.connect(finished.append)
+        w.run()  # synchronous
+
+        # fresh grid: part 1 (1-2), part 2 (3-4) — NOT the locked (3-3)/(4-4) split
+        name_full_part2 = video_part_name(slug, 3, 4, whole_novel=False)
+        out_full_part2 = project.video_dir / Path(name_full_part2).stem / name_full_part2
+        assert out_full_part2 in rendered
+        assert len(rendered) == 2
+        assert finished == [2]
+
+    def test_redo_all_still_honors_a_manual_split_boundary(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        """Unlike an auto-discovered "đã tạo" commit, a manual split (e.g. to stay under
+        YouTube's 12h cap) must survive "Tạo lại tất cả video" too — redo-all changes
+        visual settings, not the chaptering plan, and silently re-merging the split would
+        reintroduce the exact policy violation it exists to avoid."""
+        from pathlib import Path
+
+        from noveltrans.gui.workers import VideoWorker
+        from noveltrans.models import ChapterRef
+        from noveltrans.storage import NovelProject
+        from noveltrans.storage.project import slugify
+        from noveltrans.tts.video import video_part_name
+        from noveltrans.video_windows import split_window
+
+        refs = [ChapterRef(index=i, title=f"第{i + 1}章", url=f"https://x/{i + 1}")
+                for i in range(4)]
+        project = NovelProject.create(library_dir, sample_meta, refs)
+        for i in range(4):
+            rel = f"exports/audio/{i}.mp3"
+            project.save_audio(i, rel, "V", 1.0)
+            (project.path / rel).parent.mkdir(parents=True, exist_ok=True)
+            (project.path / rel).write_bytes(b"fake audio")
+        path = project.path
+        slug = slugify(project.meta.translated_title or project.meta.title)
+        split_window(path, 1, 4, 1)  # batch=4 would be one part; split off the last chương
+        project.close()
+
+        rendered = []
+
+        def _fake_render_video(segments, image_path, out_path, *a, **k):
+            out_path = Path(out_path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(b"fake mp4")
+            rendered.append(out_path)
+
+        monkeypatch.setattr("noveltrans.tts.video.render_video", _fake_render_video)
+
+        image = tmp_path / "bg.png"
+        image.write_bytes(b"fake")
+        w = VideoWorker(path, voice="V", mode="batch", image_path=str(image), batch=4,
+                        skip_existing=False)  # redo-all
+        w.run()  # synchronous
+
+        name_a = video_part_name(slug, 1, 3, whole_novel=False)
+        name_b = video_part_name(slug, 4, 4, whole_novel=False)
+        out_a = project.video_dir / Path(name_a).stem / name_a
+        out_b = project.video_dir / Path(name_b).stem / name_b
+        assert set(rendered) == {out_a, out_b}  # the split held — not one 4-chapter part
+
+    def test_explicit_windows_renders_exactly_those_with_correct_titles(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        """A multi-select "Tạo video" (right-click 2+ chosen rows) passes an explicit
+        window list + part-number map, bypassing mode-based planning entirely — only
+        those windows render, skipping any others that happen to be pending too, and each
+        gets its true (non-grid) part number/title."""
+        from pathlib import Path
+
+        from noveltrans.gui.workers import VideoWorker
+        from noveltrans.storage import NovelProject
+        from noveltrans.storage.project import slugify
+        from noveltrans.models import ChapterRef
+        from noveltrans.tts.merge import MergeWindow
+        from noveltrans.tts.video import video_part_name
+
+        refs = [ChapterRef(index=i, title=f"第{i + 1}章", url=f"https://x/{i + 1}")
+                for i in range(30)]
+        project = NovelProject.create(library_dir, sample_meta, refs)
+        for i in range(30):
+            rel = f"exports/audio/{i}.mp3"
+            project.save_audio(i, rel, "V", 1.0)
+            (project.path / rel).parent.mkdir(parents=True, exist_ok=True)
+            (project.path / rel).write_bytes(b"fake audio")
+        chapters = project.chapters()  # re-fetch with audio_path populated
+        path = project.path
+        slug = slugify(project.meta.translated_title or project.meta.title)
+        project.close()
+
+        # rows 1 (chương 1-10) and 3 (chương 21-30) selected — row 2 (11-20) skipped
+        window_1 = MergeWindow(1, 10, [c for c in chapters if c.index < 10])
+        window_3 = MergeWindow(21, 30, [c for c in chapters if c.index >= 20])
+
+        rendered = []
+
+        def _fake_render_video(segments, image_path, out_path, *a, **k):
+            out_path = Path(out_path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(b"fake mp4")
+            rendered.append(out_path)
+
+        monkeypatch.setattr("noveltrans.tts.video.render_video", _fake_render_video)
+
+        image = tmp_path / "bg.png"
+        image.write_bytes(b"fake")
+        w = VideoWorker(
+            path, voice="V", mode="batch", image_path=str(image), batch=10,
+            skip_existing=True,
+            explicit_windows=[window_1, window_3],
+            explicit_part_numbers={1: 1, 21: 3},
+        )
+        w.run()  # synchronous
+
+        name1 = video_part_name(slug, 1, 10, whole_novel=False)
+        name3 = video_part_name(slug, 21, 30, whole_novel=False)
+        out1 = project.video_dir / Path(name1).stem / name1
+        out3 = project.video_dir / Path(name3).stem / name3
+        assert set(rendered) == {out1, out3}  # NOT the middle window (11-20)
+        title1 = (out1.parent / (out1.stem + ".title.txt")).read_text(encoding="utf-8")
+        title3 = (out3.parent / (out3.stem + ".title.txt")).read_text(encoding="utf-8")
+        assert "Phần 1" in title1
+        assert "Phần 3" in title3  # not "Phần 2" from grid arithmetic on first_num=21
 
 
 class TestRealDurations:

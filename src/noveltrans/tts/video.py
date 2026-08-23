@@ -393,6 +393,86 @@ def video_part_dir_name(slug: str, first_num: int, last_num: int, *, whole_novel
     return Path(video_part_name(slug, first_num, last_num, whole_novel=whole_novel)).stem
 
 
+_COMMITTED_SUFFIX_RE = re.compile(r"^(\d+)-(\d+)$")
+
+
+def discover_committed_video_windows(video_dir: Path, slug: str) -> dict[int, int]:
+    """Already-"đã tạo" batch windows on disk for this novel, as `{first_num: last_num}`.
+
+    A window counts as committed once a real render exists for it, or the user manually
+    ticked it "đã tạo" (see `noveltrans.video_state`) — either way, the user has treated
+    that exact chapter span as finished. `plan_locked_video_windows` uses this to freeze a
+    part that was rendered before translation caught up (e.g. only 8 of a 10-chapter
+    batch existed yet), instead of silently growing it once more chapters arrive — new
+    chapters start the *next* part instead of retroactively swelling an already-"đã tạo"
+    one out from under an already-uploaded video.
+
+    Only the modern per-part-subfolder layout is scanned (`video_dir/<stem>/<stem>.mp4`,
+    written by every render since feature 026) — legacy flat single-folder renders predate
+    the per-folder change entirely and are read-compatible for display purposes only, not
+    reconsidered here as commit points.
+    """
+    from noveltrans.video_state import effective_created
+
+    video_dir = Path(video_dir)
+    if not video_dir.is_dir():
+        return {}
+    prefix = f"{slug}-"
+    committed: dict[int, int] = {}
+    for entry in video_dir.iterdir():
+        if not entry.is_dir() or not entry.name.startswith(prefix):
+            continue
+        m = _COMMITTED_SUFFIX_RE.match(entry.name[len(prefix):])
+        if not m:
+            continue
+        first_num, last_num = int(m.group(1)), int(m.group(2))
+        if effective_created(entry / f"{entry.name}.mp4"):
+            committed[first_num] = last_num
+    return committed
+
+
+def plan_locked_video_windows(
+    chapters: list, voice: str, batch: int, committed: dict[int, int]
+) -> list[tuple[int, MergeWindow]]:
+    """Batch-mode `MergeWindow`s for video export, each paired with its true part number.
+
+    Identical to `plan_merge_windows(..., mode="batch")` when `committed` is empty — same
+    fixed grid, same windows. The difference: a window whose start chapter is a key in
+    `committed` (from `discover_committed_video_windows`) is frozen to that window's
+    already-committed span instead of pulling in up to `batch` chapters fresh. Chapters
+    that arrive after a part was committed start the *next* part instead of retroactively
+    growing one that may already be uploaded — see feature 058's follow-up discussion.
+
+    Part numbers can no longer be `(first_num - 1) // batch + 1` once a window deviates
+    from the fixed grid — they're this window's 1-based position in the *entire* novel's
+    sequence instead, counted here from chapter 1 regardless of what range the caller
+    actually wants rendered, so a single re-rendered part still gets its true number (the
+    same reason `merge.part_number` avoids "position in the list being rendered").
+    """
+    avail = sorted(
+        (c for c in chapters if c.audio_path and c.audio_voice == voice),
+        key=lambda c: c.index,
+    )
+    if not avail:
+        return []
+    size = int(batch or 0)
+    if size < 1:
+        raise ValueError("batch size must be >= 1")
+    max_num = avail[-1].index + 1
+
+    result: list[tuple[int, MergeWindow]] = []
+    lo = 1
+    part_num = 0
+    while lo <= max_num:
+        hi = committed.get(lo, lo + size - 1)
+        sel = [c for c in avail if lo <= c.index + 1 <= hi]
+        part_num += 1
+        if sel:
+            result.append((part_num, MergeWindow(sel[0].index + 1, sel[-1].index + 1, sel)))
+        lo = hi + 1
+    return result
+
+
 def build_upload_title(vn_title: str, part_num: int | None) -> str:
     """The video title: `{vn_title} - Phần {N}`, or just `vn_title` for a whole-novel video.
 
