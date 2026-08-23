@@ -255,6 +255,7 @@ class TestApplyReplacements:
             "translated": 1,
             "errors": 1,
             "audio": 0,
+            "downloaded_audio": 0,
         }
 
 
@@ -334,6 +335,59 @@ class TestAudioState:
         assert chapter.audio_voice == "" and chapter.audio_seconds == 0
         # translation state untouched
         assert chapter.translated == "bản dịch"
+
+    def test_pending_audio_excludes_downloaded(self, library_dir, sample_meta, sample_refs):
+        """Downloaded narration must not be perpetually pending.
+
+        audio_source = "downloaded" never equals the "translated"/"original" the
+        voice-mismatch clause tests, so without the guard every bulk pass would re-voice
+        it with TTS — and AudioWorker's stale-file cleanup would then delete the
+        downloaded file. Regression-pins the guard, not just the query.
+        """
+        project = self._translated_project(library_dir, sample_meta, sample_refs)
+        project.save_audio(
+            0, "exports/audio/0001-tieuthuyetmang.m4a", "tieuthuyetmang", 900.0, "downloaded"
+        )
+        assert project.pending_audio() == []
+        assert project.pending_audio("Ngọc Lan") == []
+        # ...and still excluded when the caller asks about the other text source
+        assert project.pending_audio("Ngọc Lan", use_translation=False) == []
+        # opt back in only when the caller explicitly means to overwrite narration
+        assert [c.index for c in project.pending_audio("Ngọc Lan", include_downloaded=True)] == [0]
+
+    def test_clear_audio_spares_downloaded(self, library_dir, sample_meta, sample_refs):
+        """"Tạo lại từ đầu" must not forget where downloaded narration came from.
+
+        Nothing re-fetches it, and the user may no longer be entitled to, so clearing the
+        row would orphan the file with no record of its origin.
+        """
+        project = self._translated_project(library_dir, sample_meta, sample_refs)
+        project.save_content(1, "nội dung")
+        project.save_translation(1, "Chương 2", "bản dịch 2", "vi")
+        project.save_audio(0, "exports/audio/0001-tts.wav", "Ngọc Lan", 9.0)
+        project.save_audio(
+            1, "exports/audio/0002-tieuthuyetmang.m4a", "tieuthuyetmang", 900.0, "downloaded"
+        )
+        project.clear_audio()
+        assert not project.chapter(0).has_audio  # synthesised: cleared as before
+        kept = project.chapter(1)
+        assert kept.has_audio and kept.audio_voice == "tieuthuyetmang"
+        assert kept.audio_seconds == 900.0
+        # a deliberate "forget the downloads too" still works
+        project.clear_audio(include_downloaded=True)
+        assert not project.chapter(1).has_audio
+
+    def test_counts_reports_downloaded_audio(self, library_dir, sample_meta, sample_refs):
+        project = self._translated_project(library_dir, sample_meta, sample_refs)
+        project.save_audio(0, "exports/audio/0001-tts.wav", "Ngọc Lan", 9.0)
+        counts = project.counts()
+        assert counts["audio"] == 1 and counts["downloaded_audio"] == 0
+        project.save_audio(
+            0, "exports/audio/0001-tieuthuyetmang.m4a", "tieuthuyetmang", 900.0, "downloaded"
+        )
+        counts = project.counts()
+        # a subset of "audio", not a sibling of it
+        assert counts["audio"] == 1 and counts["downloaded_audio"] == 1
 
     def test_audio_dir(self, library_dir, sample_meta, sample_refs):
         project = self._translated_project(library_dir, sample_meta, sample_refs)

@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from noveltrans.models import (
+    AUDIO_SOURCE_DOWNLOADED,
     STATUS_DOWNLOADED,
     STATUS_ERROR,
     STATUS_PENDING,
@@ -330,24 +331,41 @@ class NovelProject:
         ).fetchall()
         return [_row_to_chapter(r) for r in rows]
 
-    def pending_audio(self, voice: str = "", use_translation: bool = True) -> list[Chapter]:
+    def pending_audio(
+        self,
+        voice: str = "",
+        use_translation: bool = True,
+        include_downloaded: bool = False,
+    ) -> list[Chapter]:
         """Chapters that need audio in `voice` from the requested source.
 
         `use_translation` chooses which text gates availability — the translation
         (default) or the original `content`. A chapter is pending if it has that source
         text AND (has no audio yet, OR its audio used a *different* voice, OR its audio
         was made from the *other* source). Empty `voice` skips the voice-mismatch check.
+
+        `include_downloaded` guards audio fetched from the source site. Such a row has
+        audio_source = AUDIO_SOURCE_DOWNLOADED, which never equals the "translated" /
+        "original" the voice-mismatch clause tests, so it would otherwise be pending on
+        *every* pass — a bulk "tạo audio" run would re-voice it with TTS and the
+        stale-file unlink in AudioWorker would delete the downloaded file. Excluded by
+        default; pass True only when the caller genuinely means to overwrite narration.
         """
         src_col = "translated" if use_translation else "content"
         source = "translated" if use_translation else "original"
+        keep_downloaded = "" if include_downloaded else " AND audio_source != ?"
+        params: tuple = (voice, voice, source)
+        if not include_downloaded:
+            params += (AUDIO_SOURCE_DOWNLOADED,)
         rows = self._db.execute(
             f"""
             SELECT * FROM chapters
             WHERE {src_col} != ''
               AND (audio_path = '' OR (? != '' AND audio_voice != ?) OR audio_source != ?)
+              {keep_downloaded}
             ORDER BY idx
             """,
-            (voice, voice, source),
+            params,
         ).fetchall()
         return [_row_to_chapter(r) for r in rows]
 
@@ -371,12 +389,19 @@ class NovelProject:
         audio = self._db.execute(
             "SELECT COUNT(*) FROM chapters WHERE audio_path != ''"
         ).fetchone()[0]
+        # Subset of `audio`, not a sibling of it: narration fetched from the source site
+        # rather than synthesised, so the tab can report the two kinds apart.
+        downloaded_audio = self._db.execute(
+            "SELECT COUNT(*) FROM chapters WHERE audio_path != '' AND audio_source = ?",
+            (AUDIO_SOURCE_DOWNLOADED,),
+        ).fetchone()[0]
         return {
             "total": total,
             "downloaded": downloaded,
             "translated": translated,
             "errors": errors,
             "audio": audio,
+            "downloaded_audio": downloaded_audio,
         }
 
     # ---------------------------------------------------------------- writes
@@ -547,16 +572,25 @@ class NovelProject:
                 (message, _now(), idx),
             )
 
-    def clear_audio(self) -> None:
-        """Reset all audio state so the novel can be re-voiced from scratch.
+    def clear_audio(self, include_downloaded: bool = False) -> None:
+        """Reset audio state so the novel can be re-voiced from scratch.
 
-        Does not delete the audio files — the worker overwrites them.
+        Does not delete the audio files — the worker overwrites them. That last part is
+        exactly why downloaded narration is spared by default: nothing re-fetches it, so
+        clearing its row would orphan the file on disk and lose the only record of where
+        it came from, while the following TTS pass writes a *differently* named file. The
+        user may also no longer be entitled to fetch it again. Pass True only for a
+        deliberate "forget the downloads too".
         """
+        keep = "" if include_downloaded else " WHERE audio_source != ?"
+        params: tuple = (_now(),)
+        if not include_downloaded:
+            params += (AUDIO_SOURCE_DOWNLOADED,)
         with self._db:
             self._db.execute(
                 "UPDATE chapters SET audio_path = '', audio_voice = '',"
-                " audio_seconds = 0, audio_error = '', updated_at = ?",
-                (_now(),),
+                " audio_seconds = 0, audio_error = '', updated_at = ?" + keep,
+                params,
             )
 
     def save_meta_translation(

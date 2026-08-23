@@ -22,6 +22,15 @@ class AuthRequiredError(ScrapeError):
     or the chapter is paywalled for this account."""
 
 
+class AudioUnavailableError(ScrapeError):
+    """This item has no audio, or the signed-in account is not entitled to it.
+
+    Distinct from `AuthRequiredError`: the session is valid, it simply does not cover
+    this item. The correct response is to report and skip — never to retry, and never
+    to look for another way in.
+    """
+
+
 class RateLimitedError(ScrapeError):
     """The site is throttling reads ("reading too fast"); retry after a wait."""
 

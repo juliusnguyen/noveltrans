@@ -92,6 +92,28 @@ class TestPlanMergeWindows:
         [w] = plan_merge_windows(chs, "Ngọc Lan", "all")
         assert [c.index + 1 for c in w.chapters] == [1, 2, 5]
 
+    def test_downloaded_narration_is_mergeable(self):
+        """Audio fetched from the source site merges like any other, keyed on its voice.
+
+        plan_merge_windows selects on audio_voice, and the tab used to pass the *TTS
+        synthesis* voice — so downloaded narration (audio_voice "tieuthuyetmang") could
+        never be merged at all. The planner was always able to do this; the tab now asks
+        it the right question.
+        """
+        chs = [_ch(i, voice="tieuthuyetmang", source="downloaded") for i in range(3)]
+        [w] = plan_merge_windows(chs, "tieuthuyetmang", "all")
+        assert [c.index + 1 for c in w.chapters] == [1, 2, 3]
+
+    def test_mixed_project_selects_only_the_asked_for_voice(self):
+        # TTS and downloaded audio coexist in one project; each merges on its own key.
+        chs = [_ch(i) for i in range(4)]
+        chs[1].audio_voice, chs[1].audio_source = "tieuthuyetmang", "downloaded"
+        chs[3].audio_voice, chs[3].audio_source = "tieuthuyetmang", "downloaded"
+        [tts] = plan_merge_windows(chs, "Ngọc Lan", "all")
+        assert [c.index + 1 for c in tts.chapters] == [1, 3]
+        [fetched] = plan_merge_windows(chs, "tieuthuyetmang", "all")
+        assert [c.index + 1 for c in fetched.chapters] == [2, 4]
+
     def test_range_by_chapter_number(self):
         chs = [_ch(i) for i in range(10)]
         [w] = plan_merge_windows(chs, "Ngọc Lan", "range", start=3, end=7)

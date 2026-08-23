@@ -406,6 +406,32 @@ class TestAudioWorker:
         assert project.chapter(0).audio_path.endswith("-ngoc-lan.wav")
         assert not stale.exists()  # old differently-named file cleaned up
 
+    def test_downloaded_narration_is_never_unlinked(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        """The stale-file cleanup must spare audio fetched from the source site.
+
+        A TTS pass always writes a differently-named file, so the cleanup above would
+        delete narration this app cannot recreate and the user may no longer be entitled
+        to re-fetch. pending_audio already excludes these rows, but an explicit `indices`
+        regenerate bypasses that — this is the last line of defence, so it is pinned here
+        rather than only at the UI layer.
+        """
+        engine = FakeTtsEngine()
+        project = self._project(library_dir, sample_meta, sample_refs)
+        fetched = project.path / "exports/audio/0001-tieuthuyetmang.m4a"
+        fetched.parent.mkdir(parents=True, exist_ok=True)
+        fetched.write_bytes(b"\x00\x00\x00 ftypM4A ")
+        project.save_audio(
+            0, "exports/audio/0001-tieuthuyetmang.m4a", "tieuthuyetmang", 900.0, "downloaded"
+        )
+        _, results = self._run_worker(project, engine, indices=[0])
+        assert results["finished"] == (1, 0)
+        # the row now points at the new TTS file...
+        assert project.chapter(0).audio_path.endswith("-ngoc-lan.wav")
+        # ...but the downloaded file survives on disk rather than being cleaned up
+        assert fetched.exists()
+
     def test_engine_error_marks_chapter_and_continues(
         self, library_dir, sample_meta, sample_refs
     ):
@@ -521,6 +547,31 @@ class TestAudioWorkerParallel:
         assert results["finished"] == (2, 0)
         assert project.chapter(0).audio_path.endswith("-ngoc-lan.wav")
         assert not stale.exists()  # old differently-named file cleaned up
+
+    def test_downloaded_narration_is_never_unlinked(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        """Same guard as the sequential path, at the second unlink site.
+
+        The pool hands the orchestrator an _AudioResult rather than the Chapter row, so
+        this path can only spare the file if prev_audio_source is carried back with
+        prev_audio_path — which is exactly what a refactor is liable to drop.
+        """
+        project = self._project(library_dir, sample_meta, sample_refs, translated=(0, 1))
+        fetched = project.path / "exports/audio/0001-tieuthuyetmang.m4a"
+        fetched.parent.mkdir(parents=True, exist_ok=True)
+        fetched.write_bytes(b"\x00\x00\x00 ftypM4A ")
+        project.save_audio(
+            0, "exports/audio/0001-tieuthuyetmang.m4a", "tieuthuyetmang", 900.0, "downloaded"
+        )
+        stale = project.path / "exports/audio/0002-old-format.mp3"
+        stale.write_bytes(b"ID3")
+        project.save_audio(1, "exports/audio/0002-old-format.mp3", "Giọng Cũ", 1.0)
+        factory = MagicMock(side_effect=lambda *a, **k: FakeTtsEngine())
+        results = self._run(project, factory, workers=2, indices=[0, 1])
+        assert results["finished"] == (2, 0)
+        assert fetched.exists()  # downloaded narration survives
+        assert not stale.exists()  # an ordinary re-voice still cleans up
 
     def test_engine_count_capped_by_chapters(self, library_dir, sample_meta, sample_refs):
         # workers=5 but only 2 chapters → never more than 2 engines load

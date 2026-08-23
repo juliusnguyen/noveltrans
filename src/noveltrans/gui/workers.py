@@ -23,7 +23,7 @@ from noveltrans.errors import (
     UnsupportedSiteError,
 )
 from noveltrans.gui.pause import PauseGate
-from noveltrans.models import ChapterRef
+from noveltrans.models import AUDIO_SOURCE_DOWNLOADED, ChapterRef
 from noveltrans.scrapers import adapter_for_url
 from noveltrans.scrapers.base import HttpClient
 from noveltrans.storage import Library, NovelProject
@@ -515,6 +515,7 @@ class _AudioResult:
     rel_path: str = ""
     seconds: float = 0.0
     prev_audio_path: str = ""  # chapter.audio_path, for stale-file cleanup
+    prev_audio_source: str = ""  # chapter.audio_source, so cleanup can spare downloads
     error: str = ""
 
 
@@ -704,7 +705,12 @@ class AudioWorker(PausableWorker):
 
                     out_path = convert_to_mp3(out_path)
                 rel_path = out_path.relative_to(project.path).as_posix()
-                if chapter.audio_path and chapter.audio_path != rel_path:
+                # Never unlink narration fetched from the source site: the TTS filename
+                # always differs from the download's, so this would delete a file nothing
+                # here can recreate and the user may no longer be entitled to re-fetch.
+                # An orphan on disk is the cheap failure; losing the audio is not.
+                stale = chapter.audio_path and chapter.audio_path != rel_path
+                if stale and chapter.audio_source != AUDIO_SOURCE_DOWNLOADED:
                     # re-voiced with another format — drop the stale old file
                     (project.path / chapter.audio_path).unlink(missing_ok=True)
                     _drop_cues(project.path / chapter.audio_path)
@@ -789,7 +795,13 @@ class AudioWorker(PausableWorker):
             self._write_cues(out_path, cues, raw_seconds, seconds)
             rel_path = out_path.relative_to(project_path).as_posix()
             return _AudioResult(
-                chapter.index, title, "ok", rel_path, seconds, chapter.audio_path or ""
+                chapter.index,
+                title,
+                "ok",
+                rel_path,
+                seconds,
+                chapter.audio_path or "",
+                chapter.audio_source or "",
             )
         except TtsError as exc:
             if self._cancelled:
@@ -857,7 +869,13 @@ class AudioWorker(PausableWorker):
                     if result.status == "cancelled":
                         continue  # not counted, no write (matches sequential break)
                     if result.status == "ok":
-                        if result.prev_audio_path and result.prev_audio_path != result.rel_path:
+                        stale = (
+                            result.prev_audio_path
+                            and result.prev_audio_path != result.rel_path
+                            # spare downloaded narration — see _run_sequential
+                            and result.prev_audio_source != AUDIO_SOURCE_DOWNLOADED
+                        )
+                        if stale:
                             # re-voiced with another format — drop the stale old file
                             (project.path / result.prev_audio_path).unlink(missing_ok=True)
                             _drop_cues(project.path / result.prev_audio_path)
