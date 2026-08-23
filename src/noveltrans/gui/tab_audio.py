@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from noveltrans.config import AppConfig
+from noveltrans.models import AUDIO_SOURCE_DOWNLOADED
 from noveltrans.gui.jobs import job_registry
 from noveltrans.gui.keep_awake import track_worker
 from noveltrans.gui.widgets import (
@@ -209,6 +210,13 @@ class AudioTab(QWidget):
             self.merge_format.addItem("M4B (có mục lục chương)", "m4b")
         self.merge_format.addItem("MP3 (gộp phẳng)", "mp3")
 
+        # Which audio to merge. plan_merge_windows selects on audio_voice, and this used
+        # to read voice_combo — the *synthesis* voice — so audio made with any other
+        # voice was silently unmergeable, and downloaded narration (audio_voice =
+        # "tieuthuyetmang") could never be merged at all. Populated from what the project
+        # actually holds.
+        self.merge_source = QComboBox()
+
         self.merge_button = QPushButton("Ghép audio")
         self.merge_button.clicked.connect(self._start_merge)
         if not ffmpeg_available():
@@ -223,6 +231,8 @@ class AudioTab(QWidget):
         row.addWidget(self.range_to)
         row.addWidget(self.batch_size)
         row.addWidget(self.batch_label)
+        row.addWidget(QLabel("Giọng:"))
+        row.addWidget(self.merge_source)
         row.addWidget(QLabel("Định dạng:"))
         row.addWidget(self.merge_format)
         row.addWidget(self.merge_button)
@@ -262,10 +272,39 @@ class AudioTab(QWidget):
             total = self.project.counts()["total"]
             self.range_to.setValue(max(total, 1))  # default merge range = whole novel
             self.range_from.setValue(1)
+            self._refresh_merge_sources()
             self._update_status_line()
         else:
             self.model.set_chapters([])
             self.status_label.setText("")
+
+    def _refresh_merge_sources(self) -> None:
+        """Fill the merge 'Giọng' combo with the voices this project actually has audio in.
+
+        Listing what is on disk rather than what the TTS engine offers is the point: a
+        voice with no audio merges to nothing, and downloaded narration is not a TTS
+        voice at all. Keeps the current pick when it survives the refresh.
+        """
+        previous = self.merge_source.currentData()
+        self.merge_source.clear()
+        voices: list[str] = []
+        if self.project is not None:
+            for chapter in self.project.chapters():
+                if chapter.has_audio and chapter.audio_voice not in voices:
+                    voices.append(chapter.audio_voice)
+        if not voices:
+            # Nothing merged-able yet; offer the synthesis voice so the combo is never
+            # empty and _start_merge can still give its "no audio" message.
+            fallback = self.voice_combo.currentData() or self.voice_combo.currentText().strip()
+            if fallback:
+                voices = [fallback]
+        for voice in voices:
+            label = f"{voice} (tải từ trang)" if voice == "tieuthuyetmang" else voice
+            self.merge_source.addItem(label, voice)
+        if previous:
+            at = self.merge_source.findData(previous)
+            if at >= 0:
+                self.merge_source.setCurrentIndex(at)
 
     def _use_translation(self) -> bool:
         return self.translated_radio.isChecked()
@@ -278,7 +317,10 @@ class AudioTab(QWidget):
             ready = f"{counts['translated']}/{counts['total']} chương đã dịch"
         else:
             ready = f"{counts['downloaded']}/{counts['total']} chương đã tải"
-        message = f"{ready}, {counts['audio']} đã có audio."
+        message = f"{ready}, {counts['audio']} đã có audio"
+        if counts["downloaded_audio"]:
+            message += f" (trong đó {counts['downloaded_audio']} tải từ trang)"
+        message += "."
         # A self-written Vietnamese novel usually has no translation and doesn't need
         # one — point at the radio instead of letting "0 đã dịch" look like a dead end.
         # Deliberately doesn't flip the radio: that writes a persisted preference.
@@ -407,7 +449,7 @@ class AudioTab(QWidget):
         rows = self._selected_rows()
         if index.isValid() and index.row() not in rows:
             rows = [index.row()]  # right-clicked away from the selection → act on that row
-        indices, skipped = self._regenerable_indices(rows)
+        indices, skipped_no_text, skipped_downloaded = self._regenerable_indices(rows)
         if not indices:
             return  # nothing with source text to read — offering it would only mislead
         menu.addSeparator()
@@ -420,8 +462,10 @@ class AudioTab(QWidget):
         hints = []
         if running:
             hints.append("Đang có phiên tạo audio chạy — chờ xong rồi thử lại.")
-        if skipped:
-            hints.append(f"Bỏ qua {skipped} chương chưa có nội dung.")
+        if skipped_no_text:
+            hints.append(f"Bỏ qua {skipped_no_text} chương chưa có nội dung.")
+        if skipped_downloaded:
+            hints.append(f"Bỏ qua {skipped_downloaded} chương đang dùng audio tải về.")
         if hints:
             menu.setToolTipsVisible(True)  # QMenu hides action tooltips unless asked
             action.setToolTip(" ".join(hints))
@@ -441,29 +485,39 @@ class AudioTab(QWidget):
             return []
         return sorted({index.row() for index in selection.selectedIndexes()})
 
-    def _regenerable_indices(self, rows: list[int]) -> tuple[list[int], int]:
-        """(chapter indices to re-voice, rows dropped) for `rows`, in chapter order.
+    def _regenerable_indices(self, rows: list[int]) -> tuple[list[int], int, int]:
+        """(indices to re-voice, dropped for no text, dropped as downloaded) for `rows`.
 
         Rows are table positions; AudioWorker wants chapter.index — not the same number
         once a novel has gaps, so this is the one place that converts. A row is dropped
         when its source (translation or original, per the radio) is empty: the worker
         filters those out anyway, so counting them would overstate the job and leave the
         progress bar's maximum lying. Sorted because AudioWorker reads `indices` in order.
+
+        Rows carrying narration downloaded from the source site are dropped too, and
+        counted separately because the two need different wording: "chưa có nội dung" is
+        a "do this first", while a downloaded row is deliberately protected — re-voicing
+        it would replace real narration with TTS. Explicit regenerate is the one path
+        that bypasses pending_audio's guard, so it has to re-apply it here.
         """
         if self.project is None:
-            return [], 0
+            return [], 0, 0
         use_translation = self._use_translation()
         indices: list[int] = []
-        skipped = 0
+        skipped_no_text = 0
+        skipped_downloaded = 0
         for row in rows:
             chapter = self.model.chapter_at(row)
             if chapter is None:
                 continue
+            if chapter.audio_source == AUDIO_SOURCE_DOWNLOADED and chapter.has_audio:
+                skipped_downloaded += 1
+                continue
             if not (chapter.translated if use_translation else chapter.content):
-                skipped += 1
+                skipped_no_text += 1
                 continue
             indices.append(chapter.index)
-        return sorted(dict.fromkeys(indices)), skipped
+        return sorted(dict.fromkeys(indices)), skipped_no_text, skipped_downloaded
 
     def _regenerate_row(self, row: int) -> None:
         """The per-row 🔊 button — one chapter, no confirmation, as before."""
@@ -483,8 +537,14 @@ class AudioTab(QWidget):
         if self._worker is not None and self._worker.isRunning():
             self.status_label.setText("Đang có phiên tạo audio chạy — chờ xong rồi thử lại.")
             return
-        indices, skipped = self._regenerable_indices(rows)
+        indices, skipped_no_text, skipped_downloaded = self._regenerable_indices(rows)
         if not indices:
+            if skipped_downloaded and not skipped_no_text:
+                self.status_label.setText(
+                    f"{skipped_downloaded} chương đã chọn đang dùng audio tải về — "
+                    "không tạo lại bằng TTS."
+                )
+                return
             nguon = "bản dịch" if self._use_translation() else "bản gốc"
             self.status_label.setText(
                 f"Chương đã chọn chưa có {nguon} để đọc — hãy dịch/tải trước."
@@ -499,23 +559,38 @@ class AudioTab(QWidget):
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
-        if skipped:
-            self.status_label.setText(f"Bỏ qua {skipped} chương chưa có nội dung.")
+        notes = []
+        if skipped_no_text:
+            notes.append(f"{skipped_no_text} chương chưa có nội dung")
+        if skipped_downloaded:
+            notes.append(f"{skipped_downloaded} chương đang dùng audio tải về")
+        if notes:
+            self.status_label.setText("Bỏ qua " + ", ".join(notes) + ".")
         self._start_generate(indices=indices)
 
     def _regenerate_all(self) -> None:
         if self.project is None:
             QMessageBox.information(self, "Chưa chọn truyện", "Hãy tải một truyện ở Tab 1 trước.")
             return
-        generated = self.project.counts()["audio"]
+        counts = self.project.counts()
+        # clear_audio() and pending_audio() both spare downloaded narration, so quoting
+        # counts["audio"] here would promise to redo files this pass will not touch.
+        generated = counts["audio"] - counts["downloaded_audio"]
+        kept = counts["downloaded_audio"]
         if generated:
+            note = f" ({kept} chương dùng audio tải về sẽ được giữ nguyên.)" if kept else ""
             answer = QMessageBox.question(
                 self,
                 "Tạo lại từ đầu?",
-                f"Sẽ tạo lại audio cho toàn bộ {generated} chương đã có. Tiếp tục chứ?",
+                f"Sẽ tạo lại audio cho toàn bộ {generated} chương đã có.{note} Tiếp tục chứ?",
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
+        elif kept:
+            self.status_label.setText(
+                f"Chỉ có {kept} chương dùng audio tải về — không có gì để tạo lại bằng TTS."
+            )
+            return
         self.project.clear_audio()
         self.model.set_chapters(self.project.chapters())
         self._start_generate()
@@ -618,6 +693,7 @@ class AudioTab(QWidget):
 
     def _on_finished(self, ok: int, errors: int) -> None:
         self._reset_buttons()
+        self._refresh_merge_sources()  # a new voice may now have audio to merge
         message = f"Xong: {ok} chương có audio"
         if errors:
             message += f", {errors} lỗi (bấm 'Tạo audio tất cả' để thử lại)"
@@ -639,7 +715,7 @@ class AudioTab(QWidget):
             return
         if self._merge_worker is not None and self._merge_worker.isRunning():
             return
-        voice = self.voice_combo.currentData() or self.voice_combo.currentText().strip()
+        voice = self.merge_source.currentData() or ""
         mode = self.merge_mode.currentData()
         start = self.range_from.value() if mode == "range" else None
         end = self.range_to.value() if mode == "range" else None

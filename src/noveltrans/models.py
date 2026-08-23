@@ -127,6 +127,15 @@ STATUS_DOWNLOADED = "downloaded"
 STATUS_TRANSLATED = "translated"
 STATUS_ERROR = "error"
 
+# Which text an audio file was voiced from, or that it was not voiced at all.
+# Deliberately a separate namespace from the STATUS_* constants above:
+# AUDIO_SOURCE_DOWNLOADED and STATUS_DOWNLOADED share the literal "downloaded" but mean
+# unrelated things — narration fetched from the source site vs. chapter *text* fetched.
+# Never compare a status against an audio source.
+AUDIO_SOURCE_TRANSLATED = "translated"
+AUDIO_SOURCE_ORIGINAL = "original"
+AUDIO_SOURCE_DOWNLOADED = "downloaded"
+
 
 @dataclass
 class Chapter:
@@ -147,7 +156,7 @@ class Chapter:
     # audio pipeline (parallel to download/translate status)
     audio_path: str = ""  # path relative to the project folder ("" = not generated)
     audio_voice: str = ""
-    audio_source: str = "translated"  # which text the audio was voiced from
+    audio_source: str = AUDIO_SOURCE_TRANSLATED  # see AUDIO_SOURCE_* above
     audio_seconds: float = 0.0  # duration of the generated audio
     audio_error: str = ""
     # True once the user renamed this chapter by hand; a re-scan then leaves the title

@@ -31,6 +31,7 @@ from PySide6.QtGui import QColor, QKeySequence, QShortcut
 
 from noveltrans.gui.jobs import job_registry
 from noveltrans.models import (
+    AUDIO_SOURCE_DOWNLOADED,
     STATUS_DOWNLOADED,
     STATUS_ERROR,
     STATUS_PENDING,
@@ -303,6 +304,10 @@ class AudioChapterTableModel(QAbstractTableModel):
             return "Chưa tải", STATUS_COLORS[STATUS_PENDING]
         if chapter.audio_error:
             return "Lỗi", STATUS_COLORS[STATUS_ERROR]
+        if chapter.has_audio and chapter.audio_source == AUDIO_SOURCE_DOWNLOADED:
+            # Narration fetched from the source site, not synthesised here — worth its
+            # own label so the user can see at a glance what a re-voice would destroy.
+            return "Đã tải", STATUS_COLORS[STATUS_TRANSLATED]
         if chapter.has_audio:
             return "Đã tạo", STATUS_COLORS[STATUS_TRANSLATED]
         return "Chưa tạo", STATUS_COLORS[STATUS_DOWNLOADED]
@@ -356,9 +361,13 @@ class AudioChapterTableModel(QAbstractTableModel):
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         if column == self.REGENERATE_COLUMN:
             has_source = bool(chapter.translated if self._use_translation else chapter.content)
+            # A downloaded row has nothing to re-synthesise: pressing 🔊 would replace
+            # fetched narration with TTS. Both the delegate's painter and its click
+            # handler gate on UserRole, so returning False removes the button entirely.
+            downloadable = chapter.audio_source == AUDIO_SOURCE_DOWNLOADED
             if role == Qt.ItemDataRole.UserRole:
-                return has_source
-            if role == Qt.ItemDataRole.ToolTipRole and has_source:
+                return has_source and not downloadable
+            if role == Qt.ItemDataRole.ToolTipRole and has_source and not downloadable:
                 return "Tạo (lại) audio riêng chương này"
         return None
 
