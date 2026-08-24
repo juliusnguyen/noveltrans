@@ -52,7 +52,12 @@ from noveltrans.config import AppConfig, translator_labels
 from noveltrans.gui.job_popup import BROWSER_PAUSE_HINT
 from noveltrans.gui.jobs import job_registry
 from noveltrans.gui.keep_awake import track_worker
-from noveltrans.gui.widgets import CheckableHeaderView, PauseButton, ProjectPicker
+from noveltrans.gui.widgets import (
+    CheckableHeaderView,
+    PauseButton,
+    ProjectPicker,
+    audio_source_label,
+)
 from noveltrans.gui.workers import (
     CompletionWorker,
     TagsWorker,
@@ -73,6 +78,12 @@ _TAG_ENGINES = ("cli", "claude_cli", "claude", "lmstudio")
 _IMAGE_FILTER = "Ảnh (*.png *.jpg *.jpeg *.webp *.bmp)"
 
 
+# Combo entry for the site's own audio edition. A sentinel rather than a voice id
+# because a release is not synthesized and has no voice: it selects a different SOURCE
+# of parts (`plan_source_windows`), not a different narrator.
+SOURCE_AUDIO_KEY = "__source_audio__"
+
+
 class VideoTab(QWidget):
     def __init__(self, config: AppConfig, parent=None):
         super().__init__(parent)
@@ -87,6 +98,10 @@ class VideoTab(QWidget):
         self._subtitle_upload_worker: SubtitleUploadWorker | None = None
         self._preview_worker: VideoPreviewWorker | None = None
         self._voices_worker: TtsVoicesWorker | None = None
+        # The TTS engine's catalogue, kept only as a FALLBACK for a project that has no
+        # audio yet. What the combo normally lists is what the project actually holds —
+        # see `_refresh_audio_sources`.
+        self._tts_voices: list[tuple[str, str]] = []
         self._tags_worker: TagsWorker | None = None
         self._image_prompt_worker: CompletionWorker | None = None
         self._render_after_tags = False  # auto-generate tags, then start the render
@@ -123,7 +138,9 @@ class VideoTab(QWidget):
 
         self.voice_combo = QComboBox()
         self.voice_combo.setMinimumWidth(200)
-        self.voice_combo.setToolTip("Giọng đọc của audio dùng để tạo video.")
+        self.voice_combo.setToolTip(
+            "Nguồn audio dùng để tạo video: giọng TTS đã tạo, hoặc bản đọc tải từ trang."
+        )
         self._load_voices()
 
         top_row = QHBoxLayout()
@@ -599,6 +616,14 @@ class VideoTab(QWidget):
         batch = self.video_batch_size.value() if mode == "batch" else None
         if mode == "range" and start and end and start > end:
             return []
+        if voice == SOURCE_AUDIO_KEY:
+            from noveltrans.tts.merge import plan_source_windows
+
+            # Numbering counts RELEASES here, so "phần 1..N" runs 1..21 for a novel with
+            # 21 volumes rather than following the chapter numbers they cover.
+            return plan_source_windows(
+                self.project.source_audio(), mode, start=start, end=end, batch=batch
+            )
         if mode == "batch":
             return self._locked_batch_windows(voice, batch)
         return plan_merge_windows(
@@ -2088,13 +2113,50 @@ class VideoTab(QWidget):
         self._voices_worker.start()
 
     def _on_voices_listed(self, voices: list) -> None:
-        saved = self.config.tts_voice
+        # Arrives asynchronously, possibly after a project is already open. Writing
+        # straight into the combo here is what would overwrite a project-derived list
+        # with the engine catalogue, depending purely on which finished first.
+        self._tts_voices = [
+            (re.sub(r"\s*·\s*Phong cách.*$", "", label), voice_id) for label, voice_id in voices
+        ]
+        self._refresh_audio_sources()
+
+    def _refresh_audio_sources(self) -> None:
+        """Fill the combo with the audio this project actually has.
+
+        This tab never SYNTHESIZES anything — it only consumes audio already on disk — so
+        listing the TTS engine's voices was wrong in a way that mattered: narration
+        downloaded from the source site is stored under `audio_voice="tieuthuyetmang"`,
+        which is not an engine voice and so could never be selected. `plan_merge_windows`
+        filters on `audio_voice == voice`, so downloaded audio was structurally
+        unreachable from the video tab. Same bug family as the merge step's, fixed the
+        same way (059.01).
+
+        Falls back to the engine catalogue only when the project has no audio at all, so
+        the combo is never empty before the first chapter is voiced.
+        """
+        previous = self.voice_combo.currentData() or self.config.tts_voice
+        pretty = dict(self._tts_voices)
+        have: list[str] = []
+        downloaded = 0
+        if self.project is not None:
+            for chapter in self.project.chapters():
+                if chapter.has_audio and chapter.audio_voice not in have:
+                    have.append(chapter.audio_voice)
+            downloaded = sum(1 for r in self.project.source_audio() if r.has_audio)
         self.voice_combo.blockSignals(True)
         self.voice_combo.clear()
-        for label, voice_id in voices:
-            label = re.sub(r"\s*·\s*Phong cách.*$", "", label)
-            self.voice_combo.addItem(label, voice_id)
-        index = self.voice_combo.findData(saved)
+        if downloaded:
+            # Listed first: on a novel fetched from the site this is the edition the user
+            # actually has, and often the only one.
+            self.voice_combo.addItem(f"Audio từ nguồn ({downloaded} mục)", SOURCE_AUDIO_KEY)
+        if have:
+            for voice in have:
+                self.voice_combo.addItem(audio_source_label(voice, pretty), voice)
+        elif not downloaded:
+            for label, voice_id in self._tts_voices:
+                self.voice_combo.addItem(label, voice_id)
+        index = self.voice_combo.findData(previous)
         self.voice_combo.setCurrentIndex(index if index >= 0 else 0)
         self.voice_combo.blockSignals(False)
 
@@ -2146,6 +2208,7 @@ class VideoTab(QWidget):
             self.display_title_edit.clear()
             self.display_title_edit.setPlaceholderText("")
             self.status_label.setText("")
+        self._refresh_audio_sources()
         self._refresh_video_list()
 
     def _sync_display_title(self) -> None:
@@ -2700,6 +2763,7 @@ class VideoTab(QWidget):
         self._video_worker = VideoWorker(
             self.project.path, voice=voice, mode=mode, image_path=image,
             start=start, end=end, batch=batch,
+            source_audio=voice == SOURCE_AUDIO_KEY,
             width=preset["width"], height=preset["height"], fps=preset["fps"],
             spin_vinyl=preset["spin_vinyl"], font=font_family, font_key=font_key,
             thumb_font_key=self._video_settings["video_thumbnail_font"],
