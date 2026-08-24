@@ -358,16 +358,28 @@ def parse_chapter_list(markup: str, url: str) -> tuple[list[ChapterRef], list[di
 def is_paywalled(markup: str) -> bool:
     """True when the page carries a subscribe call-to-action.
 
-    Scanned over the whole body, NOT scoped to the content container — MEASURED: the CTA
-    (`div.btn-login`, "登录订阅本章") sits *outside* `#article`, so a container-scoped
-    search would miss it and let the teaser through.
+    Scanned over the page chrome with the **content container removed** — MEASURED, and
+    the hard-won part:
 
-    `<script>` is stripped first because the Nuxt payload embeds every chapter name and
-    the site's own UI strings; a bare `"订阅" in html` matches free pages too.
+    * the CTA (`div.btn-login`, "登录订阅本章") sits *outside* `#article`, so scoping the
+      search **to** the container would miss it and let a teaser through;
+    * the story itself is *inside* `#article`, and ordinary prose contains these words all
+      the time — 购买 ("buy") is an everyday verb in a wuxia novel (buying pills, herbs,
+      treasures). Scanning the whole page therefore refused free chapters 26, 27 and 30 on
+      sentences about villagers buying medicine.
+
+    Removing the container is what separates the two. Length is a secondary guard only: a
+    Chinese paragraph is routinely under 200 characters, so length alone cannot tell prose
+    from a button and must never be the deciding signal.
+
+    `<script>` goes too, because the Nuxt payload embeds every chapter name and the site's
+    own UI strings; a bare `"订阅" in html` matches free pages as well.
     """
     soup = BeautifulSoup(markup or "", "lxml")
     for tag in soup(["script", "style", "head"]):
         tag.decompose()
+    for container in soup.select(SEL_CONTENT):
+        container.decompose()  # the story lives here; CTAs never do
     for element in soup.find_all(True):
         text = element.get_text(strip=True)
         if 0 < len(text) <= _CTA_MAX_CHARS and any(m in text for m in _PAYWALL_MARKERS):
