@@ -23,6 +23,7 @@ from noveltrans.config import TARGET_LANGS, AppConfig, translator_labels
 from noveltrans.gui.find_replace_dialog import FindReplaceDialog
 from noveltrans.gui.jobs import job_registry
 from noveltrans.gui.keep_awake import track_worker
+from noveltrans.gui.rewrite_dialog import RewriteDialog
 from noveltrans.gui.widgets import (
     PauseButton,
     ChapterTableModel,
@@ -31,7 +32,13 @@ from noveltrans.gui.widgets import (
     RetranslateButtonDelegate,
     enable_cell_copy,
 )
-from noveltrans.gui.workers import CliModelsWorker, LmStudioModelsWorker, TranslateWorker
+from noveltrans.gui.workers import (
+    CliModelsWorker,
+    LmStudioModelsWorker,
+    RewriteWorker,
+    TranslateWorker,
+    chapters_to_rewrite,
+)
 from noveltrans.models import Chapter
 from noveltrans.storage import NovelProject
 
@@ -43,6 +50,12 @@ class TranslateTab(QWidget):
         self.project: NovelProject | None = None
         self._preview_idx: int | None = None  # chapter shown in the preview panes
         self._worker: TranslateWorker | None = None
+        # A second batch worker on the same tab. Every lifecycle site below — _busy,
+        # _cancel, _reset_buttons, has_running_workers, shutdown — has to account for it,
+        # or quitting mid-rewrite abandons a running QThread.
+        self._rewrite_worker: RewriteWorker | None = None
+        self._rewrite_dialog: RewriteDialog | None = None
+        self._progress_verb = "Đang dịch"
         self._models_worker: CliModelsWorker | LmStudioModelsWorker | None = None
         self._model_suggestions: dict[str, list[str]] = {}  # binary/url -> model labels
 
@@ -101,7 +114,10 @@ class TranslateTab(QWidget):
         self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
-        enable_cell_copy(self.table)  # Ctrl+C / right-click to copy a cell (e.g. errors)
+        # Ctrl+C / right-click to copy a cell (e.g. errors); the same menu also carries
+        # the per-chapter "Viết lại" / "Hoàn tác" actions via the extra_actions hook —
+        # RETRANSLATE_COLUMN already holds the table's only row-button slot.
+        enable_cell_copy(self.table, extra_actions=self._table_context_actions)
         self.table.setMouseTracking(True)  # hover state for the row buttons
         self.model.translated_title_edited.connect(self._on_translated_title_edited)
         # Same clipping as the chapter title in Tải truyện: the styled QLineEdit
@@ -153,6 +169,12 @@ class TranslateTab(QWidget):
             "Thay thế hàng loạt trong bản dịch/bản gốc (ví dụ: sửa một tên nhân vật)."
         )
         self.find_replace_button.clicked.connect(self._open_find_replace)
+        self.rewrite_button = QPushButton("✍️ Viết lại văn phong")
+        self.rewrite_button.setToolTip(
+            "Dùng AI viết lại bản dịch cho đúng văn phong tiếng Việt (truyện convert dịch "
+            "word-by-word). Không đổi tên riêng, không đổi xưng hô. Có thể hoàn tác."
+        )
+        self.rewrite_button.clicked.connect(self._open_rewrite)
         self.cancel_button = QPushButton("Dừng")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self._cancel)
@@ -164,6 +186,7 @@ class TranslateTab(QWidget):
         bottom_row.addWidget(self.translate_button)
         bottom_row.addWidget(self.retranslate_button)
         bottom_row.addWidget(self.find_replace_button)
+        bottom_row.addWidget(self.rewrite_button)
         bottom_row.addWidget(self.cancel_button)
         bottom_row.addWidget(self.pause_button)
         bottom_row.addWidget(self.progress, stretch=1)
@@ -264,7 +287,7 @@ class TranslateTab(QWidget):
         self.picker.refresh(self.config.library_dir, select_path)
 
     def showEvent(self, event) -> None:  # refresh lists every time the tab appears
-        if self._worker is None or not self._worker.isRunning():
+        if not self._busy():
             self.refresh_projects()
             self._populate_engines()  # pick up a changed CLI command in Settings
         super().showEvent(event)
@@ -401,6 +424,12 @@ class TranslateTab(QWidget):
         if self.project is None:
             QMessageBox.information(self, "Chưa chọn truyện", "Hãy tải một truyện ở Tab 1 trước.")
             return
+        # The buttons are already disabled during a run, but "Dịch lại từ đầu" and the
+        # per-row retranslate reach this by other routes — and a translation racing a
+        # rewrite would have them writing the same rows.
+        if self._busy():
+            self.status_label.setText(self._busy_message())
+            return
         target = self.lang_combo.currentData()
         if indices is None:
             pending = self.project.pending_translation(target)
@@ -426,9 +455,11 @@ class TranslateTab(QWidget):
         self.config.translator = engine
         self.config.target_lang = target
 
+        self._progress_verb = "Đang dịch"
         self.translate_button.setEnabled(False)
         self.retranslate_button.setEnabled(False)
         self.find_replace_button.setEnabled(False)
+        self.rewrite_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.picker.setEnabled(False)
         self.progress.setMaximum(max(total, 1))
@@ -462,8 +493,8 @@ class TranslateTab(QWidget):
         chapter = self.model.chapter_at(row)
         if chapter is None or self.project is None or not chapter.content:
             return
-        if self._worker is not None and self._worker.isRunning():
-            self.status_label.setText("Đang có phiên dịch chạy — chờ xong rồi thử lại.")
+        if self._busy():
+            self.status_label.setText(self._busy_message())
             return
         self._start_translate(indices=[chapter.index])
 
@@ -488,8 +519,8 @@ class TranslateTab(QWidget):
         if self.project is None:
             QMessageBox.information(self, "Chưa chọn truyện", "Hãy tải một truyện ở Tab 1 trước.")
             return
-        if self._worker is not None and self._worker.isRunning():
-            self.status_label.setText("Đang có phiên dịch chạy — chờ xong rồi thử lại.")
+        if self._busy():
+            self.status_label.setText(self._busy_message())
             return
         # Flush a half-typed manual edit to disk FIRST, so the scan sees the latest text
         # and a later focus-out can't overwrite the replacement. The modal then blocks
@@ -512,16 +543,226 @@ class TranslateTab(QWidget):
         if self._preview_idx is not None and self._preview_idx in indices:
             self._load_preview(self.project.chapter(self._preview_idx))
 
+    # --------------------------------------------------------------- rewrite
+
+    def _open_rewrite(self) -> None:
+        if self.project is None:
+            QMessageBox.information(self, "Chưa chọn truyện", "Hãy tải một truyện ở Tab 1 trước.")
+            return
+        if self._busy():
+            self.status_label.setText(self._busy_message())
+            return
+        # Flush half-typed manual edits FIRST, so the rewrite reads the latest text and a
+        # later focus-out cannot overwrite its result. The modal then blocks further pane
+        # edits while it is open.
+        self._save_preview_edits()
+        self._save_original_edits()
+
+        dialog = RewriteDialog(self.project, self.config, self._preview_idx, self)
+        self._rewrite_dialog = dialog
+        dialog.start_requested.connect(self._start_rewrite)
+        dialog.preview_requested.connect(self._start_rewrite)
+        dialog.undo_requested.connect(self._undo_rewrite)
+        dialog.applied.connect(self._on_replacements_applied)  # same refresh either way
+        try:
+            dialog.exec()
+        finally:
+            self._rewrite_dialog = None
+
+    def _start_rewrite(self, params: dict) -> None:
+        """Run a rewrite batch, or a one-chapter preview when `dry_run` is set.
+
+        One worker for both: a preview that took a different path would prove nothing
+        about the hours-long run it exists to justify.
+        """
+        if self.project is None or self._busy():
+            return
+        engine = params.get("engine_name", "")
+        dry_run = bool(params.get("dry_run"))
+        worker = RewriteWorker(
+            self.project.path,
+            engine,
+            params.get("target_lang", "vi"),
+            api_key=self.config.claude_api_key,
+            model=params.get("model", ""),
+            cli_command=self.config.cli_command_for(engine),
+            base_url=self.config.lmstudio_url if engine == "lmstudio" else "",
+            indices=params.get("indices"),
+            start_idx=params.get("start_idx", 0),
+            end_idx=params.get("end_idx"),
+            force=bool(params.get("force")),
+            dry_run=dry_run,
+        )
+        self._rewrite_worker = worker
+        worker.failed.connect(self._on_rewrite_failed)
+
+        if dry_run:
+            # Writes nothing, so it stays out of the progress bar, the job registry and
+            # the wake-lock; its results go straight back to the dialog that asked.
+            dialog = self._rewrite_dialog
+            if dialog is not None:
+                worker.preview_ready.connect(dialog.show_preview)
+                worker.chapter_error.connect(dialog.show_preview_error)
+                worker.finished_ok.connect(lambda *_: dialog.preview_finished())
+            worker.start()
+            return
+
+        total = len(
+            chapters_to_rewrite(
+                self.project,
+                params.get("target_lang", "vi"),
+                indices=params.get("indices"),
+                start_idx=params.get("start_idx", 0),
+                end_idx=params.get("end_idx"),
+                force=bool(params.get("force")),
+            )
+        )
+        self._progress_verb = "Đang viết lại"
+        self.translate_button.setEnabled(False)
+        self.retranslate_button.setEnabled(False)
+        self.find_replace_button.setEnabled(False)
+        self.rewrite_button.setEnabled(False)
+        self.cancel_button.setEnabled(True)
+        self.picker.setEnabled(False)
+        self.progress.setMaximum(max(total, 1))
+        self.progress.setValue(0)
+
+        worker.progress.connect(self._on_progress)
+        worker.chapter_done.connect(self._on_chapter_updated)
+        worker.chapter_error.connect(lambda idx, _msg: self._on_chapter_updated(idx))
+        worker.finished_ok.connect(self._on_rewrite_finished)
+        track_worker(worker)  # a whole novel is hours — don't let the Mac sleep
+        self._job = job_registry.register(worker, kind="Viết lại", novel=self._job_novel())
+        self.pause_button.set_job(self._job.id if self._job else None)
+        worker.start()
+
+    def _rewrite_rows(self, indices: list[int]) -> None:
+        """Rewrite exactly these chapters (the table's right-click menu)."""
+        if not indices or self.project is None:
+            return
+        if self._busy():
+            self.status_label.setText(self._busy_message())
+            return
+        self._save_preview_edits()
+        self._start_rewrite(
+            {
+                "engine_name": self.config.rewrite_ai_engine,
+                "model": self.config.rewrite_ai_model,
+                "target_lang": "vi",
+                "indices": indices,
+            }
+        )
+
+    def _undo_rewrite(self, idx) -> None:
+        """Undo a rewrite: `idx` is a chapter index, or None for the whole novel."""
+        if self.project is None:
+            return
+        restored = self.project.restore_translation(idx)
+        if not restored:
+            return
+        self.model.set_chapters(self.project.chapters())
+        if self._preview_idx is not None:
+            self._load_preview(self.project.chapter(self._preview_idx))
+        self.status_label.setText(f"Đã hoàn tác viết lại {restored} chương.")
+
+    def _undo_rewrite_rows(self, indices: list[int]) -> None:
+        for index in indices:
+            self._undo_rewrite(index)
+
+    def _table_context_actions(self, menu, index) -> None:
+        """Per-chapter "Viết lại" / "Hoàn tác" on the table's right-click menu.
+
+        Built from the *selection* rather than the row under the cursor, so one
+        right-click can act on everything highlighted; `enable_cell_copy` keeps a
+        multi-row selection alive when the click lands inside it.
+        """
+        if self.project is None:
+            return
+        selection = self.table.selectionModel()
+        rows = sorted({i.row() for i in selection.selectedIndexes()}) if selection else []
+        if index.isValid() and index.row() not in rows:
+            rows = [index.row()]  # right-clicked away from the selection → act on that row
+        chapters = [c for c in (self.model.chapter_at(row) for row in rows) if c is not None]
+        rewritable = [c.index for c in chapters if c.translated]
+        undoable = [c.index for c in chapters if c.is_rewritten]
+        if not rewritable and not undoable:
+            return  # nothing translated here — offering it would only mislead
+
+        menu.addSeparator()
+        busy = self._busy()
+        if rewritable:
+            label = (
+                "✍️ Viết lại chương này"
+                if len(rewritable) == 1
+                else f"✍️ Viết lại {len(rewritable)} chương"
+            )
+            action = menu.addAction(label)
+            action.setEnabled(not busy)
+            action.triggered.connect(lambda _=False, idxs=rewritable: self._rewrite_rows(idxs))
+        if undoable:
+            label = (
+                "↩︎ Hoàn tác viết lại"
+                if len(undoable) == 1
+                else f"↩︎ Hoàn tác viết lại {len(undoable)} chương"
+            )
+            action = menu.addAction(label)
+            action.setEnabled(not busy)
+            action.triggered.connect(
+                lambda _=False, idxs=undoable: self._undo_rewrite_rows(idxs)
+            )
+        if busy:
+            menu.setToolTipsVisible(True)  # QMenu hides action tooltips unless asked
+
+    def _on_rewrite_failed(self, message: str) -> None:
+        self._reset_buttons()
+        if self._rewrite_dialog is not None:
+            self._rewrite_dialog.preview_finished()
+        QMessageBox.warning(self, "Không viết lại được", message)
+
+    def _on_rewrite_finished(self, ok: int, errors: int) -> None:
+        self._reset_buttons()
+        message = f"Viết lại xong: {ok} chương"
+        if errors:
+            message += (
+                f", {errors} chương giữ nguyên bản dịch cũ vì bản viết lại không đạt "
+                "(xem cột Lỗi)"
+            )
+        self.status_label.setText(message + ".")
+
+    # -------------------------------------------------------------- lifecycle
+
+    def _busy_message(self) -> str:
+        """Which run is in the way. Naming it beats a generic "something is running":
+        the two batches take very different amounts of time to finish."""
+        if self._rewrite_worker is not None and self._rewrite_worker.isRunning():
+            return "Đang có phiên viết lại chạy — chờ xong rồi thử lại."
+        return "Đang có phiên dịch chạy — chờ xong rồi thử lại."
+
+    def _busy(self) -> bool:
+        """True while either batch is running.
+
+        The two must never overlap: they write the same rows, and a rewrite reads
+        `translated` while a translation is replacing it.
+        """
+        return any(
+            worker is not None and worker.isRunning()
+            for worker in (self._worker, self._rewrite_worker)
+        )
+
     def _cancel(self) -> None:
-        if self._worker is not None:
-            self._worker.cancel()
+        cancelled = False
+        for worker in (self._worker, self._rewrite_worker):
+            if worker is not None:
+                worker.cancel()
+                cancelled = True
+        if cancelled:
             self.status_label.setText("Đang dừng sau chương hiện tại…")
 
     def _on_progress(self, done: int, total: int, title: str) -> None:
         self.progress.setMaximum(total)
         self.progress.setValue(done)
         if title:
-            self.status_label.setText(f"Đang dịch: {title}")
+            self.status_label.setText(f"{self._progress_verb}: {title}")
 
     def _on_chapter_updated(self, idx: int) -> None:
         if self.project is None:
@@ -547,6 +788,7 @@ class TranslateTab(QWidget):
         self.translate_button.setEnabled(True)
         self.retranslate_button.setEnabled(True)
         self.find_replace_button.setEnabled(True)
+        self.rewrite_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
         self.picker.setEnabled(True)
 
@@ -559,15 +801,16 @@ class TranslateTab(QWidget):
         return self.project.meta.display_name() if self.project is not None else ""
 
     def has_running_workers(self) -> bool:
-        # Only the translation run is user-meaningful work worth a close-confirm; the
+        # Only the batch runs are user-meaningful work worth a close-confirm; the
         # models-list fetch is a short background metadata call (shutdown still joins it).
-        return self._worker is not None and self._worker.isRunning()
+        return self._busy()
 
     def shutdown(self) -> None:
         self._save_preview_edits()
         self._save_original_edits()
-        if self._worker is not None and self._worker.isRunning():
-            self._worker.cancel()
-            self._worker.wait(60_000)
+        for worker in (self._worker, self._rewrite_worker):
+            if worker is not None and worker.isRunning():
+                worker.cancel()
+                worker.wait(60_000)
         if self._models_worker is not None and self._models_worker.isRunning():
             self._models_worker.wait(20_000)  # bounded by the 15s subprocess timeout

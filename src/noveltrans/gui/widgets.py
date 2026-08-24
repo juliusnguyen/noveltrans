@@ -566,13 +566,24 @@ class ChapterTableModel(QAbstractTableModel):
             if column == self.STATUS_COLUMN:
                 return STATUS_LABELS.get(chapter.status, chapter.status)
             if column == self.TRANSLATOR_COLUMN:
-                return chapter.translator
+                # A suffix rather than a ninth column: a new column would shift
+                # RETRANSLATE_COLUMN and every hard-coded index that follows it, for a
+                # fact two characters convey at a glance.
+                if not chapter.is_rewritten:
+                    return chapter.translator
+                return f"{chapter.translator} ✍️".strip()
             if column == self.DURATION_COLUMN:
                 return format_duration(chapter.translate_seconds)
             if column == self.ERROR_COLUMN:
                 return chapter.error
         if role == Qt.ItemDataRole.ToolTipRole and column == self.ERROR_COLUMN and chapter.error:
             return chapter.error  # full text on hover (cell is truncated)
+        if (
+            role == Qt.ItemDataRole.ToolTipRole
+            and column == self.TRANSLATOR_COLUMN
+            and chapter.is_rewritten
+        ):
+            return "Đã viết lại văn phong — chuột phải để hoàn tác"
         if role == Qt.ItemDataRole.EditRole and column == self.TRANSLATED_TITLE_COLUMN:
             return chapter.translated_title
         if role == Qt.ItemDataRole.EditRole and column == self.TITLE_COLUMN:

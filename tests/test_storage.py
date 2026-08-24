@@ -253,6 +253,7 @@ class TestApplyReplacements:
             "total": 5,
             "downloaded": 2,
             "translated": 1,
+            "rewritten": 0,
             "errors": 1,
             "audio": 0,
             "downloaded_audio": 0,
@@ -273,6 +274,8 @@ class TestMigration:
         for column in (
             "translator",
             "translate_seconds",
+            "translated_raw",
+            "translated_title_raw",
             "audio_path",
             "audio_voice",
             "audio_seconds",
@@ -286,9 +289,169 @@ class TestMigration:
         assert reopened.chapter(0).translator == ""
         assert reopened.chapter(0).translate_seconds == 0
         assert reopened.chapter(0).audio_path == ""
+        assert reopened.chapter(0).translated_raw == ""
+        assert reopened.chapter(0).translated_title_raw == ""
+        assert not reopened.chapter(0).is_rewritten
         reopened.save_translation(0, "t", "dịch", "vi", translator="CLI (agy)", seconds=3.0)
         assert reopened.chapter(0).translator == "CLI (agy)"
         assert reopened.chapter(0).translate_seconds == 3.0
+        # the rewrite pass must work on a migrated DB, not just a freshly created one
+        reopened.save_rewrite(0, "t", "dịch lại")
+        assert reopened.chapter(0).is_rewritten
+        assert reopened.chapter(0).translated_raw == "dịch"
+
+
+class TestRewriteState:
+    """Feature 060 — the style-rewrite backup columns and the queries over them."""
+
+    def _translated(self, library_dir, sample_meta, sample_refs, count: int = 3):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        for idx in range(count):
+            project.save_content(idx, f"原文{idx}")
+            project.save_translation(
+                idx, f"Chương {idx}", f"convert {idx}", "vi", translator="Google Translate"
+            )
+        return project
+
+    def test_save_rewrite_backs_up_and_leaves_the_translation_metadata_alone(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        project = self._translated(library_dir, sample_meta, sample_refs)
+        project.save_rewrite(0, "Chương 0 hay hơn", "văn phong tự nhiên")
+        chapter = project.chapter(0)
+        assert chapter.translated == "văn phong tự nhiên"
+        assert chapter.translated_title == "Chương 0 hay hơn"
+        assert chapter.translated_raw == "convert 0"
+        assert chapter.translated_title_raw == "Chương 0"
+        assert chapter.is_rewritten
+        # the chapter is still the same translation, by the same engine, in the same
+        # language — only its prose changed
+        assert chapter.translator == "Google Translate"
+        assert chapter.target_lang == "vi"
+
+    def test_a_second_rewrite_keeps_the_original_backup(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        project = self._translated(library_dir, sample_meta, sample_refs)
+        project.save_rewrite(0, "lần 1", "viết lại lần 1")
+        project.save_rewrite(0, "lần 2", "viết lại lần 2")
+        chapter = project.chapter(0)
+        assert chapter.translated == "viết lại lần 2"
+        assert chapter.translated_raw == "convert 0"  # NOT "viết lại lần 1"
+        assert chapter.translated_title_raw == "Chương 0"
+
+    def test_restore_translation_puts_the_original_back_and_clears_the_flag(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        project = self._translated(library_dir, sample_meta, sample_refs)
+        project.save_rewrite(0, "Chương 0 hay hơn", "văn phong tự nhiên")
+        assert project.restore_translation(0) == 1
+        chapter = project.chapter(0)
+        assert chapter.translated == "convert 0"
+        assert chapter.translated_title == "Chương 0"
+        assert chapter.translated_raw == ""
+        assert chapter.translated_title_raw == ""
+        assert not chapter.is_rewritten
+
+    def test_restore_translation_whole_novel_reports_how_many_it_restored(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        project = self._translated(library_dir, sample_meta, sample_refs)
+        project.save_rewrite(0, "a", "A")
+        project.save_rewrite(2, "c", "C")
+        assert project.restore_translation() == 2
+        assert [c.translated for c in project.chapters()][:3] == [
+            "convert 0",
+            "convert 1",
+            "convert 2",
+        ]
+
+    def test_restore_translation_is_a_no_op_on_a_chapter_never_rewritten(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        project = self._translated(library_dir, sample_meta, sample_refs)
+        assert project.restore_translation(1) == 0
+        assert project.chapter(1).translated == "convert 1"
+
+    def test_undo_after_a_rewrite_makes_the_chapter_eligible_again(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        project = self._translated(library_dir, sample_meta, sample_refs)
+        project.save_rewrite(0, "a", "A")
+        assert 0 not in [c.index for c in project.pending_rewrite("vi")]
+        project.restore_translation(0)
+        assert 0 in [c.index for c in project.pending_rewrite("vi")]
+
+    def test_pending_rewrite_skips_rewritten_and_untranslated_chapters(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        project = self._translated(library_dir, sample_meta, sample_refs)
+        project.save_rewrite(1, "b", "B")
+        assert [c.index for c in project.pending_rewrite("vi")] == [0, 2]
+
+    def test_pending_rewrite_honours_the_chapter_range(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        project = self._translated(library_dir, sample_meta, sample_refs)
+        assert [c.index for c in project.pending_rewrite("vi", 1, 1)] == [1]
+        assert [c.index for c in project.pending_rewrite("vi", 1)] == [1, 2]
+
+    def test_pending_rewrite_skips_another_target_language(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        project = self._translated(library_dir, sample_meta, sample_refs)
+        assert project.pending_rewrite("en") == []
+
+    def test_pending_rewrite_accepts_a_legacy_row_with_no_target_lang(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        project = self._translated(library_dir, sample_meta, sample_refs)
+        project._db.execute("UPDATE chapters SET target_lang = '' WHERE idx = 0")
+        project._db.commit()
+        assert 0 in [c.index for c in project.pending_rewrite("vi")]
+
+    def test_a_rewritten_chapter_is_not_re_flagged_for_translation(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        # If save_rewrite ever touched target_lang, this would queue the whole novel for
+        # a re-translation the user never asked for.
+        project = self._translated(library_dir, sample_meta, sample_refs)
+        project.save_rewrite(0, "a", "A")
+        assert 0 not in [c.index for c in project.pending_translation("vi")]
+
+    def test_clear_translations_drops_the_backup_too(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        # Otherwise "Dịch lại từ đầu" leaves every chapter flagged as rewritten, with an
+        # undo that restores text belonging to a translation that no longer exists.
+        project = self._translated(library_dir, sample_meta, sample_refs)
+        project.save_rewrite(0, "a", "A")
+        project.clear_translations()
+        chapter = project.chapter(0)
+        assert chapter.translated_raw == ""
+        assert chapter.translated_title_raw == ""
+        assert not chapter.is_rewritten
+
+    def test_counts_reports_rewritten_chapters(self, library_dir, sample_meta, sample_refs):
+        project = self._translated(library_dir, sample_meta, sample_refs)
+        assert project.counts()["rewritten"] == 0
+        project.save_rewrite(0, "a", "A")
+        project.save_rewrite(2, "c", "C")
+        counts = project.counts()
+        assert counts["rewritten"] == 2
+        assert counts["translated"] == 3  # a subset, not a sibling
+
+    def test_a_failed_rewrite_leaves_the_translation_intact(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        # The worker calls mark_error instead of save_rewrite when validation fails; the
+        # good translation must survive untouched.
+        project = self._translated(library_dir, sample_meta, sample_refs)
+        project.mark_error(0, "viết lại thất bại: số đoạn không khớp")
+        chapter = project.chapter(0)
+        assert chapter.translated == "convert 0"
+        assert not chapter.is_rewritten
+        assert "số đoạn" in chapter.error
 
 
 class TestAudioState:

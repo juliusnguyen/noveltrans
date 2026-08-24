@@ -51,6 +51,9 @@ CREATE TABLE IF NOT EXISTS chapters (
   target_lang      TEXT NOT NULL DEFAULT '',
   translator       TEXT NOT NULL DEFAULT '',
   translate_seconds REAL NOT NULL DEFAULT 0,
+  -- the translation as it stood before a style rewrite; non-empty == already rewritten
+  translated_raw       TEXT NOT NULL DEFAULT '',
+  translated_title_raw TEXT NOT NULL DEFAULT '',
   status           TEXT NOT NULL DEFAULT 'pending',
   error            TEXT NOT NULL DEFAULT '',
   updated_at       TEXT NOT NULL DEFAULT '',
@@ -104,6 +107,8 @@ def _row_to_chapter(row: sqlite3.Row) -> Chapter:
         target_lang=row["target_lang"],
         translator=row["translator"],
         translate_seconds=row["translate_seconds"],
+        translated_raw=row["translated_raw"],
+        translated_title_raw=row["translated_title_raw"],
         status=row["status"],
         error=row["error"],
         updated_at=row["updated_at"],
@@ -147,6 +152,10 @@ class NovelProject:
         added = {
             "translator": "TEXT NOT NULL DEFAULT ''",
             "translate_seconds": "REAL NOT NULL DEFAULT 0",
+            # existing translations predate the rewrite pass, so none of them has a
+            # pre-rewrite copy — empty is exactly right
+            "translated_raw": "TEXT NOT NULL DEFAULT ''",
+            "translated_title_raw": "TEXT NOT NULL DEFAULT ''",
             "audio_path": "TEXT NOT NULL DEFAULT ''",
             "audio_voice": "TEXT NOT NULL DEFAULT ''",
             # existing audio predates the original/translation choice → it's translated
@@ -399,6 +408,32 @@ class NovelProject:
         ).fetchall()
         return [_row_to_chapter(r) for r in rows]
 
+    def pending_rewrite(
+        self, target_lang: str, start_idx: int = 0, end_idx: int | None = None
+    ) -> list[Chapter]:
+        """Translated chapters in `target_lang` whose style has not been rewritten yet.
+
+        `translated_raw = ''` is the "not yet rewritten" flag, so an interrupted run
+        resumes exactly where it stopped instead of paying for the same chapters twice.
+
+        A legacy row with an empty `target_lang` — translated before the column was
+        recorded — counts as a match. Skipping it would leave those chapters permanently
+        ineligible with no way for the user to tell why.
+        """
+        sql = (
+            "SELECT * FROM chapters"
+            " WHERE translated != '' AND translated_raw = ''"
+            "   AND (target_lang = ? OR target_lang = '')"
+            "   AND idx >= ?"
+        )
+        params: list = [target_lang, start_idx]
+        if end_idx is not None:
+            sql += " AND idx <= ?"
+            params.append(end_idx)
+        sql += " ORDER BY idx"
+        rows = self._db.execute(sql, params).fetchall()
+        return [_row_to_chapter(r) for r in rows]
+
     def pending_audio(
         self,
         voice: str = "",
@@ -451,6 +486,11 @@ class NovelProject:
         translated = self._db.execute(
             "SELECT COUNT(*) FROM chapters WHERE translated != ''"
         ).fetchone()[0]
+        # Subset of `translated`: chapters whose translation has been style-rewritten,
+        # so the rewrite dialog can say how much of the novel is left to do.
+        rewritten = self._db.execute(
+            "SELECT COUNT(*) FROM chapters WHERE translated_raw != ''"
+        ).fetchone()[0]
         errors = self._db.execute(
             "SELECT COUNT(*) FROM chapters WHERE status = ?", (STATUS_ERROR,)
         ).fetchone()[0]
@@ -467,6 +507,7 @@ class NovelProject:
             "total": total,
             "downloaded": downloaded,
             "translated": translated,
+            "rewritten": rewritten,
             "errors": errors,
             "audio": audio,
             "downloaded_audio": downloaded_audio,
@@ -521,6 +562,68 @@ class NovelProject:
                 f"UPDATE chapters SET {', '.join(sets)}, updated_at = ? WHERE idx = ?",
                 (*params, _now(), idx),
             )
+
+    def save_rewrite(self, idx: int, title: str, text: str) -> None:
+        """Replace a chapter's translation with its style-rewritten version.
+
+        The first rewrite captures the pre-rewrite text; later ones must not, or a second
+        pass would record the first pass's output as "the original" and the way back would
+        be gone. That is the same trap `edit_title` documents for `title_source`, so it
+        uses the same capture-once shape. Both CASE arms key off `translated_raw`: an
+        empty title backup is a legal state (a title that rewrote to itself), so it cannot
+        be the sentinel for itself.
+
+        `target_lang` and `translator` are deliberately untouched. The chapter is still
+        the same translation into the same language by the same engine — it has only been
+        restyled — and writing `target_lang` here would risk re-flagging the chapter in
+        `pending_translation` and queueing the whole novel for re-translation.
+
+        `error` is cleared so a chapter that failed an earlier rewrite attempt comes back
+        clean on success.
+        """
+        with self._db:
+            self._db.execute(
+                """
+                UPDATE chapters SET
+                    translated_raw = CASE WHEN translated_raw = '' THEN translated
+                                          ELSE translated_raw END,
+                    translated_title_raw = CASE WHEN translated_raw = ''
+                                                THEN translated_title
+                                                ELSE translated_title_raw END,
+                    translated = ?, translated_title = ?,
+                    status = ?, error = '', updated_at = ?
+                WHERE idx = ?
+                """,
+                (text, title, STATUS_TRANSLATED, _now(), idx),
+            )
+
+    def restore_translation(self, idx: int | None = None) -> int:
+        """Undo a style rewrite, putting the pre-rewrite translation back.
+
+        `idx=None` restores the whole novel. Returns how many chapters were restored.
+        Blanking the backup is what makes a chapter eligible for a fresh rewrite, so
+        "already rewritten" and "can be rewritten" stay one flag read two ways.
+
+        This restores the text as it stood **at the moment of the rewrite**: manual edits
+        and find-and-replace runs made afterwards write `translated` without touching the
+        backup, so they are lost. The GUI must say so before calling this.
+        """
+        sql = (
+            "UPDATE chapters SET"
+            "  translated = translated_raw,"
+            "  translated_title = CASE WHEN translated_title_raw != ''"
+            "                          THEN translated_title_raw"
+            "                          ELSE translated_title END,"
+            "  translated_raw = '', translated_title_raw = '', updated_at = ?"
+            " WHERE translated_raw != ''"
+        )
+        params: list = [_now()]
+        if idx is not None:
+            sql += " AND idx = ?"
+            params.append(idx)
+        with self._db:
+            cursor = self._db.execute(sql, params)
+        return cursor.rowcount
 
     def edit_title(self, idx: int, title: str) -> None:
         """Rename one chapter by hand, and remember both that it was renamed and what it
@@ -875,6 +978,10 @@ class NovelProject:
             self._db.execute(
                 "UPDATE chapters SET translated = '', translated_title = '', target_lang = '',"
                 "  translator = '', translate_seconds = 0,"
+                # the backup belongs to the translation being dropped; keeping it would
+                # leave every chapter flagged as rewritten, with an undo that restores
+                # text from a translation that no longer exists
+                "  translated_raw = '', translated_title_raw = '',"
                 "  status = CASE WHEN content = '' THEN ? ELSE ? END, updated_at = ?",
                 (STATUS_PENDING, STATUS_DOWNLOADED, _now()),
             )

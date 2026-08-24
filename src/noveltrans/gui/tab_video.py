@@ -48,7 +48,7 @@ from PySide6.QtWidgets import (
 )
 
 from noveltrans import video_settings
-from noveltrans.config import AppConfig, translator_labels
+from noveltrans.config import LLM_ENGINES, AppConfig, translator_labels
 from noveltrans.gui.job_popup import BROWSER_PAUSE_HINT
 from noveltrans.gui.jobs import job_registry
 from noveltrans.gui.keep_awake import track_worker
@@ -74,7 +74,7 @@ from noveltrans.gui.workers import (
 from noveltrans.storage import NovelProject
 
 # Engines that can generate tags (LLMs). Google translate-only is excluded.
-_TAG_ENGINES = ("cli", "claude_cli", "claude", "lmstudio")
+_TAG_ENGINES = LLM_ENGINES
 _IMAGE_FILTER = "Ảnh (*.png *.jpg *.jpeg *.webp *.bmp)"
 
 

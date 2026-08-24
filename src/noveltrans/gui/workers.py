@@ -312,6 +312,171 @@ class TranslateWorker(PausableWorker):
             project.close()
 
 
+def chapters_to_rewrite(
+    project: NovelProject,
+    target_lang: str,
+    *,
+    indices: list[int] | None = None,
+    start_idx: int = 0,
+    end_idx: int | None = None,
+    force: bool = False,
+) -> list:
+    """Chapters a rewrite run would touch, in reading order.
+
+    Only ever chapters that HAVE a translation: the pass restyles `translated`, it cannot
+    create one. `force` re-runs chapters already rewritten once; without it the resume
+    query skips them.
+
+    Shared with `RewriteDialog` on purpose — the count the dialog shows before the user
+    commits to hours of work has to be the same set the worker then processes.
+    """
+    if indices is not None:
+        chapters = (project.chapter(i) for i in indices)
+        return [c for c in chapters if c is not None and c.translated]
+    if force:
+        return [
+            c
+            for c in project.chapters_in_range(start_idx, end_idx)
+            if c.translated and c.target_lang in (target_lang, "")
+        ]
+    return project.pending_rewrite(target_lang, start_idx, end_idx)
+
+
+class RewriteWorker(PausableWorker):
+    """Rewrite the style of already-translated chapters, resumably.
+
+    A separate, user-triggered pass — never folded into translation. Translating is free
+    and instant for a Vietnamese-source novel (`TranslateWorker._run_identity` just
+    copies the text), so bolting an hours-long LLM run onto the same button would be a
+    surprise cost on the user's own quota or API key. It also has to reach novels that
+    were merely translated badly, which the identity path never touches.
+
+    Signals mirror `TranslateWorker`'s exactly so the tab can reuse its handlers.
+
+    **A chapter that fails validation keeps its existing translation, byte for byte.**
+    `save_rewrite` is simply not reached: the chapter is marked errored and the batch
+    moves on. Unlike a failed translation, where the alternative is no text at all, the
+    alternative here is the perfectly good translation already on screen.
+    """
+
+    progress = Signal(int, int, str)  # done, total, chapter title
+    chapter_done = Signal(int)
+    chapter_error = Signal(int, str)
+    failed = Signal(str)  # engine could not even be constructed / cannot do this
+    finished_ok = Signal(int, int)  # rewritten count, error count
+    preview_ready = Signal(int, str, str)  # dry run only: index, title, body
+
+    def __init__(
+        self,
+        project_path: Path,
+        engine_name: str,
+        target_lang: str = "vi",
+        *,
+        api_key: str = "",
+        model: str = "",
+        cli_command: str = "",
+        base_url: str = "",
+        indices: list[int] | None = None,
+        start_idx: int = 0,
+        end_idx: int | None = None,
+        force: bool = False,
+        dry_run: bool = False,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.project_path = Path(project_path)
+        self.engine_name = engine_name
+        self.target_lang = target_lang
+        self.api_key = api_key
+        self.model = model
+        self.cli_command = cli_command
+        self.base_url = base_url
+        self.indices = indices  # None = every eligible chapter in range
+        self.start_idx = start_idx
+        self.end_idx = end_idx
+        self.force = force  # re-rewrite chapters already rewritten once
+        self.dry_run = dry_run  # preview: emit the result, write nothing
+
+    def run(self) -> None:
+        from noveltrans.translators import get_translator
+        from noveltrans.translators.rewrite import rewrite_chapter
+
+        project = NovelProject.open(self.project_path)
+        try:
+            try:
+                translator = get_translator(
+                    self.engine_name,
+                    api_key=self.api_key,
+                    model=self.model,
+                    cli_command=self.cli_command,
+                    base_url=self.base_url,
+                )
+            except NovelTransError as exc:
+                self.failed.emit(str(exc))
+                return
+            # Google can only translate. The dialog already hides it, but the choice is
+            # persisted config and could be stale or hand-edited, so re-check here.
+            if not translator.supports_completion:
+                self.failed.emit(
+                    "Engine này không viết lại được — hãy chọn CLI Agent, Claude "
+                    "hoặc LM Studio."
+                )
+                return
+
+            pending = chapters_to_rewrite(
+                project,
+                self.target_lang,
+                indices=self.indices,
+                start_idx=self.start_idx,
+                end_idx=self.end_idx,
+                force=self.force,
+            )
+            total = len(pending)
+            done = 0
+            errors = 0
+
+            for chapter in pending:
+                if self._checkpoint():
+                    break
+                self.progress.emit(done, total, chapter.translated_title or chapter.title)
+                try:
+                    # `complete` is called with ONE positional argument and no system
+                    # prompt — the only signature all three LLM engines share (the CLI
+                    # agent passes the prompt as an argv entry and has no second channel).
+                    title, text = rewrite_chapter(
+                        translator.complete,
+                        chapter.translated_title,
+                        chapter.translated,
+                        max_chunk_chars=translator.max_chunk_chars,
+                    )
+                    if self.dry_run:
+                        self.preview_ready.emit(chapter.index, title, text)
+                    else:
+                        project.save_rewrite(chapter.index, title, text)
+                        self.chapter_done.emit(chapter.index)
+                except NovelTransError as exc:
+                    errors += 1
+                    self._record_error(project, chapter.index, str(exc))
+                except Exception as exc:  # keep the batch going
+                    errors += 1
+                    self._record_error(project, chapter.index, repr(exc))
+                done += 1
+            self.progress.emit(done, total, "")
+            self.finished_ok.emit(done - errors, errors)
+        finally:
+            project.close()
+
+    def _record_error(self, project: NovelProject, idx: int, message: str) -> None:
+        """Report a chapter that could not be rewritten, leaving its translation alone.
+
+        A preview writes nothing at all — not even the error — because the user is only
+        being shown what a rewrite would do.
+        """
+        if not self.dry_run:
+            project.mark_error(idx, message)
+        self.chapter_error.emit(idx, message)
+
+
 class CliModelsWorker(QThread):
     """List the models an agent CLI offers (`<binary> models`), for the model box."""
 

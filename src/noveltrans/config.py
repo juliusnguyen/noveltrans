@@ -73,6 +73,12 @@ TRANSLATORS = {
 }
 
 
+# Engines that can run a free-form prompt (`Translator.supports_completion`), for the
+# features that need more than translation: YouTube tags, the thumbnail image prompt, and
+# the style rewrite. Google is translate-only and is deliberately absent.
+LLM_ENGINES = ("cli", "claude_cli", "claude", "lmstudio")
+
+
 def translator_labels(config: "AppConfig | None" = None) -> dict[str, str]:
     """Engine labels for combo boxes; CLI entries show their actual command."""
     labels = dict(TRANSLATORS)
@@ -499,12 +505,17 @@ class AppConfig:
         self._s.setValue("video_tagline", value)
 
     @property
+    def _llm_engine_default(self) -> str:
+        """What an LLM-only feature should preselect: the user's own translator when that
+        can run a free-form prompt, else CLI Agent (quota-backed, needs no API key)."""
+        return self.translator if self.translator in LLM_ENGINES else "cli"
+
+    @property
     def video_ai_engine(self) -> str:
         """LLM engine used for the video tab's AI helpers (tags, thumbnail image prompt).
         Defaults to the translator engine when that is an LLM, else CLI Agent. Google
         (translate-only) can't be used here."""
-        default = self.translator if self.translator in ("cli", "claude_cli", "claude", "lmstudio") else "cli"
-        return str(self._s.value("video_ai_engine", default))
+        return str(self._s.value("video_ai_engine", self._llm_engine_default))
 
     @video_ai_engine.setter
     def video_ai_engine(self, value: str) -> None:
@@ -518,6 +529,30 @@ class AppConfig:
     @video_ai_model.setter
     def video_ai_model(self, value: str) -> None:
         self._s.setValue("video_ai_model", value.strip())
+
+    @property
+    def rewrite_ai_engine(self) -> str:
+        """LLM engine used to rewrite translated prose into natural Vietnamese.
+
+        Chosen separately from the translator on purpose. The translate combo may hold
+        Google, which cannot rewrite at all, and the two jobs have different cost
+        profiles — translating a whole novel on the free engine and rewriting it on a
+        metered one is a reasonable thing to want.
+        """
+        return str(self._s.value("rewrite_ai_engine", self._llm_engine_default))
+
+    @rewrite_ai_engine.setter
+    def rewrite_ai_engine(self, value: str) -> None:
+        self._s.setValue("rewrite_ai_engine", value)
+
+    @property
+    def rewrite_ai_model(self) -> str:
+        """Optional model override for the style rewrite ("" = engine default)."""
+        return str(self._s.value("rewrite_ai_model", ""))
+
+    @rewrite_ai_model.setter
+    def rewrite_ai_model(self, value: str) -> None:
+        self._s.setValue("rewrite_ai_model", value.strip())
 
     @property
     def video_font(self) -> str:
