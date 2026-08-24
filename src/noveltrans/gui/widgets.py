@@ -31,6 +31,7 @@ from PySide6.QtGui import QColor, QKeySequence, QShortcut
 
 from noveltrans.gui.jobs import job_registry
 from noveltrans.models import (
+    SourceAudio,
     AUDIO_SOURCE_DOWNLOADED,
     STATUS_DOWNLOADED,
     STATUS_ERROR,
@@ -369,6 +370,112 @@ class AudioChapterTableModel(QAbstractTableModel):
                 return has_source and not downloadable
             if role == Qt.ItemDataRole.ToolTipRole and has_source and not downloadable:
                 return "Tạo (lại) audio riêng chương này"
+        return None
+
+
+def audio_source_label(voice: str, pretty: dict[str, str] | None = None) -> str:
+    """A readable label for an `audio_voice` value.
+
+    That column holds two unrelated kinds of thing: a TTS engine voice id, and — for
+    narration fetched from a source site — the ADAPTER's name. A combo showing a bare
+    "tieuthuyetmang" among engine voices gives the user no way to tell which is which.
+
+    The set of adapter names is read from the registry rather than hardcoded, so a second
+    site that grows audio support is labelled correctly without touching this.
+    """
+    from noveltrans.scrapers import ADAPTERS
+
+    if any(cls.name == voice and hasattr(cls, "fetch_audio_url") for cls in ADAPTERS):
+        return f"{voice} (tải từ trang)"
+    return (pretty or {}).get(voice, voice)
+
+
+class AudioSourceTableModel(QAbstractTableModel):
+    """Read-only table over the audio a source site publishes.
+
+    Rows are `SourceAudio` releases, not chapters, and there is deliberately no "Chương"
+    column: a release covers a range of chapters and belongs to a different edition of the
+    work, so pinning it to one row is exactly the confusion this table exists to undo.
+    """
+
+    COLUMNS = ("#", "Tên mục audio", "Âm thanh", "Thời lượng", "Lỗi", "")
+    TITLE_COLUMN = 1
+    STATUS_COLUMN = 2
+    DURATION_COLUMN = 3
+    ERROR_COLUMN = 4
+    REDOWNLOAD_COLUMN = 5
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._items: list[SourceAudio] = []
+
+    def set_items(self, items: list[SourceAudio]) -> None:
+        self.beginResetModel()
+        self._items = list(items)
+        self.endResetModel()
+
+    def item_at(self, row: int) -> SourceAudio | None:
+        return self._items[row] if 0 <= row < len(self._items) else None
+
+    def items(self) -> list[SourceAudio]:
+        return list(self._items)
+
+    def update_item(self, release: SourceAudio) -> None:
+        """Replace the row for `release.number`, so a finished download shows at once."""
+        for row, existing in enumerate(self._items):
+            if existing.number == release.number:
+                self._items[row] = release
+                self.dataChanged.emit(self.index(row, 0), self.index(row, self.columnCount() - 1))
+                return
+
+    def _status(self, item: SourceAudio) -> tuple[str, QColor]:
+        if item.error:
+            return "Lỗi", STATUS_COLORS[STATUS_ERROR]
+        if item.has_audio:
+            return "Đã tải", STATUS_COLORS[STATUS_TRANSLATED]
+        return "Chưa tải", STATUS_COLORS[STATUS_DOWNLOADED]
+
+    def rowCount(self, parent=QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._items)
+
+    def columnCount(self, parent=QModelIndex()) -> int:
+        return len(self.COLUMNS)
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
+            return self.COLUMNS[section]
+        return None
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+        item = self._items[index.row()]
+        column = index.column()
+        if role == Qt.ItemDataRole.DisplayRole:
+            if column == 0:
+                return item.ord or index.row() + 1
+            if column == self.TITLE_COLUMN:
+                return item.title
+            if column == self.STATUS_COLUMN:
+                return self._status(item)[0]
+            if column == self.DURATION_COLUMN:
+                return format_duration(item.seconds)
+            if column == self.ERROR_COLUMN:
+                return item.error
+        if role == Qt.ItemDataRole.ToolTipRole and column == self.ERROR_COLUMN:
+            return item.error
+        if role == Qt.ItemDataRole.ForegroundRole and column == self.STATUS_COLUMN:
+            return self._status(item)[1]
+        if role == Qt.ItemDataRole.TextAlignmentRole and column == self.DURATION_COLUMN:
+            return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        if column == self.REDOWNLOAD_COLUMN:
+            # On every row, including ones already downloaded — re-fetching one release is
+            # what this button is for, and it is the only affordance that overrides the
+            # skip-what-we-have rule.
+            if role == Qt.ItemDataRole.UserRole:
+                return True
+            if role == Qt.ItemDataRole.ToolTipRole:
+                return "Tải lại mục audio này từ trang nguồn"
         return None
 
 
