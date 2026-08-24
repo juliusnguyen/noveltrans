@@ -8,15 +8,20 @@ only by luck, whereas a built one encodes it deliberately. Every string in them 
 import pytest
 import responses
 
-from noveltrans.errors import AuthRequiredError, ScrapeError
+from noveltrans.errors import AudioUnavailableError, AuthRequiredError, ScrapeError
 from noveltrans.models import ChapterRef
 from noveltrans.scrapers import ADAPTERS, adapter_for_url
 from noveltrans.scrapers.base import HttpClient
 from noveltrans.scrapers.tieuthuyetmang import (
     TieuthuyetmangAdapter,
+    audio_entries,
+    audio_gate_reason,
+    audio_locked_count,
+    audio_page_url,
     chapter_entries,
     chapter_number,
     chapter_url,
+    find_audio_media,
     find_story,
     flight_payload,
     landing_url,
@@ -399,3 +404,106 @@ class TestAdapterWiring:
         )
         ref = ChapterRef(index=1, title="Chương 2: Người khách", url=CHAPTER_URL)
         assert make_adapter().fetch_chapter(ref).startswith("Trời đổ mưa")
+
+
+AUDIO_URL_1 = "https://tieuthuyetmang.com/truyen/truyen-thu-nghiem/nghe/1"
+
+
+def audio_page(name: str) -> str:
+    return load_fixture("tieuthuyetmang", name)
+
+
+class TestAudioDiscovery:
+    """Feature 059. Every state below was measured against the live site before the
+    fixtures were built; see `changes/059-TIEUTHUYETMANG-AUDIO-DOWNLOAD/059.01-HISTORY.md`."""
+
+    def test_audio_page_url_uses_the_nghe_route_and_the_chapter_number(self):
+        assert audio_page_url("truyen-thu-nghiem", 11) == (
+            "https://tieuthuyetmang.com/truyen/truyen-thu-nghiem/nghe/11"
+        )
+
+    def test_audio_entries_keeps_only_chapters_flagged_has_audio(self):
+        entries = audio_entries(stream(), "truyen-thu-nghiem")
+        assert entries, "the landing fixture must carry at least one hasAudio chapter"
+        assert all(entry["hasAudio"] for entry in entries)
+
+    def test_audio_entries_are_a_subset_of_the_novels_own_chapters(self):
+        """Anchored through `story_chapters`, so a recommended novel's audio can never
+        leak in — the same trap `find_story` exists for."""
+        numbers = {e["chapterNumber"] for e in audio_entries(stream(), "truyen-thu-nghiem")}
+        assert numbers <= {e["chapterNumber"] for e in chapter_entries(stream())}
+
+    def test_finds_an_mp3_url_in_the_flight_stream(self):
+        assert find_audio_media(audio_page("audio_ready.html")).endswith(".mp3")
+
+    def test_finds_an_aac_url_too(self):
+        """The regression that matters most. This site publishes some volumes as AAC and
+        others as MP3 (8 and 13 of 21 on the reference novel); a search that only knows
+        ".mp3" reports the AAC volumes as having no audio at all."""
+        assert find_audio_media(audio_page("audio_aac.html")).endswith(".aac")
+
+    def test_prefers_a_real_audio_element_when_the_page_has_one(self):
+        assert find_audio_media(audio_page("audio_element.html")).endswith(".mp3")
+
+    def test_returns_empty_when_the_prop_is_present_but_holds_no_url(self):
+        assert find_audio_media(audio_page("audio_pending.html")) == ""
+
+    def test_returns_empty_for_a_page_with_no_player_at_all(self):
+        assert find_audio_media(audio_page("audio_vip.html")) == ""
+
+    def test_the_url_is_decoded_not_regexed_out_of_the_raw_markup(self):
+        """A regex over the raw page picks up the flight stream's own escaping and
+        returns a URL with a trailing backslash, which then 404s."""
+        assert "\\" not in find_audio_media(audio_page("audio_ready.html"))
+
+    def test_gate_reason_is_empty_when_the_player_props_are_present(self):
+        assert audio_gate_reason(audio_page("audio_ready.html")) == ""
+        assert audio_gate_reason(audio_page("audio_pending.html")) == ""
+
+    def test_gate_reason_is_vip_when_the_player_is_replaced_by_an_upsell(self):
+        assert audio_gate_reason(audio_page("audio_vip.html")) == "vip"
+
+    def test_locked_count_counts_the_flag_without_filtering_on_it(self):
+        entries = [{"audioLocked": True}, {"audioLocked": False}, {}]
+        assert audio_locked_count(entries) == 1
+
+
+class TestAudioAdapter:
+    @responses.activate
+    def test_manifest_reuses_the_cached_landing_page(self):
+        responses.get(NOVEL_URL, body=landing())
+        adapter = make_adapter()
+        adapter.fetch_chapter_list(NOVEL_URL)
+        entries = adapter.fetch_audio_manifest(NOVEL_URL)
+        assert entries
+        assert len(responses.calls) == 1, "the manifest must not cost a second request"
+
+    @responses.activate
+    def test_fetch_audio_url_returns_the_media_url(self):
+        responses.get(AUDIO_URL_1, body=audio_page("audio_ready.html"))
+        ref = ChapterRef(index=0, title="Tập 1", url=CHAPTER_URL.replace("/doc/2", "/doc/1"))
+        assert make_adapter().fetch_audio_url(ref).endswith(".mp3")
+
+    @responses.activate
+    def test_fetch_audio_url_reads_the_nghe_page_not_the_doc_page(self):
+        """The `/doc/` reader carries no media URL with or without a session cookie."""
+        responses.get(AUDIO_URL_1, body=audio_page("audio_ready.html"))
+        ref = ChapterRef(index=0, title="Tập 1", url=CHAPTER_URL.replace("/doc/2", "/doc/1"))
+        make_adapter().fetch_audio_url(ref)
+        assert responses.calls[0].request.url == AUDIO_URL_1
+
+    @responses.activate
+    def test_an_unentitled_page_raises_auth_required(self):
+        responses.get(AUDIO_URL_1, body=audio_page("audio_vip.html"))
+        ref = ChapterRef(index=0, title="Tập 1", url=CHAPTER_URL.replace("/doc/2", "/doc/1"))
+        with pytest.raises(AuthRequiredError):
+            make_adapter().fetch_audio_url(ref)
+
+    @responses.activate
+    def test_an_entitled_page_with_no_file_yet_raises_audio_unavailable(self):
+        """Distinct from AuthRequiredError on purpose: retrying or re-authenticating
+        cannot help, so the batch reports this one and moves on."""
+        responses.get(AUDIO_URL_1, body=audio_page("audio_pending.html"))
+        ref = ChapterRef(index=0, title="Tập 1", url=CHAPTER_URL.replace("/doc/2", "/doc/1"))
+        with pytest.raises(AudioUnavailableError):
+            make_adapter().fetch_audio_url(ref)

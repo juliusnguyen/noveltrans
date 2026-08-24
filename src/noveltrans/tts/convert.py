@@ -111,3 +111,137 @@ def apply_tempo(wav_path: Path, tempo: float) -> Path:
         raise TtsError(f"ffmpeg đổi tốc độ lỗi (mã {result.returncode}): {detail}")
     tmp_path.replace(wav_path)
     return wav_path
+
+
+def probe_duration(path: Path | str) -> float:
+    """Real duration (seconds) of an audio file via ffprobe. 0.0 if it can't be read.
+
+    Lives here rather than in `video.py` because the audio downloader needs it too and
+    must not import the video stack. `video._probe_duration` is an alias onto this.
+    """
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nokey=1", str(path)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+            **no_console_kwargs(),
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return 0.0
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
+class DownloadCancelled(Exception):
+    """Raised when a media download is cancelled mid-transfer (not a failure).
+
+    The partial `.part` file is deliberately left on disk so the next run resumes it.
+    """
+
+
+# Big enough that a 200 MB file is not 200k iterations, small enough that `cancelled`
+# is still polled several times a second on a slow line.
+_DL_CHUNK = 1 << 18  # 256 KiB
+
+
+def download_media(
+    url: str,
+    dest: Path,
+    *,
+    cookies: str = "",
+    headers: dict | None = None,
+    cancelled=None,
+    on_progress=None,
+) -> Path:
+    """Stream `url` to `dest`, resuming a previous partial transfer when possible.
+
+    Written for the sizes this actually sees: the reference novel's 21 audio files total
+    1.7 GB, the largest single file is 203 MB. So the body is streamed to a `.part`
+    sibling in chunks and renamed into place only once complete — never buffered in RAM,
+    and never left looking finished when it is not. A truncated file that *looks* like
+    finished audio is the worst outcome here, because feature 059's guards then protect
+    it from being replaced.
+
+    Resume uses a `Range` request when a `.part` is already present. Servers that ignore
+    `Range` answer 200 instead of 206; that is detected and the file restarted rather
+    than appended to, which would corrupt it.
+
+    `on_progress(done_bytes, total_bytes)` is called as chunks land (`total` is 0 when the
+    server does not say). `cancelled()` is polled between chunks and raises
+    `DownloadCancelled`. Raises `TtsError` on any HTTP or disk failure.
+    """
+    import requests
+
+    dest = Path(dest)
+    part = dest.with_name(dest.name + ".part")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    if url.lower().split("?")[0].endswith(".m3u8"):
+        # No HLS has ever been observed from the one site this serves; a clear refusal
+        # beats an ffmpeg remux path that nothing exercises and no test can pin.
+        raise TtsError("Audio dạng HLS (.m3u8) chưa được hỗ trợ tải về.")
+
+    resume_from = part.stat().st_size if part.exists() else 0
+    request_headers = {
+        "Accept": "*/*",
+        # The media host serves these anonymously; the cookie is sent only because a
+        # future gate would need it, and it costs nothing today.
+        **({"Cookie": cookies} if cookies else {}),
+        **(headers or {}),
+    }
+    if resume_from:
+        request_headers["Range"] = f"bytes={resume_from}-"
+
+    try:
+        response = requests.get(url, headers=request_headers, stream=True, timeout=60)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise TtsError(f"Không tải được audio: {exc}") from exc
+
+    # 206 honours the resume; a 200 to a Range request means the server sent the whole
+    # file, so anything already on disk has to go or the two halves would be concatenated.
+    append = resume_from > 0 and response.status_code == 206
+    if resume_from and not append:
+        resume_from = 0
+
+    total = 0
+    length = response.headers.get("content-length")
+    if length and length.isdigit():
+        total = int(length) + resume_from
+
+    done = resume_from
+    try:
+        with open(part, "ab" if append else "wb") as handle:
+            for chunk in response.iter_content(chunk_size=_DL_CHUNK):
+                if cancelled is not None and cancelled():
+                    handle.flush()
+                    raise DownloadCancelled()
+                if not chunk:
+                    continue
+                handle.write(chunk)
+                done += len(chunk)
+                if on_progress is not None:
+                    on_progress(done, total)
+    except DownloadCancelled:
+        raise
+    except requests.RequestException as exc:
+        # MUST precede OSError: `requests.RequestException` subclasses `IOError`, so an
+        # `except OSError` above this line silently swallows every network failure and
+        # reports a dropped connection as a disk error. Keep the .part either way — the
+        # next run resumes from where this one stopped.
+        raise TtsError(f"Mất kết nối khi tải audio: {exc}") from exc
+    except OSError as exc:
+        raise TtsError(f"Không ghi được file audio: {exc}") from exc
+    finally:
+        response.close()
+
+    if total and done != total:
+        raise TtsError(f"Tải thiếu dữ liệu ({done}/{total} byte) — thử lại để tải tiếp.")
+    if done == 0:
+        part.unlink(missing_ok=True)
+        raise TtsError("Máy chủ trả về file audio rỗng.")
+
+    part.replace(dest)
+    return dest
