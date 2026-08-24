@@ -34,6 +34,7 @@ from importlib import resources
 from pathlib import Path
 
 from noveltrans.errors import TtsError
+from noveltrans.tts.convert import probe_duration
 from noveltrans.runtime_env import no_console_kwargs
 from noveltrans.tts.convert import ffmpeg_available  # noqa: F401 (re-exported for callers)
 from noveltrans.tts.subtitles import part_cues, part_srt
@@ -123,21 +124,9 @@ def font_dir_context():
 
 # -- audio duration probing ---------------------------------------------------
 
-def _probe_duration(path: Path | str) -> float:
-    """Real duration (seconds) of an audio file via ffprobe. 0.0 if it can't be read."""
-    try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=nw=1:nokey=1", str(path)],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
-            **no_console_kwargs(),
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return 0.0
-    try:
-        return float(result.stdout.strip())
-    except ValueError:
-        return 0.0
+# Moved to `convert.py` so the audio downloader can probe durations without
+# importing the video stack. Kept as a name here: this module and its tests use it.
+_probe_duration = probe_duration
 
 
 def _with_real_durations(segments: list[MergeSegment]) -> list[MergeSegment]:

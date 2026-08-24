@@ -26,6 +26,7 @@ from noveltrans.models import (
     Chapter,
     ChapterRef,
     NovelMeta,
+    SourceAudio,
 )
 
 META_FILE = "meta.json"
@@ -62,6 +63,19 @@ CREATE TABLE IF NOT EXISTS chapters (
   title_custom     INTEGER NOT NULL DEFAULT 0,
   -- the site's own title, kept so a rename can be undone; refreshed by every scan
   title_source     TEXT NOT NULL DEFAULT ''
+);
+
+-- Audio published by the source site. A SEPARATE edition of the work, not a property of
+-- a chapter: releases cover chapter ranges and do not line up with rows one-for-one, so
+-- keying them off `chapters` made a five-chapter volume look like one chapter's audio.
+CREATE TABLE IF NOT EXISTS source_audio (
+  number     INTEGER PRIMARY KEY,   -- the site's chapterNumber; what /nghe/<n> keys off
+  title      TEXT NOT NULL DEFAULT '',
+  ord        INTEGER NOT NULL DEFAULT 0,  -- 1-based position in the manifest's order
+  path       TEXT NOT NULL DEFAULT '',    -- project-relative; '' until downloaded
+  seconds    REAL NOT NULL DEFAULT 0,
+  error      TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT ''
 );
 """
 
@@ -103,6 +117,18 @@ def _row_to_chapter(row: sqlite3.Row) -> Chapter:
     )
 
 
+def _row_to_source_audio(row: sqlite3.Row) -> SourceAudio:
+    return SourceAudio(
+        number=row["number"],
+        title=row["title"],
+        ord=row["ord"],
+        path=row["path"],
+        seconds=row["seconds"],
+        error=row["error"],
+        updated_at=row["updated_at"],
+    )
+
+
 class NovelProject:
     """One novel's folder: meta.json + chapters.db. Single writer at a time."""
 
@@ -135,6 +161,48 @@ class NovelProject:
             for name, ddl in added.items():
                 if name not in columns:
                     self._db.execute(f"ALTER TABLE chapters ADD COLUMN {name} {ddl}")
+        self._migrate_downloaded_audio()
+
+    def _migrate_downloaded_audio(self) -> None:
+        """Move site-downloaded audio off the chapter rows and into `source_audio`.
+
+        Feature 059 first stored it on `chapters`, which is what made a five-chapter
+        volume show up as chapter N's narration. The files themselves are 50-200 MB and
+        may no longer be re-fetchable, so this MOVES the rows rather than dropping them —
+        the chapter's audio fields are cleared only once the release row exists.
+
+        The release number is read back out of the chapter URL (`/doc/<n>` or `/nghe/<n>`),
+        which is exactly what wrote it. A row whose URL carries no number is left alone
+        rather than guessed at.
+        """
+        rows = list(
+            self._db.execute(
+                "SELECT idx, url, title, audio_path, audio_seconds FROM chapters"
+                " WHERE audio_source = 'downloaded' AND audio_path != ''"
+            )
+        )
+        if not rows:
+            return
+        with self._db:
+            for order, row in enumerate(rows, start=1):
+                match = re.search(r"/(?:doc|nghe)/(\d+)", row["url"] or "")
+                if not match:
+                    continue
+                self._db.execute(
+                    "INSERT OR IGNORE INTO source_audio"
+                    " (number, title, ord, path, seconds, updated_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        int(match.group(1)), row["title"], order,
+                        row["audio_path"], row["audio_seconds"], _now(),
+                    ),
+                )
+                self._db.execute(
+                    "UPDATE chapters SET audio_path = '', audio_voice = '',"
+                    " audio_source = 'translated', audio_seconds = 0, audio_error = ''"
+                    " WHERE idx = ?",
+                    (row["idx"],),
+                )
 
     # ---------------------------------------------------------------- lifecycle
 
@@ -563,6 +631,60 @@ class NovelProject:
                 "UPDATE chapters SET audio_path = ?, audio_voice = ?, audio_source = ?,"
                 " audio_seconds = ?, audio_error = '', updated_at = ? WHERE idx = ?",
                 (rel_path, voice, source, seconds, _now(), idx),
+            )
+
+    # ------------------------------------------------------- source audio (059)
+
+    def sync_source_audio(self, entries: list[dict]) -> list[SourceAudio]:
+        """Record the site's current release list, preserving anything already downloaded.
+
+        Upserts titles and reading order from a fresh manifest without touching `path`,
+        `seconds` or `error`: a re-listed novel must not lose the 1.7 GB already on disk
+        just because the site reworded a volume title.
+        """
+        with self._db:
+            for order, entry in enumerate(entries, start=1):
+                number = entry.get("chapterNumber")
+                if not isinstance(number, int):
+                    continue
+                title = str(entry.get("title") or f"Mục {number}")
+                self._db.execute(
+                    "INSERT INTO source_audio (number, title, ord, updated_at)"
+                    " VALUES (?, ?, ?, ?)"
+                    " ON CONFLICT(number) DO UPDATE SET title = excluded.title,"
+                    " ord = excluded.ord",
+                    (number, title, order, _now()),
+                )
+        return self.source_audio()
+
+    def source_audio(self) -> list[SourceAudio]:
+        """Every known release, in the manifest's reading order."""
+        return [
+            _row_to_source_audio(row)
+            for row in self._db.execute(
+                "SELECT * FROM source_audio ORDER BY ord, number"
+            )
+        ]
+
+    def source_audio_at(self, number: int) -> SourceAudio | None:
+        row = self._db.execute(
+            "SELECT * FROM source_audio WHERE number = ?", (number,)
+        ).fetchone()
+        return _row_to_source_audio(row) if row is not None else None
+
+    def save_source_audio(self, number: int, rel_path: str, seconds: float) -> None:
+        with self._db:
+            self._db.execute(
+                "UPDATE source_audio SET path = ?, seconds = ?, error = '', updated_at = ?"
+                " WHERE number = ?",
+                (rel_path, seconds, _now(), number),
+            )
+
+    def mark_source_audio_error(self, number: int, message: str) -> None:
+        with self._db:
+            self._db.execute(
+                "UPDATE source_audio SET error = ?, updated_at = ? WHERE number = ?",
+                (message, _now(), number),
             )
 
     def mark_audio_error(self, idx: int, message: str) -> None:

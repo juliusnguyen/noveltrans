@@ -121,6 +121,56 @@ class ChapterRef:
     url: str
 
 
+@dataclass
+class SourceAudio:
+    """One audio release published by the source site — NOT a chapter.
+
+    These are a different edition of the work, not a property of a chapter: the reference
+    novel ships 21 releases ("[ YTB TẬP 1 ] Chương 1-5") against 122 chapters, and their
+    titles name chapter ranges that no single row corresponds to. Storing them on chapter
+    rows made a five-chapter volume look like chapter 1's narration.
+
+    The `audio_*`/`index`/`translated_title` members below are not decoration: they are the
+    narrow protocol `plan_merge_windows`, `chapter_marker_title` and the video renderer
+    already read off a Chapter. Satisfying it lets a release flow through the whole
+    merge/render pipeline unchanged, with `ord` standing in for the chapter number so
+    "phần 1..N" counts releases in reading order.
+    """
+
+    number: int  # the site's own chapterNumber — what /nghe/<n> keys off
+    title: str = ""
+    ord: int = 0  # 1-based position in the manifest's reading order
+    path: str = ""  # project-relative; "" until downloaded
+    seconds: float = 0.0
+    error: str = ""
+    updated_at: str = ""
+
+    @property
+    def has_audio(self) -> bool:
+        return bool(self.path)
+
+    # -- the Chapter-shaped protocol the merge/video pipeline reads --------------
+    @property
+    def index(self) -> int:
+        return self.ord - 1
+
+    @property
+    def audio_path(self) -> str:
+        return self.path
+
+    @property
+    def audio_seconds(self) -> float:
+        return self.seconds
+
+    @property
+    def audio_source(self) -> str:
+        return AUDIO_SOURCE_DOWNLOADED
+
+    @property
+    def translated_title(self) -> str:
+        return self.title
+
+
 # Chapter lifecycle: pending -> downloaded -> translated (or error at any step)
 STATUS_PENDING = "pending"
 STATUS_DOWNLOADED = "downloaded"

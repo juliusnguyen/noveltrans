@@ -15,8 +15,9 @@ from PySide6.QtCore import QSettings, Qt
 from PySide6.QtWidgets import QMenu
 
 from noveltrans.config import AppConfig
-from noveltrans.gui.tab_audio import AudioTab
-from noveltrans.models import AUDIO_SOURCE_DOWNLOADED, Chapter
+from noveltrans.gui.tab_audio import SOURCE_AUDIO_KEY, AudioTab
+from noveltrans.gui.widgets import AudioSourceTableModel
+from noveltrans.models import AUDIO_SOURCE_DOWNLOADED, Chapter, SourceAudio
 
 
 def _config(tmp_path) -> AppConfig:
@@ -49,12 +50,43 @@ def _make_downloaded(chapter: Chapter) -> Chapter:
     return chapter
 
 
+TTM_URL = "https://tieuthuyetmang.com/truyen/truyen-thu-nghiem"
+
+
+def _release(number: int, *, path: str = "", error: str = "") -> SourceAudio:
+    return SourceAudio(
+        number=number, title=f"[ YTB TẬP {number} ]", ord=number,
+        path=path, seconds=120.0 if path else 0.0, error=error,
+    )
+
+
+class _FakeMeta:
+    def __init__(self, url: str):
+        self.url = url
+
+    def display_name(self) -> str:
+        return "Truyện Thử Nghiệm"
+
+
 class _FakeProject:
     """Just enough NovelProject for the guards — no DB, no filesystem."""
 
-    def __init__(self, chapters):
+    # Defaults to a site with no downloadable audio, so the pre-existing tests below
+    # describe the ordinary case and the download wiring has to opt in explicitly.
+    def __init__(self, chapters, url: str = "https://ixdzs.com/read/1/", releases=None):
         self._chapters = chapters
         self.path = "/nowhere"
+        self.meta = _FakeMeta(url)
+        self._releases = list(releases or [])
+
+    def source_audio(self):
+        return list(self._releases)
+
+    def sync_source_audio(self, entries):
+        return list(self._releases)
+
+    def source_audio_at(self, number):
+        return next((r for r in self._releases if r.number == number), None)
 
     def chapters(self):
         return self._chapters
@@ -74,9 +106,9 @@ class _FakeProject:
         }
 
 
-def _tab(qapp, tmp_path, chapters) -> AudioTab:
+def _tab(qapp, tmp_path, chapters, url: str = "https://ixdzs.com/read/1/", releases=None):
     tab = AudioTab(_config(tmp_path))
-    tab.project = _FakeProject(chapters)
+    tab.project = _FakeProject(chapters, url, releases)
     tab.model.set_chapters(chapters)
     return tab
 
@@ -169,34 +201,36 @@ class TestTableRendering:
 
 
 class TestMergeSource:
-    def test_lists_the_voices_the_project_actually_has(self, qapp, tmp_path):
+    def test_lists_the_tts_voices_the_project_actually_has(self, qapp, tmp_path):
         chapters = _chapters(3)
-        _make_downloaded(chapters[0])
         chapters[1].audio_path = "exports/audio/0002-ngoc-lan.wav"
         chapters[1].audio_voice = "Ngọc Lan"
-        # chapters[2] has no audio and must not contribute an empty entry
+        # chapters[0] and [2] have no audio and must not contribute empty entries
         tab = _tab(qapp, tmp_path, chapters)
         tab._refresh_merge_sources()
         voices = [tab.merge_source.itemData(i) for i in range(tab.merge_source.count())]
-        assert voices == ["tieuthuyetmang", "Ngọc Lan"]
+        assert voices == ["Ngọc Lan"]
 
-    def test_downloaded_voice_is_labelled_for_the_user(self, qapp, tmp_path):
-        chapters = [_make_downloaded(c) for c in _chapters(1)]
-        tab = _tab(qapp, tmp_path, chapters)
+    def test_site_audio_is_offered_as_its_own_edition(self, qapp, tmp_path):
+        """Not as a voice: it lives in `source_audio`, not on any chapter row."""
+        tab = _tab(qapp, tmp_path, _chapters(2), TTM_URL, releases=[_release(1, path="a.mp3")])
         tab._refresh_merge_sources()
-        assert "tải từ trang" in tab.merge_source.itemText(0)
+        assert tab.merge_source.itemData(0) == SOURCE_AUDIO_KEY
+        assert "Audio từ nguồn" in tab.merge_source.itemText(0)
 
-    def test_keeps_the_current_pick_across_a_refresh(self, qapp, tmp_path):
+    def test_both_editions_can_be_offered_at_once(self, qapp, tmp_path):
         chapters = _chapters(2)
-        _make_downloaded(chapters[0])
-        chapters[1].audio_path = "exports/audio/0002-ngoc-lan.wav"
-        chapters[1].audio_voice = "Ngọc Lan"
-        tab = _tab(qapp, tmp_path, chapters)
+        chapters[0].audio_path = "exports/audio/0001-ngoc-lan.wav"
+        chapters[0].audio_voice = "Ngọc Lan"
+        tab = _tab(qapp, tmp_path, chapters, TTM_URL, releases=[_release(1, path="a.mp3")])
         tab._refresh_merge_sources()
-        tab.merge_source.setCurrentIndex(1)
-        assert tab.merge_source.currentData() == "Ngọc Lan"
+        data = [tab.merge_source.itemData(i) for i in range(tab.merge_source.count())]
+        assert data == [SOURCE_AUDIO_KEY, "Ngọc Lan"]
+
+    def test_a_release_with_no_file_yet_is_not_offered(self, qapp, tmp_path):
+        tab = _tab(qapp, tmp_path, _chapters(1), TTM_URL, releases=[_release(1)])
         tab._refresh_merge_sources()
-        assert tab.merge_source.currentData() == "Ngọc Lan"
+        assert tab.merge_source.itemData(0) != SOURCE_AUDIO_KEY
 
     def test_falls_back_to_the_synthesis_voice_when_nothing_has_audio(self, qapp, tmp_path):
         tab = _tab(qapp, tmp_path, _chapters(2))
@@ -204,3 +238,240 @@ class TestMergeSource:
         tab._refresh_merge_sources()
         # never empty: _start_merge still needs something to report "no audio" about
         assert tab.merge_source.currentData() == "Ngọc Lan"
+
+
+class TestSourceAudioModel:
+    """Rows are releases. There is deliberately no chapter column."""
+
+    def test_rows_are_releases(self, qapp, tmp_path):
+        tab = _tab(qapp, tmp_path, _chapters(6), TTM_URL,
+                   releases=[_release(1), _release(11)])
+        tab._rebuild_source_rows()
+        assert tab.source_model.rowCount() == 2, "two releases, not six chapters"
+
+    def test_the_table_has_no_chapter_column(self, qapp, tmp_path):
+        assert "Chương" not in AudioSourceTableModel.COLUMNS
+
+    def test_status_separates_downloaded_pending_and_error(self, qapp, tmp_path):
+        rels = [_release(1, path="a.mp3"), _release(2), _release(3, error="hỏng")]
+        tab = _tab(qapp, tmp_path, _chapters(3), TTM_URL, releases=rels)
+        tab._rebuild_source_rows()
+        labels = [
+            tab.source_model.index(r, AudioSourceTableModel.STATUS_COLUMN).data()
+            for r in range(3)
+        ]
+        assert labels == ["Đã tải", "Chưa tải", "Lỗi"]
+
+    def test_a_finished_download_updates_the_row_in_place(self, qapp, tmp_path):
+        tab = _tab(qapp, tmp_path, _chapters(2), TTM_URL, releases=[_release(1)])
+        tab._rebuild_source_rows()
+        status = AudioSourceTableModel.STATUS_COLUMN
+        assert tab.source_model.index(0, status).data() == "Chưa tải"
+        tab.source_model.update_item(_release(1, path="a.mp3"))
+        assert tab.source_model.index(0, status).data() == "Đã tải"
+
+
+class TestChaptersStayClean:
+    """The 059.07 ask: site audio must not show up in the chapter list."""
+
+    def test_a_downloaded_release_leaves_every_chapter_row_untouched(self, qapp, tmp_path):
+        chapters = _chapters(4)
+        tab = _tab(qapp, tmp_path, chapters, TTM_URL,
+                   releases=[_release(1, path="a.mp3"), _release(2, path="b.mp3")])
+        tab._rebuild_source_rows()
+        statuses = [
+            tab.model.index(r, tab.model.STATUS_COLUMN).data() for r in range(len(chapters))
+        ]
+        assert set(statuses) == {"Chưa tạo"}, "no chapter may report site audio"
+
+    def test_the_chapter_view_still_offers_tts_on_every_row(self, qapp, tmp_path):
+        """Previously a downloaded row lost its 🔊 button. With the editions separated
+        there is nothing on the chapter row to protect, so TTS is available again."""
+        tab = _tab(qapp, tmp_path, _chapters(2), TTM_URL,
+                   releases=[_release(1, path="a.mp3")])
+        column = tab.model.REGENERATE_COLUMN
+        assert all(
+            tab.model.index(r, column).data(Qt.ItemDataRole.UserRole) for r in range(2)
+        )
+
+
+class TestViewToggle:
+    def test_the_toggle_is_hidden_for_a_source_with_no_audio(self, qapp, tmp_path):
+        tab = _tab(qapp, tmp_path, _chapters())
+        tab.show()
+        tab._sync_download_button()
+        assert not tab.view_combo.isVisible()
+
+    def test_the_toggle_is_shown_for_tieuthuyetmang(self, qapp, tmp_path):
+        tab = _tab(qapp, tmp_path, _chapters(), TTM_URL)
+        tab.show()
+        tab._sync_download_button()
+        assert tab.view_combo.isVisible()
+
+    def test_switching_swaps_the_table_model(self, qapp, tmp_path):
+        tab = _tab(qapp, tmp_path, _chapters(), TTM_URL, releases=[_release(1)])
+        assert tab.table.model() is tab.model
+        tab.view_combo.setCurrentIndex(1)
+        assert tab.table.model() is tab.source_model
+        tab.view_combo.setCurrentIndex(0)
+        assert tab.table.model() is tab.model
+
+    def test_the_tts_buttons_are_off_while_the_audio_list_shows(self, qapp, tmp_path):
+        tab = _tab(qapp, tmp_path, _chapters(), TTM_URL, releases=[_release(1)])
+        tab.view_combo.setCurrentIndex(1)
+        assert not tab.generate_button.isEnabled()
+        tab.view_combo.setCurrentIndex(0)
+        assert tab.generate_button.isEnabled()
+
+    def test_reset_buttons_does_not_re_enable_tts_in_the_audio_view(self, qapp, tmp_path):
+        tab = _tab(qapp, tmp_path, _chapters(), TTM_URL, releases=[_release(1)])
+        tab.view_combo.setCurrentIndex(1)
+        tab._reset_buttons()  # what _on_finished calls
+        assert not tab.generate_button.isEnabled()
+
+    def test_regenerate_context_action_is_absent_in_the_audio_view(self, qapp, tmp_path):
+        tab = _tab(qapp, tmp_path, _chapters(), TTM_URL, releases=[_release(1)])
+        tab.view_combo.setCurrentIndex(1)
+        menu = QMenu()
+        tab._add_regenerate_actions(menu, tab.source_model.index(0, 0))
+        assert not [a for a in menu.actions() if a.text()]
+
+    def test_leaving_an_unsupported_source_returns_to_the_chapter_view(self, qapp, tmp_path):
+        tab = _tab(qapp, tmp_path, _chapters(), TTM_URL, releases=[_release(1)])
+        tab.view_combo.setCurrentIndex(1)
+        tab.project = _FakeProject(_chapters())
+        tab._sync_download_button()
+        assert not tab._in_source_view()
+        assert tab.table.model() is tab.model
+
+
+class TestDownloadWiring:
+    def test_refuses_without_a_stored_cookie(self, qapp, tmp_path, monkeypatch):
+        tab = _tab(qapp, tmp_path, _chapters(), TTM_URL)
+        shown: list[tuple] = []
+        monkeypatch.setattr(
+            "noveltrans.gui.tab_audio.QMessageBox.information",
+            lambda *a, **k: shown.append(a),
+        )
+        tab._start_audio_download()
+        assert shown and "cookie" in shown[0][1].lower()
+        assert tab._worker is None
+
+    def test_the_selection_is_read_as_release_numbers(self, qapp, tmp_path, monkeypatch):
+        tab = _tab(qapp, tmp_path, _chapters(6), TTM_URL,
+                   releases=[_release(1), _release(11), _release(21)])
+        tab.config.tieuthuyetmang_cookies = "session=abc"
+        tab.view_combo.setCurrentIndex(1)
+        _select_rows(tab, [1])  # the SECOND release, number 11
+        started: list = []
+        monkeypatch.setattr(
+            "noveltrans.gui.tab_audio.AudioDownloadWorker",
+            lambda *a, **kw: _StubWorker(started, *a, **kw),
+        )
+        tab._start_audio_download()
+        assert started[0]["numbers"] == [11]
+
+    def test_no_selection_means_everything_the_source_offers(self, qapp, tmp_path, monkeypatch):
+        tab = _tab(qapp, tmp_path, _chapters(6), TTM_URL, releases=[_release(1), _release(11)])
+        tab.config.tieuthuyetmang_cookies = "session=abc"
+        tab.view_combo.setCurrentIndex(1)
+        started: list = []
+        monkeypatch.setattr(
+            "noveltrans.gui.tab_audio.AudioDownloadWorker",
+            lambda *a, **kw: _StubWorker(started, *a, **kw),
+        )
+        tab._start_audio_download()
+        assert started[0]["numbers"] is None
+
+    def test_the_batch_button_does_not_force(self, qapp, tmp_path, monkeypatch):
+        tab = _tab(qapp, tmp_path, _chapters(6), TTM_URL, releases=[_release(1)])
+        tab.config.tieuthuyetmang_cookies = "session=abc"
+        tab.view_combo.setCurrentIndex(1)
+        started: list = []
+        monkeypatch.setattr(
+            "noveltrans.gui.tab_audio.AudioDownloadWorker",
+            lambda *a, **kw: _StubWorker(started, *a, **kw),
+        )
+        tab._start_audio_download()
+        assert started[0]["skip_downloaded"] is True
+
+
+class TestPerRowRedownloadButton:
+    def test_offered_on_every_release(self, qapp, tmp_path):
+        tab = _tab(qapp, tmp_path, _chapters(3), TTM_URL,
+                   releases=[_release(1), _release(11, path="b.mp3")])
+        tab._rebuild_source_rows()
+        column = AudioSourceTableModel.REDOWNLOAD_COLUMN
+        assert all(
+            tab.source_model.index(r, column).data(Qt.ItemDataRole.UserRole) for r in range(2)
+        )
+
+    def test_clicking_it_forces_a_re_fetch_of_that_release_only(
+        self, qapp, tmp_path, monkeypatch
+    ):
+        tab = _tab(qapp, tmp_path, _chapters(6), TTM_URL,
+                   releases=[_release(1), _release(11, path="b.mp3")])
+        tab.config.tieuthuyetmang_cookies = "session=abc"
+        tab.view_combo.setCurrentIndex(1)
+        started: list = []
+        monkeypatch.setattr(
+            "noveltrans.gui.tab_audio.AudioDownloadWorker",
+            lambda *a, **kw: _StubWorker(started, *a, **kw),
+        )
+        tab._redownload_row(1)
+        assert started[0]["numbers"] == [11]
+        assert started[0]["skip_downloaded"] is False
+
+    def test_the_context_action_forces_and_is_absent_in_the_chapter_view(
+        self, qapp, tmp_path, monkeypatch
+    ):
+        tab = _tab(qapp, tmp_path, _chapters(3), TTM_URL, releases=[_release(1)])
+        chapter_menu = QMenu()
+        tab._add_download_actions(chapter_menu, tab.model.index(0, 0))
+        assert not [a for a in chapter_menu.actions() if a.text()], "no release behind a chapter"
+
+        tab.view_combo.setCurrentIndex(1)
+        menu = QMenu()
+        tab._add_download_actions(menu, tab.source_model.index(0, 0))
+        started: list = []
+        monkeypatch.setattr(
+            "noveltrans.gui.tab_audio.AudioDownloadWorker",
+            lambda *a, **kw: _StubWorker(started, *a, **kw),
+        )
+        tab.config.tieuthuyetmang_cookies = "session=abc"
+        next(a for a in menu.actions() if "Tải lại" in a.text()).trigger()
+        assert started[0]["skip_downloaded"] is False
+
+    def test_the_button_delegate_is_removed_in_the_chapter_view(self, qapp, tmp_path):
+        """RowButtonDelegate.paint draws nothing when UserRole is falsy and does not chain
+        to the default painter, so leaving it on would blank a chapter-view cell."""
+        tab = _tab(qapp, tmp_path, _chapters(2), TTM_URL, releases=[_release(1)])
+        tab.view_combo.setCurrentIndex(1)
+        column = AudioSourceTableModel.REDOWNLOAD_COLUMN
+        assert tab.table.itemDelegateForColumn(column) is tab._redownload_delegate
+        tab.view_combo.setCurrentIndex(0)
+        assert tab.table.itemDelegateForColumn(column) is tab._plain_delegate
+
+
+class _StubWorker:
+    """Captures the constructor kwargs; never starts a thread."""
+
+    def __init__(self, sink, path, **kwargs):
+        sink.append({"path": path, **kwargs})
+
+    def __getattr__(self, name):
+        return _Noop()
+
+    def isRunning(self):
+        return False
+
+    def start(self):
+        pass
+
+
+class _Noop:
+    def connect(self, *a, **k):
+        pass
+
+    def __call__(self, *a, **k):
+        return None

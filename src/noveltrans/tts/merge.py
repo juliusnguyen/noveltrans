@@ -56,11 +56,54 @@ def plan_merge_windows(
         (c for c in chapters if c.audio_path and c.audio_voice == voice),
         key=lambda c: c.index,
     )
+    return _group_windows(avail, mode, start=start, end=end, batch=batch)
+
+
+def plan_source_windows(
+    releases: list,
+    mode: str,  # "all" | "range" | "batch"
+    *,
+    start: int | None = None,
+    end: int | None = None,
+    batch: int | None = None,
+) -> list[MergeWindow]:
+    """Group downloaded SOURCE AUDIO releases into output windows.
+
+    The counterpart of `plan_merge_windows` for the site's own audio edition. Two
+    differences, both structural rather than cosmetic:
+
+    * There is no voice to filter on — a release is not synthesized — so availability is
+      simply "the file is on disk".
+    * Numbering counts RELEASES, not chapters: `SourceAudio.index` is its position in the
+      manifest, so "phần 1..N" runs 1..21 for a novel with 21 releases rather than jumping
+      with the chapter numbers the volumes happen to cover.
+
+    Everything downstream is shared: a release satisfies the same narrow protocol
+    (`audio_path`, `audio_seconds`, `audio_source`, `title`, `translated_title`) that
+    `chapter_marker_title` and the renderers read off a Chapter.
+    """
+    avail = sorted((r for r in releases if r.audio_path), key=lambda r: r.index)
+    return _group_windows(avail, mode, start=start, end=end, batch=batch)
+
+
+def _group_windows(
+    avail: list,
+    mode: str,
+    *,
+    start: int | None = None,
+    end: int | None = None,
+    batch: int | None = None,
+) -> list[MergeWindow]:
+    """Slice an already-filtered, index-sorted list into windows. Shared by both planners.
+
+    Works on anything carrying `.index`; the two callers differ only in what they consider
+    available, which is why the filter is theirs and the slicing is here.
+    """
     if not avail:
         return []
 
-    def window(chs: list[Chapter]) -> MergeWindow:
-        return MergeWindow(chs[0].index + 1, chs[-1].index + 1, chs)
+    def window(items: list) -> MergeWindow:
+        return MergeWindow(items[0].index + 1, items[-1].index + 1, items)
 
     if mode == "range":
         lo, hi = int(start or 1), int(end or 0)

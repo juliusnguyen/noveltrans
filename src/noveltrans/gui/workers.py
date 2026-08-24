@@ -896,6 +896,206 @@ class AudioWorker(PausableWorker):
         self.finished_ok.emit(done - errors, errors)
 
 
+class AudioManifestWorker(QThread):
+    """List what audio a source site publishes for one novel, off-thread.
+
+    One request (the landing page carries the whole TOC), so this is a plain QThread with
+    no pause gate — there is nothing to pause between.
+    """
+
+    listed = Signal(list)  # manifest entries, as the adapter returns them
+    failed = Signal(str)
+    progress = Signal(str)
+
+    def __init__(self, url: str, delay: float = 2.0, cookies: str = "", parent=None):
+        super().__init__(parent)
+        self.url = url
+        self.delay = max(float(delay), 2.0)  # the adapter's politeness floor
+        self.cookies = cookies
+
+    def run(self) -> None:
+        try:
+            client = HttpClient(delay_seconds=self.delay)
+            adapter = adapter_for_url(self.url, client)
+            if adapter is None or not hasattr(adapter, "fetch_audio_manifest"):
+                self.failed.emit("Nguồn của truyện này không hỗ trợ tải audio.")
+                return
+            client.set_cookies(self.cookies)
+            adapter.on_status = self.progress.emit
+            self.listed.emit(list(adapter.fetch_audio_manifest(self.url)))
+        except NovelTransError as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:  # noqa: BLE001 — a background list must never crash the GUI
+            self.failed.emit(f"Lỗi không mong đợi khi đọc danh sách audio: {exc!r}")
+
+
+class AudioDownloadWorker(PausableWorker):
+    """Fetch narration published by the source site, instead of synthesizing it.
+
+    Writes to `source_audio`, NOT to chapter rows. Releases are a separate edition of the
+    work — the reference novel ships 21 of them against 122 chapters, each covering a
+    five-chapter range — so landing one on a chapter row made a whole volume look like
+    that chapter's narration, and put site audio in the chapter list where it does not
+    belong.
+
+    Single-site (tieuthuyetmang) by design: the adapter must expose `fetch_audio_manifest`
+    and `fetch_audio_url`, and the worker refuses politely when it does not. `SiteAdapter`
+    is deliberately NOT widened for two methods only one site can answer.
+
+    Sequential only. The adapter's docstring forbids parallel requests, and the files are
+    large enough (up to 203 MB; 1.7 GB for a whole novel) that concurrency would buy
+    little but a rate-limit.
+    """
+
+    progress = Signal(int, int, str)  # done, total, release title / phase message
+    item_done = Signal(int)  # release number
+    item_error = Signal(int, str)
+    failed = Signal(str)  # nothing could be attempted at all
+    finished_ok = Signal(int, int)  # ok count, error count
+
+    def __init__(
+        self,
+        project_path: Path,
+        delay: float = 2.0,
+        cookies: str = "",
+        numbers: list[int] | None = None,
+        skip_downloaded: bool = True,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.project_path = Path(project_path)
+        # The adapter asks for >=2s and says why; a lower setting elsewhere in the app
+        # must not quietly override a politeness rule for a small paid site.
+        self.delay = max(float(delay), 2.0)
+        self.cookies = cookies
+        self.numbers = numbers  # None = every release the manifest offers
+        # Audio already fetched is not re-fetched: the files are 50-200 MB each and the
+        # bytes cannot change. Only the explicit "Tải lại" affordances turn this off.
+        self.skip_downloaded = skip_downloaded
+        self.skipped = 0  # set by _resolve; read by the tab for its summary line
+
+    def run(self) -> None:
+        from noveltrans.errors import AudioUnavailableError, AuthRequiredError, ScrapeError
+        from noveltrans.errors import TtsError
+        from noveltrans.scrapers.tieuthuyetmang import chapter_url, slug
+        from noveltrans.storage.project import slugify
+        from noveltrans.tts.convert import DownloadCancelled, download_media, probe_duration
+
+        project = NovelProject.open(self.project_path)
+        try:
+            client = HttpClient(delay_seconds=self.delay)
+            adapter = adapter_for_url(project.meta.url, client)
+            if adapter is None or not hasattr(adapter, "fetch_audio_url"):
+                self.failed.emit("Nguồn của truyện này không hỗ trợ tải audio.")
+                return
+            client.set_cookies(self.cookies)
+
+            done = 0
+            total = 0
+            adapter.on_status = lambda msg: self.progress.emit(done, total, msg)
+            try:
+                manifest = adapter.fetch_audio_manifest(project.meta.url)
+            except (ScrapeError, NovelTransError) as exc:
+                self.failed.emit(str(exc))
+                return
+
+            novel_slug = slug(project.meta.url)
+            releases = project.sync_source_audio(manifest)
+            targets = self._resolve(releases)
+            total = len(targets)
+            if self.skipped:
+                self.progress.emit(0, total, f"Bỏ qua {self.skipped} mục đã tải.")
+            if not total:
+                message = (
+                    f"Đã tải đủ {self.skipped} mục audio."
+                    if self.skipped
+                    else "Không tìm thấy mục nào có audio."
+                )
+                self.progress.emit(0, 0, message)
+                self.finished_ok.emit(0, 0)
+                return
+
+            project.audio_dir.mkdir(parents=True, exist_ok=True)
+            errors = 0
+            for release in targets:
+                if self._checkpoint():
+                    break
+                self.progress.emit(done, total, release.title)
+                try:
+                    url = adapter.fetch_audio_url(
+                        ChapterRef(
+                            index=release.index,
+                            title=release.title,
+                            # `fetch_audio_url` only reads the URL, to recover the slug
+                            # and the number it turns into /nghe/<n>.
+                            url=chapter_url(novel_slug, release.number),
+                        )
+                    )
+                    # The extension comes from the URL: this site publishes some volumes
+                    # as .mp3 and others as .aac, and a hardcoded suffix would leave AAC
+                    # bytes in a file called .mp3 for every player downstream to mishandle.
+                    suffix = Path(url.split("?")[0]).suffix.lower() or ".mp3"
+                    name = f"nguon-{release.ord:04d}-{slugify(release.title)}{suffix}"
+                    out_path = project.audio_dir / name
+                    self._download(release, url, out_path, done, total, download_media)
+                    seconds = probe_duration(out_path)
+                    rel_path = out_path.relative_to(project.path).as_posix()
+                    # The only file this may unlink is our OWN earlier download of the
+                    # same release, and only when the extension changed.
+                    if release.path and release.path != rel_path:
+                        (project.path / release.path).unlink(missing_ok=True)
+                    project.save_source_audio(release.number, rel_path, seconds)
+                    self.item_done.emit(release.number)
+                except DownloadCancelled:
+                    break  # .part kept on disk; the next run resumes it
+                except (AudioUnavailableError, AuthRequiredError, ScrapeError, TtsError) as exc:
+                    # Report and carry on: one volume the account cannot reach must not
+                    # abandon the twenty it can.
+                    errors += 1
+                    project.mark_source_audio_error(release.number, str(exc))
+                    self.item_error.emit(release.number, str(exc))
+                done += 1
+
+            self.progress.emit(done, total, "")
+            self.finished_ok.emit(done - errors, errors)
+        finally:
+            project.close()
+
+    def _download(self, release, url, out_path, done, total, download_media) -> None:
+        """One file, with byte progress folded into the existing (done, total) signal."""
+        label = release.title
+
+        def on_progress(got: int, size: int) -> None:
+            if size:
+                self.progress.emit(done, total, f"{label} — {got / 1e6:.0f}/{size / 1e6:.0f} MB")
+
+        download_media(
+            url,
+            out_path,
+            cookies=self.cookies,
+            cancelled=lambda: self._cancelled,
+            on_progress=on_progress,
+        )
+
+    def _resolve(self, releases: list) -> list:
+        """Which releases this run should fetch, in reading order."""
+        wanted = set(self.numbers) if self.numbers is not None else None
+        targets = []
+        self.skipped = 0
+        for release in releases:
+            if wanted is not None and release.number not in wanted:
+                continue
+            already = release.has_audio and (self.project_path / release.path).exists()
+            if self.skip_downloaded and already:
+                # The file is on disk and byte-identical to what the site would send
+                # again. Counted, not silently dropped, so the summary can say so.
+                self.skipped += 1
+                continue
+            targets.append(release)
+        return targets
+
+
+
 class MergeWorker(PausableWorker):
     """Merge per-chapter audio into one or more files (all / range / batch), off-thread."""
 
@@ -913,11 +1113,14 @@ class MergeWorker(PausableWorker):
         start: int | None = None,
         end: int | None = None,
         batch: int | None = None,
+        source_audio: bool = False,  # merge the site's audio edition (059.07)
         parent=None,
     ):
         super().__init__(parent)
         self.project_path = Path(project_path)
         self.voice = voice
+        # Render the SITE's audio edition instead of chapter audio (059.07).
+        self.source_audio = source_audio
         self.fmt = fmt
         self.mode = mode
         # NOTE: not `self.start` — that would shadow QThread.start() and the thread
@@ -926,6 +1129,12 @@ class MergeWorker(PausableWorker):
         self.end_num = end
         self.batch_size = batch
 
+
+    def _nothing_message(self) -> str:
+        """Why the plan came out empty — the two cases need different advice."""
+        if self.source_audio:
+            return "Chưa tải mục audio nào từ trang nguồn trong phạm vi đã chọn."
+        return "Không có chương nào có audio giọng này trong phạm vi đã chọn."
 
     def run(self) -> None:
         from noveltrans.errors import TtsError
@@ -936,20 +1145,30 @@ class MergeWorker(PausableWorker):
             chapter_marker_title,
             merge_chapters,
             plan_merge_windows,
+            plan_source_windows,
         )
 
         project = NovelProject.open(self.project_path)
         try:
-            windows = plan_merge_windows(
-                project.chapters(),
-                self.voice,
-                self.mode,
-                start=self.start_num,
-                end=self.end_num,
-                batch=self.batch_size,
-            )
+            if self.source_audio:
+                windows = plan_source_windows(
+                    project.source_audio(),
+                    self.mode,
+                    start=self.start_num,
+                    end=self.end_num,
+                    batch=self.batch_size,
+                )
+            else:
+                windows = plan_merge_windows(
+                    project.chapters(),
+                    self.voice,
+                    self.mode,
+                    start=self.start_num,
+                    end=self.end_num,
+                    batch=self.batch_size,
+                )
             if not windows:
-                self.failed.emit("Không có chương nào có audio giọng này trong phạm vi đã chọn.")
+                self.failed.emit(self._nothing_message())
                 return
             project.audio_dir.mkdir(parents=True, exist_ok=True)
             # NOT display_name(): the slug keys <stem>.mp4 and its sidecars, so an
@@ -1049,11 +1268,13 @@ class VideoWorker(PausableWorker):
         tagline: str = "",  # thumbnail subtitle under "PHẦN N"
         thumb_image_path: Path | str = "",  # thumbnail base image; "" → reuse image_path
         tags: str = "",  # novel-level YouTube tags (comma-joined) written per part
+        source_audio: bool = False,  # render the site's audio edition (059.07)
         parent=None,
     ):
         super().__init__(parent)
         self.project_path = Path(project_path)
         self.voice = voice
+        self.source_audio = source_audio
         self.mode = mode
         self.image_path = Path(image_path)
         # NOTE: not `self.start` — that shadows QThread.start() (same trap as MergeWorker).
@@ -1085,6 +1306,12 @@ class VideoWorker(PausableWorker):
         self.tags = tags
 
 
+    def _nothing_message(self) -> str:
+        """Why the plan came out empty — the two cases need different advice."""
+        if self.source_audio:
+            return "Chưa tải mục audio nào từ trang nguồn trong phạm vi đã chọn."
+        return "Không có chương nào có audio giọng này trong phạm vi đã chọn."
+
     def run(self) -> None:
         from noveltrans.errors import TtsError
         from noveltrans.storage.project import slugify
@@ -1094,6 +1321,7 @@ class VideoWorker(PausableWorker):
             chapter_marker_title,
             part_number,
             plan_merge_windows,
+            plan_source_windows,
         )
         from noveltrans.tts.player_skin import hex_to_rgb
         from noveltrans.tts.thumbnail import render_thumbnail
@@ -1155,6 +1383,14 @@ class VideoWorker(PausableWorker):
                 )
                 windows = [w for _, w in locked]
                 locked_part_numbers = {w.first_num: pn for pn, w in locked}
+            elif self.source_audio:
+                windows = plan_source_windows(
+                    project.source_audio(),
+                    self.mode,
+                    start=self.start_num,
+                    end=self.end_num,
+                    batch=self.batch_size,
+                )
             else:
                 windows = plan_merge_windows(
                     project.chapters(),
@@ -1165,7 +1401,7 @@ class VideoWorker(PausableWorker):
                     batch=self.batch_size,
                 )
             if not windows:
-                self.failed.emit("Không có chương nào có audio giọng này trong phạm vi đã chọn.")
+                self.failed.emit(self._nothing_message())
                 return
             total = len(windows)
             written = 0

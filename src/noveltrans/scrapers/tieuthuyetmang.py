@@ -2,7 +2,7 @@
 
 Landing page: https://tieuthuyetmang.com/truyen/<slug>
 Chapter page: https://tieuthuyetmang.com/truyen/<slug>/doc/<chapterNumber>
-Audio page:   https://tieuthuyetmang.com/truyen/<slug>/nghe/<chapterNumber>   (unused)
+Audio page:   https://tieuthuyetmang.com/truyen/<slug>/nghe/<chapterNumber>
 
 A Next.js App Router site with **no server-rendered chapter markup**. Everything this
 adapter needs is in the React Server Component "flight" stream the page embeds as
@@ -44,7 +44,7 @@ from collections.abc import Iterator
 
 from bs4 import BeautifulSoup
 
-from noveltrans.errors import AuthRequiredError, ScrapeError
+from noveltrans.errors import AudioUnavailableError, AuthRequiredError, ScrapeError
 from noveltrans.models import ChapterRef, NovelMeta
 from noveltrans.scrapers import register
 from noveltrans.scrapers.base import SiteAdapter
@@ -61,6 +61,10 @@ _MAX_OBJECT_SPAN = 8_192
 # a stray label or a URL that happens to be the longest string in an object, not to judge
 # how long a chapter "should" be.
 _MIN_BODY_CHARS = 200
+
+# What counts as a media URL. `?`/`#` are allowed after the extension so a CDN that
+# starts signing its URLs keeps matching; the site serves plain .mp3 today.
+_MEDIA_RE = re.compile(r"\.(?:mp3|m4a|aac|ogg|wav|m3u8)(?:[?#]|$)", re.I)
 
 
 def slug(url: str) -> str:
@@ -477,6 +481,89 @@ def parse_chapter(markup: str, url: str, *, number: int, title: str = "") -> str
     return "\n\n".join(lines)
 
 
+# --- audio -----------------------------------------------------------------
+# Everything below was MEASURED against the live site with an entitled session
+# (see 059.01-HISTORY.md). The three states the page can be in:
+#
+#   entitled, audio ready      player props present, `audioUrl` holds an .mp3
+#   entitled, not yet uploaded player props present, `audioUrl` empty
+#   signed out / not VIP       player props ABSENT, replaced by an upsell block
+#
+# That is why `audio_gate_reason` keys off the presence of the prop and not off the
+# upsell copy: the copy is Vietnamese presentation text and will not survive a redesign.
+
+
+def audio_page_url(novel_slug: str, number: int) -> str:
+    """The listen URL for one chapter.
+
+    MEASURED, like `chapter_url`, and keyed off `chapterNumber` the same way. This is
+    where the media URL lives; the `/doc/` reader page never carries one, with or
+    without a session cookie.
+    """
+    return f"{_ORIGIN}/truyen/{novel_slug}/nghe/{number}"
+
+
+def audio_entries(stream: str, novel_slug: str) -> list[dict]:
+    """This novel's chapters that claim to have audio, in reading order.
+
+    Audio is published per *volume*, not per chapter: on the reference novel 21 of 122
+    chapters carry `hasAudio`, each covering five chapters ("[ YTB TẬP 1 ] Chương 1-5"),
+    anchored at a sparse set of `chapterNumber`s. Note the chapter ranges in those titles
+    run far past the chapter count, so the TITLE cannot be used to map audio to chapters —
+    only `chapterNumber` can.
+    """
+    return [entry for entry in story_chapters(stream, novel_slug) if entry.get("hasAudio")]
+
+
+def audio_locked_count(entries: list[dict]) -> int:
+    """How many audio entries are flagged `audioLocked`.
+
+    STATUS LINE ONLY — never a filter. The flag describes what the site would show an
+    anonymous visitor and has been observed false for every entry on an entitled
+    session, so filtering on it would hide audio the user can actually fetch.
+    """
+    return sum(1 for entry in entries if entry.get("audioLocked"))
+
+
+def find_audio_media(markup: str) -> str:
+    """The media URL on a listen page, or "" when the page carries none.
+
+    Tier 1 is a real `<audio>`/`<source>` element; tier 2 is the flight stream, which is
+    where the live site actually puts it (as the `audioUrl` prop of the player component).
+    The stream is walked with `raw_decode` over every quote rather than a regex, for the
+    reason the module docstring gives — a regex over the raw text picks up the stream's
+    own backslash escaping and yields a URL with a trailing `\\`.
+
+    Returns "" rather than raising; `fetch_audio_url` decides what the emptiness means.
+    """
+    soup = BeautifulSoup(markup, "html.parser")
+    for tag in soup.find_all(["audio", "source"]):
+        src = (tag.get("src") or "").strip()
+        if src and _MEDIA_RE.search(src):
+            return src
+
+    decoder = json.JSONDecoder()
+    stream = flight_payload(markup)
+    for match in re.finditer(r'"', stream):
+        try:
+            value, _ = decoder.raw_decode(stream, match.start())
+        except ValueError:
+            continue
+        if isinstance(value, str) and _MEDIA_RE.search(value) and "/" in value:
+            return value.strip()
+    return ""
+
+
+def audio_gate_reason(markup: str) -> str:
+    """Why a listen page has no media: "vip" (not entitled), or "" (entitled).
+
+    Structural on purpose. An entitled session gets the player component server-rendered
+    with its props — `audioUrl` among them — whether or not the file has been uploaded
+    yet. A signed-out or non-VIP session gets no player at all. So the prop's presence,
+    not the URL's, is the entitlement signal.
+    """
+    return "" if '"audioUrl"' in flight_payload(markup) else "vip"
+
 @register
 class TieuthuyetmangAdapter(SiteAdapter):
     name = "tieuthuyetmang"
@@ -535,4 +622,42 @@ class TieuthuyetmangAdapter(SiteAdapter):
             ref.url,
             number=chapter_number(ref.url),
             title=ref.title,
+        )
+
+    def fetch_audio_manifest(self, url: str) -> list[dict]:
+        """The novel's audio entries, from the landing page already in the cache.
+
+        Costs no extra request during a scan: `_page` has the markup, and the manifest
+        is a filter over the same TOC `fetch_chapter_list` reads.
+        """
+        markup = self._page(landing_url(url))
+        entries = audio_entries(flight_payload(markup), slug(url))
+        if entries:
+            locked = audio_locked_count(entries)
+            note = f" ({locked} cần VIP theo trang chủ)" if locked else ""
+            self._status(f"🎧 {len(entries)} mục có audio{note}")
+        return entries
+
+    def fetch_audio_url(self, ref: ChapterRef) -> str:
+        """The media URL for one audio entry.
+
+        Plain HTTP with the account's cookie is enough — the URL is server-rendered into
+        the listen page's flight stream, so no browser automation is involved. The media
+        host itself is NOT gated: the returned URL fetches anonymously, which is why the
+        download step needs no session at all.
+        """
+        markup = self.client.get_html(audio_page_url(slug(ref.url), chapter_number(ref.url)))
+        media = find_audio_media(markup)
+        if media:
+            return media
+        if audio_gate_reason(markup) == "vip":
+            raise AuthRequiredError(
+                "Chương này có audio nhưng tài khoản chưa mở khoá — cần gói VIP, "
+                "hoặc cookie trong Cài đặt đã hết hạn",
+                ref.url,
+            )
+        # Entitled, but the site has not published this volume's file yet. Observed on
+        # 8 of the reference novel's 21 entries: the player renders, `audioUrl` is empty.
+        raise AudioUnavailableError(
+            "Trang nghe chưa có file audio cho mục này (site chưa đăng)", ref.url
         )
