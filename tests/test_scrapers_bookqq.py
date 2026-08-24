@@ -153,7 +153,7 @@ class TestMetadata:
 class TestChapterContent:
     def test_a_free_chapter_extracts_its_paragraphs(self):
         body = parse_chapter(free_chapter(), "第一章 山门", CHAPTER_URL)
-        assert len(body.split("\n\n")) == 3
+        assert len(body.split("\n\n")) == 4
         assert "下一章" not in body  # nav chrome excluded
 
     def test_the_leading_title_line_is_dropped(self):
@@ -165,6 +165,19 @@ class TestChapterContent:
         using it would refuse all 226 chapters."""
         assert "登录" in free_chapter()
         assert is_paywalled(free_chapter()) is False
+
+    def test_ordinary_prose_using_a_marker_word_is_not_a_paywall(self):
+        """The bug this gate shipped with: 购买 ("buy") is an everyday verb in a wuxia
+        novel — villagers buying pills, merchants buying herbs — and a Chinese paragraph
+        is routinely under 200 characters. Scanning the whole page therefore refused free
+        chapters 26, 27 and 30 on their own prose.
+
+        What separates a button from a sentence is WHERE it is: the CTA sits outside the
+        content container and the story sits inside it. Length never decides."""
+        markup = free_chapter()
+        assert "购买" in markup  # the trap is really in the fixture
+        assert is_paywalled(markup) is False
+        assert parse_chapter(markup, "第一章 山门", CHAPTER_URL)
 
     def test_a_paid_chapter_is_refused_not_extracted(self):
         with pytest.raises(AuthRequiredError):
@@ -197,9 +210,13 @@ class TestChapterContent:
 
     def test_length_is_never_a_refusal_criterion(self):
         """A genuinely short free chapter must extract, not be mistaken for a teaser."""
-        short = free_chapter().replace(
-            "<p>山门之外落着薄雪，石阶一路向上，看不见尽头。</p>", ""
-        ).replace("<p>他把手里的伞收起来，抖了抖上面的雪，抬头望了一眼。</p>", "")
+        short = free_chapter()
+        for gone in (
+            "<p>山门之外落着薄雪，石阶一路向上，看不见尽头。</p>",
+            "<p>他把手里的伞收起来，抖了抖上面的雪，抬头望了一眼。</p>",
+            "<p>他说山下的药铺前排着长队，村民都在购买那种新到的丹药。</p>",
+        ):
+            short = short.replace(gone, "")
         body = parse_chapter(short, "第一章 山门", CHAPTER_URL)
         assert body and len(body) < 40
 
@@ -308,7 +325,7 @@ class TestAdapterWiring:
         responses.get(chapter_url(BID, 1), body=free_chapter())
         adapter = make_adapter()
         refs = adapter.fetch_chapter_list(DETAIL_URL)
-        assert len(adapter.fetch_chapter(refs[0]).split("\n\n")) == 3
+        assert len(adapter.fetch_chapter(refs[0]).split("\n\n")) == 4
 
     @responses.activate
     def test_an_unavailable_toc_still_lets_the_page_gate_decide(self):
@@ -337,3 +354,12 @@ class TestLive:
         assert len(adapter.fetch_chapter(refs[0])) > 2000
         with pytest.raises(AuthRequiredError):
             adapter.fetch_chapter(refs[-1])
+
+    def test_free_chapters_from_the_middle_of_the_run_also_fetch(self):
+        """Checking only the first and last chapter is exactly how the 购买 false
+        positive shipped: chapters 26, 27 and 30 were refused on their own prose while
+        chapter 1 happened to contain no marker word."""
+        adapter = make_adapter()
+        refs = adapter.fetch_chapter_list(DETAIL_URL)
+        for number in (26, 27, 30):
+            assert len(adapter.fetch_chapter(refs[number - 1])) > 2000
