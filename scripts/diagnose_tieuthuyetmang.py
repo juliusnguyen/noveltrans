@@ -128,6 +128,106 @@ def flags_in(markup: str) -> dict[str, bool]:
     }
 
 
+# --- audio probes (Step 10 / Q6-Q9) -------------------------------------------------
+
+_MEDIA_RE = re.compile(r'"(https?://[^"]{0,300}?\.(?:mp3|m4a|aac|ogg|opus|wav|m3u8|mpd)[^"]{0,200})"')
+_REL_MEDIA_RE = re.compile(r'"(/[^"]{0,200}?\.(?:mp3|m4a|aac|ogg|opus|wav|m3u8|mpd)[^"]{0,200})"')
+_SIGNED_HINTS = ("token", "expires", "expiry", "signature", "sig=", "X-Amz-", "hmac", "policy")
+
+
+def audio_url(novel_slug: str, number: int) -> str:
+    """The listen URL. INFERRED from the adapter docstring, not measured like `doc`.
+
+    If every probe below 404s, that guess is the first thing to doubt — grep the route
+    chunks printed above for the real one rather than trying more shapes by hand.
+    """
+    return f"https://tieuthuyetmang.com/truyen/{novel_slug}/nghe/{number}"
+
+
+def audio_keys(entries: list[dict]) -> dict[str, list]:
+    """Every key any chapter object carries whose name looks audio-ish, with its values.
+
+    Deliberately not a fixed list of guessed names: Q6's real question is what the site
+    *actually* calls it, and a key nobody guessed is exactly the finding worth having.
+    """
+    found: dict[str, list] = {}
+    for entry in entries:
+        for key, value in entry.items():
+            if any(word in key.lower() for word in ("audio", "voice", "nghe", "mp3", "sound", "listen")):
+                found.setdefault(key, []).append(value)
+    return found
+
+
+def media_candidates(markup: str, stream: str) -> list[str]:
+    """Every media-looking URL on the page, absolute first. Q7's answer, or its absence."""
+    urls: list[str] = []
+    for text in (markup, stream):
+        urls += _MEDIA_RE.findall(text)
+    for text in (markup, stream):
+        urls += [u for u in _REL_MEDIA_RE.findall(text) if not u.startswith("/_next/static")]
+    seen: dict[str, None] = {}
+    for url in urls:
+        # These URLs are lifted out of JSON string literals, so the closing quote arrives
+        # escaped and the capture keeps the backslash. Left on, every probe 404s against a
+        # URL the site never served — strip it before the URL is ever used.
+        cleaned = url.replace("\\u0026", "&").replace("\\/", "/").rstrip("\\")
+        seen.setdefault(cleaned, None)
+    return list(seen)
+
+
+def audio_elements(markup: str) -> list[str]:
+    """`<audio>` / `<source>` tags, which discovery tier 2 would key off."""
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(markup, "lxml")
+    out = []
+    for el in soup.find_all(["audio", "source"]):
+        attrs = {k: (v if len(str(v)) < 200 else f"<{len(str(v))} chars>") for k, v in el.attrs.items()}
+        out.append(f"<{el.name} {attrs}>")
+    return out
+
+
+def probe_media(client, url: str) -> None:
+    """HEAD the media URL: format, size, and whether it is signed. Zero bytes fetched.
+
+    Falls back to a 1-byte ranged GET where HEAD is refused — still effectively nothing,
+    and this is a small paid site (see the adapter docstring on politeness).
+    """
+    print(f"    probing  {url[:160]}")
+    signed = [hint for hint in _SIGNED_HINTS if hint.lower() in url.lower()]
+    print(f"      signed-URL hints   {signed or 'none'}"
+          + ("   <-- discovery and download must stay per-item, never batched" if signed else ""))
+    response = None
+    try:
+        response = client._request("HEAD", url)
+    except Exception as exc:  # noqa: BLE001 — a probe; failure is itself the answer
+        print(f"      HEAD               refused ({exc!r:.120}); retrying as 1-byte GET")
+        try:
+            response = client.get(url, headers={"Range": "bytes=0-0"}, stream=True)
+        except Exception as exc2:  # noqa: BLE001
+            print(f"      GET                ERROR {exc2!r:.160}")
+    if response is None:
+        return
+    interesting = ("content-type", "content-length", "content-range", "accept-ranges", "location")
+    print(f"      status             {response.status_code}")
+    for header in interesting:
+        if header in response.headers:
+            print(f"      {header:<18} {response.headers[header]}")
+
+    if ".m3u8" in url.lower():
+        # Q-3 in the plan's risk list: HLS is fine, HLS+DRM stops the feature dead.
+        try:
+            playlist = client.get_html(url)
+        except Exception as exc:  # noqa: BLE001
+            print(f"      playlist           ERROR {exc!r:.160}")
+            return
+        keys = re.findall(r"#EXT-X-KEY:[^\n]*", playlist)
+        print(f"      playlist lines     {len(playlist.splitlines())}")
+        print(f"      #EXT-X-KEY         {keys or 'none — plain HLS, -c copy will work'}")
+        if any("SAMPLE-AES" in k or "widevine" in k.lower() or "fairplay" in k.lower() for k in keys):
+            print("      *** DRM markers present — per plan §5.3 the feature STOPS here. ***")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     # Either form works, and either one alone is enough — a chapter URL contains the
@@ -244,6 +344,58 @@ def main() -> int:
             print("    route chunks       (grep these for the fetch that loads the text)")
             for chunk in chunks:
                 print(f"      {unquote(chunk)}")
+
+        rule("Q6 — WHAT THE TOC SAYS ABOUT AUDIO")
+        keys = audio_keys(entries)
+        if not keys:
+            print("  no chapter-object key mentions audio at all.")
+            print("  => audio is NOT addressed through the TOC; plan §5.4's second reading holds")
+            print("     and the 21 audio items need their own id space. Data model needs rework.")
+        for key, values in keys.items():
+            truthy = [v for v in values if v not in (None, False, "", 0)]
+            print(f"  {key:<20} present on {len(values)}/{len(entries)} rows, truthy on {len(truthy)}")
+            print(f"  {'':<20} distinct values: {sorted({repr(v)[:40] for v in values})[:8]}")
+        with_audio = [e for e in entries if any(
+            e.get(k) not in (None, False, "", 0) for k in keys
+        )]
+        print(f"\n  chapters that look audio-bearing: {len(with_audio)}"
+              f"   (plan expected 21 of {len(entries)})")
+        if with_audio:
+            print(f"  their numbers: {[e['chapterNumber'] for e in with_audio][:30]}")
+
+        rule("Q7/Q8/Q9 — THE LISTEN PAGE")
+        targets = [e["chapterNumber"] for e in with_audio[:1]] or [entries[0]["chapterNumber"]]
+        if entries and entries[0]["chapterNumber"] not in targets:
+            targets.append(entries[0]["chapterNumber"])
+        for number in targets[:2]:
+            url = audio_url(novel_slug, number)
+            sessions = [("as you (cookie sent)", client)]
+            if cookies:
+                sessions.append(("anonymous (no cookie)", HttpClient(delay_seconds=2.0)))
+            for label, session in sessions:
+                print(f"\n  --- chương {number}, {label} ---")
+                print(f"      {url}")
+                try:
+                    markup = session.get_html(url)
+                except Exception as exc:  # noqa: BLE001 — a probe; failure is the answer
+                    print(f"      ERROR {exc!r:.200}")
+                    continue
+                stream, census = describe(markup)
+                for key, value in census.items():
+                    print(f"      {key:<20} {value}")
+                print(f"      flags true         {[k for k, v in flags_in(markup).items() if v]}")
+                print(f"      <audio> elements   {audio_elements(markup) or 'none'}")
+                apis = sorted(set(re.findall(r'"(/api/[^"]{0,80})"', markup)))
+                print(f"      /api/ literals     {apis}")
+                found = media_candidates(markup, stream)
+                print(f"      media URLs         {len(found)}")
+                for candidate in found[:5]:
+                    print(f"        {candidate[:180]}")
+                if not found:
+                    print("        none in HTML or flight stream => the URL arrives from a")
+                    print("        client-side XHR; grep the route chunks above for the fetch.")
+                if found and label.startswith("as you"):
+                    probe_media(session, found[0])
 
     rule("DONE")
     print("Paste everything above. Nothing was written and no chapter was unlocked.")
