@@ -99,6 +99,55 @@ class TestChapterTableModelEditing:
         assert edits == []
 
 
+class TestChapterTableModelRewriteMarker:
+    """Feature 060 — "đã viết lại" is shown as a suffix, not a new column."""
+
+    def _model(self, qapp):
+        from noveltrans.gui.widgets import ChapterTableModel
+
+        model = ChapterTableModel()
+        model.set_chapters(
+            [
+                Chapter(index=0, title="第1章", url="u", content="x", translated="dịch",
+                        translator="Google Translate"),  # translated, not rewritten
+                Chapter(index=1, title="第2章", url="u", content="x", translated="hay hơn",
+                        translator="Google Translate", translated_raw="dịch"),  # rewritten
+            ]
+        )
+        return model
+
+    def test_the_marker_appears_only_on_a_rewritten_chapter(self, qapp):
+        m = self._model(qapp)
+        col = m.TRANSLATOR_COLUMN
+        assert m.data(m.index(0, col)) == "Google Translate"
+        assert m.data(m.index(1, col)) == "Google Translate ✍️"
+
+    def test_a_rewritten_chapter_with_no_engine_recorded_has_no_stray_space(self, qapp):
+        from noveltrans.gui.widgets import ChapterTableModel
+
+        model = ChapterTableModel()
+        model.set_chapters(
+            [Chapter(index=0, title="t", url="u", translated="x", translated_raw="y")]
+        )
+        assert model.data(model.index(0, model.TRANSLATOR_COLUMN)) == "✍️"
+
+    def test_the_marker_carries_a_tooltip_pointing_at_the_undo(self, qapp):
+        from PySide6.QtCore import Qt
+
+        m = self._model(qapp)
+        col = m.TRANSLATOR_COLUMN
+        assert m.data(m.index(0, col), Qt.ItemDataRole.ToolTipRole) is None
+        tip = m.data(m.index(1, col), Qt.ItemDataRole.ToolTipRole)
+        assert "hoàn tác" in tip
+
+    def test_no_column_was_added(self, qapp):
+        # A ninth column would shift RETRANSLATE_COLUMN and every index that follows it
+        # across tab_translate.py. The suffix exists precisely to avoid that.
+        m = self._model(qapp)
+        assert len(m.COLUMNS) == 8
+        assert m.RETRANSLATE_COLUMN == 7
+
+
 class TestDefaultExportName:
     def _meta(self, **overrides):
         from noveltrans.models import NovelMeta

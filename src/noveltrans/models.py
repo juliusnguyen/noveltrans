@@ -200,6 +200,12 @@ class Chapter:
     target_lang: str = ""  # language of `translated`
     translator: str = ""  # engine that produced `translated`, e.g. "CLI (agy)"
     translate_seconds: float = 0.0  # wall-clock time of the last translation
+    # The translation as it stood before the style rewrite replaced it. Non-empty means
+    # "this chapter has been rewritten", so one field is the undo copy, the resume
+    # predicate and the done-flag at once. `restore_translation` puts the text back and
+    # blanks these, which is what makes the chapter eligible for a fresh rewrite.
+    translated_raw: str = ""
+    translated_title_raw: str = ""
     status: str = STATUS_PENDING
     error: str = ""
     updated_at: str = ""
@@ -221,6 +227,10 @@ class Chapter:
     @property
     def is_translated(self) -> bool:
         return bool(self.translated)
+
+    @property
+    def is_rewritten(self) -> bool:
+        return bool(self.translated_raw)
 
     @property
     def has_audio(self) -> bool:

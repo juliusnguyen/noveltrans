@@ -5,7 +5,7 @@
 | Tab | Chức năng |
 |---|---|
 | **1. Tải truyện** | Dán URL truyện → Quét metadata (tên, tác giả, mô tả, mục lục) → Tải toàn bộ chương về máy. Sau khi dịch, tên dịch hiện kế bên tên gốc và mô tả hiển thị bản dịch (rê chuột xem bản gốc). Có progress bar, nút Dừng, và tự resume (chạy lại chỉ tải chương còn thiếu). Hoặc bấm **✍️ Truyện tự viết** để tạo truyện của chính bạn (không cần link nguồn): thêm chương bằng tên (mỗi dòng một tên), đổi tên chương, chuột phải để xoá chương. Có nút **⏸ Tạm dừng** cạnh nút Dừng. |
-| **2. Dịch** | Dịch Trung → Việt/Anh bằng **Google Translate (miễn phí)**, **Claude API**, **CLI Agent** (agy/claude) hoặc **LM Studio** (model local). Xem song song bản gốc/bản dịch. Resume + retry chương lỗi, dịch lại từng chương. Sửa tay cả hai ô: bấm vào ô **Bản gốc** để dán/sửa nội dung gốc (đây cũng là chỗ nhập nội dung cho truyện tự viết), bấm vào ô **Bản dịch** để sửa bản dịch — cả hai tự lưu khi rời ô, dòng đầu là tên chương. Nháy đúp cột "Tên dịch" để đổi tên chương dịch. **Tìm & thay thế** hàng loạt (một chương hoặc cả truyện) — xem trước số khớp rồi mới áp dụng. Có nút **⏸ Tạm dừng** cạnh nút Dừng. |
+| **2. Dịch** | Dịch Trung → Việt/Anh bằng **Google Translate (miễn phí)**, **Claude API**, **CLI Agent** (agy/claude) hoặc **LM Studio** (model local). Xem song song bản gốc/bản dịch. Resume + retry chương lỗi, dịch lại từng chương. Sửa tay cả hai ô: bấm vào ô **Bản gốc** để dán/sửa nội dung gốc (đây cũng là chỗ nhập nội dung cho truyện tự viết), bấm vào ô **Bản dịch** để sửa bản dịch — cả hai tự lưu khi rời ô, dòng đầu là tên chương. Nháy đúp cột "Tên dịch" để đổi tên chương dịch. **Tìm & thay thế** hàng loạt (một chương hoặc cả truyện) — xem trước số khớp rồi mới áp dụng. **✍️ Viết lại văn phong**: dùng AI sửa bản dịch kiểu "convert" (dịch từng chữ, giữ trật tự từ tiếng Trung) thành tiếng Việt xuôi tai — xem bên dưới. Có nút **⏸ Tạm dừng** cạnh nút Dừng. |
 | **3. Xuất file** | Xuất bản dịch (hoặc bản gốc) ra **DOCX**, **Markdown**, **EPUB**. Tên file mặc định lấy theo tên truyện đã dịch. Cũng là nơi **sao lưu cả truyện lên OneDrive** (xem bên dưới). |
 | **4. Nghe audio** | Đọc bản dịch thành audio bằng **VieNeu-TTS** (chạy local, 20 giọng tiếng Việt). MP3/WAV từng chương, resume, tạo lại từng chương, double-click để nghe. Chọn **giọng** (mỗi giọng mang sẵn phong cách tự nhiên / kể chuyện / tin tức), xem trước văn bản engine sẽ đọc, và tinh chỉnh **tốc độ / âm lượng / khoảng lặng / độ biểu cảm / chất lượng** trong Cài đặt. Truyện tự viết bằng tiếng Việt thì chọn nguồn **Bản gốc** để đọc thẳng nội dung (không cần dịch). Có nút **⏸ Tạm dừng** cạnh nút Dừng. |
 
@@ -68,9 +68,10 @@ Nguồn đã là tiếng Việt (tải xong đọc/nghe được ngay, không c�
 | Gia Tộc Vương Tài (giatocvuongtai.com) | `https://giatocvuongtai.com/stories/<slug>` — đọc qua JSON API công khai của site, **không cần đăng nhập hay cookie** |
 | Web Truyện Dịch (webtruyendich.com) | `https://webtruyendich.com/truyen/dong-kinh-y-do` — bản dịch AI do chính trang tạo ra: app mở trình duyệt (Cloudflare), tự chọn model Gemini "Memory / No Apikey" mà trang đang có rồi bấm **Dịch lại**, và lưu thẳng kết quả làm bản dịch. Cần Google Chrome hoặc `playwright install chromium`. **Không tải song song nhiều luồng** — site bị giới hạn Cloudflare + quota AI |
 
-Truyện lấy từ nhóm thứ hai đã có sẵn bản dịch tiếng Việt nên tab **2. Dịch** chỉ dùng để
-sửa tay (hoặc dịch lại nếu muốn); riêng webtruyendich thì bản dịch được ghi luôn vào ô
-**Bản dịch** khi tải, không chạy engine dịch của NovelTrans.
+Truyện lấy từ nhóm thứ hai đã có sẵn bản dịch tiếng Việt nên tab **2. Dịch** dùng để sửa
+tay, để **✍️ Viết lại văn phong** (những bản dịch này hay là bản "convert" đọc trúc trắc),
+hoặc dịch lại nếu muốn; riêng webtruyendich thì bản dịch được ghi luôn vào ô **Bản dịch**
+khi tải, không chạy engine dịch của NovelTrans.
 
 Thêm site mới = thêm 1 file adapter trong `src/noveltrans/scrapers/` (kế thừa `SiteAdapter`, đăng ký bằng `@register`).
 
@@ -160,6 +161,49 @@ Menu **App → Cài đặt**:
 - **Google (miễn phí)**: không cần key; nội dung được cắt thành đoạn ≤1500 ký tự (giới hạn endpoint miễn phí với chữ Hán). Tốc độ ~30–60s/chương. Tên nhân vật được tự động chuyển sang **Hán-Việt** bằng bộ tự điển tích hợp (phát hiện tên lặp lại trong bản gốc, thay trước khi gửi Google).
 - **Claude API**: dịch cả chương mỗi request, văn phong tốt hơn hẳn; tốn phí theo token. Model mặc định: Haiku (đổi được trong Cài đặt).
 - **CLI Agent**: gọi một AI-agent CLI ở chế độ headless — ví dụ `agy -p` (Antigravity CLI, có Gemini/Claude/GPT-OSS bên trong) hoặc `claude -p` (Claude Code). Dùng subscription/quota sẵn có của CLI, **không cần API key**. Chất lượng ngang Claude API, ~30s/chương. Đổi lệnh trong Cài đặt (ví dụ `agy -p --model "Gemini 3.1 Pro (Low)"`).
+
+## Viết lại văn phong
+
+Nhiều bản dịch — nhất là truyện lấy từ các trang tiếng Việt, hoặc dịch bằng Google — là
+kiểu **"convert"**: máy dịch từng chữ và giữ nguyên trật tự từ của tiếng Trung, nên đọc
+rất trúc trắc. Nút **✍️ Viết lại văn phong** ở tab 2 dùng AI sắp xếp lại cho xuôi tai:
+
+> **Gốc:** Hắn nội tâm tràn ngập một loại không cách nào nói nói tư vị.
+>
+> **Viết lại:** Nội tâm hắn tràn ngập một loại tư vị khó nói.
+
+Đây **không phải dịch lại** — tiếng Việt vào, tiếng Việt ra. Chỉ đổi cách hành văn:
+
+- **Giữ nguyên tên riêng Hán-Việt** (Phó Thanh Từ, Giang Dư…) và **xưng hô** (hắn, nàng,
+  y, thị, ngươi) — đổi xưng hô là hỏng cả giọng văn tiên hiệp.
+- **Không tóm tắt, không thêm bớt.** Số đoạn văn phải khớp chính xác với bản gốc.
+- Chỉ dành cho **bản dịch tiếng Việt**; engine phải là **CLI Agent, Claude API hoặc
+  LM Studio** (Google chỉ dịch được, không viết lại được nên không xuất hiện trong danh
+  sách). Chọn engine/model riêng cho việc viết lại, độc lập với engine dịch.
+
+**Chương nào viết lại hỏng thì giữ nguyên bản dịch cũ.** Nếu AI trả về bản thiếu đoạn,
+bị tóm tắt, hay đổi tên nhân vật, app thử lại tối đa 3 lần rồi bỏ qua chương đó và ghi lý
+do vào cột **Lỗi** — bản dịch đang có không bao giờ bị ghi đè bằng một bản kém hơn.
+
+Trước khi chạy cả truyện, bấm **👁 Xem thử 1 chương**: nó chạy đúng quy trình sẽ dùng cho
+cả truyện nhưng **không ghi gì**, cho xem trước/sau cạnh nhau. Đáng làm — một truyện 1000
+chương là hàng giờ quota hoặc tiền API.
+
+Chương đã viết lại có dấu **✍️** ở cột "Dịch bằng". Bản dịch trước khi viết lại được giữ
+lại, nên **↩︎ Hoàn tác viết lại** trả về được — cho cả truyện (trong hộp thoại) hoặc từng
+chương (chuột phải vào bảng). Chuột phải cũng là chỗ viết lại riêng vài chương đang chọn.
+
+Lưu ý:
+
+- **Hoàn tác trả về bản dịch tại thời điểm viết lại** — sửa tay hay tìm & thay thế bạn
+  làm *sau* lần viết lại sẽ mất.
+- **Chương đã tạo audio thì file audio cũ vẫn giữ nguyên**, không tự khớp với bản viết
+  lại. Muốn khớp phải tạo lại audio cho những chương đó. Hộp thoại có cảnh báo kèm số
+  chương bị ảnh hưởng.
+- Viết lại lần nữa là viết lại **trên bản đã viết lại**, mỗi lượt trôi xa bản gốc thêm
+  một chút. Muốn đổi engine thì nên Hoàn tác trước rồi viết lại.
+- Chạy được **resume** (lần sau chỉ làm chương còn thiếu) và **⏸ Tạm dừng** như mọi tác
+  vụ dài khác.
 
 ## Nghe audio (VieNeu-TTS)
 
