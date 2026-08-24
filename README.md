@@ -59,6 +59,7 @@ Nguồn tiếng Trung (tải về rồi dịch ở tab 2):
 | 爱下电子书 (ixdzs8.com) | `https://ixdzs8.com/read/620438/` (nhận cả `ixdzs8.tw`) |
 | 69书吧 (69shuba.com) | `https://www.69shuba.com/book/59024/` (có kiểm tra Cloudflare — app tự mở trình duyệt để vượt qua; cần Google Chrome hoặc `playwright install chromium`; nhận cả `69shuba.cx`) |
 | QQ阅读 (book.qq.com) | `https://book.qq.com/book-detail/58625737` (nhận cả link chương `book-read/<id>/<số>`) — **truyện trên QQ thường chỉ miễn phí một phần**: ví dụ truyện trên có 226 chương thì 77 chương đọc miễn phí (65 chương đầu liền mạch), **149 chương còn lại là chương trả phí**. App báo lỗi "chương trả phí" cho những chương đó thay vì tải — đây là chuyện bình thường, không phải lỗi app. Không cần đăng nhập; NovelTrans không vượt tường phí của QQ. Số chương miễn phí hiện ngay khi quét xong, trước lúc bấm tải. |
+| 思兔閱讀 (sto9.com) | `https://sto9.com/book/13908/index.html` (nhận cả `book/<id>.html` và link chương `txt/<id>/<cid>.html` — dán kiểu nào cũng ra cùng một truyện). Không cần đăng nhập hay cookie. Nội dung là **tiếng Trung phồn thể**, tải xong dịch ở tab 2 như bình thường. Trang mục lục của site chỉ hiện ~35 chương đầu/cuối, app tự lấy danh sách đầy đủ từ máy chủ; nếu lấy hụt thì app **báo lỗi chứ không lưu danh sách thiếu** — gặp lỗi đó thì quét lại sau. |
 
 Nguồn đã là tiếng Việt (tải xong đọc/nghe được ngay, không cần qua tab 2):
 

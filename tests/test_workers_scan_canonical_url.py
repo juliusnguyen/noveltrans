@@ -120,3 +120,52 @@ class TestScanByCanonicalUrl:
         finally:
             w.adapter_for_url = original
         assert first != second
+
+
+class TestScanSto9ByEveryPasteForm:
+    """sto9 folds three paste forms to one canonical URL (see scrapers/sto9.py).
+
+    Recorded here rather than in the adapter's own module because the property being
+    pinned belongs to `ScanWorker`: the adapter canonicalises correctly on its own, but
+    only the `find_by_url(pasted) or find_by_url(meta.url)` lookup turns that into "one
+    project per novel" instead of one project per URL shape the user happened to copy.
+    """
+
+    BID = "13908"
+    FORMS = (
+        f"https://sto9.com/book/{BID}.html",
+        f"https://sto9.com/book/{BID}/index.html",
+        f"https://sto9.com/txt/{BID}/7671958.html",
+    )
+
+    @pytest.fixture
+    def sto9_like(self, monkeypatch):
+        from noveltrans.scrapers.sto9 import read_url
+
+        class _Sto9Shaped(_CanonicalisingAdapter):
+            def fetch_metadata(self, url: str) -> NovelMeta:
+                return NovelMeta(url=read_url(url), site="sto9", title="劍影孤舟", source_lang="zh")
+
+        adapter = _Sto9Shaped(None)
+        monkeypatch.setattr("noveltrans.gui.workers.adapter_for_url", lambda *_a, **_k: adapter)
+        return adapter
+
+    def test_all_three_paste_forms_land_on_one_project(self, qapp, library_dir, sto9_like):
+        paths = {_scan(url, library_dir) for url in self.FORMS}
+        assert len(paths) == 1
+
+    def test_rescanning_by_a_chapter_url_keeps_what_the_user_earned(
+        self, qapp, library_dir, sto9_like
+    ):
+        path = _scan(self.FORMS[1], library_dir)  # the form the site itself links to
+        project = NovelProject.open(path)
+        project.save_meta_translation("Kiếm Ảnh Cô Chu", "Mô tả đã dịch", "vi", "Vô Danh Thị")
+        project.close()
+
+        _scan(self.FORMS[2], library_dir)
+
+        project = NovelProject.open(path)
+        try:
+            assert project.meta.translated_title == "Kiếm Ảnh Cô Chu"
+        finally:
+            project.close()
