@@ -58,6 +58,7 @@ Nguồn tiếng Trung (tải về rồi dịch ở tab 2):
 | 半夏小說 (xbanxia.cc) | `https://www.xbanxia.cc/books/331303.html` (nhận cả `xbanxia.com`) |
 | 爱下电子书 (ixdzs8.com) | `https://ixdzs8.com/read/620438/` (nhận cả `ixdzs8.tw`) |
 | 69书吧 (69shuba.com) | `https://www.69shuba.com/book/59024/` (có kiểm tra Cloudflare — app tự mở trình duyệt để vượt qua; cần Google Chrome hoặc `playwright install chromium`; nhận cả `69shuba.cx`) |
+| QQ阅读 (book.qq.com) | `https://book.qq.com/book-detail/58625737` (nhận cả link chương `book-read/<id>/<số>`) — **truyện trên QQ thường chỉ miễn phí một phần**: ví dụ truyện trên có 226 chương thì 77 chương đọc miễn phí (65 chương đầu liền mạch), **149 chương còn lại là chương trả phí**. App báo lỗi "chương trả phí" cho những chương đó thay vì tải — đây là chuyện bình thường, không phải lỗi app. Không cần đăng nhập; NovelTrans không vượt tường phí của QQ. Số chương miễn phí hiện ngay khi quét xong, trước lúc bấm tải. |
 
 Nguồn đã là tiếng Việt (tải xong đọc/nghe được ngay, không cần qua tab 2):
 

@@ -110,7 +110,16 @@ class ScanWorker(QThread):
             refs = adapter.fetch_chapter_list(self.url)
 
             library = Library(self.library_dir)
-            existing = library.find_by_url(self.url)
+            # Look the project up by BOTH the pasted URL and the adapter's canonical one.
+            # Adapters that canonicalise (bookqq folds /book-read/<id>/<n> to the detail
+            # page; giatocvuongtai normalises its slug) store the canonical form in
+            # meta.url, while find_by_url is exact string equality — so a re-scan pasted
+            # from a chapter page would miss the existing project, fall through to
+            # create_project, and NovelProject.create overwrites meta.json wholesale,
+            # discarding translated_title, tags, thumbnail_prompt and video_settings.
+            # Chapter content survives (replace_toc preserves it) but everything
+            # refresh_meta exists to protect would be gone.
+            existing = library.find_by_url(self.url) or library.find_by_url(meta.url)
             if existing is not None:
                 project = NovelProject.open(existing)
                 project.replace_toc(refs)  # pick up newly published chapters
