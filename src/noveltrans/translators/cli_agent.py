@@ -44,6 +44,47 @@ _PROMPT = (
 )
 
 
+# Google refuses some prompts outright under its Generative AI Prohibited Use policy —
+# web-novel chapters trip it on violent or sexual themes. Three things matter about this
+# failure and none of them are obvious from the raw English blob the CLI prints:
+#   * it is the provider's decision about THAT CHAPTER, so re-running the same text
+#     through the same engine gets refused identically — retrying is not the answer;
+#   * it is not an app bug, and unless the message says so it gets reported as one;
+#   * the rest of the batch is unaffected (TranslateWorker marks the chapter and carries
+#     on), which the user cannot tell from a wall of English.
+# So the message names the cause and points at the options that actually exist: a
+# different engine, or a model running locally.
+_POLICY_MARKERS = (
+    "prohibited use",
+    "sensitive words",
+    "could not be submitted",
+)
+
+_POLICY_MESSAGE = (
+    "Google từ chối dịch chương này vì bộ lọc nội dung của họ (Generative AI Prohibited "
+    "Use policy). Đây là quyết định từ phía Google, không phải lỗi app — dịch lại bằng "
+    "cùng engine sẽ bị từ chối y hệt. Các chương khác trong mẻ vẫn dịch bình thường. "
+    "Cách xử lý: đổi engine trong Cài đặt (ví dụ Claude, hoặc LM Studio chạy model ngay "
+    "trên máy) rồi dịch lại riêng chương này."
+)
+
+
+def _friendly_error(detail: str) -> str:
+    """Map a known CLI failure to advice the user can act on. "" when unrecognised.
+
+    Returning "" rather than the input keeps every caller's existing fallback intact —
+    an unrecognised error is still passed through verbatim, just as before.
+    """
+    lowered = detail.lower()
+    if any(marker in lowered for marker in _POLICY_MARKERS):
+        return _POLICY_MESSAGE
+    if "RESOURCE_EXHAUSTED" in detail or "(code 429)" in detail:
+        reset = re.search(r"Resets in ([\w.]+)", detail)
+        when = f" (reset sau {reset.group(1).rstrip('.')})" if reset else ""
+        return f"hết hạn mức (quota) của agy{when}. Chờ reset hoặc đổi engine trong Cài đặt."
+    return ""
+
+
 def _remove_flag_with_value(args: list[str], flag: str) -> list[str]:
     """Drop every `flag value` pair (and `flag=value`) from an argv list."""
     out: list[str] = []
@@ -125,12 +166,18 @@ class CliAgentTranslator(Translator):
                 ) from exc
 
             if result.returncode != 0:
-                detail = (result.stderr or result.stdout or "").strip()[-300:]
-                detail = detail or _read_log_error(log_path)
+                raw = (result.stderr or result.stdout or "").strip()
+                detail = _friendly_error(raw) or raw[-300:] or _read_log_error(log_path)
                 raise TranslateError(
                     f"Lệnh CLI trả lỗi (mã {result.returncode}): {detail}"
                 )
             output = result.stdout.strip()
+            # A refusal printed to stdout with exit code 0 would otherwise be SAVED as the
+            # chapter's translation and exported into the EPUB — a far worse failure than
+            # a loud error. The markers are specific enough that a real Vietnamese
+            # translation cannot plausibly contain them.
+            if output and _friendly_error(output) == _POLICY_MESSAGE:
+                raise TranslateError(_POLICY_MESSAGE)
             if not output:
                 detail = _read_log_error(log_path)
                 if detail:
@@ -161,8 +208,4 @@ def _read_log_error(log_path: str) -> str:
     mid = (len(message) - 2) // 2
     if message[mid : mid + 2] == ": " and message[:mid] == message[mid + 2 :]:
         message = message[:mid]
-    if "RESOURCE_EXHAUSTED" in message or "(code 429)" in message:
-        reset = re.search(r"Resets in ([\w.]+)", message)
-        when = f" (reset sau {reset.group(1).rstrip('.')})" if reset else ""
-        return f"hết hạn mức (quota) của agy{when}. Chờ reset hoặc đổi engine trong Cài đặt."
-    return message[:300]
+    return _friendly_error(message) or message[:300]

@@ -30,6 +30,7 @@ def _import_adapters() -> None:
         shuba69,
         sto9,
         tieuthuyetmang,
+        twkan,
         webtruyendich,
         xbanxia,
     )

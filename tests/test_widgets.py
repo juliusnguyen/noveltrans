@@ -391,3 +391,72 @@ class TestPauseButton:
         _registry, _worker, _job, button = self._setup(qapp)
         button.set_job(None)
         assert not button.isEnabled()
+
+
+class TestProjectPickerLabel:
+    """The picker row: "原文  —  Bản dịch — site.com".
+
+    The point of showing both titles is that the two audiences differ: the original is how
+    the novel is recognised on the source site, the translation is how the user thinks
+    about it. Each half is optional, and the failure that matters is a row that shows a
+    dangling separator (or a UUID) when a half is missing.
+    """
+
+    def _meta(self, **kw):
+        from noveltrans.models import NovelMeta
+
+        base = dict(
+            url="https://twkan.com/book/114283/index.html",
+            site="twkan",
+            title="穿書反派",
+        )
+        base.update(kw)
+        return NovelMeta(**base)
+
+    def test_shows_both_titles_and_the_site(self):
+        from noveltrans.gui.widgets import _picker_label
+
+        label = _picker_label(self._meta(translated_title="Xuyên thư thành phản diện"))
+        assert label == "穿書反派  —  Xuyên thư thành phản diện — twkan.com"
+
+    def test_an_untranslated_novel_has_no_dangling_separator(self):
+        # Before the first translation run there is no Vietnamese title at all.
+        from noveltrans.gui.widgets import _picker_label
+
+        assert _picker_label(self._meta()) == "穿書反派 — twkan.com"
+
+    def test_a_whitespace_only_translation_counts_as_none(self):
+        from noveltrans.gui.widgets import _picker_label
+
+        assert _picker_label(self._meta(translated_title="   ")) == "穿書反派 — twkan.com"
+
+    def test_the_site_is_the_domain_not_the_adapter_name(self):
+        # meta.site is "twkan"; what reads naturally in a list is what the user pasted.
+        from noveltrans.gui.widgets import _picker_label
+
+        assert _picker_label(self._meta()).endswith(" — twkan.com")
+
+    def test_www_is_dropped_so_one_site_has_one_spelling(self):
+        from noveltrans.gui.widgets import _picker_label
+
+        label = _picker_label(
+            self._meta(url="https://www.69shuba.com/book/59024/", site="69shuba")
+        )
+        assert label == "穿書反派 — 69shuba.com"
+
+    def test_a_local_novel_shows_no_site_suffix(self):
+        # Its URL is a synthetic local://<uuid>; the netloc is a UUID, and printing that
+        # would be worse than printing nothing.
+        from noveltrans.gui.widgets import _picker_label
+        from noveltrans.models import new_local_url
+
+        label = _picker_label(
+            self._meta(url=new_local_url(), site="local", title="Truyện tự soạn")
+        )
+        assert label == "Truyện tự soạn"
+
+    def test_the_scrape_tab_header_uses_the_same_pairing(self):
+        # ScrapeTab._show_meta and the picker format the two titles identically — one
+        # helper, so they cannot drift apart.
+        meta = self._meta(translated_title="Xuyên thư thành phản diện")
+        assert meta.bilingual_title() == "穿書反派  —  Xuyên thư thành phản diện"

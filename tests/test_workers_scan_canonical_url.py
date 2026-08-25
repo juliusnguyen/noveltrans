@@ -169,3 +169,53 @@ class TestScanSto9ByEveryPasteForm:
             assert project.meta.translated_title == "Kiếm Ảnh Cô Chu"
         finally:
             project.close()
+
+
+class TestScanTwkanByEveryPasteForm:
+    """twkan folds three paste forms to one canonical URL (see scrapers/twkan.py).
+
+    Same property as the sto9 class above, and recorded for the same reason — but worth
+    its own class because twkan's chapter URLs carry **no `.html` suffix**, so the id
+    extraction this depends on is the one place sto9's regex shape would have failed.
+    """
+
+    BID = "114283"
+    FORMS = (
+        f"https://twkan.com/book/{BID}.html",
+        f"https://twkan.com/book/{BID}/index.html",
+        f"https://twkan.com/txt/{BID}/57238545",
+    )
+
+    @pytest.fixture
+    def twkan_like(self, monkeypatch):
+        from noveltrans.scrapers.twkan import read_url
+
+        class _TwkanShaped(_CanonicalisingAdapter):
+            def fetch_metadata(self, url: str) -> NovelMeta:
+                return NovelMeta(
+                    url=read_url(url), site="twkan", title="星河歸客", source_lang="zh"
+                )
+
+        adapter = _TwkanShaped(None)
+        monkeypatch.setattr("noveltrans.gui.workers.adapter_for_url", lambda *_a, **_k: adapter)
+        return adapter
+
+    def test_all_three_paste_forms_land_on_one_project(self, qapp, library_dir, twkan_like):
+        paths = {_scan(url, library_dir) for url in self.FORMS}
+        assert len(paths) == 1
+
+    def test_rescanning_by_a_suffixless_chapter_url_keeps_what_the_user_earned(
+        self, qapp, library_dir, twkan_like
+    ):
+        path = _scan(self.FORMS[1], library_dir)  # the form the site itself links to
+        project = NovelProject.open(path)
+        project.save_meta_translation("Tinh Hà Quy Khách", "Mô tả đã dịch", "vi", "Vô Danh Thị")
+        project.close()
+
+        _scan(self.FORMS[2], library_dir)
+
+        project = NovelProject.open(path)
+        try:
+            assert project.meta.translated_title == "Tinh Hà Quy Khách"
+        finally:
+            project.close()
