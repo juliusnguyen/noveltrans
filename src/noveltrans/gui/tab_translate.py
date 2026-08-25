@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QEvent, Qt
+from PySide6.QtGui import QTextCursor, QTextDocument
 from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from noveltrans.config import TARGET_LANGS, AppConfig, translator_labels
+from noveltrans.find_replace import FIELD_TRANSLATED, FIELD_TRANSLATED_TITLE
 from noveltrans.gui.find_replace_dialog import FindReplaceDialog
 from noveltrans.gui.jobs import job_registry
 from noveltrans.gui.keep_awake import track_worker
@@ -55,6 +57,9 @@ class TranslateTab(QWidget):
         # or quitting mid-rewrite abandons a running QThread.
         self._rewrite_worker: RewriteWorker | None = None
         self._rewrite_dialog: RewriteDialog | None = None
+        # Modeless, unlike the rewrite dialog: it stays up while the user fixes
+        # matches by hand in the panes, so the tab has to track and steer it.
+        self._find_dialog: FindReplaceDialog | None = None
         self._progress_verb = "Đang dịch"
         self._models_worker: CliModelsWorker | LmStudioModelsWorker | None = None
         self._model_suggestions: dict[str, list[str]] = {}  # binary/url -> model labels
@@ -295,6 +300,8 @@ class TranslateTab(QWidget):
     def _on_project_selected(self, path: str) -> None:
         self._save_preview_edits()
         self._save_original_edits()
+        # It holds this project and would be scanning a closed handle a line from now.
+        self._close_find_replace()
         if self.project is not None:
             self.project.close()
             self.project = None
@@ -331,6 +338,8 @@ class TranslateTab(QWidget):
         if chapter is None or self.project is None:
             return
         self._load_preview(self.project.chapter(chapter.index))
+        if self._find_dialog is not None:
+            self._find_dialog.set_current_chapter(self._preview_idx)
 
     def _load_preview(self, fresh: Chapter | None) -> None:
         if fresh is None:
@@ -456,6 +465,7 @@ class TranslateTab(QWidget):
         self.config.target_lang = target
 
         self._progress_verb = "Đang dịch"
+        self._close_find_replace()
         self.translate_button.setEnabled(False)
         self.retranslate_button.setEnabled(False)
         self.find_replace_button.setEnabled(False)
@@ -522,16 +532,80 @@ class TranslateTab(QWidget):
         if self._busy():
             self.status_label.setText(self._busy_message())
             return
+        if self._find_dialog is not None:  # already up — one search at a time
+            self._find_dialog.raise_()
+            self._find_dialog.activateWindow()
+            return
         # Flush a half-typed manual edit to disk FIRST, so the scan sees the latest text
-        # and a later focus-out can't overwrite the replacement. The modal then blocks
-        # further pane edits while it's open. Both panes — a replace can target the
-        # original text too (FIELD_CONTENT).
+        # and a later focus-out can't overwrite the replacement. Both panes — a replace
+        # can target the original text too (FIELD_CONTENT). The dialog is modeless, so
+        # later edits are covered by its own staleness check instead.
         self._save_preview_edits()
         self._save_original_edits()
 
         dialog = FindReplaceDialog(self.project, self._preview_idx, self)
         dialog.applied.connect(self._on_replacements_applied)
-        dialog.exec()
+        dialog.chapter_activated.connect(self._jump_to_match)
+        dialog.finished.connect(lambda _result: setattr(self, "_find_dialog", None))
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self._find_dialog = dialog
+        dialog.show()
+
+    def _close_find_replace(self) -> None:
+        """Shut the dialog before a batch run — they write the same rows.
+
+        Clears the handle here rather than waiting for `finished`: a dialog that was
+        never actually shown emits nothing on close, and a stale handle would make the
+        button think a dialog is still up.
+        """
+        dialog, self._find_dialog = self._find_dialog, None
+        if dialog is not None:
+            dialog.close()
+
+    def _jump_to_match(self, index: int, field: str, search: str, case_sensitive: bool) -> None:
+        """Open a chapter from the dialog's list and select its first match there.
+
+        Selecting the row loads the panes through the normal path (which also flushes
+        pending edits), then the pane re-finds the text rather than trusting an offset
+        from the scan: a pane shows "title\n\nbody", so a raw field offset would land in
+        the wrong place — and for a title match, in the wrong text entirely.
+        """
+        if self.project is None:
+            return
+        row = self.model.row_for_index(index)
+        if row is None:
+            return  # deleted since the preview — nothing to open
+        was_open = self._preview_idx
+        self.table.selectRow(row)  # → _on_row_selected loads the preview panes
+        self.table.scrollTo(self.model.index(row, 0))
+        view = (
+            self.translated_view
+            if field in (FIELD_TRANSLATED, FIELD_TRANSLATED_TITLE)
+            else self.original_view
+        )
+        flags = (
+            QTextDocument.FindFlag.FindCaseSensitively
+            if case_sensitive
+            else QTextDocument.FindFlag(0)
+        )
+        if was_open != index:
+            self._move_to_start(view)  # a freshly loaded pane starts from the top
+        # Otherwise search on from the cursor, so double-clicking the same row again
+        # walks a chapter with several hits instead of pinning the first one.
+        if not view.find(search, flags):
+            self._move_to_start(view)
+            view.find(search, flags)  # wrap; a real miss just leaves the cursor at the top
+        view.ensureCursorVisible()
+        # The dialog has keyboard focus right now — hand it to the pane, or the user's
+        # first keystroke on the sentence they came to fix lands in the search box.
+        self.window().activateWindow()
+        view.setFocus()
+
+    @staticmethod
+    def _move_to_start(view: QPlainTextEdit) -> None:
+        cursor = view.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.Start)
+        view.setTextCursor(cursor)
 
     def _on_replacements_applied(self, indices: set) -> None:
         if self.project is None:
@@ -618,6 +692,7 @@ class TranslateTab(QWidget):
             )
         )
         self._progress_verb = "Đang viết lại"
+        self._close_find_replace()
         self.translate_button.setEnabled(False)
         self.retranslate_button.setEnabled(False)
         self.find_replace_button.setEnabled(False)
