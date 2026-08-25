@@ -3,8 +3,14 @@
 Literal (non-regex) substring replace across chapter text, guarded by a mandatory
 preview: the user sees a match count and per-chapter breakdown before anything is
 written. The counting/replacing logic lives in `noveltrans.find_replace`; this file is
-only the Qt wiring. Being modal, it blocks the tab's preview-pane editing while open,
-so a replace-all can't race the tab's save-on-blur handler.
+only the Qt wiring.
+
+Modeless on purpose: double-clicking a row in the breakdown jumps the tab to that
+chapter and selects the match, so not every hit has to be fixed by a blanket replace —
+some want a hand edit of the sentence around them, which a modal dialog would block.
+The price is that chapter text can now change underneath a preview, so `_apply` re-reads
+every scanned field first and refuses rather than writing pre-computed text over an edit
+the user made in between.
 """
 
 from __future__ import annotations
@@ -37,6 +43,10 @@ class FindReplaceDialog(QDialog):
     """Preview-then-apply find & replace. Emits `applied` with the changed indices."""
 
     applied = Signal(set)  # {chapter index, …} that were written
+    # A row was double-clicked: (chapter index, field id, search text, case sensitive).
+    # The search text travels with it so the receiver can re-find the hit in the pane,
+    # where the text is laid out as "title\n\nbody" and a raw field offset would be wrong.
+    chapter_activated = Signal(int, str, str, bool)
 
     def __init__(self, project: NovelProject, preview_idx: int | None, parent=None):
         super().__init__(parent)
@@ -46,6 +56,9 @@ class FindReplaceDialog(QDialog):
 
         self.setWindowTitle("Tìm & thay thế")
         self.setMinimumWidth(460)
+        # Modeless: the tab behind stays usable, which is the whole point of the
+        # double-click jump. See the module docstring for what that costs `_apply`.
+        self.setModal(False)
 
         form = QFormLayout()
         self.search_edit = QLineEdit()
@@ -100,6 +113,11 @@ class FindReplaceDialog(QDialog):
         self.summary_label = QLabel("Nhập từ khoá rồi bấm “Xem trước”.")
         self.summary_label.setWordWrap(True)
         self.breakdown = QListWidget()
+        self.breakdown.setToolTip(
+            "Nháy đúp một chương để mở chương đó và nhảy tới chỗ khớp đầu tiên "
+            "(sửa tay ngay trong ô bên dưới bảng)."
+        )
+        self.breakdown.itemDoubleClicked.connect(self._on_breakdown_activated)
 
         buttons = QDialogButtonBox()
         self.preview_button = buttons.addButton(
@@ -151,6 +169,59 @@ class FindReplaceDialog(QDialog):
         self.breakdown.clear()
         self.summary_label.setText("Nhập từ khoá rồi bấm “Xem trước”.")
 
+    def set_current_chapter(self, index: int | None) -> None:
+        """Follow the tab's open chapter — modeless, so it moves while we are up.
+
+        “Chương hiện tại” has to mean the chapter the user is actually looking at, and a
+        preview taken under that scope describes a different chapter once it moves — so
+        it is dropped, exactly as toggling the radio would.
+        """
+        if index == self._preview_idx:
+            return
+        self._preview_idx = index
+        self.scope_current.setEnabled(index is not None)
+        if index is None and self.scope_current.isChecked():
+            self.scope_all.setChecked(True)  # invalidates via the toggled signal
+        elif self.scope_current.isChecked():
+            self._invalidate()
+
+    def _on_breakdown_activated(self, item) -> None:
+        """Double-click: ask the tab to open this chapter and select the match.
+
+        Rows are added 1:1 with `_matches` in `_preview`, so the row index IS the match.
+        The field is the first one that matched, and `_selected_fields` orders them the
+        way the checkboxes do — translated body before its title, original last — which
+        is the pane the user most likely wants to be typing in.
+        """
+        row = self.breakdown.row(item)
+        if not 0 <= row < len(self._matches):
+            return
+        match = self._matches[row]
+        self.chapter_activated.emit(
+            match.index,
+            match.changes[0].field,
+            self.search_edit.text(),
+            self.case_check.isChecked(),
+        )
+
+    def _is_stale(self) -> bool:
+        """True if any scanned field no longer holds the text the preview was built on.
+
+        The guard that makes a modeless dialog safe: `_apply` writes `change.new`, which
+        was computed from `change.old`. If the user (or a worker) has touched the chapter
+        since, that pre-computed text would silently undo their edit.
+        """
+        for match in self._matches:
+            chapter = self.project.chapter(match.index)
+            if chapter is None:
+                return True
+            if any(
+                (getattr(chapter, change.field, "") or "") != change.old
+                for change in match.changes
+            ):
+                return True
+        return False
+
     # -- actions -----------------------------------------------------------------
 
     def _preview(self) -> None:
@@ -178,13 +249,22 @@ class FindReplaceDialog(QDialog):
             return
 
         chapters = find_replace.chapter_count(self._matches)
-        self.summary_label.setText(f"{total} khớp trong {chapters} chương.")
+        self.summary_label.setText(
+            f"{total} khớp trong {chapters} chương. "
+            "Nháy đúp một chương để mở và sửa tay chỗ khớp."
+        )
         for match in self._matches:
             self.breakdown.addItem(f"{match.label}: {match.count} khớp")
         self.apply_button.setEnabled(True)
 
     def _apply(self) -> None:
         if not self._matches:  # apply is gated, but guard anyway
+            return
+        if self._is_stale():
+            self._invalidate()
+            self.summary_label.setText(
+                "Nội dung đã thay đổi kể từ lần xem trước — hãy bấm “Xem trước” lại."
+            )
             return
         changes = {
             match.index: {change.field: change.new for change in match.changes}
