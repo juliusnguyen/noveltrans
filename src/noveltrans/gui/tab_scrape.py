@@ -628,10 +628,8 @@ class ScrapeTab(QWidget):
 
     def _show_meta(self, meta) -> None:
         """Fill the metadata panel; translated info shows next to the original."""
-        if meta.translated_title:
-            self.title_label.setText(f"{meta.title}  —  {meta.translated_title}")
-        else:
-            self.title_label.setText(meta.title)
+        # Same pairing the project picker shows, formatted in one place.
+        self.title_label.setText(meta.bilingual_title())
         self.author_label.setText(meta.author or "—")
         if meta.translated_description:
             self.desc_label.setText(meta.translated_description)

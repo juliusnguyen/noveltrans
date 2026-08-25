@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import asdict, dataclass, field
+from urllib.parse import urlparse
 
 # A novel the user wrote themselves — no source website, nothing to scrape.
 LOCAL_SITE = "local"
@@ -92,6 +93,40 @@ class NovelMeta:
             if text:
                 return text
         return ""
+
+    def bilingual_title(self) -> str:
+        """Original and translated title side by side, for lists and headers.
+
+        Deliberately NOT `display_name()`: that one *replaces* the original and exists to
+        decide what a video says. Here both titles are wanted at once — the Chinese is how
+        the user recognises the novel on the source site, the Vietnamese is how they think
+        about it — so this shows the original first and appends the translation when there
+        is one. Before the first translation run there is none, and the bare title is the
+        whole label rather than a title trailed by an empty separator.
+
+        The two-space padding around the em dash is the app's existing convention for this
+        pairing (ScrapeTab._show_meta), kept identical so the picker and the "Thông tin
+        truyện" panel read the same way.
+        """
+        translated = (self.translated_title or "").strip()
+        if translated:
+            return f"{self.title}  —  {translated}"
+        return self.title
+
+    def source_host(self) -> str:
+        """The site this novel came from, as a bare hostname — "" when there isn't one.
+
+        Taken from the URL rather than `site`, because `site` is the *adapter* name
+        ("twkan", "69shuba") while what reads naturally in a list is the domain the user
+        actually pasted from ("twkan.com"). `www.` is dropped so one site cannot appear
+        under two spellings.
+
+        Empty for a local novel: its URL is a synthetic `local://<uuid>`, whose netloc is
+        a UUID, and printing that in the picker would be worse than printing nothing.
+        """
+        if self.is_local:
+            return ""
+        return urlparse(self.url).netloc.removeprefix("www.") or self.site
 
     @property
     def is_local(self) -> bool:

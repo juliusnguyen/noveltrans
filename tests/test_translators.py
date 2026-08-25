@@ -251,6 +251,63 @@ class TestCliAgent:
             with pytest.raises(TranslateError, match=r"quota.*reset sau 4h24m9s"):
                 engine.translate("你好")
 
+    # --- Google's Prohibited Use policy refusals -------------------------------------
+    # Real message, verbatim from a refused chapter: the CLI prints Google's English
+    # blob, which says nothing about whether the batch died, whether retrying helps, or
+    # whether the app is broken.
+    POLICY_STDERR = (
+        "The prompt could not be submitted. The prompt contains sensitive words that "
+        "violate Google's Generative AI Prohibited Use policy. Try rephrasing the "
+        "prompt. If you think this was an error, send feedback."
+    )
+
+    def test_a_policy_refusal_is_explained_instead_of_dumped(self):
+        with patch("noveltrans.translators.cli_agent.subprocess.run") as mock_run:
+            mock_run.return_value = self._result(stderr=self.POLICY_STDERR, returncode=1)
+            engine = get_translator("cli", cli_command="agy -p")
+            engine.max_retries = 1
+            engine.retry_delay = 0.0
+            with pytest.raises(TranslateError) as excinfo:
+                engine.translate("你好")
+        message = str(excinfo.value)
+        assert "bộ lọc nội dung" in message  # says what happened
+        assert "đổi engine" in message  # and what to do about it
+        assert "rephrasing" not in message  # not the raw English blob
+
+    def test_a_policy_refusal_on_stdout_is_never_saved_as_a_translation(self):
+        # ★ The dangerous one. agy exiting 0 with the refusal on stdout would otherwise
+        # store Google's English notice as the chapter's Vietnamese translation, and it
+        # would sail into the EPUB. A loud error is strictly better than that.
+        with patch("noveltrans.translators.cli_agent.subprocess.run") as mock_run:
+            mock_run.return_value = self._result(stdout=self.POLICY_STDERR, returncode=0)
+            engine = get_translator("cli", cli_command="agy -p")
+            engine.max_retries = 1
+            engine.retry_delay = 0.0
+            with pytest.raises(TranslateError, match="bộ lọc nội dung"):
+                engine.translate("你好")
+
+    def test_a_policy_refusal_in_the_agy_log_is_explained(self):
+        def fake_run(cmd, **kwargs):
+            log_path = cmd[cmd.index("--log-file") + 1]
+            with open(log_path, "w") as fh:
+                fh.write(f"E0705 00:21:26.054671 83855 log.go:398] {self.POLICY_STDERR}\n")
+            return self._result(stdout="")
+
+        with patch("noveltrans.translators.cli_agent.subprocess.run", side_effect=fake_run):
+            engine = get_translator("cli", cli_command="agy -p")
+            engine.max_retries = 1
+            engine.retry_delay = 0.0
+            with pytest.raises(TranslateError, match="bộ lọc nội dung"):
+                engine.translate("你好")
+
+    def test_an_ordinary_translation_is_not_mistaken_for_a_refusal(self):
+        # The stdout guard must not fire on real output — it keys on markers no
+        # Vietnamese chapter would carry.
+        with patch("noveltrans.translators.cli_agent.subprocess.run") as mock_run:
+            mock_run.return_value = self._result(stdout="Chương 10: Cốt truyện đến sớm.")
+            engine = get_translator("cli", cli_command="agy -p")
+            assert engine.translate("第10章") == "Chương 10: Cốt truyện đến sớm."
+
     def test_empty_output_reports_generic_error_from_agy_log(self):
         def fake_run(cmd, **kwargs):
             log_path = cmd[cmd.index("--log-file") + 1]

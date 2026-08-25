@@ -185,10 +185,10 @@ class TestLibraryFolderChange:
         window = self._window(tmp_path, monkeypatch, old)
         try:
             ws = window.workspaces.widget(0)
-            assert self._titles(ws) == ["Truyện Cũ"]
+            assert self._titles(ws) == ["Truyện Cũ — example.com"]
             self._settings_that_switches_to(monkeypatch, window, new)
             window._open_settings()
-            assert self._titles(ws) == ["Truyện Mới"]
+            assert self._titles(ws) == ["Truyện Mới — example.com"]
         finally:
             window.close()
 
@@ -201,7 +201,7 @@ class TestLibraryFolderChange:
             self._settings_that_switches_to(monkeypatch, window, new)
             window._open_settings()
             for index in range(window.workspaces.count()):
-                assert self._titles(window.workspaces.widget(index)) == ["Truyện Mới"]
+                assert self._titles(window.workspaces.widget(index)) == ["Truyện Mới — example.com"]
             assert ws2 is window.workspaces.widget(1)
         finally:
             window.close()
@@ -217,7 +217,7 @@ class TestLibraryFolderChange:
             for tab in (ws.scrape_tab, ws.translate_tab, ws.export_tab,
                         ws.audio_tab, ws.video_tab):
                 titles = [tab.picker.itemText(i) for i in range(tab.picker.count())]
-                assert titles == ["Truyện Mới"]
+                assert titles == ["Truyện Mới — example.com"]
         finally:
             window.close()
 

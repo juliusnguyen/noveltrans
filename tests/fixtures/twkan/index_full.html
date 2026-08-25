@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf8" />
+<title>星河歸客最新章節列表-台灣小說網</title>
+
+</head>
+<body>
+<script>
+        var bookinfo = {
+            pageType: 1,
+            articleid: '114283',
+            articlename: '星河歸客',
+            siteName: '台灣小說網',
+            site: 'https://twkan.com',
+            sortName: '現代都市',
+            author: '無名氏',
+            tags: '測試,'
+        };
+</script>
+<div class="container"><div class="mybox">
+<div class="bread"><a href="https://twkan.com">首頁</a> &gt; <a href="https://twkan.com/book/114283.html">星河歸客</a></div>
+<div class="catalog"><h3>目錄</h3>
+<div id="allchapter">
+<ul>
+<li data-num="7">
+<a href="#" id="bookcase" style="display:none"></a>
+</li>
+<li data-num="1"><a href="https://twkan.com/txt/114283/57238545">第1 章 測試章節1 </a>
+</li>
+<li data-num="2"><a href="https://twkan.com/txt/114283/57238546">第2 章 測試章節2 </a>
+</li>
+<li data-num="3"><a href="https://twkan.com/txt/114283/57238547">第3 章 測試章節3 </a>
+</li>
+<li data-num="4"><a href="https://twkan.com/txt/114283/57238548">第4章 測試章節4 </a>
+</li>
+</ul>
+
+</div>
+</div>
+</div></div>
+<script>
+    function LoadMore(){
+        $.ajax({type:'GET', url:'/ajax_novels/chapterlist/114283.html', dataType:'html',
+        success:function(data){ $('#allchapter').html(data); $('#loadmore').hide(); }});
+    }
+</script>
+</body>
+</html>

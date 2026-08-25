@@ -71,6 +71,18 @@ STATUS_COLORS = {
 }
 
 
+def _picker_label(meta) -> str:
+    """One row of the novel picker: "原文  —  Bản dịch — site.com".
+
+    `project_meta` already parses the whole meta.json, so the translated title is in hand
+    here — no project open, no extra disk read. Each half is dropped when absent, so an
+    untranslated novel is just its title and a local one carries no site suffix.
+    """
+    label = meta.bilingual_title()
+    host = meta.source_host()
+    return f"{label} — {host}" if host else label
+
+
 class ProjectPicker(QComboBox):
     """Dropdown of NovelProjects in the library. Emits the selected path."""
 
@@ -97,7 +109,7 @@ class ProjectPicker(QComboBox):
         self.clear()
         for path in library.list_projects():
             meta = library.project_meta(path)
-            self.addItem(meta.title, str(path))
+            self.addItem(_picker_label(meta), str(path))
         index = self.findData(current)
         if index < 0 and default_to_first and self.count():
             index = 0

@@ -46,6 +46,17 @@ _CHALLENGE_MARKERS = (
     "Enable JavaScript and cookies to continue",
 )
 
+# A challenge is not always a refusal. twkan answers a sustained download with an
+# HTTP 429 + interstitial once every ~10 chapters, and it clears ITSELF in ~3 s while the
+# page sits there (measured, changes/063-TWKAN-SCRAPER). `domcontentloaded` fires on the
+# interstitial, so reading `page.content()` straight away catches the challenge and — until
+# this existed — aborted a 188-chapter download over a three-second pause. Wait it out
+# before giving up, and only raise if it is still there at the deadline. Waiting in place
+# is deliberate: re-navigating would put another request into a host that has just said
+# "too many requests".
+_CHALLENGE_POLL_MS = 1_000
+_CHALLENGE_WAIT_SECONDS = 20.0
+
 # Subresources we abort to keep navigations text-only: on a 199-chapter batch this is
 # most of the bytes and most of the requests. NEVER block "document", "script" or
 # "xhr" — Cloudflare's own check is JS-driven and blocking those would fail the gate.
@@ -90,12 +101,15 @@ class BrowserSession:
         headless: bool = False,
         delay_seconds: float = 1.5,
         timeout_ms: int = 60_000,
+        challenge_wait_seconds: float = _CHALLENGE_WAIT_SECONDS,
         sync_playwright=None,
     ):
         self.profile = profile or profile_dir()
         self.headless = headless
         self.delay_seconds = delay_seconds
         self.timeout_ms = timeout_ms
+        # How long to let a challenge clear itself before treating it as a refusal.
+        self.challenge_wait_seconds = challenge_wait_seconds
         self._sync_playwright = sync_playwright
         self._playwright = None
         self._context = None
@@ -141,9 +155,11 @@ class BrowserSession:
     def get_html(self, url: str) -> str:
         """Navigate to `url` and return the rendered HTML.
 
-        Raises BrowserSessionError if the browser is gone (crashed, or the user closed
-        the window) or if Cloudflare returned an interstitial — handing challenge markup
-        to a parser would otherwise surface as a misleading "layout may have changed".
+        A transient challenge is waited out rather than raised on — see
+        `_CHALLENGE_WAIT_SECONDS`. Raises BrowserSessionError if the browser is gone
+        (crashed, or the user closed the window) or if the interstitial is STILL there at
+        the deadline — handing challenge markup to a parser would otherwise surface as a
+        misleading "layout may have changed".
         """
         if self._page is None:
             self._launch()
@@ -153,12 +169,33 @@ class BrowserSession:
         try:
             self._page.goto(url, wait_until="domcontentloaded")
             markup = self._page.content()
+            if looks_like_challenge(markup):
+                markup = self._settle_challenge()
         except Exception as exc:  # closed window, crash, navigation timeout
             self.close()  # the session is dead; don't let 198 more chapters retry it
             raise BrowserSessionError(f"Browser navigation failed: {exc}") from exc
 
+        # Still challenged at the deadline: a real refusal, not a rate-limit blip. Raise
+        # WITHOUT closing the session — the browser is fine, the site is just saying no.
         if looks_like_challenge(markup):
             raise BrowserSessionError(f"Cloudflare returned a challenge for {url}")
+        return markup
+
+    def _settle_challenge(self) -> str:
+        """Sit on an interstitial until it clears, or until the deadline. Never raises.
+
+        Polls the live DOM instead of re-navigating: the challenge resolves itself in
+        place, and a second navigation into a rate-limited host is exactly the wrong move.
+        Returns the last markup seen, which the caller re-checks.
+        """
+        waited = 0.0
+        markup = self._page.content()
+        while waited < self.challenge_wait_seconds:
+            self._page.wait_for_timeout(_CHALLENGE_POLL_MS)
+            waited += _CHALLENGE_POLL_MS / 1000.0
+            markup = self._page.content()
+            if not looks_like_challenge(markup):
+                return markup
         return markup
 
 

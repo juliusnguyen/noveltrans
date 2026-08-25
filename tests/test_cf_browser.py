@@ -50,9 +50,13 @@ class _FakePage:
         self.goto_urls: list[str] = []
         self.routes: list[str] = []
         self.timeout_ms: int | None = None
+        self.waits: list[int] = []
 
     def set_default_timeout(self, ms):
         self.timeout_ms = ms
+
+    def wait_for_timeout(self, ms):
+        self.waits.append(ms)
 
     def route(self, pattern, _handler):
         self.routes.append(pattern)
@@ -64,6 +68,24 @@ class _FakePage:
 
     def content(self):
         return self.markup
+
+
+class _ClearingPage(_FakePage):
+    """A page whose challenge clears itself after N polls, the way a real one does."""
+
+    def __init__(self, challenge: str, cleared: str, clears_after: int):
+        super().__init__(markup=challenge)
+        self.challenge = challenge
+        self.cleared = cleared
+        self.clears_after = clears_after
+        self.polls = 0
+
+    def content(self):
+        return self.cleared if self.polls >= self.clears_after else self.challenge
+
+    def wait_for_timeout(self, ms):
+        self.polls += 1
+        super().wait_for_timeout(ms)
 
 
 class _FakeContext:
@@ -143,13 +165,50 @@ class TestThrottle:
 
 
 class TestChallengeAndFailure:
-    def test_raises_on_a_challenge_instead_of_returning_it(self, tmp_path):
+    def test_raises_on_a_challenge_that_never_clears(self, tmp_path):
         # Handing interstitial markup to the parser would surface as a misleading
         # "page layout may have changed".
         page = _FakePage(markup=load_fixture("69shuba", "challenge.html"))
-        session, _fake = make_session(tmp_path, page=page)
+        session, _fake = make_session(tmp_path, page=page, challenge_wait_seconds=0)
         with pytest.raises(BrowserSessionError, match="challenge"):
             session.get_html("https://www.69shuba.com/book/59024/")
+
+    def test_a_persistent_challenge_does_not_kill_the_session(self, tmp_path):
+        # The browser is fine — the site is just saying no. Closing here would make the
+        # next chapter pay for a fresh launch and a fresh fingerprint check.
+        page = _FakePage(markup=load_fixture("69shuba", "challenge.html"))
+        session, fake = make_session(tmp_path, page=page, challenge_wait_seconds=0)
+        with pytest.raises(BrowserSessionError):
+            session.get_html("https://www.69shuba.com/book/59024/")
+        assert session._page is page and not fake.context.closed
+
+    def test_a_transient_challenge_is_waited_out_not_raised(self, tmp_path):
+        # ★ The 063 regression. twkan answers a sustained download with a 429 +
+        # interstitial roughly every 10 chapters and clears it itself in ~3 s; raising
+        # on sight aborted a 188-chapter download over a three-second pause.
+        page = _ClearingPage(
+            challenge=load_fixture("69shuba", "challenge.html"),
+            cleared=load_fixture("69shuba", "chapter.html"),
+            clears_after=3,
+        )
+        session, _fake = make_session(tmp_path, page=page)
+        markup = session.get_html("https://www.69shuba.com/txt/59024/38369377")
+        assert "txtnav" in markup  # the real page, not the interstitial
+        assert page.goto_urls == [  # cleared by waiting, NOT by navigating again
+            "https://www.69shuba.com/txt/59024/38369377"
+        ]
+        assert page.waits == [1000, 1000, 1000]
+
+    def test_waiting_out_a_challenge_gives_up_at_the_deadline(self, tmp_path):
+        page = _ClearingPage(
+            challenge=load_fixture("69shuba", "challenge.html"),
+            cleared=load_fixture("69shuba", "chapter.html"),
+            clears_after=99,  # never, within the budget
+        )
+        session, _fake = make_session(tmp_path, page=page, challenge_wait_seconds=3)
+        with pytest.raises(BrowserSessionError, match="challenge"):
+            session.get_html("https://www.69shuba.com/txt/59024/38369377")
+        assert len(page.waits) == 3  # bounded; does not hang the download forever
 
     def test_navigation_failure_closes_the_session(self, tmp_path):
         # User closed the window / browser crashed: don't let 198 more chapters retry
