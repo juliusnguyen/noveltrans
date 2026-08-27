@@ -38,6 +38,10 @@ from noveltrans.tts.convert import probe_duration
 from noveltrans.runtime_env import no_console_kwargs
 from noveltrans.tts.convert import ffmpeg_available  # noqa: F401 (re-exported for callers)
 from noveltrans.tts.subtitles import part_cues, part_srt
+from noveltrans.tts.description import (  # noqa: F401 (re-exported for video callers)
+    YOUTUBE_DESCRIPTION_CHAR_LIMIT,
+    fit_description,
+)
 from noveltrans.tts.player_skin import (
     PlayerLayout,
     build_knob,
@@ -335,24 +339,27 @@ def build_ass_subtitles(
 
 # -- YouTube description ------------------------------------------------------
 
-def build_youtube_description(segments: list[MergeSegment], novel_title: str) -> str:
+def build_youtube_description(
+    segments: list[MergeSegment], novel_title: str, *, max_chars: int | None = None
+) -> str:
     """A YouTube description whose chapter timestamps become clickable jump markers.
 
     YouTube turns a description into video chapters when it finds timestamps that start
     at `0:00`, ascend, and number at least 3 — so the first chapter here is always `0:00`.
     Each line is `<timestamp> <chapter title>`; the title header lines above are ignored
     by YouTube's parser but read nicely for a human.
+
+    Capped to YouTube's 5000 characters like the richer builder below. It writes to the
+    same `.txt` path `_write_metadata` does and is normally overwritten by it — but if a
+    render succeeds and the metadata pass then fails, this is the description the upload
+    reads, so it must not be the one that overflows.
     """
-    lines = []
-    if novel_title.strip():
-        lines.append(novel_title.strip())
-        lines.append("")
-    lines.append("Mục lục chương:")
-    start = 0.0
-    for seg in segments:
-        lines.append(f"{_yt_timestamp(start)} {seg.title}")
-        start += seg.seconds
-    return "\n".join(lines) + "\n"
+    header = [novel_title.strip(), "", "Mục lục chương:"] if novel_title.strip() \
+        else ["Mục lục chương:"]
+    text, _dropped = fit_description(
+        header, _chapter_timestamp_lines(segments), [], max_chars=max_chars
+    )
+    return text
 
 
 # -- rich per-part title & description (feature 025) --------------------------
@@ -403,21 +410,32 @@ def discover_committed_video_windows(video_dir: Path, slug: str) -> dict[int, in
     """
     from noveltrans.video_state import effective_created
 
+    return {
+        first_num: last_num
+        for part_dir, first_num, last_num in iter_rendered_part_dirs(video_dir, slug)
+        if effective_created(part_dir / f"{part_dir.name}.mp4")
+    }
+
+
+def iter_rendered_part_dirs(video_dir: Path, slug: str):
+    """`(part_dir, first_num, last_num)` for every per-part subfolder of this novel.
+
+    The shared scan behind `discover_committed_video_windows` and the video tab's
+    description resync. It yields folders and their chapter spans only — whether a part
+    counts as "đã tạo" (a real render vs. a manual tick) is the caller's question, and the
+    two callers answer it differently: freezing a batch window needs the manual tick to
+    count, while rewriting a stale `.txt` needs a file that actually exists.
+    """
     video_dir = Path(video_dir)
     if not video_dir.is_dir():
-        return {}
+        return
     prefix = f"{slug}-"
-    committed: dict[int, int] = {}
-    for entry in video_dir.iterdir():
+    for entry in sorted(video_dir.iterdir()):
         if not entry.is_dir() or not entry.name.startswith(prefix):
             continue
         m = _COMMITTED_SUFFIX_RE.match(entry.name[len(prefix):])
-        if not m:
-            continue
-        first_num, last_num = int(m.group(1)), int(m.group(2))
-        if effective_created(entry / f"{entry.name}.mp4"):
-            committed[first_num] = last_num
-    return committed
+        if m:
+            yield entry, int(m.group(1)), int(m.group(2))
 
 
 def plan_locked_video_windows(
@@ -484,6 +502,64 @@ def _chapter_timestamp_lines(segments: list[MergeSegment]) -> list[str]:
     return lines
 
 
+def fit_video_description(
+    segments: list[MergeSegment],
+    *,
+    original_title: str,
+    vn_title: str,
+    original_author: str,
+    vn_author: str,
+    total_chapters: int,
+    credit: str = DEFAULT_VIDEO_CREDIT,
+    max_chars: int | None = None,
+) -> tuple[str, int]:
+    """`(description, chapters dropped from the index)` — the capped primary builder.
+
+    Same output as `build_video_description` (which is the plain-string wrapper over this),
+    plus how many chapters had to be lopped off the index to fit YouTube's 5000-character
+    budget. Callers that can surface that — the video tab's parts table — use this one; the
+    render worker discards it. See `tts/description.py` for the fitting rules.
+    """
+    return fit_description(
+        [
+            *description_header_lines(
+                original_title=original_title, vn_title=vn_title,
+                original_author=original_author, vn_author=vn_author,
+            ),
+            f"Số chương: {total_chapters}",
+            "",
+            "Mục lục chương:",
+        ],
+        _chapter_timestamp_lines(segments),
+        ["", f"Tạo bởi: {credit}"],
+        max_chars=max_chars,
+    )
+
+
+def description_header_lines(
+    *, original_title: str, vn_title: str, original_author: str, vn_author: str
+) -> list[str]:
+    """The `Tên truyện:` / `Tác giả:` pair at the top of a description.
+
+    Shared so the AI-shortened form can put back exactly the same two lines when there's
+    budget left over, rather than growing a second, subtly different spelling of them.
+
+    The `Tác giả:` line drops the trailing quoted Vietnamese clause when `vn_author` is
+    empty (older projects translated before the field existed), rather than printing empty
+    quotes.
+    """
+    original_title = (original_title or "").strip()
+    vn_title = (vn_title or "").strip()
+    original_author = (original_author or "").strip()
+    vn_author = (vn_author or "").strip()
+
+    author_line = (
+        f'Tác giả: {original_author} "{vn_author}"' if vn_author
+        else f"Tác giả: {original_author}"
+    )
+    return [f'Tên truyện: {original_title} — "{vn_title}"', author_line]
+
+
 def build_video_description(
     segments: list[MergeSegment],
     *,
@@ -493,6 +569,7 @@ def build_video_description(
     vn_author: str,
     total_chapters: int,
     credit: str = DEFAULT_VIDEO_CREDIT,
+    max_chars: int | None = None,
 ) -> str:
     """A YouTube description for one part: header block + clickable chapter table + credit.
 
@@ -512,28 +589,21 @@ def build_video_description(
     (older projects translated before the field existed), rather than printing empty quotes.
     Chapter timestamps come from the cumulative `MergeSegment.seconds`, so pass segments that
     already carry real durations (the caller runs `_with_real_durations` first).
+
+    The chapter table is trimmed (with a `… còn N chương nữa` line) when a part gathers more
+    chapters than YouTube's 5000-character description budget can hold — the header block and
+    the credit line always survive. Use `fit_video_description` to learn how many were cut.
     """
-    original_title = (original_title or "").strip()
-    vn_title = (vn_title or "").strip()
-    original_author = (original_author or "").strip()
-    vn_author = (vn_author or "").strip()
-
-    if vn_author:
-        author_line = f'Tác giả: {original_author} "{vn_author}"'
-    else:
-        author_line = f"Tác giả: {original_author}"
-
-    lines = [
-        f'Tên truyện: {original_title} — "{vn_title}"',
-        author_line,
-        f"Số chương: {total_chapters}",
-        "",
-        "Mục lục chương:",
-        *_chapter_timestamp_lines(segments),
-        "",
-        f"Tạo bởi: {credit}",
-    ]
-    return "\n".join(lines) + "\n"
+    return fit_video_description(
+        segments,
+        original_title=original_title,
+        vn_title=vn_title,
+        original_author=original_author,
+        vn_author=vn_author,
+        total_chapters=total_chapters,
+        credit=credit,
+        max_chars=max_chars,
+    )[0]
 
 
 # -- the ffmpeg render --------------------------------------------------------

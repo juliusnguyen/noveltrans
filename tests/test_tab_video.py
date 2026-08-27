@@ -3968,3 +3968,479 @@ class TestPerNovelVideoSettings:
         assert stored.meta.video_settings["video_tagline"] == "của truyện một"
         stored.close()
         tab.shutdown()
+
+
+class TestDescriptionCapWarning:
+    """Feature 065 — the parts table flags a part whose chapter index won't fit."""
+
+    def _project_with_audio(self, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)  # 5 chapters
+        for i in range(5):
+            project.save_audio(i, f"exports/audio/{i}.mp3", "V", 60.0)
+        path = project.path
+        project.close()
+        return path
+
+    def _tab_on_project(self, tmp_path, path, batch=5):
+        tab = VideoTab(_config(tmp_path))
+        tab.voice_combo.addItem("V", "V")
+        tab.voice_combo.setCurrentIndex(tab.voice_combo.findData("V"))
+        tab.video_mode.setCurrentIndex(tab.video_mode.findData("batch"))
+        tab.video_batch_size.setValue(batch)
+        tab._on_project_selected(str(path))
+        return tab
+
+    def _shrink(self, monkeypatch, limit=120):
+        """The cap is resolved at call time precisely so this works — see tts/description."""
+        monkeypatch.setattr(
+            "noveltrans.tts.description.YOUTUBE_DESCRIPTION_CHAR_LIMIT", limit
+        )
+
+    def test_chapter_cell_warns_when_the_description_would_be_truncated(
+        self, qapp, tmp_path, monkeypatch, library_dir, sample_meta, sample_refs
+    ):
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)
+        self._shrink(monkeypatch)
+        tab._refresh_video_list()
+        assert "⚠️" in tab.video_list.item(0, 1).text()
+        assert "mục lục" in tab.video_list.item(0, 1).toolTip()
+        tab.shutdown()
+
+    def test_no_truncation_warning_at_the_real_limit(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        # The regression guard: a normal 5-chapter part must not sprout a warning
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)
+        assert "⚠️" not in tab.video_list.item(0, 1).text()
+        tab.shutdown()
+
+    def test_computed_part_description_is_capped(
+        self, qapp, tmp_path, monkeypatch, library_dir, sample_meta, sample_refs
+    ):
+        from noveltrans.tts.description import description_length
+
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)
+        self._shrink(monkeypatch)
+        window = tab._windows_for_current_selection()[0]
+        assert description_length(tab._compute_part_description(window, "Tựa")) <= 120
+        tab.shutdown()
+
+    def test_description_label_shows_the_character_count(self, qapp, tmp_path):
+        tab = VideoTab(_config(tmp_path))
+        assert "/5000 ký tự" in tab._description_label_text("abc\n")
+        tab.shutdown()
+
+    def test_description_label_warns_when_truncated(self, qapp, tmp_path):
+        from noveltrans.tts.description import truncation_line
+
+        tab = VideoTab(_config(tmp_path))
+        text = "Mục lục chương:\n0:00 A\n" + truncation_line(9, 5000) + "\n"
+        assert "⚠️" in tab._description_label_text(text)
+        tab.shutdown()
+
+
+class TestShortenByAI:
+    """Feature 065 — the "Shorten by AI" button's orchestration in "Chi tiết phần"."""
+
+    def _project_with_audio(self, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)  # 5 chapters
+        for i in range(5):
+            project.save_audio(i, f"exports/audio/{i}.mp3", "V", 60.0)
+        path = project.path
+        project.close()
+        return path
+
+    def _tab_on_project(self, tmp_path, path):
+        tab = VideoTab(_config(tmp_path))
+        tab.voice_combo.addItem("V", "V")
+        tab.voice_combo.setCurrentIndex(tab.voice_combo.findData("V"))
+        tab.video_mode.setCurrentIndex(tab.video_mode.findData("batch"))
+        tab.video_batch_size.setValue(5)
+        tab._on_project_selected(str(path))
+        return tab
+
+    def _render_part(self, tab, index=0):
+        window = tab._windows_for_current_selection()[index]
+        out = tab._part_output_path(window, whole_novel=False)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"fake mp4")
+        return window, out
+
+    def _stub_worker(self, monkeypatch, titles=None, fell_back=0):
+        """Replace ShortenTitlesWorker with one that emits finished_ok on start()."""
+        from PySide6.QtCore import QObject, Signal
+
+        class _Stub(QObject):
+            progress = Signal(int, int)
+            finished_ok = Signal(list, int)
+            failed = Signal(str)
+
+            def __init__(self, given, engine_name, **kw):
+                super().__init__()
+                self.given = given
+
+            def isRunning(self):
+                return False
+
+            def start(self):
+                out = titles if titles is not None else [f"ngắn {t}" for t in self.given]
+                self.finished_ok.emit(out, fell_back)
+
+        monkeypatch.setattr("noveltrans.gui.tab_video.ShortenTitlesWorker", _Stub)
+        monkeypatch.setattr("noveltrans.gui.tab_video.track_worker", lambda w: None)
+
+    def _widgets(self):
+        from PySide6.QtWidgets import QLabel, QPlainTextEdit, QPushButton
+
+        return QPlainTextEdit(), QPushButton(), QLabel()
+
+    def test_shorten_replaces_the_description_with_the_short_form(
+        self, qapp, tmp_path, monkeypatch, library_dir, sample_meta, sample_refs
+    ):
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)
+        self._stub_worker(monkeypatch)
+        window = tab._windows_for_current_selection()[0]
+        edit, button, status = self._widgets()
+        tab._shorten_description(window, edit, button, status, False, False)
+
+        text = edit.toPlainText()
+        assert "Tên truyện" not in text
+        assert "Tác giả" not in text
+        assert "Tạo bởi" not in text
+        assert "Mục lục chương:" in text
+        assert "0:00 C.1 " in text
+        tab.shutdown()
+
+    def test_extras_come_back_when_there_is_room(
+        self, qapp, tmp_path, monkeypatch, library_dir, sample_meta, sample_refs
+    ):
+        """Five short chapters leave thousands of characters spare, so the header and the
+        credit line cost nothing and go back on."""
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)
+        self._stub_worker(monkeypatch)
+        window = tab._windows_for_current_selection()[0]
+        edit, button, status = self._widgets()
+        tab._shorten_description(window, edit, button, status, False, True)
+
+        text = edit.toPlainText()
+        assert text.startswith("Tên truyện: ")
+        assert "Tác giả: " in text
+        assert text.rstrip().endswith("Tạo bởi: Fox Novel")
+        assert "0:00 C.1 " in text  # ...and the shortened index is still the point
+        assert "Còn chỗ nên giữ lại" in status.text()
+        tab.shutdown()
+
+    def test_extras_are_skipped_when_they_would_cost_a_chapter(
+        self, qapp, tmp_path, monkeypatch, library_dir, sample_meta, sample_refs
+    ):
+        """The index wins: shortening exists to fit more chapters, so the header is never
+        bought at the price of one."""
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)
+        self._stub_worker(monkeypatch)
+        monkeypatch.setattr(
+            "noveltrans.tts.description.YOUTUBE_DESCRIPTION_CHAR_LIMIT", 150
+        )
+        window = tab._windows_for_current_selection()[0]
+        edit, button, status = self._widgets()
+        tab._shorten_description(window, edit, button, status, False, True)
+
+        text = edit.toPlainText()
+        assert "Tên truyện" not in text
+        assert "Mục lục chương:" in text
+        assert "Không đủ chỗ" in status.text()
+        tab.shutdown()
+
+    def test_the_chapter_number_never_comes_from_the_model(
+        self, qapp, tmp_path, monkeypatch, library_dir, sample_meta, sample_refs
+    ):
+        """The model is only ever sent the descriptive half, and `C.N` is reassembled
+        locally — a renumbered index would be a far worse bug than a long description."""
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)
+        # a model that returns garbage numbering must not move any chapter number
+        self._stub_worker(monkeypatch, titles=[f"999. rác {i}" for i in range(5)])
+        window = tab._windows_for_current_selection()[0]
+        edit, button, status = self._widgets()
+        tab._shorten_description(window, edit, button, status, False)
+
+        lines = [ln for ln in edit.toPlainText().splitlines() if ln.startswith("0:")]
+        assert lines and lines[0].split()[1] == "C.1"
+        tab.shutdown()
+
+    def test_shorten_writes_the_sidecar_when_the_part_is_rendered(
+        self, qapp, tmp_path, monkeypatch, library_dir, sample_meta, sample_refs
+    ):
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)
+        window, _out = self._render_part(tab)
+        self._stub_worker(monkeypatch)
+        edit, button, status = self._widgets()
+        tab._shorten_description(window, edit, button, status, False)
+
+        sidecar = tab._part_sidecar(window, False, ".txt")
+        assert sidecar.is_file()
+        assert "0:00 C.1 " in sidecar.read_text(encoding="utf-8")
+        assert "Đã lưu" in status.text()
+        tab.shutdown()
+
+    def test_shorten_does_not_write_a_sidecar_for_an_unrendered_part(
+        self, qapp, tmp_path, monkeypatch, library_dir, sample_meta, sample_refs
+    ):
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)
+        self._stub_worker(monkeypatch)
+        window = tab._windows_for_current_selection()[0]
+        edit, button, status = self._widgets()
+        tab._shorten_description(window, edit, button, status, False)
+
+        assert not tab._part_sidecar(window, False, ".txt").is_file()
+        assert "chưa lưu" in status.text().lower()
+        tab.shutdown()
+
+    def test_shorten_reports_partial_fallbacks_in_the_status(
+        self, qapp, tmp_path, monkeypatch, library_dir, sample_meta, sample_refs
+    ):
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)
+        self._stub_worker(monkeypatch, fell_back=2)
+        window = tab._windows_for_current_selection()[0]
+        edit, button, status = self._widgets()
+        tab._shorten_description(window, edit, button, status, False)
+        assert "2 nhóm giữ nguyên" in status.text()
+        tab.shutdown()
+
+    def test_a_mismatched_reply_leaves_the_description_alone(
+        self, qapp, tmp_path, monkeypatch, library_dir, sample_meta, sample_refs
+    ):
+        from PySide6.QtWidgets import QMessageBox
+
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)
+        self._stub_worker(monkeypatch, titles=["chỉ một"])  # 1 title for 5 chapters
+        monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: None)
+        window = tab._windows_for_current_selection()[0]
+        edit, button, status = self._widgets()
+        edit.setPlainText("giữ nguyên")
+        tab._shorten_description(window, edit, button, status, False)
+        assert edit.toPlainText() == "giữ nguyên"
+        tab.shutdown()
+
+
+class TestDescriptionResync:
+    """Feature 065 — an already-rendered part's `.txt` follows a chapter rename."""
+
+    def _project_with_audio(self, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)  # 5 chapters
+        for i in range(5):
+            project.save_audio(i, f"exports/audio/{i}.mp3", "V", 60.0)
+        path = project.path
+        project.close()
+        return path
+
+    def _tab_on_project(self, tmp_path, path):
+        tab = VideoTab(_config(tmp_path))
+        tab.voice_combo.addItem("V", "V")
+        tab.voice_combo.setCurrentIndex(tab.voice_combo.findData("V"))
+        tab.video_mode.setCurrentIndex(tab.video_mode.findData("batch"))
+        tab.video_batch_size.setValue(5)
+        tab._on_project_selected(str(path))
+        return tab
+
+    def _render_with_description(self, tab, index=0, text=None):
+        """Fake a rendered part plus its description sidecar, as a real render would."""
+        window = tab._windows_for_current_selection()[index]
+        out = tab._part_output_path(window, whole_novel=False)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"fake mp4")
+        sidecar = tab._part_sidecar(window, False, ".txt")
+        if text is None:
+            text = tab._compute_part_description(window, tab.project.meta.display_name())
+        sidecar.write_text(text, encoding="utf-8")
+        return window, sidecar
+
+    def _rename(self, path, idx, title):
+        project = NovelProject.open(path)
+        project.edit_title(idx, title)
+        project.close()
+
+    def test_renaming_a_chapter_rewrites_the_sidecar(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)
+        _window, sidecar = self._render_with_description(tab)
+        self._rename(path, 0, "Chương 1: Tên hoàn toàn mới")
+
+        tab._on_project_selected(str(path))  # what returning to the tab does
+        assert "Tên hoàn toàn mới" in sidecar.read_text(encoding="utf-8")
+        tab.shutdown()
+
+    def test_editing_the_translated_title_rewrites_the_sidecar(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        # chapter_marker_title reads `translated_title or title`, so this counts too
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)
+        _window, sidecar = self._render_with_description(tab)
+        project = NovelProject.open(path)
+        project.edit_translation(0, title="Bản dịch mới")
+        project.close()
+
+        tab._on_project_selected(str(path))
+        assert "Bản dịch mới" in sidecar.read_text(encoding="utf-8")
+        tab.shutdown()
+
+    def test_a_fresh_sidecar_is_not_rewritten(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)
+        self._render_with_description(tab)
+        assert tab._resync_description_sidecars() == (0, 0)
+        tab.shutdown()
+
+    def test_an_unrendered_part_has_nothing_to_resync(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)
+        self._rename(path, 0, "Chương 1: Tên mới")
+        tab._on_project_selected(str(path))
+        assert tab._resync_description_sidecars() == (0, 0)
+        tab.shutdown()
+
+    def test_a_legacy_simple_description_is_upgraded(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        from noveltrans.tts.video import build_youtube_description
+
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)
+        window = tab._windows_for_current_selection()[0]
+        legacy = build_youtube_description(
+            tab._part_segments(window), tab.project.meta.display_name()
+        )
+        _w, sidecar = self._render_with_description(tab, text=legacy)
+
+        rewritten, customised = tab._resync_description_sidecars()
+        assert (rewritten, customised) == (1, 0)
+        assert "Tạo bởi:" in sidecar.read_text(encoding="utf-8")
+        tab.shutdown()
+
+    def test_an_ai_shortened_sidecar_is_never_overwritten(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """The data-loss guard: shortened titles cannot be rebuilt from the database, so
+        overwriting one is not a regeneration."""
+        from noveltrans.tts.description import build_short_description
+
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)
+        short, _d, _e = build_short_description(
+            [(f"{i}:00", f"C.{i}", f"ngắn {i}") for i in range(1, 6)], total_chapters=5
+        )
+        _w, sidecar = self._render_with_description(tab, text=short)
+        self._rename(path, 0, "Chương 1: Tên mới")
+
+        tab._on_project_selected(str(path))
+        assert sidecar.read_text(encoding="utf-8") == short
+        tab.shutdown()
+
+    def test_an_ai_shortened_stale_sidecar_is_flagged(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        from noveltrans.tts.description import build_short_description
+
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)
+        short, _d, _e = build_short_description(
+            [(f"{i}:00", f"C.{i}", f"ngắn {i}") for i in range(1, 6)], total_chapters=5
+        )
+        window, _sidecar = self._render_with_description(tab, text=short)
+        self._rename(path, 0, "Chương 1: Tên mới")
+
+        tab._on_project_selected(str(path))
+        assert tab._part_dir_name(window) in tab._stale_descriptions
+        assert "⚠️" in tab.video_list.item(0, 1).text()
+        assert "rút gọn bằng AI" in tab.video_list.item(0, 1).toolTip()
+        tab.shutdown()
+
+    def test_a_part_that_lost_chapters_is_flagged_not_rewritten(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """Deleting a chapter leaves the .mp4's audio unchanged, so rebuilding the index
+        around fewer chapters would produce timestamps that point nowhere."""
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)
+        window, sidecar = self._render_with_description(tab)
+        before = sidecar.read_text(encoding="utf-8")
+        project = NovelProject.open(path)
+        project.delete_chapter(4)  # the 5th chapter is gone; the .mp4 still narrates it
+        project.close()
+
+        tab._on_project_selected(str(path))
+        assert tab._part_dir_name(window) in tab._stale_descriptions
+        assert sidecar.read_text(encoding="utf-8") == before
+        tab.shutdown()
+
+    def test_resync_respects_the_char_limit(
+        self, qapp, tmp_path, monkeypatch, library_dir, sample_meta, sample_refs
+    ):
+        from noveltrans.tts.description import description_length
+
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)
+        _w, sidecar = self._render_with_description(tab)
+        self._rename(path, 0, "Chương 1: " + "ả" * 300)
+        monkeypatch.setattr(
+            "noveltrans.tts.description.YOUTUBE_DESCRIPTION_CHAR_LIMIT", 400
+        )
+        tab._on_project_selected(str(path))
+        assert description_length(sidecar.read_text(encoding="utf-8")) <= 400
+        tab.shutdown()
+
+    def test_restore_button_overwrites_a_customised_sidecar(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        from PySide6.QtWidgets import QLabel, QPlainTextEdit, QPushButton
+        from noveltrans.tts.description import build_short_description
+
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)
+        short, _d, _e = build_short_description(
+            [(f"{i}:00", f"C.{i}", f"ngắn {i}") for i in range(1, 6)], total_chapters=5
+        )
+        window, sidecar = self._render_with_description(tab, text=short)
+        self._rename(path, 0, "Chương 1: Tên mới")
+        tab._on_project_selected(str(path))
+        assert tab._part_dir_name(window) in tab._stale_descriptions
+
+        window = tab._windows_for_current_selection()[0]
+        edit, button, status = QPlainTextEdit(), QPushButton(), QLabel()
+        tab._restore_generated_description(window, edit, button, status, False)
+        text = sidecar.read_text(encoding="utf-8")
+        assert "Tạo bởi:" in text and "Tên mới" in text
+        assert tab._part_dir_name(window) not in tab._stale_descriptions
+        tab.shutdown()
+
+    def test_upload_request_picks_up_the_resynced_description(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """The bug that actually matters: without the resync, the OLD chapter name is what
+        gets typed into Studio."""
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)
+        self._render_with_description(tab)
+        self._rename(path, 0, "Chương 1: Tên hoàn toàn mới")
+
+        tab._on_project_selected(str(path))
+        window = tab._windows_for_current_selection()[0]
+        request = tab._upload_request(window, "Phần 1", 1, False, publish_at=None)
+        assert "Tên hoàn toàn mới" in request.description
+        tab.shutdown()
