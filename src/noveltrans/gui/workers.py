@@ -1632,10 +1632,28 @@ class VideoWorker(PausableWorker):
             # all of this planning — the caller already knows exactly which windows and
             # part numbers it wants, computed from the same locked/manual-aware plan the
             # table shows.
+            #
+            # A `source_audio` run skips it too, in EVERY mode — see its branch below.
             locked_part_numbers: dict[int, int] = {}
             if self.explicit_windows is not None:
                 windows = self.explicit_windows
                 locked_part_numbers = dict(self.explicit_part_numbers)
+            elif self.source_audio:
+                # BEFORE the batch branch: the site's audio edition has no chapter grid to
+                # lock. Manual split/merge boundaries and discovered "đã tạo" commits are
+                # both keyed by CHAPTER number, while a source window is keyed by release
+                # ordinal (`SourceAudio.index`), so applying either would mix two number
+                # spaces — a manual split of "chương 1-10" would reshape "phần 1-10" of the
+                # releases. Batch mode here is a plain fixed grid over releases, exactly
+                # what the parts table previews (`_windows_for_current_selection`).
+                # `MergeWorker.run()` orders its branches the same way for the same reason.
+                windows = plan_source_windows(
+                    project.source_audio(),
+                    self.mode,
+                    start=self.start_num,
+                    end=self.end_num,
+                    batch=self.batch_size,
+                )
             elif self.mode == "batch":
                 manual = read_manual_windows(project.path)
                 committed = (
@@ -1648,14 +1666,6 @@ class VideoWorker(PausableWorker):
                 )
                 windows = [w for _, w in locked]
                 locked_part_numbers = {w.first_num: pn for pn, w in locked}
-            elif self.source_audio:
-                windows = plan_source_windows(
-                    project.source_audio(),
-                    self.mode,
-                    start=self.start_num,
-                    end=self.end_num,
-                    batch=self.batch_size,
-                )
             else:
                 windows = plan_merge_windows(
                     project.chapters(),

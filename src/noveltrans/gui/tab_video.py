@@ -627,8 +627,39 @@ class VideoTab(QWidget):
         more = f" … (+{len(pending) - 4} phần)" if len(pending) > 4 else ""
         self.schedule_preview.setText("→ " + "   ".join(shown) + more)
 
-    def _windows_for_current_selection(self) -> list:
-        """The parts (`MergeWindow`s) implied by the current voice/mode/range/batch."""
+    def _voice_label(self, voice: str) -> str:
+        """How to name this edition in a dialog — never the raw `SOURCE_AUDIO_KEY`.
+
+        The sentinel is an internal key; "giọng __source_audio__" in a confirm box reads
+        as a bug. The site's own audio has no voice at all, so it gets named, not voiced.
+        """
+        return "audio từ nguồn" if voice == SOURCE_AUDIO_KEY else f"giọng {voice}"
+
+    def _unit_label(self, voice: str) -> str:
+        """What a window's members are called. A source window groups RELEASES (volumes),
+        not chapters — `plan_source_windows` keys them by `SourceAudio.index` — so counting
+        them as "chương" in a dialog overstates the run by a wide margin (21 mục ≠ 21 chương).
+        """
+        return "mục" if voice == SOURCE_AUDIO_KEY else "chương"
+
+    def _nothing_selected_message(self, voice: str) -> str:
+        """Why the plan came out empty — mirrors `VideoWorker._nothing_message()`.
+
+        The two editions need different advice: "chưa voice hoá chương nào" is useless
+        when the user picked the site's own audio and simply hasn't downloaded it yet.
+        """
+        if voice == SOURCE_AUDIO_KEY:
+            return "Chưa tải mục audio nào từ trang nguồn trong phạm vi đã chọn."
+        return f"Không có chương nào có audio giọng {voice} trong phạm vi đã chọn."
+
+    def _windows_for_current_selection(self, *, honor_committed: bool = True) -> list:
+        """The parts (`MergeWindow`s) implied by the current voice/mode/range/batch.
+
+        `honor_committed=False` is the redo-all view: manual split/merge boundaries still
+        hold (they encode a real constraint that outlives a re-render), but already-"đã
+        tạo" commits do not — the same asymmetry `VideoWorker.run()` applies when
+        `skip_existing` is False, so the confirm dialog counts exactly what gets rendered.
+        """
         if self.project is None:
             return []
         from noveltrans.tts.merge import plan_merge_windows
@@ -645,16 +676,27 @@ class VideoTab(QWidget):
 
             # Numbering counts RELEASES here, so "phần 1..N" runs 1..21 for a novel with
             # 21 volumes rather than following the chapter numbers they cover.
+            #
+            # Nothing is locked for the source edition (see `_locked_batch_windows` and
+            # VideoWorker's own source branch), and the caches are per-plan: leaving a
+            # chapter-voice plan's entries behind would make `_part_number` hand a release
+            # window a chapter part number — disagreeing with the number the worker derives
+            # — and `_chapter_range_item` paint a phantom "bị khoá" warning on its row.
+            self._locked_part_numbers = {}
+            self._locked_committed = {}
+            self._locked_manual = {}
             return plan_source_windows(
                 self.project.source_audio(), mode, start=start, end=end, batch=batch
             )
         if mode == "batch":
-            return self._locked_batch_windows(voice, batch)
+            return self._locked_batch_windows(voice, batch, honor_committed=honor_committed)
         return plan_merge_windows(
             self.project.chapters(), voice, mode, start=start, end=end, batch=batch
         )
 
-    def _locked_batch_windows(self, voice: str, batch: int) -> list:
+    def _locked_batch_windows(
+        self, voice: str, batch: int, *, honor_committed: bool = True
+    ) -> list:
         """Batch windows, honoring already-"đã tạo" commits AND manual split/merge
         boundaries — see `noveltrans.tts.video.plan_locked_video_windows`.
 
@@ -680,14 +722,23 @@ class VideoTab(QWidget):
         from noveltrans.video_windows import read_manual_windows
 
         slug = slugify(self.project.meta.translated_title or self.project.meta.title)
-        committed = discover_committed_video_windows(self.project.video_dir, slug)
+        committed = (
+            discover_committed_video_windows(self.project.video_dir, slug)
+            if honor_committed
+            else {}
+        )
         manual = read_manual_windows(self.project.path)
         plan = plan_locked_video_windows(
             self.project.chapters(), voice, batch, {**committed, **manual}
         )
-        self._locked_part_numbers = {w.first_num: part_num for part_num, w in plan}
-        self._locked_committed = committed
-        self._locked_manual = manual
+        # Only the table's own view (honor_committed=True) may refresh the caches. A
+        # redo-all preview deliberately ignores commits, and writing that narrower plan
+        # here would mis-number a per-row "Tạo lại" clicked before the next refresh —
+        # `_render_one` reads `_part_number` without re-planning first.
+        if honor_committed:
+            self._locked_part_numbers = {w.first_num: part_num for part_num, w in plan}
+            self._locked_committed = committed
+            self._locked_manual = manual
         return [w for _, w in plan]
 
     def _part_number(self, window) -> int:
@@ -797,13 +848,18 @@ class VideoTab(QWidget):
         render_action = menu.addAction("Tạo video")
         render_action.triggered.connect(lambda: self._render_selected_parts(selected_windows))
         menu.addSeparator()
-        if mode == "batch" and len(selected_windows) == 1:
+        # Not for the source edition: `video_manual_windows.json` is keyed by CHAPTER
+        # number, while these windows are keyed by release ordinal. Writing one into the
+        # other's map would silently reshape the chapter plan — a "split" of releases 1-10
+        # would come back as a split of chương 1-10. See `_windows_for_current_selection`.
+        splittable = mode == "batch" and self.voice_combo.currentData() != SOURCE_AUDIO_KEY
+        if splittable and len(selected_windows) == 1:
             window = selected_windows[0]
             action = menu.addAction("Tách phần…")
             action.setEnabled(len(window.chapters) >= 2)
             action.triggered.connect(lambda: self._split_part(window))
             menu.addSeparator()
-        elif mode == "batch" and len(selected_windows) == 2:
+        elif splittable and len(selected_windows) == 2:
             window_a, window_b = selected_windows
             adjacent = window_a.last_num + 1 == window_b.first_num
             action = menu.addAction("Gộp 2 phần liền kề")
@@ -2948,10 +3004,7 @@ class VideoTab(QWidget):
         # grown here, and the render below (also `skip_existing=True`) matches exactly.
         windows = self._windows_for_current_selection()
         if not windows:
-            QMessageBox.information(
-                self, "Chưa có audio",
-                f"Không có chương nào có audio giọng {voice} trong phạm vi đã chọn.",
-            )
+            QMessageBox.information(self, "Chưa có audio", self._nothing_selected_message(voice))
             return
 
         # skip parts already "đã tạo" — either really rendered, or manually ticked so —
@@ -2981,8 +3034,8 @@ class VideoTab(QWidget):
         skip_note = f" (bỏ qua {existing} phần đã có)" if existing else ""
         answer = QMessageBox.question(
             self, "Tạo video",
-            f"Sẽ tạo {len(pending)} video{skip_note} từ {n_chapters} chương "
-            f"(giọng {voice}), tổng ~{hours:.1f} giờ audio.\n\n"
+            f"Sẽ tạo {len(pending)} video{skip_note} từ {n_chapters} {self._unit_label(voice)} "
+            f"({self._voice_label(voice)}), tổng ~{hours:.1f} giờ audio.\n\n"
             f"Chất lượng: {self.video_quality.currentText()} "
             f"({preset['width']}×{preset['height']}).\n"
             f"Ước tính thời gian render: {est} (chưa tính máy nóng/tải khác).\n\n"
@@ -3005,7 +3058,6 @@ class VideoTab(QWidget):
         those settings are baked into the .mp4, so the existing files are simply wrong
         and there's no per-part change to hunt for.
         """
-        from noveltrans.tts.merge import plan_merge_windows
         from noveltrans.tts.video import video_preset
 
         if self.project is None:
@@ -3024,16 +3076,16 @@ class VideoTab(QWidget):
         if mode == "range" and start > end:
             QMessageBox.warning(self, "Phạm vi sai", "Chương bắt đầu phải ≤ chương kết thúc.")
             return
-        batch = self.video_batch_size.value() if mode == "batch" else None
 
-        windows = plan_merge_windows(
-            self.project.chapters(), voice, mode, start=start, end=end, batch=batch
-        )
+        # The same planner the table and "Tạo video" use — including the source-audio
+        # edition, which has no chapter grid at all. `honor_committed=False` because a
+        # redo-all worker is launched with `skip_existing=False`, and that makes it ignore
+        # auto-discovered "đã tạo" commits while still honoring manual split/merge
+        # boundaries (see the long comment in `VideoWorker.run()`). Planning any other way
+        # here would count parts the render doesn't actually produce.
+        windows = self._windows_for_current_selection(honor_committed=False)
         if not windows:
-            QMessageBox.information(
-                self, "Chưa có audio",
-                f"Không có chương nào có audio giọng {voice} trong phạm vi đã chọn.",
-            )
+            QMessageBox.information(self, "Chưa có audio", self._nothing_selected_message(voice))
             return
 
         whole = len(windows) == 1 and mode == "all"
@@ -3062,7 +3114,9 @@ class VideoTab(QWidget):
         answer = QMessageBox.question(
             self, "Tạo lại tất cả video",
             f"Sẽ render lại toàn bộ {len(windows)} phần "
-            f"({sum(len(w.chapters) for w in windows)} chương, giọng {voice}).{overwrite_note}\n\n"
+            f"({sum(len(w.chapters) for w in windows)} {self._unit_label(voice)}, "
+            f"{self._voice_label(voice)})"
+            f".{overwrite_note}\n\n"
             f"Chất lượng: {self.video_quality.currentText()} "
             f"({preset['width']}×{preset['height']}).\n"
             f"Ước tính thời gian render: {est} (chưa tính máy nóng/tải khác).\n\n"
@@ -3139,7 +3193,8 @@ class VideoTab(QWidget):
         skip_note = f" (bỏ qua {existing} phần đã có)" if existing else ""
         answer = QMessageBox.question(
             self, "Tạo video",
-            f"Sẽ tạo {len(pending)} phần đã chọn{skip_note} từ {n_chapters} chương, "
+            f"Sẽ tạo {len(pending)} phần đã chọn{skip_note} từ {n_chapters} "
+            f"{self._unit_label(self.voice_combo.currentData() or '')}, "
             f"tổng ~{hours:.1f} giờ audio.\n\n"
             f"Chất lượng: {self.video_quality.currentText()} "
             f"({preset['width']}×{preset['height']}).\n"

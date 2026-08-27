@@ -1465,6 +1465,112 @@ class TestRedoAllVideos:
         assert captured == {"skip_existing": False}  # redo-all never locks anything
         tab.shutdown()
 
+    def test_redo_all_still_ignores_committed_windows_in_its_count(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        """Feature 066: the confirm dialog now plans through the shared helper, but with
+        `honor_committed=False` — it must still count the FRESH grid, matching the worker
+        it launches with `skip_existing=False`, not the incremental run's locked plan."""
+        from noveltrans.models import ChapterRef
+        from noveltrans.storage import NovelProject
+        from noveltrans.video_state import set_created_override
+
+        refs = [ChapterRef(index=i, title=f"第{i + 1}章", url=f"https://x/{i + 1}")
+                for i in range(3)]
+        project = NovelProject.create(library_dir, sample_meta, refs)
+        for i in range(3):
+            project.save_audio(i, f"exports/audio/{i}.mp3", "V", 60.0)
+        path = project.path
+        project.close()
+
+        tab = self._tab_on_project(tmp_path, path)  # batch 2 → part 1 (1-2), part 2 (3)
+        window2 = tab._windows_for_current_selection()[1]
+        set_created_override(
+            tab._part_output_path(window2, whole_novel=False), True, file_exists=False
+        )
+
+        project = NovelProject.open(path)
+        project.replace_toc(refs + [ChapterRef(index=3, title="第4章", url="https://x/4")])
+        project.save_audio(3, "exports/audio/3.mp3", "V", 60.0)
+        project.close()
+        tab._on_project_selected(str(path))  # chương 4 arrives
+
+        asked = self._yes(monkeypatch)
+        monkeypatch.setattr(tab, "_launch_video", lambda **kw: None)
+        tab._redo_all_videos()
+
+        # fresh grid: (1-2) and (3-4). The locked plan would say 3 — (1-2), (3-3), (4-4).
+        assert "toàn bộ 2 phần" in asked[0][2]
+        tab.shutdown()
+
+    def test_redo_all_count_honors_a_manual_split(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        """The other half of the asymmetry, and a pre-existing mismatch this fixes: the
+        redo-all worker has always honored a manual split (test_video.py), but the dialog
+        planned with a bare `plan_merge_windows` and under-counted the parts."""
+        from noveltrans.models import ChapterRef
+        from noveltrans.storage import NovelProject
+        from noveltrans.video_windows import split_window
+
+        refs = [ChapterRef(index=i, title=f"第{i + 1}章", url=f"https://x/{i + 1}")
+                for i in range(4)]
+        project = NovelProject.create(library_dir, sample_meta, refs)
+        for i in range(4):
+            project.save_audio(i, f"exports/audio/{i}.mp3", "V", 60.0)
+        path = project.path
+        project.close()
+        split_window(path, 1, 4, 1)  # batch=4 would be one part; split off the last chương
+
+        tab = self._tab_on_project(tmp_path, path)
+        tab.video_batch_size.setValue(4)
+
+        asked = self._yes(monkeypatch)
+        monkeypatch.setattr(tab, "_launch_video", lambda **kw: None)
+        tab._redo_all_videos()
+
+        assert "toàn bộ 2 phần" in asked[0][2], "the split the render honors, counted"
+        tab.shutdown()
+
+    def test_redo_all_does_not_disturb_the_tables_part_numbers(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        """Redo-all's committed-blind plan must not be written into the `_locked_*` caches:
+        a per-row "Tạo lại" clicked afterwards reads `_part_number` without re-planning."""
+        from noveltrans.models import ChapterRef
+        from noveltrans.storage import NovelProject
+        from noveltrans.video_state import set_created_override
+
+        refs = [ChapterRef(index=i, title=f"第{i + 1}章", url=f"https://x/{i + 1}")
+                for i in range(3)]
+        project = NovelProject.create(library_dir, sample_meta, refs)
+        for i in range(3):
+            project.save_audio(i, f"exports/audio/{i}.mp3", "V", 60.0)
+        path = project.path
+        project.close()
+
+        tab = self._tab_on_project(tmp_path, path)
+        window2 = tab._windows_for_current_selection()[1]
+        set_created_override(
+            tab._part_output_path(window2, whole_novel=False), True, file_exists=False
+        )
+
+        project = NovelProject.open(path)
+        project.replace_toc(refs + [ChapterRef(index=3, title="第4章", url="https://x/4")])
+        project.save_audio(3, "exports/audio/3.mp3", "V", 60.0)
+        project.close()
+        tab._on_project_selected(str(path))
+
+        windows = tab._windows_for_current_selection()  # locked: (1-2), (3-3), (4-4)
+        before = {w.first_num: tab._part_number(w) for w in windows}
+
+        self._yes(monkeypatch)
+        monkeypatch.setattr(tab, "_launch_video", lambda **kw: None)
+        tab._redo_all_videos()
+
+        assert {w.first_num: tab._part_number(w) for w in windows} == before
+        tab.shutdown()
+
     def test_render_and_upload_buttons_lock_each_other_out(self, qapp, tmp_path):
         """Rendering overwrites the very files an upload reads — they must not overlap."""
         tab = VideoTab(_config(tmp_path))

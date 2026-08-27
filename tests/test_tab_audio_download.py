@@ -240,6 +240,72 @@ class TestMergeSource:
         assert tab.merge_source.currentData() == "Ngọc Lan"
 
 
+class TestMergingTheSourceEdition:
+    """Feature 066: `_start_merge` previewed with `plan_merge_windows` over chapter rows
+    while already passing `source_audio=True` to the worker, so "Ghép audio" on the site's
+    edition died at the tab's own "Chưa có audio" dialog and MergeWorker — which orders its
+    branches correctly — was never started."""
+
+    def _merge(self, qapp, tmp_path, monkeypatch, releases, *, mode="all", rng=None):
+        from PySide6.QtWidgets import QMessageBox
+
+        tab = _tab(qapp, tmp_path, _chapters(2), TTM_URL, releases=releases)
+        tab._refresh_merge_sources()
+        tab.merge_source.setCurrentIndex(tab.merge_source.findData(SOURCE_AUDIO_KEY))
+        tab.merge_mode.setCurrentIndex(tab.merge_mode.findData(mode))
+        if rng is not None:
+            tab.range_from.setValue(rng[0])
+            tab.range_to.setValue(rng[1])
+
+        shown, asked, built = [], [], []
+        monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: shown.append(a))
+        monkeypatch.setattr(
+            QMessageBox, "question",
+            lambda *a, **k: (asked.append(a), QMessageBox.StandardButton.Yes)[1],
+        )
+        monkeypatch.setattr(
+            "noveltrans.gui.tab_audio.MergeWorker",
+            lambda *a, **kw: _StubWorker(built, *a, **kw),
+        )
+        monkeypatch.setattr("noveltrans.gui.tab_audio.track_worker", lambda *a, **k: None)
+        tab._start_merge()
+        return tab, shown, asked, built
+
+    def test_it_starts_the_worker_instead_of_reporting_no_audio(
+        self, qapp, tmp_path, monkeypatch
+    ):
+        releases = [_release(1, path="a.mp3"), _release(2, path="b.mp3")]
+        tab, shown, _asked, built = self._merge(qapp, tmp_path, monkeypatch, releases)
+
+        assert shown == [], "the releases are downloaded — nothing to report"
+        assert len(built) == 1 and built[0]["source_audio"] is True
+        tab.shutdown()
+
+    def test_the_confirm_counts_releases_not_chapters(self, qapp, tmp_path, monkeypatch):
+        """A source window groups releases; there are 2 of them and 2 unrelated chapters."""
+        releases = [_release(1, path="a.mp3"), _release(2, path="b.mp3")]
+        tab, _shown, asked, _built = self._merge(qapp, tmp_path, monkeypatch, releases)
+
+        assert "2 mục" in asked[0][2]
+        assert "audio từ nguồn" in asked[0][2]
+        assert "__source_audio__" not in asked[0][2], "the sentinel is not a voice name"
+        tab.shutdown()
+
+    def test_an_empty_range_reports_the_source_specific_advice(
+        self, qapp, tmp_path, monkeypatch
+    ):
+        """The empty case must not tell the user to go voice some chapters — there is no
+        voice involved, and "giọng __source_audio__" is not advice either."""
+        releases = [_release(1, path="a.mp3"), _release(2, path="b.mp3")]
+        tab, shown, _asked, built = self._merge(
+            qapp, tmp_path, monkeypatch, releases, mode="range", rng=(5, 6)
+        )
+
+        assert built == [], "nothing in range — the worker must not start"
+        assert shown and "Chưa tải mục audio nào từ trang nguồn" in shown[0][2]
+        tab.shutdown()
+
+
 class TestSourceAudioModel:
     """Rows are releases. There is deliberately no chapter column."""
 

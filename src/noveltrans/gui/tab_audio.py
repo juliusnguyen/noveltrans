@@ -1057,22 +1057,38 @@ class AudioTab(QWidget):
             QMessageBox.warning(self, "Phạm vi sai", "Chương bắt đầu phải ≤ chương kết thúc.")
             return
 
-        # cheap preview (no ffmpeg) so we can show the file/chapter count before a long run
-        windows = plan_merge_windows(
-            self.project.chapters(), voice, mode, start=start, end=end, batch=batch
-        )
+        # cheap preview (no ffmpeg) so we can show the file/chapter count before a long run.
+        # Branch on the edition exactly the way `MergeWorker.run()` does: the site's audio
+        # is a separate set of releases, not chapter rows, so planning over chapters here
+        # returned nothing and stopped a perfectly valid merge at the dialog below —
+        # the worker that knows better was never started.
+        if voice == SOURCE_AUDIO_KEY:
+            from noveltrans.tts.merge import plan_source_windows
+
+            windows = plan_source_windows(
+                self.project.source_audio(), mode, start=start, end=end, batch=batch
+            )
+        else:
+            windows = plan_merge_windows(
+                self.project.chapters(), voice, mode, start=start, end=end, batch=batch
+            )
         if not windows:
             QMessageBox.information(
                 self,
                 "Chưa có audio",
-                f"Không có chương nào có audio giọng {voice} trong phạm vi đã chọn.",
+                "Chưa tải mục audio nào từ trang nguồn trong phạm vi đã chọn."
+                if voice == SOURCE_AUDIO_KEY
+                else f"Không có chương nào có audio giọng {voice} trong phạm vi đã chọn.",
             )
             return
         n_chapters = sum(len(w.chapters) for w in windows)
+        # A source window groups releases, not chapters — see `plan_source_windows`.
+        unit = "mục" if voice == SOURCE_AUDIO_KEY else "chương"
+        label = "audio từ nguồn" if voice == SOURCE_AUDIO_KEY else f"giọng {voice}"
         answer = QMessageBox.question(
             self,
             "Ghép audio",
-            f"Sẽ tạo {len(windows)} file từ {n_chapters} chương (giọng {voice}). Tiếp tục?",
+            f"Sẽ tạo {len(windows)} file từ {n_chapters} {unit} ({label}). Tiếp tục?",
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
