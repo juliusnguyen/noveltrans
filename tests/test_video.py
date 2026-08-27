@@ -641,6 +641,62 @@ class TestVideoPartName:
         assert video_part_dir_name("my-slug", 1, 10) == "my-slug-0001-0010"
         assert video_part_dir_name("my-slug", 1, 199, whole_novel=True) == "my-slug"
 
+    def test_edition_slug_is_the_identity_for_chapter_audio(self):
+        """Feature 067's "no migration" guarantee at its lowest level: chapter audio's
+        names are byte-for-byte what they were, so nothing already on disk moves."""
+        from noveltrans.tts.video import edition_slug
+
+        assert edition_slug("my-slug") == "my-slug"
+        assert edition_slug("my-slug", source_audio=False) == "my-slug"
+        assert edition_slug("my-slug", source_audio=True) == "my-slug-nguon"
+
+    def test_the_source_edition_gets_its_own_slug(self):
+        from noveltrans.tts.video import video_part_name
+
+        assert (
+            video_part_name("my-slug", 1, 10, source_audio=True)
+            == "my-slug-nguon-0001-0010.mp4"
+        )
+
+    def test_the_source_whole_novel_name_is_namespaced_too(self):
+        """`{slug}.mp4` carries no range suffix, so it collided just as squarely."""
+        from noveltrans.tts.video import video_part_name
+
+        assert (
+            video_part_name("my-slug", 1, 199, whole_novel=True, source_audio=True)
+            == "my-slug-nguon.mp4"
+        )
+
+    def test_part_dir_name_is_the_stem_for_the_source_edition_too(self):
+        from noveltrans.tts.video import video_part_dir_name
+
+        assert (
+            video_part_dir_name("my-slug", 1, 10, source_audio=True)
+            == "my-slug-nguon-0001-0010"
+        )
+        assert (
+            video_part_dir_name("my-slug", 1, 199, whole_novel=True, source_audio=True)
+            == "my-slug-nguon"
+        )
+
+    def test_the_two_editions_can_never_produce_the_same_name(self):
+        """The feature, stated once: every sidecar — thumbnail, description, "đã tạo" tick,
+        and the `.upload.json` holding a live YouTube video id — is keyed off this name."""
+        from noveltrans.tts.video import video_part_name
+
+        spans = [(1, 1), (1, 10), (21, 30), (1, 199)]
+        chapter, source = set(), set()
+        for first, last in spans:
+            for whole in (False, True):
+                chapter.add(video_part_name("my-slug", first, last, whole_novel=whole))
+                source.add(
+                    video_part_name(
+                        "my-slug", first, last, whole_novel=whole, source_audio=True
+                    )
+                )
+        assert chapter and source
+        assert chapter & source == set()
+
 
 def _chapter(i, *, voiced=True, voice="V"):
     from noveltrans.models import Chapter
@@ -752,6 +808,26 @@ class TestDiscoverCommittedVideoWindows:
         (folder / "other-slug-0091-0098.mp4").write_bytes(b"fake mp4")
         assert discover_committed_video_windows(tmp_path, "slug") == {}
 
+    def test_a_committed_chapter_part_is_not_a_source_commit(self, tmp_path):
+        """Feature 067: the two editions are separate namespaces, so a rendered chapter
+        part cannot freeze the source edition's grid (its numbers are release ordinals)."""
+        from noveltrans.tts.video import discover_committed_video_windows
+
+        folder = tmp_path / "slug-0091-0098"
+        folder.mkdir()
+        (folder / "slug-0091-0098.mp4").write_bytes(b"fake mp4")
+        assert discover_committed_video_windows(tmp_path, "slug") == {91: 98}
+        assert discover_committed_video_windows(tmp_path, "slug", source_audio=True) == {}
+
+    def test_a_committed_source_part_is_not_a_chapter_commit(self, tmp_path):
+        from noveltrans.tts.video import discover_committed_video_windows
+
+        folder = tmp_path / "slug-nguon-0001-0002"
+        folder.mkdir()
+        (folder / "slug-nguon-0001-0002.mp4").write_bytes(b"fake mp4")
+        assert discover_committed_video_windows(tmp_path, "slug", source_audio=True) == {1: 2}
+        assert discover_committed_video_windows(tmp_path, "slug") == {}
+
 
 class TestIterRenderedPartDirs:
     """Feature 065 — the shared folder scan behind commit discovery and the description
@@ -791,6 +867,36 @@ class TestIterRenderedPartDirs:
     def test_ignores_loose_files(self, tmp_path):
         (tmp_path / "slug-0001-0010.mp4").write_bytes(b"x")
         assert self._dirs(tmp_path) == []
+
+    def test_source_part_folders_are_invisible_to_the_chapter_scan(self, tmp_path):
+        """Feature 067. No extra filtering does this — the source folder's remainder after
+        the `slug-` prefix is `nguon-0001-0010`, which is not digits-dash-digits."""
+        (tmp_path / "slug-nguon-0001-0010").mkdir()
+        (tmp_path / "slug-nguon").mkdir()  # the source whole-novel folder
+        assert self._dirs(tmp_path) == []
+
+    def test_the_source_scan_sees_only_source_folders(self, tmp_path):
+        from noveltrans.tts.video import iter_rendered_part_dirs
+
+        (tmp_path / "slug-0001-0010").mkdir()
+        (tmp_path / "slug-nguon-0011-0020").mkdir()
+        found = [
+            (d.name, a, b)
+            for d, a, b in iter_rendered_part_dirs(tmp_path, "slug", source_audio=True)
+        ]
+        assert found == [("slug-nguon-0011-0020", 11, 20)]
+
+    def test_a_novel_whose_slug_ends_in_the_marker_still_partitions(self, tmp_path):
+        """The pathological case: the extra segment leaves the remainder non-numeric either
+        way, so neither scan can stray into the other's folders."""
+        from noveltrans.tts.video import iter_rendered_part_dirs
+
+        (tmp_path / "slug-nguon-0001-0010").mkdir()  # source part of novel "slug"
+        assert self._dirs(tmp_path, slug="slug") == []
+        chapter_of_nguon_novel = [
+            d.name for d, _a, _b in iter_rendered_part_dirs(tmp_path, "slug-nguon")
+        ]
+        assert chapter_of_nguon_novel == ["slug-nguon-0001-0010"]
 
 
 class TestVideoWorker:

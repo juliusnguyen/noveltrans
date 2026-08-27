@@ -367,18 +367,48 @@ def build_youtube_description(
 DEFAULT_VIDEO_CREDIT = "Fox Novel"
 
 
-def video_part_name(slug: str, first_num: int, last_num: int, *, whole_novel: bool = False) -> str:
+# The source edition's on-disk marker. The site's own audio releases already carry it
+# (`exports/audio/nguon-0007-….mp3`, written by `AudioDownloadWorker`); this is the same
+# idea one level up. It exists because a chapter window and a source window are keyed by
+# two different number spaces — chapter number vs `SourceAudio.index` — so rendering both
+# under one name made "chương 1-10" and "phần 1-10 của bản nguồn" the same folder, the same
+# .mp4, and the same `<stem>.upload.json` (which holds a live YouTube video id).
+SOURCE_EDITION_MARKER = "nguon"
+
+
+def edition_slug(slug: str, *, source_audio: bool = False) -> str:
+    """The slug this EDITION's parts are named after. The only place the marker is spelled.
+
+    Chapter audio keeps the plain slug, unchanged and forever: it already names every part
+    folder and every `.upload.json` on disk, so moving it would strand published videos.
+    Only the source edition is namespaced, which is why this feature needed no migration.
+    """
+    return f"{slug}-{SOURCE_EDITION_MARKER}" if source_audio else slug
+
+
+def video_part_name(
+    slug: str, first_num: int, last_num: int, *,
+    whole_novel: bool = False, source_audio: bool = False,
+) -> str:
     """The output file name for one part video — the single source of truth for naming.
 
     A single whole-novel video is just `{slug}.mp4`; every windowed part is
     `{slug}-{first:04d}-{last:04d}.mp4`. The GUI uses this to tell which parts already exist.
+
+    `source_audio` selects the edition (see `edition_slug`). The two editions must never
+    produce the same name: their numbers mean different things, and every sidecar — the
+    thumbnail, the description, the "đã tạo" tick, the upload record — is keyed off this.
     """
+    slug = edition_slug(slug, source_audio=source_audio)
     if whole_novel:
         return f"{slug}.mp4"
     return f"{slug}-{first_num:04d}-{last_num:04d}.mp4"
 
 
-def video_part_dir_name(slug: str, first_num: int, last_num: int, *, whole_novel: bool = False) -> str:
+def video_part_dir_name(
+    slug: str, first_num: int, last_num: int, *,
+    whole_novel: bool = False, source_audio: bool = False,
+) -> str:
     """The per-part output SUBFOLDER name — one folder per video.
 
     Each part video and its sidecars (`.title.txt` / `.txt` / `.tags.txt` / `.jpg`) live in
@@ -386,13 +416,20 @@ def video_part_dir_name(slug: str, first_num: int, last_num: int, *, whole_novel
     the other parts. The folder name is just the part's file stem (`video_part_name` minus
     the `.mp4`).
     """
-    return Path(video_part_name(slug, first_num, last_num, whole_novel=whole_novel)).stem
+    return Path(
+        video_part_name(
+            slug, first_num, last_num,
+            whole_novel=whole_novel, source_audio=source_audio,
+        )
+    ).stem
 
 
 _COMMITTED_SUFFIX_RE = re.compile(r"^(\d+)-(\d+)$")
 
 
-def discover_committed_video_windows(video_dir: Path, slug: str) -> dict[int, int]:
+def discover_committed_video_windows(
+    video_dir: Path, slug: str, *, source_audio: bool = False
+) -> dict[int, int]:
     """Already-"đã tạo" batch windows on disk for this novel, as `{first_num: last_num}`.
 
     A window counts as committed once a real render exists for it, or the user manually
@@ -407,25 +444,39 @@ def discover_committed_video_windows(video_dir: Path, slug: str) -> dict[int, in
     written by every render since feature 026) — legacy flat single-folder renders predate
     the per-folder change entirely and are read-compatible for display purposes only, not
     reconsidered here as commit points.
+
+    Scoped to ONE edition (`source_audio`, see `edition_slug`): a rendered chapter part is
+    not a commit point for the source edition's grid, and vice versa — their numbers mean
+    different things. `iter_rendered_part_dirs` enforces that; see its docstring.
     """
     from noveltrans.video_state import effective_created
 
     return {
         first_num: last_num
-        for part_dir, first_num, last_num in iter_rendered_part_dirs(video_dir, slug)
+        for part_dir, first_num, last_num in iter_rendered_part_dirs(
+            video_dir, slug, source_audio=source_audio
+        )
         if effective_created(part_dir / f"{part_dir.name}.mp4")
     }
 
 
-def iter_rendered_part_dirs(video_dir: Path, slug: str):
-    """`(part_dir, first_num, last_num)` for every per-part subfolder of this novel.
+def iter_rendered_part_dirs(video_dir: Path, slug: str, *, source_audio: bool = False):
+    """`(part_dir, first_num, last_num)` for every per-part subfolder of ONE edition.
 
     The shared scan behind `discover_committed_video_windows` and the video tab's
     description resync. It yields folders and their chapter spans only — whether a part
     counts as "đã tạo" (a real render vs. a manual tick) is the caller's question, and the
     two callers answer it differently: freezing a batch window needs the manual tick to
     count, while rewriting a stale `.txt` needs a file that actually exists.
+
+    The two editions partition cleanly here with no extra filtering, which is the whole
+    reason the marker is a slug SUFFIX rather than a separate directory: the scan is
+    `{slug}-` followed by digits-dash-digits, so a source folder (`{slug}-nguon-0001-0010`,
+    remainder `nguon-0001-0010`) simply fails the regex during a chapter scan, and a chapter
+    folder fails the prefix during a source scan. A novel whose own slug happens to end in
+    `-nguon` is still safe: the extra segment leaves the remainder non-numeric either way.
     """
+    slug = edition_slug(slug, source_audio=source_audio)
     video_dir = Path(video_dir)
     if not video_dir.is_dir():
         return

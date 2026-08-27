@@ -11,6 +11,13 @@ with the disk-discovered "committed" map, manual entries taking precedence).
 Merging is exactly the inverse of splitting: two adjacent windows collapse into the span
 that a single (never-split) window would have covered, and a later merge of two split
 halves is how a split gets undone — there's no separate "clear override" action.
+
+CHAPTER numbers only. A novel can also have the site's own audio edition, whose parts are
+keyed by release ordinal (see `noveltrans.tts.merge.plan_source_windows`), and this flat map
+has no room for a second number space — an entry meant for one edition would silently
+reshape the other's plan. So the source edition deliberately does not use this file, and the
+split/merge menu entries are hidden for it. Supporting both would mean a versioned schema
+(`{"chapters": {...}, "nguon": {...}}`) with a back-compat read of the flat form.
 """
 
 from __future__ import annotations
