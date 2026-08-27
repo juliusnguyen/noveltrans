@@ -54,6 +54,10 @@ class Workspace(QWidget):
         # A scan/load/download in the scrape tab is the authoritative "project opened"
         # event: it fans out to the sibling pickers, the tab title, and the host guard.
         self.scrape_tab.project_changed.connect(self._on_scrape_project)
+        # Relabel on every metadata refresh, not just on open: a novel translated while
+        # its tab is already open would otherwise keep showing the pre-translation name
+        # until the app restarts. Signal-to-signal — the host does the rest.
+        self.scrape_tab.title_changed.connect(self.title_changed)
         # The other pickers only record recency. They must NOT re-refresh here: a
         # picker's refresh() re-emits project_selected, so refreshing from this handler
         # would recurse forever.

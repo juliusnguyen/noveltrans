@@ -484,3 +484,33 @@ def test_the_onedrive_row_does_not_disturb_the_youtube_one(qapp, tmp_path):
     assert dialog.youtube_status.text()
     assert dialog.onedrive_status.text()
     assert dialog.youtube_status is not dialog.onedrive_status
+
+
+def test_vertical_tabs_checkbox_defaults_to_on(qapp, tmp_path):
+    """Feature 068 ships the novel bar vertical; horizontal is the opt-out."""
+    dialog = SettingsDialog(_isolated_config(tmp_path))
+    assert dialog.vertical_tabs_check.isChecked() is True
+
+
+def test_vertical_tabs_checkbox_loads_the_saved_value(qapp, tmp_path):
+    config = _isolated_config(tmp_path)
+    config.workspace_tabs_vertical = False
+    dialog = SettingsDialog(config)
+    assert dialog.vertical_tabs_check.isChecked() is False
+
+
+def test_unticking_vertical_tabs_persists_and_reloads(qapp, tmp_path):
+    config = _isolated_config(tmp_path)
+    dialog = SettingsDialog(config)
+    dialog.vertical_tabs_check.setChecked(False)
+    dialog.accept()
+    assert config.workspace_tabs_vertical is False
+    assert SettingsDialog(config).vertical_tabs_check.isChecked() is False
+
+
+def test_the_config_default_is_vertical(qapp, tmp_path):
+    """The property itself, independent of the dialog — nothing else covers it."""
+    config = _isolated_config(tmp_path)
+    assert config.workspace_tabs_vertical is True
+    config.workspace_tabs_vertical = False
+    assert config.workspace_tabs_vertical is False

@@ -327,6 +327,20 @@ class AppConfig:
         self._s.setValue("tts_format", value)
 
     @property
+    def workspace_tabs_vertical(self) -> bool:
+        """Stack the novel tabs down the side (True) instead of across the top (False).
+
+        Defaults to True: the label is a novel title, which is far longer than the "1. Tải
+        truyện" style labels a horizontal strip is sized for, and a side column gives each
+        one a usable width instead of squeezing every open novel into one row.
+        """
+        return self._s.value("workspace_tabs_vertical", True, type=bool)
+
+    @workspace_tabs_vertical.setter
+    def workspace_tabs_vertical(self, value: bool) -> None:
+        self._s.setValue("workspace_tabs_vertical", bool(value))
+
+    @property
     def tts_use_translation(self) -> bool:
         """Voice the translation (True) or the original text (False)."""
         return self._s.value("tts_use_translation", True, type=bool)

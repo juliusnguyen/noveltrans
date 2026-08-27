@@ -94,24 +94,35 @@ class NovelMeta:
                 return text
         return ""
 
-    def bilingual_title(self) -> str:
-        """Original and translated title side by side, for lists and headers.
+    def novel_label(self, *, with_source: bool = True) -> str:
+        """How this novel is named wherever it is listed: translation, original, source.
 
-        Deliberately NOT `display_name()`: that one *replaces* the original and exists to
-        decide what a video says. Here both titles are wanted at once — the Chinese is how
-        the user recognises the novel on the source site, the Vietnamese is how they think
-        about it — so this shows the original first and appends the translation when there
-        is one. Before the first translation run there is none, and the bare title is the
-        whole label rather than a title trailed by an empty separator.
+        The single naming rule for the novel tab bar, its tooltip, the picker and the
+        "Thông tin truyện" header, so those four cannot drift apart.
 
-        The two-space padding around the em dash is the app's existing convention for this
-        pairing (ScrapeTab._show_meta), kept identical so the picker and the "Thông tin
-        truyện" panel read the same way.
+        **Translation first**, which reverses what `bilingual_title` did before feature
+        068. That order was chosen so the original would anchor the row ("the Chinese is
+        how the user recognises the novel on the source site"), but in a narrow tab column
+        it buried the half the user actually reads — the first ~20 characters are all a tab
+        shows, and they were being spent on text the user does not think in. The original
+        is still there, one field along, for exactly the recognition the old order served.
+
+        `display_title` wins the first slot when set: it is the user's own name for this
+        novel (feature 025's override, see `display_name`), so it beats a machine
+        translation that may still carry a "[ĐM/EDIT] " tag the override exists to drop.
+
+        Every part is optional and each is dropped whole — an untranslated novel is not a
+        title behind an empty separator, and a local novel carries no trailing site. Pass
+        `with_source=False` where the site is already obvious from the surrounding UI.
         """
-        translated = (self.translated_title or "").strip()
-        if translated:
-            return f"{self.title}  —  {translated}"
-        return self.title
+        translated = (self.display_title or "").strip() or (self.translated_title or "").strip()
+        original = (self.title or "").strip()
+        # Not twice. An override set to the original, or a source already in the target
+        # language (translated_title == title), would otherwise read "X — X — site.com".
+        parts = [translated, original] if translated != original else [original]
+        if with_source:
+            parts.append(self.source_host())
+        return " — ".join(part for part in parts if part)
 
     def source_host(self) -> str:
         """The site this novel came from, as a bare hostname — "" when there isn't one.

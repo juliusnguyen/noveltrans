@@ -11,22 +11,26 @@ from PySide6.QtCore import QEvent, Qt, QUrl
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
+    QHBoxLayout,
     QMainWindow,
     QMessageBox,
     QPushButton,
     QTabBar,
     QTabWidget,
     QToolButton,
+    QVBoxLayout,
+    QWidget,
 )
 
 from noveltrans.config import AppConfig
 from noveltrans.gui.dock import hide_dock_icon, show_dock_icon
 from noveltrans.gui.notify import clear_dock_badge
 from noveltrans.gui.settings_dialog import SettingsDialog
+from noveltrans.gui.style import VERTICAL_WORKSPACE_TABS_QSS
 from noveltrans.gui.workspace import Workspace
+from noveltrans.gui.workspace_tab_bar import WorkspaceTabBar
 from noveltrans.storage import AppState
 
-_MAX_TAB_LABEL = 24  # truncate a novel title to this before the outer tab shows it
 
 
 class MainWindow(QMainWindow):
@@ -54,27 +58,50 @@ class MainWindow(QMainWindow):
         # our own ✕ button per tab (Qt's default close icon is invisible on this dark
         # theme); tabsClosable stays off so the two don't fight
         self.workspaces = QTabWidget()
+        # BEFORE any addTab: setTabBar replaces the object that owns all tab metadata,
+        # so swapping it later would empty the window. One bar serves both orientations.
+        self.workspaces.setTabBar(WorkspaceTabBar())
         self.workspaces.setObjectName("workspaceTabs")
         self.workspaces.setDocumentMode(True)
         self.workspaces.setMovable(True)
         self.workspaces.setUsesScrollButtons(True)
         self.workspaces.tabBar().setExpanding(False)
         self.workspaces.tabBar().setElideMode(Qt.TextElideMode.ElideRight)
-        self.setCentralWidget(self.workspaces)
 
-        # flat icon-style corner buttons: Settings left, "＋ new workspace" right
+        # flat icon-style buttons: Settings, then "＋ new workspace".
         self.settings_button = QPushButton("⚙")
         self.settings_button.setObjectName("cornerButton")
         self.settings_button.setToolTip("Cài đặt (thư viện, engine dịch, cookie…)")
         self.settings_button.clicked.connect(self._open_settings)
-        self.workspaces.setCornerWidget(self.settings_button, Qt.Corner.TopLeftCorner)
 
         self.new_button = QPushButton("＋")
         self.new_button.setObjectName("cornerButton")
         self.new_button.setToolTip("Mở truyện mới trong tab riêng (Cmd/Ctrl+T)")
         self.new_button.clicked.connect(lambda: self._add_workspace())
-        self.workspaces.setCornerWidget(self.new_button, Qt.Corner.TopRightCorner)
 
+        # Their home while the bar is vertical. Qt gives a QTabWidget's corner widgets
+        # ZERO geometry for West/East — measured: QRect(0,0,0,0) while isVisible() stays
+        # True — so on a vertical bar they would simply disappear. This row is where
+        # `_apply_tab_orientation` puts them instead; it is hidden in horizontal mode,
+        # where the real corners work.
+        self.tab_toolbar = QWidget()
+        self.tab_toolbar.setObjectName("workspaceToolbar")
+        toolbar_row = QHBoxLayout(self.tab_toolbar)
+        toolbar_row.setContentsMargins(0, 0, 0, 0)
+        toolbar_row.setSpacing(0)
+        toolbar_row.addWidget(self.settings_button)
+        toolbar_row.addWidget(self.new_button)
+        toolbar_row.addStretch(1)
+
+        container = QWidget()
+        container_column = QVBoxLayout(container)
+        container_column.setContentsMargins(0, 0, 0, 0)
+        container_column.setSpacing(0)
+        container_column.addWidget(self.tab_toolbar)
+        container_column.addWidget(self.workspaces, stretch=1)
+        self.setCentralWidget(container)
+
+        self._apply_tab_orientation()
         self._build_menu()
 
         # first workspace reopens the novel from the previous session (old behaviour)
@@ -85,6 +112,43 @@ class MainWindow(QMainWindow):
         geometry = self.config.window_geometry
         if geometry is not None:
             self.restoreGeometry(geometry)
+
+    def _apply_tab_orientation(self) -> None:
+        """Move the novel bar between the left column and the top strip, live.
+
+        Everything survives the flip — Qt keeps the tabs, their labels, their tooltips,
+        their close buttons and the current index — because the QTabBar object never
+        changes, only its paint/measure mode does.
+
+        The ⚙/＋ buttons do have to move house. Qt gives a QTabWidget's corner widgets
+        zero geometry for West/East, so in vertical mode they live in `tab_toolbar`
+        above the bar; in horizontal mode they go back to the real corners, where they
+        sit inline with the tabs and cost no vertical space.
+
+        Idempotent, so callers need no before/after bookkeeping.
+        """
+        vertical = self.config.workspace_tabs_vertical
+        bar = self.workspaces.tabBar()
+        bar.set_vertical(vertical)
+        self.workspaces.setTabPosition(
+            QTabWidget.TabPosition.West if vertical else QTabWidget.TabPosition.North
+        )
+        # A widget-level sheet beats the app-wide one at equal specificity; "" restores it.
+        self.workspaces.setStyleSheet(VERTICAL_WORKSPACE_TABS_QSS if vertical else "")
+
+        if vertical:
+            self.workspaces.setCornerWidget(None, Qt.Corner.TopLeftCorner)
+            self.workspaces.setCornerWidget(None, Qt.Corner.TopRightCorner)
+            row = self.tab_toolbar.layout()
+            row.insertWidget(0, self.settings_button)
+            row.insertWidget(1, self.new_button)
+        else:
+            self.workspaces.setCornerWidget(self.settings_button, Qt.Corner.TopLeftCorner)
+            self.workspaces.setCornerWidget(self.new_button, Qt.Corner.TopRightCorner)
+        # Reparenting hides a widget; Qt does not show it again on its own.
+        self.settings_button.show()
+        self.new_button.show()
+        self.tab_toolbar.setVisible(vertical)
 
     def _build_menu(self) -> None:
         new_action = QAction("&Truyện mới (tab)", self)
@@ -166,13 +230,20 @@ class MainWindow(QMainWindow):
         if self.workspaces.count() == 0:
             self._add_workspace()
 
-    def _set_ws_title(self, ws: Workspace, title: str) -> None:
+    def _set_ws_title(self, ws: Workspace, label: str) -> None:
+        """Name a novel's tab, and make the part that doesn't fit reachable on hover.
+
+        No hand truncation: the tab elides to whatever width it has (in either
+        orientation), and the tooltip is what makes the cut-off remainder readable — so
+        the two must always be set together. A tab with no novel loaded keeps its
+        "Truyện N" label and gets NO tooltip: that label is fully visible, and a tooltip
+        repeating it would be noise.
+        """
         index = self.workspaces.indexOf(ws)
-        if index < 0 or not title:
+        if index < 0 or not label:
             return  # keep the default "Truyện N" label until a novel actually loads
-        if len(title) > _MAX_TAB_LABEL:
-            title = title[: _MAX_TAB_LABEL - 1] + "…"
-        self.workspaces.setTabText(index, title)
+        self.workspaces.setTabText(index, label)
+        self.workspaces.setTabToolTip(index, label)
 
     # --------------------------------------------- same-project-open guard
 
@@ -218,6 +289,7 @@ class MainWindow(QMainWindow):
         dialog.exec()
         if self.config.library_dir != before:
             self._reload_library()
+        self._apply_tab_orientation()  # idempotent — cheaper than tracking the old value
         # A multi-novel OneDrive sync is started from Settings but must not run inside it:
         # Settings is modal and a sync takes hours. It hands the chosen novels over here,
         # where the run gets its own modeless window and the app stays usable.

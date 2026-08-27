@@ -370,6 +370,16 @@ class SettingsDialog(QDialog):
         onedrive_hint.setWordWrap(True)
         form.addRow("", onedrive_hint)
 
+        # Vertical is the default: a tab label is now a novel's full name, which needs
+        # far more width than a horizontal strip can give each tab once several are open.
+        self.vertical_tabs_check = QCheckBox("Xếp tab truyện thành cột dọc bên trái")
+        self.vertical_tabs_check.setChecked(config.workspace_tabs_vertical)
+        self.vertical_tabs_check.setToolTip(
+            "Bật: mỗi truyện là một dòng trong cột bên trái, tên hiển thị ngang. "
+            "Tắt: các tab nằm ngang phía trên như trình duyệt. Áp dụng ngay khi bấm OK."
+        )
+        form.addRow("Thanh tab truyện:", self.vertical_tabs_check)
+
         # Keep the Mac awake while a job runs so it doesn't idle-sleep mid-download.
         self.keep_awake_check = QCheckBox("Giữ máy thức khi đang chạy (tải/dịch/tạo audio)")
         self.keep_awake_check.setChecked(config.keep_awake_enabled)
@@ -750,6 +760,9 @@ class SettingsDialog(QDialog):
         self.config.discord_autounlock_enabled = self.discord_enable.isChecked()
         self.config.discord_channel_url = channel_url
         self.config.onedrive_root = self.onedrive_root_edit.text()
+        # No live-apply call here, unlike keep_awake below: this is window state, and
+        # MainWindow._open_settings re-applies it after exec() returns.
+        self.config.workspace_tabs_vertical = self.vertical_tabs_check.isChecked()
         self.config.keep_awake_enabled = self.keep_awake_check.isChecked()
         keep_awake.set_enabled(self.keep_awake_check.isChecked())  # apply live
         self.config.tts_workers = self.tts_workers_spin.value()
