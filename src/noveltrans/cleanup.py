@@ -43,6 +43,7 @@ from pathlib import Path
 
 from noveltrans.onedrive_upload import STATUS_DONE, read_manifest
 from noveltrans.storage.project import AUDIO_DIR, EXPORTS_DIR, VIDEO_DIR
+from noveltrans.tts.video import SOURCE_EDITION_MARKER
 from noveltrans.youtube_upload import is_published
 
 KIND_AUDIO = "audio"
@@ -52,6 +53,13 @@ KIND_VIDEO = "video"
 _CHAPTER_INDEX_RE = re.compile(r"^(\d+)-")
 # `exports/video/<slug>-0041-0060/` — the part's chapter range, trailing.
 _PART_RANGE_RE = re.compile(r"-(\d+)-(\d+)$")
+# A SOURCE-edition part (`<slug>-nguon-0041-0060`) ends in the same shape, but those are
+# RELEASE ordinals, not chapter numbers. Reading them as chapters would let a rendered
+# source part authorise deleting chapter audio that no video contains — exactly what this
+# module exists to refuse. Deliberately NOT filtered out of `rendered_parts`: a published
+# source `.mp4` is still a perfectly good *video* deletion candidate, and that path never
+# touches chapter audio.
+_SOURCE_PART_RE = re.compile(rf"-{SOURCE_EDITION_MARKER}-\d+-\d+$")
 
 # Audio the renderer consumed. `.mp3`/`.wav` are the bulk; `.cues.json` is tiny but it is
 # purely an intermediate on the way to the part's `.srt`.
@@ -104,8 +112,12 @@ def part_range(folder_name: str) -> tuple[int, int] | None:
     """The `(first, last)` chapters a part folder covers, or None. Pure.
 
     Returns None rather than guessing when the name does not carry a range — a folder we
-    cannot read the range of covers nothing, so nothing is deleted on its account.
+    cannot read the range of covers nothing, so nothing is deleted on its account. A
+    source-edition part is treated the same way, for the same reason: its trailing numbers
+    are release ordinals and mean nothing in chapter space.
     """
+    if _SOURCE_PART_RE.search(folder_name or ""):
+        return None
     match = _PART_RANGE_RE.search(folder_name or "")
     if not match:
         return None

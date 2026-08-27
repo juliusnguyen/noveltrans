@@ -1640,13 +1640,23 @@ class VideoWorker(PausableWorker):
                 locked_part_numbers = dict(self.explicit_part_numbers)
             elif self.source_audio:
                 # BEFORE the batch branch: the site's audio edition has no chapter grid to
-                # lock. Manual split/merge boundaries and discovered "đã tạo" commits are
-                # both keyed by CHAPTER number, while a source window is keyed by release
-                # ordinal (`SourceAudio.index`), so applying either would mix two number
-                # spaces — a manual split of "chương 1-10" would reshape "phần 1-10" of the
-                # releases. Batch mode here is a plain fixed grid over releases, exactly
-                # what the parts table previews (`_windows_for_current_selection`).
+                # lock. Batch mode here is a plain fixed grid over releases, exactly what
+                # the parts table previews (`_windows_for_current_selection`).
                 # `MergeWorker.run()` orders its branches the same way for the same reason.
+                #
+                # Manual split/merge boundaries stay out because `video_manual_windows.json`
+                # is a single per-novel map keyed by CHAPTER number, with no room for a
+                # second number space — a manual split of "chương 1-10" would otherwise
+                # reshape "phần 1-10" of the releases.
+                #
+                # Commit discovery stays out for a narrower reason than feature 066 gave.
+                # 066 argued the semantics don't exist for releases; that was wrong — a
+                # source window DOES grow retroactively when later releases are downloaded
+                # after an earlier part was rendered, which is exactly what commit-locking
+                # is for. Since 067 the two editions no longer share a filename namespace,
+                # so `discover_committed_video_windows(..., source_audio=True)` would now
+                # be well defined. What still blocks it is `plan_locked_video_windows`:
+                # it filters on `c.audio_voice`, which `SourceAudio` does not have.
                 windows = plan_source_windows(
                     project.source_audio(),
                     self.mode,
@@ -1697,14 +1707,18 @@ class VideoWorker(PausableWorker):
                         continue
                     whole_novel = total == 1 and self.mode == "all"
                     name = video_part_name(
-                        slug, window.first_num, window.last_num, whole_novel=whole_novel
+                        slug, window.first_num, window.last_num,
+                        whole_novel=whole_novel, source_audio=self.source_audio,
                     )
                     # Each part goes in its own folder (video + sidecars) so it can be
                     # uploaded on its own; legacy flat renders still count for skip_existing.
                     out_path = project.video_dir / Path(name).stem / name
                     legacy_path = project.video_dir / name
-                    # Same resolution `_part_output_path` uses in the tab: prefer the
-                    # per-folder path, fall back to a pre-existing legacy flat file. This
+                    # Same resolution `_part_output_path` uses in the tab — the EDITION as
+                    # well as the layout: prefer the per-folder path, fall back to a
+                    # pre-existing legacy flat file. If the two ever disagree about which
+                    # edition a window belongs to, the tab shows one file and the worker
+                    # writes another. This
                     # is the exact path the "Trạng thái" tick's sidecar sits beside, so a
                     # part manually marked "đã tạo" is skipped here too — not just file
                     # existence — even though no .mp4 has actually been rendered for it.
@@ -2016,6 +2030,11 @@ class SubtitleWorker(PausableWorker):
                 segments = _with_real_durations(segments)
                 srt, covered, _n = part_srt(segments)
                 whole_novel = total == 1 and self.mode == "all"
+                # No `source_audio` here, and none needed: this worker plans only with
+                # `plan_merge_windows` filtered by `audio_voice`, so every window it can
+                # produce is a CHAPTER window and its `.srt` belongs in the chapter
+                # namespace. The source edition has no subtitle path at all — releases
+                # carry no cues and no per-chapter text for `_backfill` to work from.
                 name = video_part_name(
                     slug, window.first_num, window.last_num, whole_novel=whole_novel
                 )

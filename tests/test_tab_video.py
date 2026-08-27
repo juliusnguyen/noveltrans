@@ -373,6 +373,29 @@ class TestVideoPartsList:
         assert out.parent.parent == tab.project.video_dir
         tab.shutdown()
 
+    def test_the_chapter_edition_keeps_its_pre_067_name(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """Feature 067's "no migration" guarantee, stated where it is easiest to break.
+
+        Only the SOURCE edition was given a namespace; chapter audio's folder, `.mp4` and
+        every sidecar beside it — including the `.upload.json` holding a published video id
+        — keep the exact names they already have on disk. If `_novel_slug` or
+        `_part_output_path` ever picks up the edition marker for chapter audio, every
+        rendered part on every existing install is stranded, and this fails.
+        """
+        from noveltrans.storage.project import slugify
+
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)
+        slug = slugify(sample_meta.translated_title or sample_meta.title)
+        out = tab._part_output_path(tab._windows_for_current_selection()[0], whole_novel=False)
+
+        assert out.name == f"{slug}-0001-0002.mp4"
+        assert out.parent.name == f"{slug}-0001-0002"
+        assert "nguon" not in out.name
+        tab.shutdown()
+
     def test_legacy_flat_render_is_still_recognised(
         self, qapp, tmp_path, library_dir, sample_meta, sample_refs
     ):

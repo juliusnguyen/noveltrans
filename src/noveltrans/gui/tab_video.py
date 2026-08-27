@@ -677,11 +677,15 @@ class VideoTab(QWidget):
             # Numbering counts RELEASES here, so "phần 1..N" runs 1..21 for a novel with
             # 21 volumes rather than following the chapter numbers they cover.
             #
-            # Nothing is locked for the source edition (see `_locked_batch_windows` and
-            # VideoWorker's own source branch), and the caches are per-plan: leaving a
-            # chapter-voice plan's entries behind would make `_part_number` hand a release
-            # window a chapter part number — disagreeing with the number the worker derives
-            # — and `_chapter_range_item` paint a phantom "bị khoá" warning on its row.
+            # Nothing is locked for the source edition — manual windows are chapter-keyed,
+            # and commit-locking is blocked on `plan_locked_video_windows`'s `audio_voice`
+            # filter, which `SourceAudio` has no answer for. See VideoWorker's own source
+            # branch for the full reasoning (and for what feature 066 got wrong about it).
+            #
+            # The caches are per-plan: leaving a chapter-voice plan's entries behind would
+            # make `_part_number` hand a release window a chapter part number — disagreeing
+            # with the number the worker derives — and `_chapter_range_item` paint a phantom
+            # "bị khoá" warning on its row.
             self._locked_part_numbers = {}
             self._locked_committed = {}
             self._locked_manual = {}
@@ -762,6 +766,19 @@ class VideoTab(QWidget):
 
         return part_number(window.first_num, self.video_batch_size.value())
 
+    def _is_source_edition(self) -> bool:
+        """Whether the parts on screen are the site's own audio edition, not chapter audio.
+
+        The two are separate part namespaces (`noveltrans.tts.video.edition_slug`), and this
+        combo is the single fact that decides which one every path in this tab resolves to.
+        That is safe because every caller of `_part_output_path` obtains its windows from
+        `_windows_for_current_selection` (or `_selected_window`) inside the same method, and
+        that helper reads this same combo — no window outlives a voice change. A future
+        caller that *stored* windows across one would resolve them under the wrong edition.
+        """
+        voice = self.voice_combo.currentData() or self.voice_combo.currentText().strip()
+        return voice == SOURCE_AUDIO_KEY
+
     def _part_output_path(self, window, *, whole_novel: bool):
         """The .mp4 path a given window would render to (for the exists check).
 
@@ -769,6 +786,11 @@ class VideoTab(QWidget):
         video (with its sidecars) can be uploaded without hunting through the others. Older
         parts rendered flat in `video_dir` are still recognised, so they keep showing as
         “đã tạo” and their thumbnail/detail keep opening after this change.
+
+        The name carries the edition (`_is_source_edition`), so a chapter part and a source
+        part covering the same numbers are different files. The legacy flat fallback below
+        is inert for the source edition — a `{slug}-nguon-….mp4` cannot predate the feature
+        that introduced the name.
         """
         from pathlib import Path
 
@@ -780,7 +802,8 @@ class VideoTab(QWidget):
         # strand every rendered part and orphan its upload record.
         slug = slugify(self.project.meta.translated_title or self.project.meta.title)
         name = video_part_name(
-            slug, window.first_num, window.last_num, whole_novel=whole_novel
+            slug, window.first_num, window.last_num,
+            whole_novel=whole_novel, source_audio=self._is_source_edition(),
         )
         per_folder = self.project.video_dir / Path(name).stem / name
         legacy = self.project.video_dir / name
@@ -799,19 +822,30 @@ class VideoTab(QWidget):
         NOT `display_name()` — same reason `_part_output_path` spells this out: the slug is
         baked into names already on disk, so keying it to an editable title would strand
         every rendered part.
+
+        Deliberately the BASE slug, never the edition slug. Its other caller is
+        `_resync_description_sidecars`, which must stay chapter-only: a source part's
+        numbers are releases, so rebuilding its `.txt` from chapters by number would
+        describe the wrong content entirely. `_part_dir_name` applies the edition itself.
         """
         from noveltrans.storage.project import slugify
 
         return slugify(self.project.meta.translated_title or self.project.meta.title)
 
     def _part_dir_name(self, window, whole_novel: bool = False) -> str:
-        """This part's folder name — the key `_stale_descriptions` is stored under."""
+        """This part's folder name — the key `_stale_descriptions` is stored under.
+
+        Edition-aware, because that key must be unique across both editions: the same
+        `{first}-{last}` span exists in each, and a shared key would let one edition's
+        stale-description flag light up the other's row.
+        """
         from noveltrans.tts.video import video_part_dir_name
 
         if self.project is None:
             return ""
         return video_part_dir_name(
-            self._novel_slug(), window.first_num, window.last_num, whole_novel=whole_novel
+            self._novel_slug(), window.first_num, window.last_num,
+            whole_novel=whole_novel, source_audio=self._is_source_edition(),
         )
 
     # ------------------------------------------------------------ split / merge parts
@@ -1100,6 +1134,54 @@ class VideoTab(QWidget):
         finally:
             self._suppress_status_toggle = False
         self._sync_upload_header()
+        self._warn_about_legacy_source_parts()
+
+    def _legacy_source_part_dirs(self) -> list:
+        """Chapter-named folders that are probably source parts rendered before 067.
+
+        Before the two editions were given separate names, a source render landed under the
+        chapter name. Nothing in a folder records which planner made it, so this cannot be
+        decided — only suspected, and only under the one condition that makes the suspicion
+        worth raising: the folder's span matches a part the SOURCE edition is planning right
+        now, and the source edition has nothing rendered there itself.
+
+        Reported, never acted on. Renaming on a guess would be a coin flip with a live
+        YouTube video id (`<stem>.upload.json`) at stake.
+        """
+        from noveltrans.tts.video import iter_rendered_part_dirs
+
+        if self.project is None or not self._is_source_edition():
+            return []
+        video_dir = self.project.video_dir
+        if not video_dir.is_dir():
+            return []
+        planned = {
+            (w.first_num, w.last_num): self._part_output_path(w, whole_novel=False)
+            for w in self._windows_for_current_selection()
+        }
+        return [
+            part_dir
+            for part_dir, first, last in iter_rendered_part_dirs(video_dir, self._novel_slug())
+            if (first, last) in planned and not planned[(first, last)].is_file()
+        ]
+
+    def _warn_about_legacy_source_parts(self) -> None:
+        """Say so in the status line when `_legacy_source_part_dirs` finds something.
+
+        The whole migration story for 067, deliberately: no dialog, no file touched. The
+        risk being flagged is a duplicate YouTube upload — the old folder's `.upload.json`
+        no longer participates, so re-rendering and re-uploading would publish the same
+        episode twice.
+        """
+        stale = self._legacy_source_part_dirs()
+        if not stale:
+            return
+        self.status_label.setText(
+            f"⚠️ {len(stale)} phần cùng phạm vi đã có trong thư mục video theo tên cũ. "
+            "Nếu đó là bản nguồn tạo trước bản cập nhật, hãy đổi tên thư mục (và các file "
+            "bên trong) thành “…-nguon-…” trước khi tạo lại hoặc tải lên — tránh đăng "
+            "trùng lên YouTube."
+        )
 
     def _upload_rows(self) -> list:
         """(row, path) for every listed part that has a rendered video."""
@@ -2719,6 +2801,13 @@ class VideoTab(QWidget):
         Parts are enumerated from DISK, not from the current window selection: a part's
         description depends on its own chapter span, and the mode/batch/range the user
         happens to have selected need not reproduce the windows that were actually rendered.
+
+        CHAPTER parts only, and deliberately so — it scans `_novel_slug()` (the base slug),
+        which since feature 067 excludes the source edition's folders. The reconstruction
+        below selects chapters by number (`first_num <= c.index + 1 <= last_num`), and a
+        source part's numbers are release ordinals, so running this over one would rewrite
+        its `.txt` to describe a completely different set of chapters. The source edition
+        simply has no description resync; that is a gap, not a bug.
 
         Returns `(rewritten, stale but customised)`. A sidecar that doesn't `looks_generated`
         is left strictly alone and recorded in `_stale_descriptions` — an AI-shortened

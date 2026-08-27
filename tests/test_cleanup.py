@@ -36,6 +36,20 @@ def _project(tmp_path, *, chapters=(1, 2, 3), parts=()):
     return root
 
 
+def _source_part(project, first, last, *, files=(".mp4",)):
+    """A SOURCE-edition part folder (feature 067's `{slug}-nguon-NNNN-MMMM`).
+
+    Its trailing numbers are RELEASE ordinals, not chapter numbers — the whole reason this
+    module has to refuse to read them as coverage.
+    """
+    name = f"truyen-nguon-{first:04d}-{last:04d}"
+    folder = project / "exports" / "video" / name
+    folder.mkdir(parents=True)
+    for suffix in files:
+        (folder / f"{name}{suffix}").write_bytes(b"v" * 50)
+    return name
+
+
 def _publish(project, part_name, *, published=True):
     folder = project / "exports" / "video" / part_name
     (folder / f"{part_name}.upload.json").write_text(
@@ -64,6 +78,9 @@ class TestPureHelpers:
             ("truyen-0060-0041", (41, 60)),  # reversed is still a range
             ("truyen", None),
             ("", None),
+            # feature 067 — a source part's numbers are release ordinals, not chapters
+            ("truyen-nguon-0041-0060", None),
+            ("truyen-nguon", None),
         ],
     )
     def test_part_range(self, name, expected):
@@ -76,6 +93,29 @@ class TestPureHelpers:
         (project / "exports" / "video" / "khong-co-so").mkdir()
         (project / "exports" / "video" / "khong-co-so" / "x.mp4").write_bytes(b"v")
         assert cl.covered_chapters(project) == {1, 2, 3}
+
+
+class TestSourceEditionCoversNoChapters:
+    """Feature 067. A source-edition part contains RELEASES, so its `-0001-0003` says
+    nothing about chapters 1-3. Reading it as chapter coverage let a rendered source part
+    authorise deleting chapter audio that no video contains — the exact class of mistake
+    this module exists to refuse."""
+
+    def test_a_source_part_covers_no_chapters(self, tmp_path):
+        project = _project(tmp_path, chapters=(1, 2, 3))
+        _source_part(project, 1, 3)
+        assert cl.covered_chapters(project) == set()
+
+    def test_and_so_offers_no_audio_for_deletion(self, tmp_path):
+        project = _project(tmp_path, chapters=(1, 2, 3))
+        _source_part(project, 1, 3, files=(".mp4", ".srt"))
+        assert _relpaths(cl.plan_audio_cleanup(project)) == []
+
+    def test_a_chapter_part_alongside_it_still_counts(self, tmp_path):
+        """The guard is scoped to source folders — it must not suppress real coverage."""
+        project = _project(tmp_path, chapters=(1, 2, 3), parts=[(1, 2, (".mp4",))])
+        _source_part(project, 1, 3)
+        assert cl.covered_chapters(project) == {1, 2}
 
 
 class TestAudioCleanup:
@@ -139,6 +179,16 @@ class TestVideoCleanupRefusesWithoutProof:
         candidates = cl.video_cleanup_candidates(self._ready(tmp_path))
         assert len(candidates) == 1
         assert "chờ kiểm tra" in candidates[0].reason
+
+    def test_a_published_source_part_is_still_a_video_candidate(self, tmp_path):
+        """Feature 067's guard is scoped to CHAPTER COVERAGE only. An `.mp4` that is on
+        YouTube and verified on OneDrive is deletable whichever edition rendered it, and
+        this path never touches chapter audio — so source parts must stay visible here."""
+        project = _project(tmp_path, chapters=(1,))
+        name = _source_part(project, 1, 3, files=(".mp4", ".srt"))
+        _publish(project, name)
+        candidates = cl.video_cleanup_candidates(project)
+        assert [c.relpath for c in candidates] == [f"exports/video/{name}/{name}.mp4"]
 
     def test_plan_cleanup_never_includes_video(self, tmp_path):
         """**The load-bearing test.** Video deletion requires looking at OneDrive, and
