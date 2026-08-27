@@ -266,6 +266,46 @@ class TestStudioDateTimeStrings:
         assert _format_time(datetime(2026, 8, 1, hour, 30), vietnamese=False) == expected
 
 
+class TestDescriptionCap:
+    """Feature 065 — `UploadRequest` is the choke point that must never let an over-budget
+    description reach Studio, the same way `save_tags` is for the 500-char tag budget.
+
+    Not redundant with the builders: the description usually comes straight off a `.txt`
+    sidecar which may have been written before the cap existed, and re-rendering a part
+    just to shorten its description isn't something to ask of the user.
+    """
+
+    def _request(self, part, description):
+        return UploadRequest(video=part, title="Phần 1", description=description)
+
+    def test_request_clamps_an_oversized_description(self, tmp_path):
+        from noveltrans.tts.description import (
+            YOUTUBE_DESCRIPTION_CHAR_LIMIT,
+            description_length,
+        )
+
+        part = tmp_path / "p.mp4"
+        part.write_bytes(b"x")
+        request = self._request(part, "x" * 9000)
+        assert description_length(request.description) <= YOUTUBE_DESCRIPTION_CHAR_LIMIT
+
+    def test_request_leaves_a_normal_description_alone(self, tmp_path):
+        part = tmp_path / "p.mp4"
+        part.write_bytes(b"x")
+        text = "Tên truyện: A\n\nMục lục chương:\n0:00 Chương 1\n\nTạo bởi: Fox Novel\n"
+        assert self._request(part, text).description == text
+
+    def test_clamped_description_ends_on_a_whole_line(self, tmp_path):
+        part = tmp_path / "p.mp4"
+        part.write_bytes(b"x")
+        text = "\n".join(f"{i}:00 Chương {i}: {'ả' * 40}" for i in range(400)) + "\n"
+        clamped = self._request(part, text).description
+        assert clamped.endswith("\n")
+        # every surviving line is a complete one from the original
+        original = set(text.splitlines())
+        assert all(line in original for line in clamped.splitlines())
+
+
 class TestRequestValidation:
     """Every one of these must be caught before a browser is launched."""
 

@@ -6,14 +6,22 @@ and status/progress/cancel widgets. When exporting, each produced part-video get
 next to the `.mp4`:
   * `<name>.title.txt`  — "{tên truyện} - Phần {N}"
   * `<name>.txt`        — the YouTube description (original+VN title/author, chapter count,
-                           the chapter timestamp table, "Tạo bởi: …")
+                           the chapter timestamp table, "Tạo bởi: …"), capped to YouTube's
+                           5000 characters
   * `<name>.tags.txt`   — the novel-level YouTube tags (LLM-generated, like "2. Dịch")
   * `<name>.jpg`        — a thumbnail composited from a chosen base image + styled text
+
+The `.txt` is not write-once: opening a novel re-syncs it from the database for every
+rendered part, so renaming a chapter updates what an already-rendered part will upload
+(`_resync_description_sidecars`). The exception is a description replaced by "Shorten by
+AI" in "Chi tiết phần" — its shortened titles can't be rebuilt from the database, so a
+stale one is flagged on the row instead of overwritten.
 """
 
 from __future__ import annotations
 
 import re
+from types import SimpleNamespace
 
 from PySide6.QtCore import QDateTime, Qt, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QPixmap
@@ -60,6 +68,7 @@ from noveltrans.gui.widgets import (
 )
 from noveltrans.gui.workers import (
     CompletionWorker,
+    ShortenTitlesWorker,
     TagsWorker,
     TtsVoicesWorker,
     VideoPreviewWorker,
@@ -72,6 +81,11 @@ from noveltrans.gui.workers import (
     YouTubeUploadWorker,
 )
 from noveltrans.storage import NovelProject
+from noveltrans.tts.description import (
+    YOUTUBE_DESCRIPTION_CHAR_LIMIT,
+    description_length,
+    was_truncated,
+)
 
 # Engines that can generate tags (LLMs). Google translate-only is excluded.
 _TAG_ENGINES = LLM_ENGINES
@@ -104,6 +118,7 @@ class VideoTab(QWidget):
         self._tts_voices: list[tuple[str, str]] = []
         self._tags_worker: TagsWorker | None = None
         self._image_prompt_worker: CompletionWorker | None = None
+        self._shorten_worker: ShortenTitlesWorker | None = None
         self._render_after_tags = False  # auto-generate tags, then start the render
         # guards the "Trạng thái" / "Đã tải lên" checkbox handlers while the table is
         # being repopulated
@@ -115,6 +130,10 @@ class VideoTab(QWidget):
         self._locked_part_numbers: dict[int, int] = {}
         self._locked_committed: dict[int, int] = {}
         self._locked_manual: dict[int, int] = {}
+        # Part folder names whose `.txt` description no longer matches the database but
+        # was customised (AI-shortened), so `_resync_description_sidecars` refused to
+        # overwrite it. Consumed by `_chapter_range_item` and the detail dialog.
+        self._stale_descriptions: set[str] = set()
         # a persistent, non-modal preview window so the color can be tuned live
         self._preview_dialog: QDialog | None = None
         self._preview_label: QLabel | None = None
@@ -241,6 +260,11 @@ class VideoTab(QWidget):
         self.video_batch_size.setValue(self.config.video_batch_size)  # remembered between sessions
         self.video_batch_size.valueChanged.connect(
             lambda v: self._save_video_setting("video_batch_size", v)
+        )
+        self.video_batch_size.setToolTip(
+            "Số chương gộp vào một video. Mô tả YouTube tối đa 5000 ký tự, nên mục lục "
+            "chương chỉ chứa được khoảng 70–110 chương; phần dư sẽ gộp thành một dòng "
+            "“… còn N chương nữa”."
         )
         self.video_batch_label = QLabel("chương/video")
 
@@ -718,6 +742,27 @@ class VideoTab(QWidget):
         out = self._part_output_path(window, whole_novel=whole_novel)
         return out.parent / (out.stem + ext)
 
+    def _novel_slug(self) -> str:
+        """The slug every rendered folder and sidecar of this novel is named after.
+
+        NOT `display_name()` — same reason `_part_output_path` spells this out: the slug is
+        baked into names already on disk, so keying it to an editable title would strand
+        every rendered part.
+        """
+        from noveltrans.storage.project import slugify
+
+        return slugify(self.project.meta.translated_title or self.project.meta.title)
+
+    def _part_dir_name(self, window, whole_novel: bool = False) -> str:
+        """This part's folder name — the key `_stale_descriptions` is stored under."""
+        from noveltrans.tts.video import video_part_dir_name
+
+        if self.project is None:
+            return ""
+        return video_part_dir_name(
+            self._novel_slug(), window.first_num, window.last_num, whole_novel=whole_novel
+        )
+
     # ------------------------------------------------------------ split / merge parts
 
     def _on_video_list_context_menu(self, pos) -> None:
@@ -909,16 +954,30 @@ class VideoTab(QWidget):
     # YouTube caps a single video at 12 hours.
     _YOUTUBE_MAX_SECONDS = 12 * 3600
 
-    def _chapter_range_item(self, window, mode: str) -> QTableWidgetItem:
-        """The "Chương" cell — flagged when this batch window is locked short.
+    def _chapter_range_item(
+        self, window, mode: str, total_chapters: int = 0, novel_title: str = "",
+        whole_novel: bool = False,
+    ) -> QTableWidgetItem:
+        """The "Chương" cell — flagged when something about this part's span needs saying.
 
-        A window counts as locked once `_locked_batch_windows` found it either already
-        "đã tạo" (rendered, or manually ticked) on disk, or manually split/merged by hand
-        — see `noveltrans.tts.video.plan_locked_video_windows`. If it also has fewer
-        chapters than the configured batch size, it's frozen there permanently: new
-        chapters will never grow it, they start the next part instead. Worth calling out,
-        since without this a stuck-at-8-of-10 part looks identical to one that's simply
-        still waiting for its 9th and 10th chapters to get audio.
+        Three warnings share the one ⚠️ + amber treatment, joined into one tooltip:
+
+        1. The batch window is *locked short*. A window counts as locked once
+           `_locked_batch_windows` found it either already "đã tạo" (rendered, or manually
+           ticked) on disk, or manually split/merged by hand — see
+           `noveltrans.tts.video.plan_locked_video_windows`. If it also has fewer chapters
+           than the configured batch size, it's frozen there permanently: new chapters will
+           never grow it, they start the next part instead. Worth calling out, since without
+           this a stuck-at-8-of-10 part looks identical to one that's simply still waiting
+           for its 9th and 10th chapters to get audio.
+        2. The part holds more chapters than a 5000-character YouTube description can index.
+           This is the batch-size pre-warning: the batch spinbox already re-runs
+           `_refresh_video_list`, so it appears and disappears live as the user drags it.
+           Flagged, never enforced — the safe maximum depends on how long this part's
+           chapter titles happen to be, and the 12h video cap next door is only flagged too.
+        3. The part's `.txt` description went stale (a chapter was renamed) but had been
+           AI-shortened, so `_resync_description_sidecars` left it alone rather than
+           destroying titles that can't be rebuilt from the database.
         """
         text = f"chương {window.first_num}–{window.last_num} ({len(window.chapters)} chương)"
         item = QTableWidgetItem(text)
@@ -929,18 +988,38 @@ class VideoTab(QWidget):
             and (manual or window.first_num in self._locked_committed)
             and len(window.chapters) < batch_size
         )
+        warnings: list[str] = []
         if locked:
-            item.setForeground(QColor("#e5c07b"))
-            item.setText("⚠️ " + text)
             reason = (
                 "bị khoá ở mức này vì đã tách/gộp thủ công."
                 if manual
                 else "bị khoá ở mức này vì đã tạo trước khi đủ chương."
             )
-            item.setToolTip(
+            warnings.append(
                 f"Phần này có {len(window.chapters)}/{batch_size} chương — {reason} "
                 "Chương mới sẽ vào phần kế tiếp, không tự thêm vào đây."
             )
+        if total_chapters:
+            _text, dropped = self._description_result(window, novel_title, total_chapters)
+            if dropped:
+                kept = len(window.chapters) - dropped
+                warnings.append(
+                    f"Mô tả YouTube tối đa {YOUTUBE_DESCRIPTION_CHAR_LIMIT} ký tự — mục lục "
+                    f"của phần này chỉ liệt kê {kept}/{len(window.chapters)} chương, "
+                    f"{dropped} chương còn lại gộp thành một dòng “… còn {dropped} chương "
+                    "nữa”. Giảm số chương/video, hoặc bấm “Shorten by AI” trong Chi tiết, "
+                    "nếu muốn mục lục đầy đủ."
+                )
+        if self._part_dir_name(window, whole_novel) in self._stale_descriptions:
+            warnings.append(
+                "Tên chương đã đổi sau khi tạo video, nhưng mô tả của phần này đã được rút "
+                "gọn bằng AI nên không tự cập nhật — mở “Chi tiết” rồi bấm “Shorten by AI” "
+                "lại, hoặc “Khôi phục mô tả gốc”."
+            )
+        if warnings:
+            item.setForeground(QColor("#e5c07b"))
+            item.setText("⚠️ " + text)
+            item.setToolTip("\n\n".join(warnings))
         return item
 
     def _duration_item(self, window) -> QTableWidgetItem:
@@ -1109,13 +1188,22 @@ class VideoTab(QWidget):
         mode = self.video_mode.currentData()
         total = len(windows)
         self.video_list.setRowCount(total)
+        # Hoisted out of the loop: `counts()` runs eight COUNT(*) queries, and the
+        # description each row's warning is derived from needs both of these.
+        total_chapters = self.project.counts()["total"]
+        novel_title = self.project.meta.display_name()
         for i, window in enumerate(windows):
             whole_novel = total == 1 and mode == "all"
             part_num = None if whole_novel else self._part_number(window)
             exists = self._part_output_path(window, whole_novel=whole_novel).is_file()
             label = "Toàn bộ" if whole_novel else f"Phần {part_num}"
             self.video_list.setItem(i, 0, QTableWidgetItem(label))
-            self.video_list.setItem(i, 1, self._chapter_range_item(window, mode))
+            self.video_list.setItem(
+                i, 1,
+                self._chapter_range_item(
+                    window, mode, total_chapters, novel_title, whole_novel
+                ),
+            )
             self.video_list.setItem(i, 2, self._duration_item(window))
             self.video_list.setItem(i, 3, QTableWidgetItem(self._part_title(part_num)))
             self.video_list.setItem(i, 4, self._created_item(window, whole_novel))
@@ -1454,24 +1542,41 @@ class VideoTab(QWidget):
 
         return is_published(self._part_output_path(window, whole_novel=whole_novel))
 
-    def _compute_part_description(self, window, novel_title: str) -> str:
-        """Build a part's description on the fly (before it's rendered) from stored audio."""
+    def _part_segments(self, window) -> list:
+        """A part's `MergeSegment`s built from stored audio — what the description reads."""
         from noveltrans.tts.merge import MergeSegment, chapter_marker_title
-        from noveltrans.tts.video import build_video_description
 
-        segments = [
+        return [
             MergeSegment(path="", seconds=c.audio_seconds, title=chapter_marker_title(c))
             for c in window.chapters
         ]
-        return build_video_description(
-            segments,
+
+    def _description_result(
+        self, window, novel_title: str, total_chapters: int
+    ) -> tuple[str, int]:
+        """`(description, chapters dropped from the index)` for a part, computed fresh.
+
+        `total_chapters` is a parameter rather than a `self.project.counts()` call so the
+        table refresh can hoist it: `counts()` runs eight `COUNT(*)` queries, and doing that
+        once per row on a 200-part list is the one real cost in rebuilding the table.
+        """
+        from noveltrans.tts.video import fit_video_description
+
+        return fit_video_description(
+            self._part_segments(window),
             original_title=self.project.meta.title,
             vn_title=novel_title,
             original_author=self.project.meta.author,
             vn_author=self.project.meta.translated_author,
-            total_chapters=self.project.counts()["total"],
+            total_chapters=total_chapters,
             credit=self.credit_edit.text().strip() or "Fox Novel",
         )
+
+    def _compute_part_description(self, window, novel_title: str) -> str:
+        """Build a part's description on the fly (before it's rendered) from stored audio."""
+        return self._description_result(
+            window, novel_title, self.project.counts()["total"]
+        )[0]
 
     def _part_metadata(self, window, part_num, whole_novel) -> tuple[str, str, str]:
         """(title, description, tags) for a part — from the rendered sidecars if they exist,
@@ -1494,6 +1599,168 @@ class VideoTab(QWidget):
             if tags_p.is_file() else self.tags_edit.toPlainText().strip()
         )
         return title, description, tags
+
+    def _description_label_text(self, description: str) -> str:
+        """The "Mô tả:" caption, with Studio's own character count and a truncation note.
+
+        Its own method rather than an inline f-string because `_show_part_detail` ends in
+        `dialog.exec()` and can't be driven from a test.
+        """
+        text = (
+            f"Mô tả: ({description_length(description)}/"
+            f"{YOUTUBE_DESCRIPTION_CHAR_LIMIT} ký tự)"
+        )
+        if was_truncated(description):
+            text += " — ⚠️ mục lục chương đã rút gọn cho vừa giới hạn của YouTube."
+        return text
+
+    def _short_description_extras(self) -> tuple[list[str], list[str]]:
+        """The header/credit lines the short form puts back when they cost no chapters.
+
+        Built from the very same helpers the full description uses, so a shortened
+        description that has room reads identically at the top and bottom.
+        """
+        from noveltrans.tts.video import DEFAULT_VIDEO_CREDIT, description_header_lines
+
+        meta = self.project.meta
+        before = description_header_lines(
+            original_title=meta.title,
+            vn_title=meta.display_name(),
+            original_author=meta.author,
+            vn_author=meta.translated_author,
+        )
+        credit = self.credit_edit.text().strip() or DEFAULT_VIDEO_CREDIT
+        return before, ["", f"Tạo bởi: {credit}"]
+
+    def _shorten_description(
+        self, window, desc_edit, button, status, whole_novel: bool,
+        keep_extras: bool = True,
+    ) -> None:
+        """"Shorten by AI": rebuild the description as a bare, AI-shortened chapter index.
+
+        The chapter NUMBER never goes near the model — `split_chapter_number` strips it, the
+        model only ever sees the descriptive half, and `C.N` is reassembled here. Trusting an
+        LLM to carry a couple hundred chapter numbers through intact is how you get a
+        silently renumbered index, which is a far worse bug than a long description.
+        """
+        from noveltrans.tts.description import split_chapter_number
+        from noveltrans.tts.merge import chapter_marker_title
+        from noveltrans.tts.video import _yt_timestamp
+
+        if self.project is None:
+            return
+        if self._shorten_worker is not None and self._shorten_worker.isRunning():
+            return
+
+        stamps: list[str] = []
+        numbers: list[int | None] = []
+        rests: list[str] = []
+        start = 0.0
+        for chapter in window.chapters:
+            number, rest = split_chapter_number(chapter_marker_title(chapter))
+            stamps.append(_yt_timestamp(start))
+            # The title's own number wins when it has one (a scrape with gaps stays
+            # consistent with what the site published); `index + 1` is what the rest of the
+            # app calls this chapter otherwise.
+            numbers.append(number if number is not None else chapter.index + 1)
+            rests.append(rest)
+            start += chapter.audio_seconds
+
+        button.setEnabled(False)
+        status.setText("✨ Đang rút gọn bằng AI…")
+        worker = ShortenTitlesWorker(rests, **self._ai_engine_params())
+        self._shorten_worker = worker
+        worker.progress.connect(
+            lambda done, total: status.setText(f"✨ Đang rút gọn… {done}/{total}")
+        )
+        worker.finished_ok.connect(
+            lambda titles, fell_back: self._on_shorten_ready(
+                window, desc_edit, button, status, whole_novel,
+                stamps, numbers, rests, titles, fell_back, keep_extras,
+            )
+        )
+        worker.failed.connect(
+            lambda message: self._on_shorten_failed(button, status, message)
+        )
+        track_worker(worker)
+        worker.start()
+
+    def _on_shorten_ready(
+        self, window, desc_edit, button, status, whole_novel,
+        stamps, numbers, originals, titles, fell_back, keep_extras=True,
+    ) -> None:
+        from noveltrans.tts.description import build_short_description, short_chapter_label
+
+        button.setEnabled(True)
+        if len(titles) != len(originals):  # a worker that lost its place — keep the old text
+            self._on_shorten_failed(button, status, "Số dòng trả về không khớp số chương.")
+            return
+        entries = [
+            (stamp, short_chapter_label(number), title)
+            for stamp, number, title in zip(stamps, numbers, titles)
+        ]
+        extras_before, extras_after = (
+            self._short_description_extras() if keep_extras else ([], [])
+        )
+        text, dropped, extras_kept = build_short_description(
+            entries,
+            total_chapters=self.project.counts()["total"],
+            extras_before=extras_before,
+            extras_after=extras_after,
+        )
+        desc_edit.setPlainText(text)
+        saved = self._write_description_sidecar(window, whole_novel, text)
+
+        notes = [f"✅ Đã rút gọn {len(titles)} chương."]
+        if keep_extras:
+            notes.append(
+                "Còn chỗ nên giữ lại tên truyện/tác giả/dòng “Tạo bởi”."
+                if extras_kept
+                else "Không đủ chỗ cho tên truyện/tác giả nên chỉ giữ mục lục."
+            )
+        if fell_back:
+            notes.append(f"⚠️ {fell_back} nhóm giữ nguyên tên gốc.")
+        if dropped:
+            notes.append(f"⚠️ {dropped} chương vẫn không vừa mục lục.")
+        notes.append("Đã lưu vào .txt." if saved else "Chưa tạo video nên chưa lưu.")
+        status.setText(" ".join(notes))
+
+    def _on_shorten_failed(self, button, status, message: str) -> None:
+        button.setEnabled(True)
+        status.setText("")
+        QMessageBox.warning(self, "Rút gọn thất bại", message)
+
+    def _restore_generated_description(
+        self, window, desc_edit, button, status, whole_novel: bool
+    ) -> None:
+        """Throw away a customised description and rebuild the full one from the database.
+
+        The deliberate way out of a stale AI-shortened sidecar — the one thing
+        `_resync_description_sidecars` refuses to do on its own, because it can't be undone.
+        """
+        if self.project is None:
+            return
+        text = self._compute_part_description(window, self.project.meta.display_name())
+        desc_edit.setPlainText(text)
+        saved = self._write_description_sidecar(window, whole_novel, text)
+        self._stale_descriptions.discard(self._part_dir_name(window, whole_novel))
+        button.setEnabled(False)
+        status.setText(
+            "✅ Đã khôi phục mô tả gốc." + ("" if saved else " (chưa tạo video nên chưa lưu)")
+        )
+        self._refresh_video_list()
+
+    def _write_description_sidecar(self, window, whole_novel: bool, text: str) -> bool:
+        """Write a part's `.txt` — only if it's actually been rendered. Returns whether it was.
+
+        An unrendered part has no folder to write into and can't be uploaded yet, so the
+        dialog's copy is the whole deliverable there. A rendered one must be written:
+        `_upload_request` reads this file, so without it nothing new ever reaches YouTube.
+        """
+        if not self._part_output_path(window, whole_novel=whole_novel).is_file():
+            return False
+        self._part_sidecar(window, whole_novel, ".txt").write_text(text, encoding="utf-8")
+        return True
 
     def _show_part_detail(self, window, part_num, whole_novel) -> None:
         """A dialog with the part's title / description / tags (each copyable) + open buttons."""
@@ -1524,10 +1791,59 @@ class VideoTab(QWidget):
         desc_edit = QPlainTextEdit(description)
         desc_edit.setReadOnly(True)
         desc_copy = QPushButton("Copy mô tả")
-        desc_copy.clicked.connect(lambda: copy(description, "mô tả"))
-        layout.addWidget(QLabel("Mô tả:"))
+        # Read the widget, not the captured string: "Shorten by AI" replaces the text in
+        # place, and copying the description the dialog opened with would be wrong.
+        desc_copy.clicked.connect(lambda: copy(desc_edit.toPlainText(), "mô tả"))
+        desc_label = QLabel(self._description_label_text(description))
+        desc_edit.textChanged.connect(
+            lambda: desc_label.setText(
+                self._description_label_text(desc_edit.toPlainText())
+            )
+        )
+
+        shorten = QPushButton("Shorten by AI")
+        shorten.setToolTip(
+            "Dùng AI rút gọn tên từng chương (giữ nguyên ý nghĩa), đổi “Chương 1” thành "
+            "“C.1”, và bỏ tên truyện / tác giả / dòng “Tạo bởi” — chỉ giữ mục lục chương, "
+            f"để nhiều chương vừa trong giới hạn {YOUTUBE_DESCRIPTION_CHAR_LIMIT} ký tự "
+            "của YouTube."
+        )
+        keep_extras = QCheckBox("Giữ tên truyện / tác giả nếu còn chỗ")
+        keep_extras.setChecked(True)
+        keep_extras.setToolTip(
+            "Sau khi rút gọn, nếu mô tả vẫn còn chỗ thì thêm lại “Tên truyện:”, “Tác giả:” "
+            "và dòng “Tạo bởi:”. Chỉ thêm khi KHÔNG phải bỏ bớt chương nào khỏi mục lục — "
+            "còn nếu chật thì mục lục được ưu tiên."
+        )
+        shorten.clicked.connect(
+            lambda: self._shorten_description(
+                window, desc_edit, shorten, status, whole_novel,
+                keep_extras.isChecked(),
+            )
+        )
+        restore = QPushButton("Khôi phục mô tả gốc")
+        restore.setToolTip(
+            "Dựng lại mô tả đầy đủ từ dữ liệu hiện tại (tên truyện, tác giả, mục lục "
+            "chương đầy đủ) — dùng khi mô tả đã rút gọn không còn khớp tên chương."
+        )
+        restore.setEnabled(
+            self._part_dir_name(window, whole_novel) in self._stale_descriptions
+        )
+        restore.clicked.connect(
+            lambda: self._restore_generated_description(
+                window, desc_edit, restore, status, whole_novel
+            )
+        )
+
+        desc_row = QHBoxLayout()
+        desc_row.addWidget(desc_copy)
+        desc_row.addWidget(shorten)
+        desc_row.addWidget(keep_extras)
+        desc_row.addWidget(restore)
+        desc_row.addStretch()
+        layout.addWidget(desc_label)
         layout.addWidget(desc_edit, 1)
-        layout.addWidget(desc_copy)
+        layout.addLayout(desc_row)
 
         tags_edit = QPlainTextEdit(tags)
         tags_edit.setReadOnly(True)
@@ -2209,7 +2525,27 @@ class VideoTab(QWidget):
             self.display_title_edit.setPlaceholderText("")
             self.status_label.setText("")
         self._refresh_audio_sources()
+        # Once per project open — not from `_refresh_video_list`, which fires on every
+        # spinbox tick. Once is enough because a rename made in another tab forces a reopen:
+        # returning here runs showEvent → refresh_projects → picker.refresh →
+        # project_selected → this method.
+        self._resync_descriptions_and_report()
         self._refresh_video_list()
+
+    def _resync_descriptions_and_report(self) -> None:
+        """Run the description resync and fold what it did into the status line."""
+        if self.project is None:
+            return
+        rewritten, customised = self._resync_description_sidecars()
+        notes = []
+        if rewritten:
+            notes.append(f"đã cập nhật mô tả {rewritten} phần")
+        if customised:
+            notes.append(f"⚠️ {customised} phần có mô tả rút gọn đã cũ")
+        if notes:
+            base = self.status_label.text()
+            joined = ", ".join(notes)
+            self.status_label.setText(f"{base} ({joined})" if base else joined.capitalize())
 
     def _sync_display_title(self) -> None:
         """Show the override, with the current fallback as the placeholder.
@@ -2304,6 +2640,103 @@ class VideoTab(QWidget):
             sidecar.write_text(tags + "\n", encoding="utf-8")
             updated += 1
         return updated
+
+    # ------------------------------------------------- keep descriptions fresh
+
+    def _resync_description_sidecars(self) -> tuple[int, int]:
+        """Rewrite the `.txt` of every rendered part whose chapter names have changed.
+
+        Same problem `_resync_tags_sidecars` solves, one field over: a part's description is
+        written once, at render time, and never touched again — while `_part_metadata`
+        prefers that file over recomputing it and `_upload_request` reads it straight off
+        disk. So renaming a chapter left an already-rendered part showing (and *uploading*)
+        the old name until it was re-rendered.
+
+        Staleness is detected by regenerating and diffing rather than by hooking the rename:
+        a title can move through at least six routes (`edit_title` from two tabs,
+        `reset_title`, `edit_translation`, Tìm & Thay thế, a re-translation — and
+        `chapter_marker_title` reads `translated_title or title`, so all of them count).
+        A generated description is a pure function of the database, so comparing against a
+        fresh build covers every route at once, including ones added later and renames made
+        in a previous session.
+
+        Parts are enumerated from DISK, not from the current window selection: a part's
+        description depends on its own chapter span, and the mode/batch/range the user
+        happens to have selected need not reproduce the windows that were actually rendered.
+
+        Returns `(rewritten, stale but customised)`. A sidecar that doesn't `looks_generated`
+        is left strictly alone and recorded in `_stale_descriptions` — an AI-shortened
+        description's titles cannot be rebuilt from the database, so overwriting one would
+        be data loss, not a regeneration.
+        """
+        from noveltrans.tts.description import indexed_chapter_count, looks_generated
+        from noveltrans.tts.video import (
+            build_youtube_description,
+            iter_rendered_part_dirs,
+            video_part_dir_name,
+        )
+
+        self._stale_descriptions = set()
+        if self.project is None:
+            return 0, 0
+        video_dir = self.project.video_dir
+        if not video_dir.is_dir():
+            return 0, 0
+
+        slug = self._novel_slug()
+        chapters = self.project.chapters()
+        total_chapters = self.project.counts()["total"]
+        novel_title = self.project.meta.display_name()
+
+        spans = list(iter_rendered_part_dirs(video_dir, slug))
+        # A whole-novel render lives in `{slug}/` with no span suffix, so the scan above
+        # (which keys on `{slug}-{first}-{last}`) can't see it.
+        whole_dir = video_dir / video_part_dir_name(slug, 0, 0, whole_novel=True)
+        if whole_dir.is_dir() and chapters:
+            spans.append((whole_dir, chapters[0].index + 1, chapters[-1].index + 1))
+
+        rewritten = 0
+        customised = 0
+        for part_dir, first_num, last_num in spans:
+            sidecar = part_dir / f"{part_dir.name}.txt"
+            if not sidecar.is_file() or not (part_dir / f"{part_dir.name}.mp4").is_file():
+                continue
+            try:
+                current = sidecar.read_text(encoding="utf-8")
+            except OSError:
+                continue
+
+            selected = [c for c in chapters if first_num <= c.index + 1 <= last_num]
+            if not selected:
+                continue
+            window = SimpleNamespace(
+                first_num=first_num, last_num=last_num, chapters=selected
+            )
+            fresh, _dropped = self._description_result(
+                window, novel_title, total_chapters
+            )
+            if current == fresh:
+                continue
+            if not (
+                looks_generated(current)
+                or current == build_youtube_description(
+                    self._part_segments(window), novel_title
+                )
+            ):
+                self._stale_descriptions.add(part_dir.name)
+                customised += 1
+                continue
+            # Chapters deleted since the render would leave the description describing a
+            # different set of chapters than the audio in the .mp4 actually contains —
+            # timestamps that point nowhere. Renaming, the case this exists for, keeps the
+            # count identical; anything else is flagged rather than silently rewritten.
+            if indexed_chapter_count(current) != len(selected):
+                self._stale_descriptions.add(part_dir.name)
+                customised += 1
+                continue
+            sidecar.write_text(fresh, encoding="utf-8")
+            rewritten += 1
+        return rewritten, customised
 
     def _on_tags_ready(self, tags: str) -> None:
         self.tags_button.setEnabled(True)

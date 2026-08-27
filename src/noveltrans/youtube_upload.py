@@ -460,7 +460,11 @@ VISIBILITIES = ("public", "unlisted", "private", "schedule")
 
 @dataclass
 class UploadRequest:
-    """One part's worth of upload inputs, all read from the sidecars beside the .mp4."""
+    """One part's worth of upload inputs, all read from the sidecars beside the .mp4.
+
+    The description is clamped to YouTube's 5000-character cap on construction — see
+    `__post_init__` — so `_fill_box` can never overflow Studio's description box.
+    """
 
     video: Path
     title: str
@@ -471,6 +475,23 @@ class UploadRequest:
     visibility: str = "private"
     publish_at: datetime | None = None  # required when visibility == "schedule"
     label: str = ""  # human name for progress lines, e.g. "Phần 3"
+
+    def __post_init__(self) -> None:
+        """Clamp the description to YouTube's 5000 characters — the single choke point.
+
+        Not redundant with the builders in `tts.description`: `description` is usually read
+        straight off a `.txt` sidecar, which may have been written by a version of this app
+        that predates the cap. Every project with already-rendered oversized parts is
+        exactly the population this cap exists for, and re-rendering them just to shorten a
+        description is not something to ask of the user.
+
+        Clamping rather than raising, and here rather than in `validate()`: refusing an
+        upload over a too-long description would be a worse regression than sending a
+        shortened one.
+        """
+        from noveltrans.tts.description import clamp_description
+
+        self.description = clamp_description(self.description)
 
     def validate(self) -> None:
         """Reject a request that can't succeed, before any browser is launched."""
@@ -916,6 +937,9 @@ def _fill_box(page, selector: str, text: str, *, timeout_ms: int = _STEP_WAIT_MS
       timestamp table — several KB — and per-keystroke typing would take the better
       part of a minute and drop characters along the way. `insert_text` still fires the
       input events the Polymer binding listens for, so the value is committed.
+
+    The description arrives pre-clamped to 5000 characters (`UploadRequest.__post_init__`),
+    so nothing sent here can overflow Studio's box and get cut at a place of its choosing.
     """
     box = _first_present(page, selector, timeout_ms=timeout_ms)
     if box is None:

@@ -193,6 +193,19 @@ class TestBuildYoutubeDescription:
         ts_lines = [ln for ln in desc.splitlines() if ln[:1].isdigit()]
         assert len(ts_lines) == len(segs)
 
+    def test_is_capped_to_the_youtube_limit(self):
+        """Feature 065 — it writes the same `.txt` the rich builder does, and is what an
+        upload reads if the metadata pass fails after a successful render."""
+        from noveltrans.tts.description import (
+            YOUTUBE_DESCRIPTION_CHAR_LIMIT,
+            description_length,
+        )
+
+        segs = [_seg(300.0, f"Chương {i}: {'ả' * 45}") for i in range(400)]
+        desc = build_youtube_description(segs, "Tựa truyện")
+        assert description_length(desc) <= YOUTUBE_DESCRIPTION_CHAR_LIMIT
+        assert "Mục lục chương:" in desc
+
 
 class TestFiltergraph:
     def _graph(self):
@@ -738,6 +751,46 @@ class TestDiscoverCommittedVideoWindows:
         folder.mkdir()
         (folder / "other-slug-0091-0098.mp4").write_bytes(b"fake mp4")
         assert discover_committed_video_windows(tmp_path, "slug") == {}
+
+
+class TestIterRenderedPartDirs:
+    """Feature 065 — the shared folder scan behind commit discovery and the description
+    resync. The two callers want different things from it (a manual "đã tạo" tick counts
+    for one, a real file for the other), so it yields folders and lets them decide."""
+
+    def _dirs(self, tmp_path, slug="slug"):
+        from noveltrans.tts.video import iter_rendered_part_dirs
+
+        return [(d.name, a, b) for d, a, b in iter_rendered_part_dirs(tmp_path, slug)]
+
+    def test_nothing_when_the_directory_does_not_exist(self, tmp_path):
+        assert self._dirs(tmp_path / "nope") == []
+
+    def test_yields_every_per_part_subfolder(self, tmp_path):
+        (tmp_path / "slug-0001-0010").mkdir()
+        (tmp_path / "slug-0011-0020").mkdir()
+        assert self._dirs(tmp_path) == [
+            ("slug-0001-0010", 1, 10),
+            ("slug-0011-0020", 11, 20),
+        ]
+
+    def test_yields_a_folder_with_no_render_in_it(self, tmp_path):
+        # unlike discover_committed_video_windows, which filters on effective_created
+        (tmp_path / "slug-0001-0010").mkdir()
+        assert self._dirs(tmp_path) == [("slug-0001-0010", 1, 10)]
+
+    def test_ignores_folders_of_other_novels(self, tmp_path):
+        (tmp_path / "other-slug-0001-0010").mkdir()
+        assert self._dirs(tmp_path) == []
+
+    def test_ignores_names_that_are_not_a_span(self, tmp_path):
+        (tmp_path / "slug-notaspan").mkdir()
+        (tmp_path / "slug").mkdir()  # the whole-novel folder has no span suffix
+        assert self._dirs(tmp_path) == []
+
+    def test_ignores_loose_files(self, tmp_path):
+        (tmp_path / "slug-0001-0010.mp4").write_bytes(b"x")
+        assert self._dirs(tmp_path) == []
 
 
 class TestVideoWorker:

@@ -4,7 +4,16 @@ from __future__ import annotations
 
 from noveltrans.storage import NovelProject
 from noveltrans.tts.merge import MergeSegment
-from noveltrans.tts.video import build_upload_title, build_video_description
+from noveltrans.tts.description import (
+    YOUTUBE_DESCRIPTION_CHAR_LIMIT,
+    description_length,
+    indexed_chapter_count,
+)
+from noveltrans.tts.video import (
+    build_upload_title,
+    build_video_description,
+    fit_video_description,
+)
 
 
 class TestBuildUploadTitle:
@@ -77,6 +86,77 @@ class TestBuildVideoDescription:
 
     def test_custom_credit(self):
         assert "Tạo bởi: Kênh Khác" in self._out(credit="Kênh Khác")
+
+
+def _many(n: int, title_len: int = 45) -> list[MergeSegment]:
+    """`n` chapters with realistic Vietnamese titles — enough of them to bust the cap."""
+    return [
+        MergeSegment(path=f"{i}", seconds=350, title=f"Chương {i}: {'ả' * title_len}")
+        for i in range(1, n + 1)
+    ]
+
+
+class TestVideoDescriptionCap:
+    """Feature 065 — a part with too many chapters must not overflow YouTube's 5000."""
+
+    def _out(self, segments, **over):
+        kw = dict(
+            original_title="穿书反派", vn_title="Xuyên sách phản diện",
+            original_author="远赴人间", vn_author="Lữ khách phương xa",
+            total_chapters=1990, credit="Fox Novel",
+        )
+        kw.update(over)
+        return fit_video_description(segments, **kw)
+
+    def test_never_exceeds_the_youtube_limit(self):
+        text, _ = self._out(_many(400))
+        assert description_length(text) <= YOUTUBE_DESCRIPTION_CHAR_LIMIT
+
+    def test_header_and_credit_survive_truncation(self):
+        text, _ = self._out(_many(400))
+        assert "Tên truyện: 穿书反派" in text
+        assert "Tác giả: 远赴人间" in text
+        assert "Số chương: 1990" in text
+        assert text.rstrip().endswith("Tạo bởi: Fox Novel")
+
+    def test_first_chapter_is_still_0_00_after_truncation(self):
+        # YouTube only makes clickable chapters when the first timestamp is 0:00
+        text, dropped = self._out(_many(400))
+        assert dropped > 0
+        assert "\n0:00 Chương 1:" in text
+
+    def test_fit_reports_how_many_chapters_were_dropped(self):
+        segments = _many(400)
+        text, dropped = self._out(segments)
+        assert dropped > 0
+        # listed + reported-dropped accounts for the whole part, nothing goes missing
+        assert indexed_chapter_count(text) == len(segments)
+
+    def test_marker_line_names_the_remaining_chapters(self):
+        text, dropped = self._out(_many(400))
+        assert f"… còn {dropped} chương nữa" in text
+
+    def test_no_marker_at_a_normal_batch_size(self):
+        # The regression guard: the default batch of 10 must be completely unaffected
+        text, dropped = self._out(_many(10))
+        assert dropped == 0
+        assert "… còn " not in text
+
+    def test_max_chars_override_is_respected(self):
+        text, dropped = self._out(_many(50), max_chars=400)
+        assert description_length(text) <= 400
+        assert dropped > 0
+
+    def test_build_video_description_still_returns_just_the_text(self):
+        segments = _many(400)
+        kw = dict(
+            original_title="穿书反派", vn_title="Xuyên sách phản diện",
+            original_author="远赴人间", vn_author="Lữ khách phương xa",
+            total_chapters=1990, credit="Fox Novel",
+        )
+        assert build_video_description(segments, **kw) == fit_video_description(
+            segments, **kw
+        )[0]
 
 
 class TestMetaRoundtrip:

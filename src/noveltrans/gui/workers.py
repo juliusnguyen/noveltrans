@@ -678,6 +678,97 @@ class CompletionWorker(QThread):
         self.finished_ok.emit(reply)
 
 
+class ShortenTitlesWorker(QThread):
+    """Shorten a part's chapter titles via an LLM, in chunks, order preserved.
+
+    Backs the video tab's "Shorten by AI" button. Takes the same engine params as
+    `TagsWorker` but opens no project: it is handed plain strings and hands plain strings
+    back, so the caller owns every read and write.
+
+    Chunked because one part can hold hundreds of chapters, and a chunk whose reply doesn't
+    parse falls back to that chunk's *original* titles instead of failing the whole run —
+    losing 60 shortened titles because the model miscounted is worse than keeping them long,
+    and returning fewer lines than chapters would silently misalign every timestamp after
+    the gap. The returned list therefore always has exactly one entry per input title.
+
+    Only a translator that can't be built, an engine without `complete()`, or *every* chunk
+    falling back reaches `failed`.
+    """
+
+    CHUNK = 60
+
+    progress = Signal(int, int)  # titles done, total
+    finished_ok = Signal(list, int)  # shortened titles, chunks that fell back
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        titles: list[str],
+        engine_name: str,
+        *,
+        api_key: str = "",
+        model: str = "",
+        cli_command: str = "",
+        base_url: str = "",
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.titles = list(titles)
+        self.engine_name = engine_name
+        self.api_key = api_key
+        self.model = model
+        self.cli_command = cli_command
+        self.base_url = base_url
+
+    def run(self) -> None:
+        from noveltrans.translators import get_translator
+        from noveltrans.tts.description import build_shorten_prompt, parse_shortened_titles
+
+        if not self.titles:
+            self.finished_ok.emit([], 0)
+            return
+        try:
+            translator = get_translator(
+                self.engine_name,
+                api_key=self.api_key,
+                model=self.model,
+                cli_command=self.cli_command,
+                base_url=self.base_url,
+            )
+        except NovelTransError as exc:
+            self.failed.emit(str(exc))
+            return
+        if not translator.supports_completion:
+            self.failed.emit(
+                "Engine này không rút gọn được tên chương — hãy chọn CLI Agent, Claude "
+                "hoặc LM Studio."
+            )
+            return
+
+        result: list[str] = []
+        fell_back = 0
+        chunks = 0
+        for start in range(0, len(self.titles), self.CHUNK):
+            chunk = self.titles[start:start + self.CHUNK]
+            chunks += 1
+            try:
+                raw = translator.complete(build_shorten_prompt(chunk))
+                shortened, ok = parse_shortened_titles(raw, chunk)
+            except NovelTransError:
+                shortened, ok = list(chunk), False
+            except Exception:  # noqa: BLE001 — engine/library-specific errors
+                shortened, ok = list(chunk), False
+            if not ok:
+                fell_back += 1
+            result.extend(shortened)
+            self.progress.emit(len(result), len(self.titles))
+
+        if fell_back == chunks:
+            self.failed.emit("Không rút gọn được tên chương (phản hồi không hợp lệ).")
+            return
+        self.finished_ok.emit(result, fell_back)
+
+
 @dataclass
 class _AudioResult:
     """One chapter's synthesis outcome, passed from a pool thread back to the
@@ -1503,8 +1594,8 @@ class VideoWorker(PausableWorker):
             FONT_NAME,
             _with_real_durations,
             build_upload_title,
-            build_video_description,
             discover_committed_video_windows,
+            fit_video_description,
             font_dir_context,
             plan_locked_video_windows,
             render_video,
@@ -1641,7 +1732,7 @@ class VideoWorker(PausableWorker):
                         self._write_metadata(
                             project, out_path, novel_title, segments, part_num, font_dir,
                             _with_real_durations, build_upload_title,
-                            build_video_description, video_font, render_thumbnail,
+                            fit_video_description, video_font, render_thumbnail,
                         )
                         written += 1
                         self.file_done.emit(str(out_path))
@@ -1659,7 +1750,7 @@ class VideoWorker(PausableWorker):
 
     def _write_metadata(
         self, project, out_path, novel_title, segments, part_num, font_dir,
-        with_real_durations, build_upload_title, build_video_description,
+        with_real_durations, build_upload_title, fit_video_description,
         video_font, render_thumbnail,
     ) -> None:
         """Write the title / description / tags / thumbnail sidecars next to `out_path`.
@@ -1681,7 +1772,7 @@ class VideoWorker(PausableWorker):
         title = build_upload_title(novel_title, part_num)
         sidecar(".title.txt").write_text(title + "\n", encoding="utf-8")
 
-        desc = build_video_description(
+        desc, _dropped = fit_video_description(
             timed,
             original_title=project.meta.title,
             vn_title=novel_title,
@@ -1690,7 +1781,11 @@ class VideoWorker(PausableWorker):
             total_chapters=project.counts()["total"],
             credit=self.credit or "Fox Novel",
         )
-        sidecar(".txt").write_text(desc, encoding="utf-8")  # richer than render_video's
+        # Richer than render_video's, and already capped to YouTube's 5000 characters —
+        # `_dropped` (chapters lopped off the index to fit) is discarded here on purpose:
+        # the parts table flags an over-long part *before* the render, which is when the
+        # user can still do something about it.
+        sidecar(".txt").write_text(desc, encoding="utf-8")
 
         if self.tags.strip():
             from noveltrans.tts.tags import format_tags, parse_tags
