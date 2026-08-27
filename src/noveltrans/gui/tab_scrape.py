@@ -50,6 +50,11 @@ _UNLOCK_SETTLE_MS = 6_000
 
 class ScrapeTab(QWidget):
     project_changed = Signal(str)  # project path — other tabs refresh their pickers
+    # the novel's name changed (or first arrived) — the workspace tab relabels itself.
+    # Separate from project_changed because the NAME can change without the project
+    # doing so: the first slot of `novel_label` is the translation, which only exists
+    # after a translation run fills it in on a novel that was already open.
+    title_changed = Signal(str)
 
     def __init__(self, config: AppConfig, parent=None):
         super().__init__(parent)
@@ -628,8 +633,10 @@ class ScrapeTab(QWidget):
 
     def _show_meta(self, meta) -> None:
         """Fill the metadata panel; translated info shows next to the original."""
-        # Same pairing the project picker shows, formatted in one place.
-        self.title_label.setText(meta.bilingual_title())
+        # Same naming the picker and the novel tab bar show, formatted in one place.
+        # No source here: this panel sits under the URL box the novel was scraped from,
+        # so repeating the domain would only spend width on something already on screen.
+        self.title_label.setText(meta.novel_label(with_source=False))
         self.author_label.setText(meta.author or "—")
         if meta.translated_description:
             self.desc_label.setText(meta.translated_description)
@@ -637,6 +644,11 @@ class ScrapeTab(QWidget):
         else:
             self.desc_label.setText(meta.description or "—")
             self.desc_label.setToolTip("")
+        # `_show_meta` is the single point where fresh meta reaches the UI — on load, and
+        # again from `showEvent` once a translation run has filled `translated_title`. So
+        # this is the one place that can keep the tab label from going stale. The host's
+        # handler is idempotent, so re-emitting the same name costs nothing.
+        self.title_changed.emit(self.current_title())
 
     def showEvent(self, event) -> None:  # a translation run may have filled the meta
         busy = any(
@@ -681,8 +693,13 @@ class ScrapeTab(QWidget):
         self.range_to.setValue(top)  # default: to the last chapter
 
     def current_title(self) -> str:
-        """The loaded novel's title (for the workspace tab label), or ""."""
-        return self.project.meta.title if self.project is not None else ""
+        """The loaded novel's name for the workspace tab and its tooltip, or "".
+
+        The one naming rule (`NovelMeta.novel_label`): translation — original — source,
+        the same string the picker shows, so the bar and the picker cannot disagree about
+        what a novel is called.
+        """
+        return self.project.meta.novel_label() if self.project is not None else ""
 
     def _job_novel(self) -> str:
         """The novel label for the menu-bar job row — this tab's own project.

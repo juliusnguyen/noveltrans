@@ -25,6 +25,11 @@ ACCENT = "#3f7bef"
 ACCENT_HI = "#5590ff"
 ACCENT_LO = "#3468d6"
 
+# Width of the vertical novel column. Shared with WorkspaceTabBar.tabSizeHint and with the
+# min/max-width in VERTICAL_WORKSPACE_TABS_QSS below, so the row rect and the QSS box that
+# the label is measured against cannot drift apart.
+TAB_COLUMN_WIDTH = 190
+
 # The menu-bar popup is a top-level window, so it does NOT inherit the main window's
 # styling context — it needs its own surface/border rules or it renders as a bare grey box.
 _POPUP_QSS = f"""
@@ -467,4 +472,57 @@ def repolish(widget) -> None:
 
 
 # `Qt` re-exported for callers that style ad-hoc widgets alongside the theme.
-__all__ = ["apply_theme", "mark_primary", "repolish", "Qt"]
+
+
+# Applied to MainWindow.workspaces ONLY while the bar is vertical — never app-wide, and
+# never as an edit to _QSS. The outer-tab rules above are written for a tab that merges
+# into the pane BELOW it (border-bottom: none, top corners rounded, margin-right for the
+# gap); a left-hand column merges into the pane on its RIGHT instead, and its gap is
+# vertical. Cleared with setStyleSheet("") when the user switches back.
+#
+# The selectors deliberately match the app sheet's specificity. Shortening them to
+# `QTabBar::tab` would LOSE to `QTabWidget#workspaceTabs > QTabBar::tab` and silently do
+# nothing.
+VERTICAL_WORKSPACE_TABS_QSS = f"""
+QTabWidget#workspaceTabs::pane {{
+    border: 1px solid {BORDER};
+    border-radius: 10px;
+    top: 0;
+    left: -1px;
+    background-color: {SURFACE};
+}}
+QTabWidget#workspaceTabs > QTabBar::tab {{
+    background: {BG};
+    color: {MUTED};
+    padding: 7px 26px 7px 14px;
+    margin-right: 0;
+    margin-bottom: 3px;
+    border: 1px solid {BORDER};
+    border-right: none;
+    border-top-left-radius: 9px;
+    border-bottom-left-radius: 9px;
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+    min-width: {TAB_COLUMN_WIDTH}px;
+    max-width: {TAB_COLUMN_WIDTH}px;
+}}
+QTabWidget#workspaceTabs > QTabBar::tab:selected {{
+    background: {SURFACE};
+    color: {TEXT};
+    border-color: {BORDER_HI};
+}}
+QTabWidget#workspaceTabs > QTabBar::tab:hover:!selected {{
+    background: {SURFACE_HI};
+    color: {TEXT};
+}}
+"""
+
+
+__all__ = [
+    "apply_theme",
+    "mark_primary",
+    "repolish",
+    "Qt",
+    "TAB_COLUMN_WIDTH",
+    "VERTICAL_WORKSPACE_TABS_QSS",
+]

@@ -72,15 +72,14 @@ STATUS_COLORS = {
 
 
 def _picker_label(meta) -> str:
-    """One row of the novel picker: "原文  —  Bản dịch — site.com".
+    """One row of the novel picker: "Bản dịch — 原文 — site.com".
 
     `project_meta` already parses the whole meta.json, so the translated title is in hand
-    here — no project open, no extra disk read. Each half is dropped when absent, so an
-    untranslated novel is just its title and a local one carries no site suffix.
+    here — no project open, no extra disk read. `NovelMeta.novel_label` owns the format,
+    shared with the novel tab bar and the "Thông tin truyện" header so the three cannot
+    drift apart; each part is dropped when absent.
     """
-    label = meta.bilingual_title()
-    host = meta.source_host()
-    return f"{label} — {host}" if host else label
+    return meta.novel_label()
 
 
 class ProjectPicker(QComboBox):

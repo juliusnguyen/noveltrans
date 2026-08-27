@@ -417,7 +417,7 @@ class TestProjectPickerLabel:
         from noveltrans.gui.widgets import _picker_label
 
         label = _picker_label(self._meta(translated_title="Xuyên thư thành phản diện"))
-        assert label == "穿書反派  —  Xuyên thư thành phản diện — twkan.com"
+        assert label == "Xuyên thư thành phản diện — 穿書反派 — twkan.com"
 
     def test_an_untranslated_novel_has_no_dangling_separator(self):
         # Before the first translation run there is no Vietnamese title at all.
@@ -455,8 +455,37 @@ class TestProjectPickerLabel:
         )
         assert label == "Truyện tự soạn"
 
-    def test_the_scrape_tab_header_uses_the_same_pairing(self):
-        # ScrapeTab._show_meta and the picker format the two titles identically — one
-        # helper, so they cannot drift apart.
+    def test_the_scrape_tab_header_uses_the_same_naming_minus_the_site(self):
+        # ScrapeTab._show_meta and the picker share one helper, so they cannot drift
+        # apart. The header drops the site: it sits under the URL box the novel came
+        # from, so the domain is already on screen.
         meta = self._meta(translated_title="Xuyên thư thành phản diện")
-        assert meta.bilingual_title() == "穿書反派  —  Xuyên thư thành phản diện"
+        assert meta.novel_label(with_source=False) == "Xuyên thư thành phản diện — 穿書反派"
+
+    def test_the_translation_comes_first(self):
+        """Feature 068 reversed this. A tab column shows ~20 characters, and spending them
+        on text the user does not think in buried the half that identifies the novel."""
+        meta = self._meta(translated_title="Xuyên thư thành phản diện")
+        assert meta.novel_label().startswith("Xuyên thư thành phản diện")
+
+    def test_a_display_title_override_wins_the_first_slot(self):
+        """`display_title` is the user's own name for the novel (feature 025) and exists
+        to drop tags like "[ĐM/EDIT] " — so it beats the raw machine translation here."""
+        meta = self._meta(
+            translated_title="[ĐM/EDIT] Xuyên thư thành phản diện",
+            display_title="Xuyên Thư Phản Diện",
+        )
+        assert meta.novel_label() == "Xuyên Thư Phản Diện — 穿書反派 — twkan.com"
+
+    def test_a_whitespace_only_display_title_falls_through(self):
+        meta = self._meta(
+            translated_title="Xuyên thư thành phản diện", display_title="   "
+        )
+        assert meta.novel_label().startswith("Xuyên thư thành phản diện")
+
+    def test_a_local_untranslated_novel_is_just_its_title(self):
+        """Every part optional: nothing to translate, no site — no stray separators."""
+        from noveltrans.models import new_local_url
+
+        meta = self._meta(url=new_local_url(), site="local", title="Truyện tự soạn")
+        assert meta.novel_label() == "Truyện tự soạn"

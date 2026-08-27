@@ -422,3 +422,139 @@ class TestDockIcon:
         monkeypatch.setattr(main, "showNormal", lambda: order.append("window"))
         main.show_from_tray()
         assert order == ["dock", "window"]
+
+
+class TestWorkspaceTabOrientation:
+    """Feature 068 — the novel bar as a left-hand column, and the naming that goes on it.
+
+    Two of these are regressions for Qt behaviour that is easy to miss and impossible to
+    see in a unit test that only checks `tabPosition()`: Qt places a vertical tab's close
+    button from the transposed frame (top-centre instead of right-edge), and it gives a
+    QTabWidget's corner widgets zero geometry entirely when the bar is West/East.
+    """
+
+    def _config(self, tmp_path, *, vertical):
+        from PySide6.QtCore import QSettings
+
+        config = AppConfig()
+        config._s = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+        config.workspace_tabs_vertical = vertical
+        # An EMPTY library, not the default one. `AppConfig.library_dir` falls back to the
+        # real ~/NovelTrans, and a fresh workspace's picker auto-selects the first project
+        # it finds there — so without this a test asserting on a fresh tab's label reads
+        # whatever novel happens to sort first on the developer's machine.
+        library = tmp_path / "empty-library"
+        library.mkdir(exist_ok=True)
+        config.library_dir = library
+        return config
+
+    def _window(self, tmp_path, monkeypatch, *, vertical):
+        monkeypatch.setattr(mw, "AppState", lambda: AppState(state_dir=tmp_path))
+        return mw.MainWindow(self._config(tmp_path, vertical=vertical))
+
+    def test_the_bar_is_vertical_by_default(self, main):
+        from PySide6.QtWidgets import QTabWidget
+
+        assert main.workspaces.tabPosition() is QTabWidget.TabPosition.West
+        assert main.workspaces.tabBar().is_vertical is True
+
+    def test_horizontal_setting_puts_the_bar_back_on_top(self, qapp, tmp_path, monkeypatch):
+        from PySide6.QtWidgets import QTabWidget
+
+        window = self._window(tmp_path, monkeypatch, vertical=False)
+        try:
+            assert window.workspaces.tabPosition() is QTabWidget.TabPosition.North
+            assert window.workspaces.tabBar().is_vertical is False
+            # the vertical override sheet is cleared, so the app-wide rules apply again
+            assert window.workspaces.styleSheet() == ""
+        finally:
+            window.close()
+
+    def test_switching_orientation_keeps_every_tab(self, main):
+        """The live-apply guarantee: flipping the setting must not cost tabs or state."""
+        ws2 = main._add_workspace()
+        main._set_ws_title(main.workspaces.widget(0), "Truyện A — 原文 — a.com")
+        main._set_ws_title(ws2, "Truyện B — 原文 — b.com")
+        main.workspaces.setCurrentIndex(1)
+        before = (
+            main.workspaces.count(),
+            [main.workspaces.tabText(i) for i in range(main.workspaces.count())],
+            [main.workspaces.tabToolTip(i) for i in range(main.workspaces.count())],
+            main.workspaces.currentIndex(),
+        )
+
+        main.config.workspace_tabs_vertical = False
+        main._apply_tab_orientation()
+        main.config.workspace_tabs_vertical = True
+        main._apply_tab_orientation()
+
+        assert (
+            main.workspaces.count(),
+            [main.workspaces.tabText(i) for i in range(main.workspaces.count())],
+            [main.workspaces.tabToolTip(i) for i in range(main.workspaces.count())],
+            main.workspaces.currentIndex(),
+        ) == before
+
+    def test_vertical_tabs_are_wide_rows_not_tall_columns(self, main):
+        from noveltrans.gui.style import TAB_COLUMN_WIDTH
+
+        bar = main.workspaces.tabBar()
+        hint = bar.tabSizeHint(0)
+        assert hint.width() == TAB_COLUMN_WIDTH
+        assert hint.height() < hint.width()
+
+    def test_the_close_button_sits_at_the_right_edge_of_a_vertical_tab(self, main):
+        """Regression: Qt puts it top-centre (x≈86 of 190) using the transposed frame."""
+        from PySide6.QtWidgets import QTabBar
+
+        bar = main.workspaces.tabBar()
+        bar.resize(bar.sizeHint())
+        bar.grab()  # force a real paintEvent, which is where the buttons are placed
+        button = bar.tabButton(0, QTabBar.ButtonPosition.RightSide)
+        tab = bar.tabRect(0)
+        assert button is not None
+        assert tab.right() - button.geometry().right() < 12, "button is not at the edge"
+        assert tab.top() < button.geometry().center().y() < tab.bottom()
+
+    def test_the_settings_and_new_buttons_are_visible_in_both_orientations(self, main):
+        """Regression: Qt gives corner widgets QRect(0,0,0,0) on a West/East bar, so the
+        ⚙ and ＋ buttons silently vanish unless they are rehoused."""
+        for vertical in (True, False, True):
+            main.config.workspace_tabs_vertical = vertical
+            main._apply_tab_orientation()
+            main.show()
+            for button in (main.settings_button, main.new_button):
+                assert button.isVisibleTo(main), f"hidden when vertical={vertical}"
+                assert button.sizeHint().width() > 0
+        main.hide()
+
+    def test_the_tab_label_is_not_hand_truncated(self, main):
+        """Elision plus a tooltip replaced the old 24-character chop, so the full name is
+        what is stored — and the tooltip is what makes the elided part readable."""
+        label = "Xuyên thư thành phản diện — 穿書反派 — twkan.com"
+        main._set_ws_title(main.workspaces.widget(0), label)
+        assert main.workspaces.tabText(0) == label
+        assert main.workspaces.tabToolTip(0) == label
+        assert "…" not in main.workspaces.tabText(0)
+
+    def test_a_tab_with_no_novel_has_no_tooltip(self, qapp, tmp_path, monkeypatch):
+        """Its "Truyện 1" label is fully visible; a tooltip repeating it is noise.
+
+        Builds its own window because the shared `main` fixture isolates AppState but not
+        the library, so its first workspace auto-loads a real novel and is never blank.
+        """
+        window = self._window(tmp_path, monkeypatch, vertical=True)
+        try:
+            assert window.workspaces.tabText(0).startswith("Truyện")
+            assert window.workspaces.tabToolTip(0) == ""
+        finally:
+            window.close()
+
+    def test_an_empty_title_leaves_the_default_label_alone(self, qapp, tmp_path, monkeypatch):
+        window = self._window(tmp_path, monkeypatch, vertical=True)
+        try:
+            window._set_ws_title(window.workspaces.widget(0), "")
+            assert window.workspaces.tabText(0).startswith("Truyện")
+            assert window.workspaces.tabToolTip(0) == ""
+        finally:
+            window.close()
