@@ -24,9 +24,12 @@ test-live:
 lint:
 	$(VENV)/bin/ruff check src tests
 
-## Vẽ lại icon (packaging/NovelTrans.icns) từ PNG
+## Dựng lại toàn bộ icon từ design/logo-icon.png + design/bar-icon.png
 icon:
-	QT_QPA_PLATFORM=offscreen $(PY) packaging/make_icon.py packaging/NovelTrans.png
+	$(PY) packaging/make_icon.py packaging/NovelTrans.png \
+		--asset src/noveltrans/gui/assets/app-icon.png
+	$(PY) packaging/make_tray_glyph.py
+	$(PY) packaging/make_ico.py packaging/NovelTrans.png
 	rm -rf packaging/NovelTrans.iconset && mkdir packaging/NovelTrans.iconset
 	for s in 16 32 128 256 512; do \
 		sips -z $$s $$s packaging/NovelTrans.png --out packaging/NovelTrans.iconset/icon_$${s}x$${s}.png >/dev/null; \
