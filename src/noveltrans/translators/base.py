@@ -6,6 +6,7 @@ import re
 import time
 from abc import ABC, abstractmethod
 
+from noveltrans.translators.ads import drop_site_ads
 from noveltrans.errors import TranslateError
 
 _CJK_RE = re.compile(r"[㐀-䶿一-鿿豈-﫿]")
@@ -98,4 +99,13 @@ class Translator(ABC):
         translated_title = self._translate_with_retry(title, source, target) if title else ""
         chunks = split_paragraph_chunks(content, self.max_chunk_chars)
         translated_chunks = [self._translate_with_retry(c, source, target) for c in chunks]
-        return translated_title.strip(), "\n\n".join(translated_chunks).strip()
+        # Source-site watermarks are stripped HERE, not inside `_translate_with_retry`:
+        # that loop scores each attempt by `cjk_count(result)` to pick the cleanest one,
+        # and filtering before the count would silently change which attempt wins — a
+        # behaviour change to an unrelated heuristic. Here it is also once per chapter on
+        # the joined body, so a paragraph break at a chunk seam normalises correctly.
+        # `complete()` is deliberately NOT filtered: tags and image prompts go through it.
+        return (
+            drop_site_ads(translated_title.strip()),
+            drop_site_ads("\n\n".join(translated_chunks).strip()),
+        )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import anthropic
 
+from noveltrans.translators.ads import PROMPT_RULE
 from noveltrans.errors import TranslateError
 from noveltrans.translators.base import Translator
 
@@ -19,6 +20,7 @@ _SYSTEM_PROMPT = (
     "title — translate exactly what is given; NEVER ask for more text and NEVER "
     "remark that content seems missing. "
     "Translate every word — leave NO Chinese characters in the output. "
+    f"{PROMPT_RULE}"
     "Output ONLY the translation — no notes, no explanations, no preamble."
 )
 
