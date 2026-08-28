@@ -23,6 +23,9 @@ _NAME_RULES = {
     "vi": (
         "Render ALL Chinese person and place names in Sino-Vietnamese (Hán-Việt) "
         "reading, never pinyin — e.g. 傅清辭 -> Phó Thanh Từ, 江妤 -> Giang Dư. "
+        "Any name already written in Latin script is a Vietnamese Hán-Việt name: copy it "
+        "EXACTLY, character for character — never re-spell it, never translate it, "
+        "never convert it to pinyin. "
     ),
     "en": "Render Chinese person names in standard pinyin without tone marks. ",
 }

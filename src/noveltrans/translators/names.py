@@ -198,14 +198,29 @@ def _dominant_follower(corpus: str, candidate: str) -> bool:
     return bool(re.match(f"[{_CJK}]", top_char or "")) and top_count >= 0.8 * total
 
 
+def detect_names(corpus: str, min_count: int = 5) -> list[tuple[str, str, int]]:
+    """`(chinese, hán-việt or "", count)` for every recurring name, in count order.
+
+    Deliberately keeps the names `to_hanviet` could not convert, which `build_glossary`
+    drops on the floor. A name is dropped whole when even one character has no reading
+    (`to_hanviet` returns None), so a common given-name character missing from the table
+    silently costs the whole name — and the user can never see that it happened.
+
+    The review list built on this shows those names with an empty reading so they can be
+    filled in by hand, which is why this returns them rather than filtering.
+    """
+    counts = extract_names(corpus, min_count)
+    return [
+        (name, to_hanviet(name) or "", count)
+        for name, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+
+
 def build_glossary(corpus: str, min_count: int = 5) -> dict[str, str]:
     """{chinese_name: 'Hán Việt'} for every convertible recurring name."""
-    glossary: dict[str, str] = {}
-    for name in extract_names(corpus, min_count):
-        hanviet = to_hanviet(name)
-        if hanviet:
-            glossary[name] = hanviet
-    return glossary
+    return {
+        name: reading for name, reading, _count in detect_names(corpus, min_count) if reading
+    }
 
 
 def apply_glossary(text: str, glossary: dict[str, str]) -> str:

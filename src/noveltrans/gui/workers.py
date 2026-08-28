@@ -214,7 +214,13 @@ class TranslateWorker(PausableWorker):
         self.finished_ok.emit(done, 0)
 
     def run(self) -> None:
-        from noveltrans.translators.names import apply_glossary, build_glossary
+        from noveltrans.name_glossary import (
+            applied_glossary,
+            build_from_project,
+            read_names,
+            write_names,
+        )
+        from noveltrans.translators.names import apply_glossary
 
         project = NovelProject.open(self.project_path)
         try:
@@ -250,15 +256,33 @@ class TranslateWorker(PausableWorker):
             done = 0
             errors = 0
 
-            # Google romanizes Chinese names to pinyin; for Vietnamese output,
-            # pre-replace recurring names with their Hán-Việt reading so the
-            # whole novel gets consistent, correctly-styled names.
+            # Pre-replace recurring character names with their Hán-Việt reading, so the
+            # same person is spelled the same way in every chapter.
+            #
+            # This used to run for Google only, on the reasoning that Google romanises
+            # names to pinyin while the LLM engines are told to use Hán-Việt in their
+            # prompt. But a prompt instruction only has scope over ONE request, and a long
+            # chapter is several requests — so the LLM engines had nothing enforcing
+            # consistency at all and re-derived every name from scratch. That is feature
+            # 072's bug report: one novel's character came back with two different
+            # spellings in different chapters.
+            #
+            # The list is read from the novel's own `names.json` rather than rebuilt each
+            # run, so the user's corrections stick and the run is deterministic. A novel
+            # that has never been scanned gets one built and saved here — the review dialog
+            # is the CORRECTION path, not the activation path, or every existing user would
+            # silently lose the substitution they have today.
             glossary: dict[str, str] = {}
-            if self.engine_name == "google" and self.target_lang == "vi":
-                corpus = "\n".join(
-                    c.title + "\n" + c.content for c in project.chapters() if c.content
-                )
-                glossary = build_glossary(corpus)
+            if self.target_lang == "vi":
+                entries = read_names(project.path)
+                if not entries:
+                    self.progress.emit(0, total, "Đang dò tên nhân vật…")
+                    entries = build_from_project(project)
+                    if entries:
+                        write_names(project.path, entries, chapters_scanned=total)
+                glossary = applied_glossary(entries)
+            if self._cancelled:
+                return
 
             # translate the novel title/description once, for export front matter
             if project.meta.translated_lang != self.target_lang and not self._cancelled:
@@ -484,6 +508,35 @@ class RewriteWorker(PausableWorker):
         if not self.dry_run:
             project.mark_error(idx, message)
         self.chapter_error.emit(idx, message)
+
+
+class NameScanWorker(QThread):
+    """Detect character names across a whole novel, off the GUI thread.
+
+    Reads only: the review dialog decides what to keep and writes the file itself. Joining
+    a whole novel's text and initialising the segmenter takes seconds to minutes on a long
+    novel, which is the only reason this is a thread at all.
+    """
+
+    scanned = Signal(list)  # list[NameEntry]
+
+    def __init__(self, project_path, parent=None):
+        super().__init__(parent)
+        self.project_path = project_path
+
+    def run(self) -> None:
+        from noveltrans.name_glossary import build_from_project
+        from noveltrans.storage import NovelProject
+
+        # Its own handle: this runs on a different thread from whoever opened the project.
+        project = NovelProject.open(self.project_path)
+        try:
+            entries = build_from_project(project)
+        except Exception:  # noqa: BLE001 — a failed scan must not take the window down
+            entries = []
+        finally:
+            project.close()
+        self.scanned.emit(entries)
 
 
 class CliModelsWorker(QThread):
