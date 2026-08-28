@@ -57,6 +57,7 @@ class TranslateTab(QWidget):
         # or quitting mid-rewrite abandons a running QThread.
         self._rewrite_worker: RewriteWorker | None = None
         self._rewrite_dialog: RewriteDialog | None = None
+        self._names_dialog = None  # NameGlossaryDialog; imported lazily where used
         # Modeless, unlike the rewrite dialog: it stays up while the user fixes
         # matches by hand in the panes, so the tab has to track and steer it.
         self._find_dialog: FindReplaceDialog | None = None
@@ -174,6 +175,12 @@ class TranslateTab(QWidget):
             "Thay thế hàng loạt trong bản dịch/bản gốc (ví dụ: sửa một tên nhân vật)."
         )
         self.find_replace_button.clicked.connect(self._open_find_replace)
+        self.names_button = QPushButton("👤 Tên nhân vật")
+        self.names_button.setToolTip(
+            "Xem và sửa cách viết tên nhân vật. Tên trong danh sách được thay sẵn trước "
+            "khi gửi cho AI, nên mọi chương đều viết giống nhau."
+        )
+        self.names_button.clicked.connect(self._open_names)
         self.rewrite_button = QPushButton("✍️ Viết lại văn phong")
         self.rewrite_button.setToolTip(
             "Dùng AI viết lại bản dịch cho đúng văn phong tiếng Việt (truyện convert dịch "
@@ -191,6 +198,7 @@ class TranslateTab(QWidget):
         bottom_row.addWidget(self.translate_button)
         bottom_row.addWidget(self.retranslate_button)
         bottom_row.addWidget(self.find_replace_button)
+        bottom_row.addWidget(self.names_button)
         bottom_row.addWidget(self.rewrite_button)
         bottom_row.addWidget(self.cancel_button)
         bottom_row.addWidget(self.pause_button)
@@ -618,6 +626,38 @@ class TranslateTab(QWidget):
             self._load_preview(self.project.chapter(self._preview_idx))
 
     # --------------------------------------------------------------- rewrite
+
+    def _open_names(self) -> None:
+        """Review the novel's character-name list — see `name_glossary.py`."""
+        from noveltrans.gui.name_glossary_dialog import NameGlossaryDialog
+
+        if self.project is None:
+            QMessageBox.information(self, "Chưa chọn truyện", "Hãy tải một truyện ở Tab 1 trước.")
+            return
+        if self._busy():
+            self.status_label.setText(self._busy_message())
+            return
+        # Same flush as the rewrite dialog: a half-typed manual edit must reach the database
+        # before a dialog reads or rewrites the same rows.
+        self._save_preview_edits()
+        self._save_original_edits()
+
+        dialog = NameGlossaryDialog(self.project, self)
+        self._names_dialog = dialog
+        dialog.applied.connect(self._on_replacements_applied)  # same refresh as find/replace
+        dialog.retranslate_requested.connect(self._retranslate_indices)
+        try:
+            dialog.exec()
+        finally:
+            self._names_dialog = None
+
+    def _retranslate_indices(self, indices: list) -> None:
+        """Drop the translations of `indices` and queue exactly those for another pass."""
+        if self.project is None or not indices:
+            return
+        self.project.clear_translations(list(indices))
+        self._reload_table()
+        self._start_translate(indices=list(indices))
 
     def _open_rewrite(self) -> None:
         if self.project is None:
