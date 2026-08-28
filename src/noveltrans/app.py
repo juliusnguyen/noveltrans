@@ -5,12 +5,14 @@ from __future__ import annotations
 import sys
 
 from PySide6.QtCore import QEvent, QObject
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
 from noveltrans import __version__
 from noveltrans.config import AppConfig
 from noveltrans.gui import keep_awake
 from noveltrans.gui.dock import POLICY_REGULAR, current_policy
+from noveltrans.gui.icons import load_pixmap
 from noveltrans.gui.main_window import MainWindow
 from noveltrans.gui.style import apply_theme
 from noveltrans.gui.tray import TrayController
@@ -60,6 +62,10 @@ def main() -> int:
     app.setApplicationName("NovelTrans")
     app.setApplicationVersion(__version__)
     app.setOrganizationName("noveltrans")
+    # On macOS the .app bundle's own icon owns the Dock, so this only shows up in a
+    # `make run` dev session; on Windows and Linux it is also the window and taskbar
+    # icon. A missing asset yields a null pixmap and simply leaves the app iconless.
+    app.setWindowIcon(QIcon(load_pixmap("app-icon.png")))
     apply_theme(app)
     # The window may be hidden to the menu bar while jobs run, so hiding it must not be
     # read as "the last window closed, quit". TrayController owns the matching flag on

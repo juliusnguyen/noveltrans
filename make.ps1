@@ -53,15 +53,16 @@ switch ($Target) {
         & $Ruff check src tests
     }
     "icon" {
-        # Build packaging/NovelTrans.ico from the already-committed NovelTrans.png.
+        # Mirrors the Makefile's `icon` target. Both converters are Pillow-only and read
+        # from design/, so they behave identically here — the older warning about
+        # make_icon.py needing the macOS-only "Songti SC" font no longer applies now that
+        # the icon is converted from design/logo-icon.png rather than drawn with Qt.
         #
-        # Deliberately does NOT re-run make_icon.py on Windows: that script draws the
-        # glyph with the macOS-only "Songti SC" font, and this offscreen Qt platform
-        # can't find any font at all to fall back to (QFontDatabase: Cannot find font
-        # directory ...) — it silently renders blank tofu boxes instead of erroring.
-        # Re-running it here would replace the correct, macOS-rendered PNG with a
-        # broken one. If NovelTrans.png ever needs to change, regenerate it on macOS
-        # via `make icon` and commit the result; this just derives the .ico from it.
+        # The one thing still missing on Windows is packaging/NovelTrans.icns: sips and
+        # iconutil are macOS-only, so the .icns has to be rebuilt with `make icon`.
+        & $Py packaging/make_icon.py packaging/NovelTrans.png `
+            --asset src/noveltrans/gui/assets/app-icon.png
+        & $Py packaging/make_tray_glyph.py
         & $Py packaging/make_ico.py packaging/NovelTrans.png
     }
     "app" {

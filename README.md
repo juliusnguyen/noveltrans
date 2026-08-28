@@ -125,7 +125,10 @@ make dmg                      # → dist/NovelTrans.app + dist/NovelTrans.dmg
 App **chưa được ký (unsigned)**, nên lần đầu mở macOS sẽ cảnh báo. Cách mở:
 chuột phải vào app → **Open** → **Open**, hoặc chạy `xattr -cr /Applications/NovelTrans.app`.
 Model TTS (~334 MB) tải về lần đầu khi dùng tab "Nghe audio" (cần mạng).
-Đổi icon: sửa `packaging/make_icon.py` rồi `make icon`.
+Đổi icon: thay ảnh nguồn trong `design/` rồi chạy `make icon`. Lệnh này dựng lại tất cả
+từ hai file: `design/logo-icon.png` → icon app (`packaging/NovelTrans.png`, `.icns`,
+`.ico` và `src/noveltrans/gui/assets/app-icon.png`), `design/bar-icon.png` → biểu tượng
+thanh menu (`src/noveltrans/gui/assets/tray-glyph.png`).
 
 ## Đóng gói thành app Windows
 
@@ -149,9 +152,9 @@ bản **essentials** (không phải "full", để dung lượng gói cài nhỏ 
 commit vào git (xem `.gitignore`).
 
 Model TTS (~330 MB) tải về lần đầu khi dùng tab "Nghe audio" (cần mạng), giống macOS.
-Icon dùng chung `packaging/NovelTrans.png`; `.\make.ps1 icon` chỉ tạo lại
-`packaging/NovelTrans.ico` từ PNG đã có sẵn — **không** vẽ lại PNG (script vẽ icon dùng
-font "Songti SC" chỉ có trên macOS).
+Icon dùng chung nguồn trong `design/`. `.\make.ps1 icon` dựng lại được mọi thứ trừ
+`packaging/NovelTrans.icns` — file đó cần `sips`/`iconutil` (chỉ có trên macOS), nên
+phải chạy `make icon` trên macOS rồi commit kết quả.
 
 ## Cấu hình
 
