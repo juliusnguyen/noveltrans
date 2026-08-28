@@ -285,3 +285,123 @@ def test_launching_a_download_registers_a_job(qapp, library_dir, monkeypatch):
 def test_the_pause_button_starts_disabled(qapp, library_dir):
     tab = _tab_with_project(qapp, library_dir)
     assert not tab.pause_button.isEnabled()  # nothing running yet
+
+
+def _timotxt_tab(qapp, library_dir, n=4) -> ScrapeTab:
+    """A tab on a timotxt project whose chapter 1 was stored with an undecoded glyph."""
+    config = AppConfig()
+    config.library_dir = library_dir
+    meta = NovelMeta(
+        url="https://www.timotxt.com/2608569069/", site="timotxt", title="T"
+    )
+    refs = [
+        ChapterRef(index=i, title=f"C{i + 1}", url=f"https://www.timotxt.com/2608569069/{i + 1}.html")
+        for i in range(n)
+    ]
+    project = NovelProject.create(library_dir, meta, refs)
+    project.save_content(0, "뷁走進院子。")          # residue — needs repair
+    project.save_translation(0, "C1", "bản dịch hỏng", "vi")
+    project.save_audio(0, "exports/audio/0.wav", "Ngọc Lan", 9.0)
+    project.save_content(1, "他走進院子。")           # clean — must be left alone
+    project.save_translation(1, "C2", "bản dịch tốt", "vi")
+    project.close()
+    tab = ScrapeTab(config)
+    tab._load_project(project.path)
+    return tab
+
+
+class TestResidueRepair:
+    """Feature 071 — repairing chapters stored before the adapter learned to re-fetch."""
+
+    def test_the_button_is_only_shown_for_timotxt(self, qapp, library_dir):
+        assert not _tab_with_project(qapp, library_dir).repair_button.isVisible()
+
+    def test_the_button_is_shown_for_a_timotxt_project(self, qapp, library_dir):
+        tab = _timotxt_tab(qapp, library_dir)
+        assert tab._is_timotxt()
+        assert tab.repair_button.isVisibleTo(tab)
+
+    def test_the_detector_finds_only_damaged_chapters(self, qapp, library_dir):
+        tab = _timotxt_tab(qapp, library_dir)
+        assert [c.index for c in tab._residue_chapters()] == [0]
+
+    def test_a_non_timotxt_project_detects_nothing(self, qapp, library_dir):
+        """Hangul in a chapter body only means damage on timotxt. Anywhere else it is
+        just text, and offering to re-download would destroy a good translation."""
+        config = AppConfig()
+        config.library_dir = library_dir
+        meta = NovelMeta(url="https://fake.test/book/9", site="fake", title="T")
+        refs = [ChapterRef(index=0, title="C1", url="https://fake.test/9")]
+        project = NovelProject.create(library_dir, meta, refs)
+        project.save_content(0, "뷁走進院子。")
+        project.close()
+        tab = ScrapeTab(config)
+        tab._load_project(project.path)
+
+        assert tab._residue_chapters() == []
+
+    def test_confirming_clears_the_translation_and_audio_and_scopes_the_download(
+        self, qapp, library_dir, monkeypatch
+    ):
+        """The test that fails if someone re-fetches the source without invalidating what
+        was derived from it. The damage is not visible in the translation, so a repair that
+        keeps it is silently wrong."""
+        tab = _timotxt_tab(qapp, library_dir)
+        monkeypatch.setattr(
+            QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes
+        )
+        launched: list = []
+        monkeypatch.setattr(tab, "_launch_download", lambda: launched.append(tab._dl_indices))
+
+        tab._repair_residue()
+
+        assert launched == [[0]], "the download is scoped to the damaged chapter only"
+        assert tab.project.chapter(0).translated == ""
+        assert not tab.project.chapter(0).has_audio
+        assert tab.project.chapter(1).translated == "bản dịch tốt", "untouched"
+
+    def test_cancelling_changes_nothing(self, qapp, library_dir, monkeypatch):
+        tab = _timotxt_tab(qapp, library_dir)
+        monkeypatch.setattr(
+            QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.No
+        )
+        launched: list = []
+        monkeypatch.setattr(tab, "_launch_download", lambda: launched.append(1))
+
+        tab._repair_residue()
+
+        assert launched == []
+        assert tab.project.chapter(0).translated == "bản dịch hỏng"
+        assert tab.project.chapter(0).has_audio
+
+    def test_the_dialog_names_what_will_be_lost(self, qapp, library_dir, monkeypatch):
+        """Manual edits and rewrites go too — the user must see that before agreeing."""
+        tab = _timotxt_tab(qapp, library_dir)
+        asked: list = []
+        monkeypatch.setattr(
+            QMessageBox,
+            "question",
+            lambda *a, **k: (asked.append(a), QMessageBox.StandardButton.No)[1],
+        )
+
+        tab._repair_residue()
+
+        text = asked[0][2]
+        assert "1 chương" in text
+        assert "sửa tay" in text
+        assert "audio" in text
+
+    def test_nothing_to_repair_says_so_and_starts_no_worker(
+        self, qapp, library_dir, monkeypatch
+    ):
+        tab = _timotxt_tab(qapp, library_dir)
+        tab.project.save_content(0, "我走進院子。")  # fix it by hand first
+        shown: list = []
+        monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: shown.append(a))
+        launched: list = []
+        monkeypatch.setattr(tab, "_launch_download", lambda: launched.append(1))
+
+        tab._repair_residue()
+
+        assert launched == []
+        assert shown and "Không có gì cần sửa" in shown[0][1]
