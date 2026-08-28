@@ -84,6 +84,10 @@ class ScrapeTab(QWidget):
         self._dl_start = 0
         self._dl_end: int | None = None
         self._dl_force = False
+        # An explicit, scattered set of chapters — the residue repair. Held alongside the
+        # range because the unlock's resume path re-launches from this stored scope, and
+        # forgetting it there would turn an interrupted repair into a full re-download.
+        self._dl_indices: list[int] | None = None
 
         # --- recent projects row: continue a novel without pasting its URL
         self.picker = ProjectPicker()
@@ -164,6 +168,15 @@ class ScrapeTab(QWidget):
         self.download_button.setProperty("primary", True)
         self.download_button.setEnabled(False)
         self.download_button.clicked.connect(self._download_all)
+        # timotxt scrambles a random subset of characters per response. The adapter now
+        # re-fetches to recover them, but chapters downloaded before that shipped kept
+        # whatever the one draw happened to garble — this repairs those in place.
+        self.repair_button = QPushButton("Sửa chương lỗi ký tự")
+        self.repair_button.setToolTip(
+            "Tìm các chương còn ký tự chưa giải mã được từ trang nguồn và tải lại chúng."
+        )
+        self.repair_button.setVisible(False)
+        self.repair_button.clicked.connect(self._repair_residue)
         self.cancel_button = QPushButton("Dừng")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self._cancel_download)
@@ -175,6 +188,7 @@ class ScrapeTab(QWidget):
         download_row = QHBoxLayout()
         download_row.addWidget(self.add_chapter_button)
         download_row.addWidget(self.download_button)
+        download_row.addWidget(self.repair_button)
         download_row.addWidget(self.cancel_button)
         download_row.addWidget(self.pause_button)
         download_row.addWidget(self.progress, stretch=1)
@@ -241,6 +255,94 @@ class ScrapeTab(QWidget):
     def _is_local(self) -> bool:
         return self.project is not None and self.project.meta.is_local
 
+    def _is_timotxt(self) -> bool:
+        """Whether the open project came from timotxt.
+
+        Deliberately site-gated rather than general. "Hangul in a chapter body" only means
+        damage because timotxt substitutes Hangul for Han; anywhere else it is just text —
+        a novel quoting Korean, or some future Korean-source adapter — and offering to
+        re-download those chapters would destroy good translations for nothing.
+
+        Two signals because either alone can go stale: `meta.site` is written at creation
+        and refreshed by every re-scan, and `meta.url` is pinned to the canonical form by
+        the adapter's own `read_url`, so a project whose `site` predates an adapter rename
+        is still recognised.
+        """
+        from noveltrans.scrapers.timotxt import TimotxtAdapter
+
+        if self.project is None:
+            return False
+        meta = self.project.meta
+        return meta.site == TimotxtAdapter.name or TimotxtAdapter.matches(meta.url or "")
+
+    def _residue_chapters(self) -> list:
+        """Downloaded chapters whose stored text still holds undecodable characters."""
+        from noveltrans.scrapers.timotxt import needs_refetch
+
+        if self.project is None or not self._is_timotxt():
+            return []
+        return [c for c in self.project.chapters() if c.content and needs_refetch(c.content)]
+
+    def _repair_residue(self) -> None:
+        """Re-download chapters that were stored with characters the decoder missed.
+
+        Their translations go too, unconditionally. The damage is NOT detectable in the
+        translation: in the report that prompted this, the model met an undecodable glyph
+        and emitted a plausible-looking Han character that appears nowhere in the source —
+        it could as easily have emitted a plausible Vietnamese word that no scan could
+        find. So residue in the source means the translation derived from it is
+        untrustworthy, full stop. Audio goes with it, because `pending_audio` re-queues on
+        an empty path or a voice/source mismatch and never on the translation changing —
+        leaving it would let the video pipeline consume audio read from the bad text.
+
+        Cleared up front rather than per-chapter as bodies land: that keeps it to one
+        transaction on this thread instead of writing to the database while the worker
+        writes to it. The cost is that a failed re-download leaves a chapter with bad
+        content and an empty translation — but that state is loud (nothing downstream can
+        consume an empty translation, and this detector still flags it), whereas keeping
+        the old translation would be silently wrong.
+        """
+        running = self._download_worker is not None and self._download_worker.isRunning()
+        if self.project is None or running:
+            return
+        damaged = self._residue_chapters()
+        if not damaged:
+            QMessageBox.information(
+                self,
+                "Không có gì cần sửa",
+                "Không tìm thấy chương nào còn ký tự lỗi.",
+            )
+            return
+
+        indices = [c.index for c in damaged]
+        translated = sum(1 for c in damaged if c.translated)
+        voiced = sum(1 for c in damaged if c.audio_path)
+        lines = [
+            f"Tìm thấy {len(damaged)} chương còn ký tự chưa giải mã được từ trang timotxt.",
+            "",
+            f"• Sẽ tải lại {len(damaged)} chương này từ trang web.",
+        ]
+        if translated:
+            lines.append(
+                f"• {translated} chương trong số đó đã dịch — bản dịch sẽ bị xoá (kể cả "
+                "sửa tay và bản viết lại) vì nó được dịch từ nội dung lỗi. Tải xong hãy "
+                "bấm “Dịch” ở tab Dịch để dịch lại."
+            )
+        if voiced:
+            lines.append(
+                f"• {voiced} chương đã có audio — audio cũng sẽ bị xoá và cần tạo lại."
+            )
+        lines += ["", "Tiếp tục chứ?"]
+        if QMessageBox.question(self, "Sửa chương lỗi ký tự", "\n".join(lines)) != (
+            QMessageBox.StandardButton.Yes
+        ):
+            return
+
+        self.project.clear_translations(indices)
+        self.project.clear_audio(indices=indices)
+        self._reload_table()
+        self._begin_download(0, None, True, indices=indices)
+
     def _apply_project_ui(self) -> None:
         """Show the open project and set the chrome its kind supports.
 
@@ -264,6 +366,7 @@ class ScrapeTab(QWidget):
         self.range_from.setEnabled(not local)
         self.range_to.setEnabled(not local)
         self.add_chapter_button.setVisible(local)
+        self.repair_button.setVisible(self._is_timotxt())
         if local:
             self.status_label.setText(
                 f"Truyện tự viết: {counts['total']} chương, "
@@ -424,19 +527,29 @@ class ScrapeTab(QWidget):
             start, end = end, start  # tolerate a reversed range
         self._begin_download(start, end, False)
 
-    def _begin_download(self, start_index: int, end_index: int | None, force: bool) -> None:
+    def _begin_download(
+        self,
+        start_index: int,
+        end_index: int | None,
+        force: bool,
+        indices: list[int] | None = None,
+    ) -> None:
         """Record the scope, then launch. Resume-after-unlock reuses this scope."""
         if self._is_local():
             return  # backstop behind the disabled buttons — there is nothing to fetch
         self._dl_start = start_index
         self._dl_end = end_index
         self._dl_force = force
+        self._dl_indices = indices
         self._launch_download()
 
     def _selected_pending(self) -> list:
         """The chapters the current scope will fetch — matches the worker's choice."""
         if self.project is None:
             return []
+        if self._dl_indices is not None:
+            wanted = set(self._dl_indices)
+            return [c for c in self.project.chapters() if c.index in wanted]
         if self._dl_force:
             return self.project.chapters_in_range(self._dl_start, self._dl_end)
         return self.project.pending_download(self._dl_start, self._dl_end)
@@ -470,6 +583,7 @@ class ScrapeTab(QWidget):
             start_index=self._dl_start,
             end_index=self._dl_end,
             force=self._dl_force,
+            indices=self._dl_indices,
         )
         self._download_worker.progress.connect(self._on_progress)
         self._download_worker.chapter_done.connect(self._on_chapter_done)

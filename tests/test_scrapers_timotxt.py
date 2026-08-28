@@ -31,11 +31,16 @@ from noveltrans.scrapers import ADAPTERS, adapter_for_url
 from noveltrans.scrapers.base import HttpClient
 from noveltrans.scrapers.timotxt import (
     ORIGIN,
+    _RESIDUE_REFETCH_MAX,
+    _SUBSTITUTIONS,
     TimotxtAdapter,
+    bodies_align,
     book_id,
     chapter_numbers,
     deobfuscate,
     dir_url,
+    merge_bodies,
+    needs_refetch,
     parse_chapter,
     parse_chapter_list,
     parse_metadata,
@@ -265,6 +270,13 @@ class TestDeobfuscation:
         assert body.startswith("我走進院子")
         assert "他沒有說話" in body
 
+    def test_the_reported_missing_mapping_is_covered(self):
+        """Feature 071's regression. `꿫` was absent from the 070 table, so it survived into
+        a stored chapter and the translator turned it into a plausible-looking Han character
+        that appears nowhere in the source."""
+        assert "꿫" in _SUBSTITUTIONS
+        assert deobfuscate("꿫") == "仍"
+
     def test_a_wholly_obfuscated_body_raises(self):
         """Past the alarm ratio the scheme itself has changed and nothing can be trusted."""
         markup = fx("chapter.html").replace("놖走進院子，看見一棵老樹。", "뷁" * 40)
@@ -449,9 +461,183 @@ class TestLive:
 
     def test_the_deobfuscation_table_has_not_drifted(self):
         """The drift detector. The table is empirical, so the failure mode that matters is
-        the site rotating to a different one — which shows up as unmapped Hangul."""
+        the site rotating to a different one — which shows up as unmapped Hangul.
+
+        Measures a SINGLE draw via `parse_chapter`, deliberately not `fetch_chapter`.
+        Since feature 071 the adapter re-fetches until residue is gone, so going through it
+        would make this pass no matter how far the table had drifted — the detector would
+        still be green and would be testing nothing at all.
+        """
         adapter = make_adapter()
         refs = adapter.fetch_chapter_list(self.URL)
         for ref in refs[:5]:
-            body = adapter.fetch_chapter(ref)
+            body = parse_chapter(adapter.client.get_html(ref.url), ref.title, ref.url)
             assert residual_hangul(body) <= 3, f"{ref.title}: table may have drifted"
+
+    def test_the_refetch_clears_residue(self):
+        """The end-to-end proof of feature 071: whatever one draw leaves behind, the
+        adapter's retry recovers."""
+        adapter = make_adapter()
+        refs = adapter.fetch_chapter_list(self.URL)
+        for ref in refs[:3]:
+            assert residual_hangul(adapter.fetch_chapter(ref)) == 0, ref.title
+
+    def test_single_draw_residue_stays_rare(self):
+        """The retry-cost monitor. Every request the retry spends is the table being
+        incomplete, so if this number climbs, re-run scripts/build_timotxt_table.py."""
+        adapter = make_adapter()
+        refs = adapter.fetch_chapter_list(self.URL)
+        total = sum(
+            residual_hangul(parse_chapter(adapter.client.get_html(r.url), r.title, r.url))
+            for r in refs[:5]
+        )
+        assert total < 10, f"{total} undecoded characters across 5 chapters — table is thin"
+
+
+class TestPositionalMerge:
+    """Feature 071 — recovering characters the table missed by comparing two draws.
+
+    The site re-randomises which characters it scrambles on every response, so two draws
+    of one chapter are the same text garbled in different places. Neither is "the good
+    one", which is why the merge is positional rather than a choice between bodies.
+    """
+
+    def test_a_character_garbled_in_a_is_taken_from_b(self):
+        assert merge_bodies("뷁走了", "我走了") == "我走了"
+
+    def test_a_character_garbled_in_b_keeps_a(self):
+        """The merge is not "take B" — A is the accumulator."""
+        assert merge_bodies("我走了", "뷁走了") == "我走了"
+
+    def test_a_character_garbled_in_both_survives_verbatim(self):
+        """Never invented. An unmapped glyph neither draw resolved stays as it is."""
+        assert merge_bodies("뷁走了", "뷁走了") == "뷁走了"
+
+    def test_a_clean_character_is_never_replaced_by_a_differing_one(self):
+        """The never-over-correct guarantee, and the merge's counterpart to
+        `test_clean_prose_is_returned_byte_identical`. Only a residual Hangul syllable is
+        ever substituted, so a wrong second draw cannot damage a readable first one."""
+        assert merge_bodies("他走了", "她走了") == "他走了"
+
+    def test_it_is_not_pick_the_cleaner_body(self):
+        """A dirty at one position, B dirty at another — the result is clean and equals
+        neither input. Choosing the better of two bodies could never produce this."""
+        a, b = "뷁走了，他來了", "我走了，뷂來了"
+        merged = merge_bodies(a, b)
+        assert merged == "我走了，他來了"
+        assert merged != a and merged != b
+
+    def test_mismatched_paragraph_counts_are_not_merged(self):
+        a = "뷁走了\n\n他來了"
+        assert merge_bodies(a, "我走了") == a
+
+    def test_an_equal_count_but_different_length_is_not_merged(self):
+        """Same paragraph count is not enough — the substitution is strictly 1:1, so a
+        length change means the chapter itself was edited between the two requests."""
+        a = "뷁走了\n\n他來了"
+        assert merge_bodies(a, "我走了吧\n\n他來了") == a
+
+    def test_alignment_is_the_gate(self):
+        assert bodies_align("abc\n\ndef", "xyz\n\nuvw")
+        assert not bodies_align("abc\n\ndef", "abcd\n\ndef")
+        assert not bodies_align("abc\n\ndef", "abc")
+
+    def test_structure_is_preserved(self):
+        a, b = "뷁走了\n\n他來了", "我走了\n\n他來了"
+        merged = merge_bodies(a, b)
+        assert len(merged) == len(a)
+        assert merged.count("\n\n") == a.count("\n\n")
+
+    def test_two_identical_clean_bodies_merge_to_a_no_op(self):
+        assert merge_bodies("我走了", "我走了") == "我走了"
+
+    def test_needs_refetch_is_one_character_not_a_threshold(self):
+        """One undecoded glyph is what caused this report — there is no safe amount."""
+        assert needs_refetch("我走了뷁") is True
+        assert needs_refetch("我走了") is False
+
+
+class TestResidueRefetch:
+    """The adapter re-fetches only when the decoder left something behind."""
+
+    def _adapter(self) -> TimotxtAdapter:
+        # delay_seconds=0 or three draws cost 4.5s of real sleep (test_scrapers_medoctruyen).
+        return TimotxtAdapter(HttpClient(delay_seconds=0))
+
+    def _ref(self):
+        return parse_chapter_list(fx("dir.html"), DIR_URL)[0]
+
+    @responses.activate
+    def test_a_clean_chapter_still_costs_exactly_one_request(self):
+        """The test that fails if anyone makes the merge the default path."""
+        responses.add(responses.GET, CHAPTER_URL, body=fx("chapter.html"))
+
+        body = self._adapter().fetch_chapter(self._ref())
+
+        assert len(responses.calls) == 1
+        assert residual_hangul(body) == 0
+
+    @responses.activate
+    def test_residue_cleared_by_the_second_draw(self):
+        responses.add(responses.GET, CHAPTER_URL, body=fx("chapter_residue_a.html"))
+        responses.add(responses.GET, CHAPTER_URL, body=fx("chapter_residue_b.html"))
+
+        adapter = self._adapter()
+        messages: list[str] = []
+        adapter.on_status = messages.append
+        body = adapter.fetch_chapter(self._ref())
+
+        assert len(responses.calls) == 2
+        assert residual_hangul(body) == 0
+        assert body.startswith("我走進院子")
+        assert not any("⚠️" in m for m in messages), "cleared — nothing to warn about"
+
+    @responses.activate
+    def test_residue_in_every_draw_is_capped_and_reported(self):
+        for _ in range(4):
+            responses.add(responses.GET, CHAPTER_URL, body=fx("chapter_residue_a.html"))
+
+        adapter = self._adapter()
+        messages: list[str] = []
+        adapter.on_status = messages.append
+        body = adapter.fetch_chapter(self._ref())
+
+        assert len(responses.calls) == 1 + _RESIDUE_REFETCH_MAX
+        assert residual_hangul(body) == 1, "the chapter is still returned, not dropped"
+        assert any("chưa giải mã được" in m for m in messages)
+
+    @responses.activate
+    def test_a_misaligned_second_draw_stops_immediately(self):
+        """The chapter changed between requests — do not guess-align, and do not spend a
+        third request: the accumulator is anchored on draw 1, so later draws misalign too."""
+        responses.add(responses.GET, CHAPTER_URL, body=fx("chapter_residue_a.html"))
+        responses.add(responses.GET, CHAPTER_URL, body=fx("chapter_residue_misaligned.html"))
+
+        adapter = self._adapter()
+        body = adapter.fetch_chapter(self._ref())
+
+        assert len(responses.calls) == 2, "did not stop after the misaligned draw"
+        assert body.startswith("뷁走進院子"), "draw 1 returned verbatim"
+
+    @responses.activate
+    def test_a_failed_retry_keeps_the_draw_we_already_have(self):
+        responses.add(responses.GET, CHAPTER_URL, body=fx("chapter_residue_a.html"))
+        responses.add(responses.GET, CHAPTER_URL, status=404)
+
+        adapter = self._adapter()
+        body = adapter.fetch_chapter(self._ref())
+
+        assert body.startswith("뷁走進院子")
+        assert residual_hangul(body) == 1
+
+    @responses.activate
+    def test_an_obfuscated_first_draw_raises_with_one_request(self):
+        """The alarm path must not be swallowed by the retry. A refactor that wrapped the
+        whole thing in one `except ScrapeError` would turn the loudest failure silent."""
+        markup = fx("chapter.html").replace("놖走進院子，看見一棵老樹。", "뷁" * 40)
+        responses.add(responses.GET, CHAPTER_URL, body=markup)
+
+        with pytest.raises(ObfuscatedContentError):
+            self._adapter().fetch_chapter(self._ref())
+
+        assert len(responses.calls) == 1

@@ -243,6 +243,59 @@ class TestApplyReplacements:
         assert project.chapter(0).translator == ""
         assert project.chapter(0).translate_seconds == 0
 
+    def test_clear_translations_can_be_narrowed_to_some_chapters(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        """Feature 071's repair drops only the chapters translated from bad source text —
+        the rest of the novel, including any hand edits, must survive untouched."""
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        for idx in (0, 1, 2):
+            project.save_content(idx, "原文")
+            project.save_translation(idx, "t", f"dịch {idx}", "vi")
+
+        assert project.clear_translations([1]) == 1
+
+        assert project.chapter(0).translated == "dịch 0"
+        assert project.chapter(1).translated == ""
+        assert project.chapter(2).translated == "dịch 2"
+
+    def test_clear_translations_with_no_indices_still_clears_everything(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        for idx in (0, 1):
+            project.save_content(idx, "原文")
+            project.save_translation(idx, "t", "dịch", "vi")
+
+        project.clear_translations()
+
+        assert all(project.chapter(i).translated == "" for i in (0, 1))
+
+    def test_a_narrow_clear_drops_the_rewrite_backup_too(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        """A backup of a translation being discarded must go with it, or the chapter stays
+        flagged as rewritten with an undo pointing at text that no longer exists."""
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_content(0, "原文")
+        project.save_translation(0, "t", "dịch", "vi")
+        project.save_rewrite(0, "t", "viết lại")
+
+        project.clear_translations([0])
+
+        assert project.chapter(0).translated_raw == ""
+
+    def test_an_empty_index_list_clears_nothing(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        """`[]` means "no chapters", not "every chapter" — the difference is a whole novel."""
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_content(0, "原文")
+        project.save_translation(0, "t", "dịch", "vi")
+
+        assert project.clear_translations([]) == 0
+        assert project.chapter(0).translated == "dịch"
+
     def test_counts(self, library_dir, sample_meta, sample_refs):
         project = NovelProject.create(library_dir, sample_meta, sample_refs)
         project.save_content(0, "a")
@@ -488,6 +541,21 @@ class TestAudioState:
         assert chapter.audio_error == ""  # save clears a previous error
         assert chapter.has_audio
         assert project.counts()["audio"] == 1
+
+    def test_clear_audio_can_be_narrowed_to_some_chapters(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        """Feature 071: `pending_audio` re-queues on an empty path or a voice/source
+        mismatch, never on the translation changing — so a repair that did not clear audio
+        would leave the video pipeline consuming audio read from the bad translation."""
+        project = self._translated_project(library_dir, sample_meta, sample_refs)
+        for idx in (0, 1):
+            project.save_audio(idx, f"exports/audio/{idx}.wav", "Ngọc Lan", 9.0)
+
+        assert project.clear_audio(indices=[0]) == 1
+
+        assert not project.chapter(0).has_audio
+        assert project.chapter(1).has_audio
 
     def test_clear_audio(self, library_dir, sample_meta, sample_refs):
         project = self._translated_project(library_dir, sample_meta, sample_refs)

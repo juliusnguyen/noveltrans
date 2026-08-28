@@ -2184,6 +2184,7 @@ class DownloadWorker(PausableWorker):
         start_index: int = 0,
         end_index: int | None = None,
         force: bool = False,
+        indices: list[int] | None = None,
     ):
         super().__init__(parent)
         self.project_path = Path(project_path)
@@ -2196,9 +2197,17 @@ class DownloadWorker(PausableWorker):
         self.start_index = start_index
         self.end_index = end_index
         self.force = force
+        # An explicit, possibly scattered set of chapters — the residue repair (feature
+        # 071) picks out damaged chapters from all over the novel, which no start/end
+        # range can express. Implies force: every one of them already has content.
+        # Same shape as TranslateWorker's `indices`.
+        self.indices = indices
 
     def _select_chapters(self, project) -> list:
-        """The chapters this run will fetch, honouring the range and `force`."""
+        """The chapters this run will fetch, honouring `indices`, the range and `force`."""
+        if self.indices is not None:
+            wanted = set(self.indices)
+            return [c for c in project.chapters() if c.index in wanted]
         if self.force:
             return project.chapters_in_range(self.start_index, self.end_index)
         return project.pending_download(self.start_index, self.end_index)

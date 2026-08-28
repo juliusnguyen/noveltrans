@@ -797,8 +797,10 @@ class NovelProject:
                 (message, _now(), idx),
             )
 
-    def clear_audio(self, include_downloaded: bool = False) -> None:
-        """Reset audio state so the novel can be re-voiced from scratch.
+    def clear_audio(
+        self, include_downloaded: bool = False, indices: list[int] | None = None
+    ) -> int:
+        """Reset audio state so the novel can be re-voiced. Returns rows affected.
 
         Does not delete the audio files — the worker overwrites them. That last part is
         exactly why downloaded narration is spared by default: nothing re-fetches it, so
@@ -806,17 +808,29 @@ class NovelProject:
         it came from, while the following TTS pass writes a *differently* named file. The
         user may also no longer be entitled to fetch it again. Pass True only for a
         deliberate "forget the downloads too".
+
+        `indices` narrows it to specific chapters; None means the whole novel. The narrow
+        form is what makes a source repair complete (feature 071): `pending_audio` re-queues
+        on an empty `audio_path`, a voice mismatch or a source mismatch — never on the
+        translation changing — so audio voiced from a bad translation would otherwise
+        survive a repair and be consumed by the video pipeline as if it were fine.
         """
-        keep = "" if include_downloaded else " WHERE audio_source != ?"
-        params: tuple = (_now(),)
+        clauses, params = [], [_now()]
         if not include_downloaded:
-            params += (AUDIO_SOURCE_DOWNLOADED,)
+            clauses.append("audio_source != ?")
+            params.append(AUDIO_SOURCE_DOWNLOADED)
+        if indices is not None:
+            if not indices:
+                return 0
+            clauses.append(f"idx IN ({','.join('?' * len(indices))})")
+            params.extend(indices)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         with self._db:
-            self._db.execute(
+            return self._db.execute(
                 "UPDATE chapters SET audio_path = '', audio_voice = '',"
-                " audio_seconds = 0, audio_error = '', updated_at = ?" + keep,
-                params,
-            )
+                " audio_seconds = 0, audio_error = '', updated_at = ?" + where,
+                tuple(params),
+            ).rowcount
 
     def save_meta_translation(
         self, title: str, description: str, lang: str, author: str = ""
@@ -972,19 +986,31 @@ class NovelProject:
             json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
-    def clear_translations(self) -> None:
-        """Drop all translations so the novel can be re-translated from scratch."""
+    def clear_translations(self, indices: list[int] | None = None) -> int:
+        """Drop translations so chapters can be re-translated. Returns rows affected.
+
+        `indices` narrows it to specific chapters; None means the whole novel, so the
+        "Dịch lại toàn bộ" path is unchanged. The narrow form exists for repairs where
+        only some chapters were translated from bad source text (feature 071) — the rest
+        of the novel's translations, including any hand edits, must survive untouched.
+        """
+        sql = (
+            "UPDATE chapters SET translated = '', translated_title = '', target_lang = '',"
+            "  translator = '', translate_seconds = 0,"
+            # the backup belongs to the translation being dropped; keeping it would
+            # leave every chapter flagged as rewritten, with an undo that restores
+            # text from a translation that no longer exists
+            "  translated_raw = '', translated_title_raw = '',"
+            "  status = CASE WHEN content = '' THEN ? ELSE ? END, updated_at = ?"
+        )
+        params: tuple = (STATUS_PENDING, STATUS_DOWNLOADED, _now())
+        if indices is not None:
+            if not indices:
+                return 0
+            sql += f" WHERE idx IN ({','.join('?' * len(indices))})"
+            params += tuple(indices)
         with self._db:
-            self._db.execute(
-                "UPDATE chapters SET translated = '', translated_title = '', target_lang = '',"
-                "  translator = '', translate_seconds = 0,"
-                # the backup belongs to the translation being dropped; keeping it would
-                # leave every chapter flagged as rewritten, with an undo that restores
-                # text from a translation that no longer exists
-                "  translated_raw = '', translated_title_raw = '',"
-                "  status = CASE WHEN content = '' THEN ? ELSE ? END, updated_at = ?",
-                (STATUS_PENDING, STATUS_DOWNLOADED, _now()),
-            )
+            return self._db.execute(sql, params).rowcount
 
     def reset_errors(self) -> None:
         """Put errored chapters back into the queue (status derived from data)."""

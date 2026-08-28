@@ -51,7 +51,7 @@ HANGUL = re.compile(r"[가-힣]")
 # The reference novel from the feature request, plus a second one so the table can be
 # confirmed site-wide rather than per-novel — if the two disagree, the whole design is wrong.
 PRIMARY = "2608569069"
-SECONDARY = ""  # filled by --second, optional
+SECONDARY = ""  # filled by --second, optional (comma-separated for several)
 
 
 def paragraphs(markup: str) -> list[str]:
@@ -63,6 +63,19 @@ def paragraphs(markup: str) -> list[str]:
     for junk in container.select("div.gadBlock, div.adUnit, ins, script, style, iframe"):
         junk.decompose()
     return [t for t in (p.get_text(strip=True) for p in container.find_all("p", recursive=False)) if t]
+
+
+def chapter_count(session: requests.Session, book: str) -> int:
+    """How many chapters this novel actually has, read off its /dir page.
+
+    Never assume the reference novel's length. A shorter novel sampled on that assumption
+    turns most requests into 404s, which `main` swallows — so the sample silently collapses
+    to a handful of chapters and the run looks fine while contributing almost nothing.
+    """
+    response = session.get(f"{ORIGIN}/{book}/dir", timeout=25)
+    response.raise_for_status()
+    numbers = [int(n) for n in re.findall(rf"/{book}/(\d+)\.html", response.text)]
+    return max(numbers) if numbers else 0
 
 
 def fetch(session: requests.Session, book: str, n: int) -> list[str]:
@@ -99,7 +112,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--chapters", type=int, default=20, help="chapters to sample (x2 fetches)")
     parser.add_argument("--delay", type=float, default=1.0, help="seconds between requests")
-    parser.add_argument("--second", default=SECONDARY, help="a second novel id, to cross-check")
+    parser.add_argument("--second", default=SECONDARY,
+                        help="one or more novel ids (comma-separated), to cross-check")
+    parser.add_argument("--second-chapters", type=int, default=15,
+                        help="chapters to sample from each cross-check novel")
     args = parser.parse_args()
 
     session = requests.Session()
@@ -109,13 +125,23 @@ def main() -> int:
     conflicts: Counter = Counter()
     per_novel: dict[str, dict[str, str]] = {}
 
-    books = [(PRIMARY, args.chapters)] + ([(args.second, 8)] if args.second else [])
+    seconds = [b.strip() for b in (args.second or "").split(",") if b.strip()]
+    books = [(PRIMARY, args.chapters)] + [(b, args.second_chapters) for b in seconds]
     for book, count in books:
         book_table: dict[str, str] = {}
+        try:
+            length = chapter_count(session, book)
+        except requests.RequestException as exc:
+            print(f"  {book}: cannot read /dir ({exc})", file=sys.stderr)
+            continue
+        if not length:
+            print(f"  {book}: /dir lists no chapters", file=sys.stderr)
+            continue
         # Spread the sample across the novel rather than taking a prefix: vocabulary drifts
         # between early and late chapters, and a prefix would over-sample the opening arc.
-        step = max(1, 376 // count)
-        for n in range(1, count * step + 1, step):
+        step = max(1, length // count)
+        print(f"  {book}: {length} chapters, sampling every {step}")
+        for n in range(1, min(count * step, length) + 1, step):
             try:
                 a = fetch(session, book, n)
                 time.sleep(args.delay)
@@ -137,12 +163,15 @@ def main() -> int:
                 conflicts[key] += 1
 
     print(f"\n{len(table)} mappings, {len(conflicts)} conflicting keys")
-    if len(per_novel) > 1:
-        ids = list(per_novel)
-        shared = set(per_novel[ids[0]]) & set(per_novel[ids[1]])
-        agree = sum(per_novel[ids[0]][k] == per_novel[ids[1]][k] for k in shared)
-        print(f"cross-novel: {len(shared)} shared keys, {agree} agree "
-              f"({'SITE-WIDE' if agree == len(shared) else 'PER-NOVEL — STOP'})")
+    ids = list(per_novel)
+    for i in range(len(ids)):
+        for j in range(i + 1, len(ids)):
+            left, right = per_novel[ids[i]], per_novel[ids[j]]
+            shared = set(left) & set(right)
+            agree = sum(left[k] == right[k] for k in shared)
+            verdict = "SITE-WIDE" if agree == len(shared) else "PER-NOVEL — STOP"
+            print(f"cross-novel {ids[i]}/{ids[j]}: {len(shared)} shared keys, "
+                  f"{agree} agree ({verdict})")
     if conflicts:
         print("CONFLICTS — the fixed-table premise is wrong, do not ship:", dict(conflicts))
         return 1

@@ -126,6 +126,41 @@ class TestDownloadWorker:
         DownloadWorker(_project(library_dir), delay=0).run()
         assert adapter.closed == 1
 
+    def test_indices_select_exactly_those_chapters_in_order(
+        self, qapp, library_dir, fake_adapter
+    ):
+        """Feature 071's repair picks damaged chapters from all over a novel, which no
+        start/end range can express. `indices` implies force: every one already has content."""
+        fake_adapter()
+        path = _project(library_dir, n=5)
+        project = NovelProject.open(path)
+        for idx in range(5):
+            project.save_content(idx, "原文")
+        project.close()
+
+        worker = DownloadWorker(path, delay=0, indices=[3, 0])
+        project = NovelProject.open(path)
+        try:
+            picked = [c.index for c in worker._select_chapters(project)]
+        finally:
+            project.close()
+
+        assert picked == [0, 3], "scattered, already-downloaded chapters, in idx order"
+
+    def test_no_indices_leaves_the_range_behaviour_alone(
+        self, qapp, library_dir, fake_adapter
+    ):
+        fake_adapter()
+        path = _project(library_dir, n=3)
+        worker = DownloadWorker(path, delay=0)
+        project = NovelProject.open(path)
+        try:
+            picked = [c.index for c in worker._select_chapters(project)]
+        finally:
+            project.close()
+
+        assert picked == [0, 1, 2]  # all pending, nothing downloaded yet
+
     def test_closes_the_adapter_when_cancelled(self, qapp, library_dir, fake_adapter):
         adapter = fake_adapter()
         worker = DownloadWorker(_project(library_dir), delay=0)

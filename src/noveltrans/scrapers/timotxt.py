@@ -48,9 +48,28 @@ Only chapter bodies are affected — chapter titles and the description come bac
 
 The decoder can only ever under-correct: every key is a Hangul syllable, so no Chinese, Latin
 or punctuation character can be touched, and an unmapped glyph survives verbatim. Its worst
-case is therefore exactly the do-nothing baseline. **The scenario to watch is the site
+case is therefore exactly the do-nothing baseline.
+
+**But "under-corrects harmlessly" was wrong, and feature 071 is the correction.** A single
+undecoded glyph is enough to ruin a chapter: the translator meets a character it cannot read
+and emits something unpredictable — in the reported case a plausible-looking Han character
+that appears nowhere in the source, which no later scan of the translation could catch. So
+`fetch_chapter` no longer merely warns about residue. It re-fetches, up to
+`_RESIDUE_REFETCH_MAX` extra draws, and merges **positionally**: because the scrambled subset
+is re-randomised per response, a character garbled in one draw is very likely readable in the
+next. The merge takes the best character at each position rather than the better of two
+bodies, since neither draw is "the good one". A character garbled in every draw still survives
+verbatim, and a chapter edited between draws is not merged at all.
+
+That retry is cheap only because the table is good: a clean body costs exactly one request, so
+the extra traffic is proportional to how incomplete `_SUBSTITUTIONS` is. Extending the table
+is therefore no longer about correctness — it is the cost lever on this retry.
+
+`_OBFUSCATION_ALARM_RATIO` fires inside `parse_chapter`, on every draw, and the first parse in
+`fetch_chapter` is deliberately outside the retry's `try`. **The scenario to watch is the site
 rotating to a different table** — then previously-clean characters start arriving as unmapped
-Hangul, which is what `_OBFUSCATION_ALARM_RATIO` and the live drift test exist to catch.
+Hangul. Wrapping the whole retry in one `except ScrapeError` would convert that, the loudest
+failure mode there is, into a silent one. See `changes/071-TIMOTXT-RESIDUAL-CHARS`.
 
 `translators/ads.py` (feature 069) is a separate net and neither substitutes for the other:
 it runs on fresh *translator output*, targeting a promotional line whose wording is model
@@ -97,33 +116,46 @@ SEL_CHROME = "div.gadBlock, div.adUnit, ins, script, style, iframe"
 SEL_INTRO = "div.intro"
 
 # Recovered by diffing repeat fetches — see the module docstring and
-# scripts/build_timotxt_table.py. Built 2026-08-29 from 20 chapters of novel 2608569069 and
-# 8 of 2302601602, 2 fetches each: 122 mappings, **zero conflicts**, and of the 80 keys the
-# two novels share all 80 agree — so the table is site-wide, not per-novel.
+# scripts/build_timotxt_table.py. Rebuilt 2026-08-29 for feature 071 from 60 chapters
+# of novel 2608569069 plus 15 each of 2302601602 and 2201601601, 2 fetches apiece:
+# 140 mappings, **zero conflicts**, and all three novel pairs agree on every shared
+# key (100/100, 107/107, 86/86) — so the table is site-wide, not per-novel.
+#
+# The 070 build missed `꿫`->`仍`, and that one gap was enough to corrupt a chapter's
+# translation (see changes/071). It is here now, but the lesson is that no sample can
+# prove this complete — which is why `fetch_chapter` re-fetches rather than trusting it.
 _SUBSTITUTIONS = {
-    "괗": "二", "굛": "十", "궝": "七", "귷": "八", "그": "人", "극": "入", "깇": "九", "깊": "了",
-    "꺅": "刀", "꺆": "力", "꺗": "又", "꺘": "三", "꺛": "干", "꺳": "才", "꺴": "寸", "꺶": "大",
-    "껗": "上", "께": "小", "껙": "口", "껚": "山", "껜": "千", "껡": "亡", "껣": "之", "껥": "已",
-    "껦": "弓", "껧": "己", "껩": "也", "꼇": "川", "꼋": "久", "꼎": "凡", "꼐": "及", "꽬": "夫",
-    "꽭": "天", "꽮": "元", "꽱": "扎", "꾉": "五", "꾊": "支", "꾨": "尤", "꾩": "匹", "꾫": "巨",
-    "꾬": "牙", "꾮": "互", "꾿": "切", "꿀": "止", "꿁": "少", "꿂": "日", "꿗": "中", "꿛": "手",
-    "꿤": "升", "꿧": "片", "꿨": "化", "꿩": "仇", "꿯": "反", "꿰": "介", "꿵": "父", "꿷": "今",
-    "꿸": "凶", "꿹": "乏", "뀑": "丹", "뀔": "勾", "뀖": "六", "뀗": "文", "뀘": "方", "뀙": "火",
-    "뀞": "心", "뀟": "尺", "뀧": "巴", "뀪": "以", "뀬": "予", "냪": "幻", "냫": "玉", "냬": "末",
-    "냭": "未", "녈": "打", "녉": "巧", "녊": "正", "녌": "功", "녡": "世", "녢": "古", "녤": "本",
-    "녦": "可", "녪": "石", "놀": "布", "놂": "平", "놅": "的", "놆": "是", "놇": "在", "놊": "不",
-    "놋": "有", "놌": "和", "놖": "我", "놘": "由", "놙": "只", "놚": "要", "놛": "他", "뇽": "叫",
-    "뇾": "用", "눁": "四", "눂": "失", "눃": "生", "누": "到", "눑": "代", "눒": "作", "눓": "地",
-    "눕": "出", "늀": "就", "늁": "分", "늂": "乎", "늄": "令", "늅": "成", "늌": "外", "늳": "冬",
-    "늵": "包", "덿": "主", "뎃": "年", "돗": "它", "땡": "百", "땢": "同", "땣": "能", "땤": "而",
-    "떘": "下", "떚": "子",
+    "괗": "二", "굛": "十", "굜": "丁", "궝": "七", "귷": "八", "그": "人", "극": "入", "깇": "九",
+    "깊": "了", "꺅": "刀", "꺆": "力", "꺗": "又", "꺘": "三", "꺛": "干", "꺱": "土", "꺲": "工",
+    "꺳": "才", "꺴": "寸", "꺵": "丈", "꺶": "大", "껗": "上", "께": "小", "껙": "口", "껚": "山",
+    "껛": "巾", "껜": "千", "껡": "亡", "껣": "之", "껥": "已", "껦": "弓", "껧": "己", "껩": "也",
+    "꼇": "川", "꼊": "么", "꼋": "久", "꼎": "凡", "꼐": "及", "꽗": "叉", "꽬": "夫", "꽭": "天",
+    "꽮": "元", "꽱": "扎", "꾉": "五", "꾊": "支", "꾦": "犬", "꾨": "尤", "꾫": "巨", "꾬": "牙",
+    "꾮": "互", "꾿": "切", "꿀": "止", "꿁": "少", "꿂": "日", "꿗": "中", "꿛": "手", "꿢": "午",
+    "꿤": "升", "꿦": "仁", "꿧": "片", "꿨": "化", "꿩": "仇", "꿫": "仍", "꿭": "斤", "꿮": "爪",
+    "꿯": "反", "꿰": "介", "꿵": "父", "꿷": "今", "꿸": "凶", "꿹": "乏", "꿻": "氏", "뀑": "丹",
+    "뀔": "勾", "뀖": "六", "뀗": "文", "뀘": "方", "뀙": "火", "뀞": "心", "뀟": "尺", "뀧": "巴",
+    "뀪": "以", "뀫": "允", "뀬": "予", "냪": "幻", "냫": "玉", "냬": "末", "냭": "未", "녈": "打",
+    "녉": "巧", "녊": "正", "녌": "功", "녠": "甘", "녡": "世", "녢": "古", "녤": "本", "녦": "可",
+    "녨": "左", "녪": "石", "녿": "右", "놀": "布", "놂": "平", "놅": "的", "놆": "是", "놇": "在",
+    "놊": "不", "놋": "有", "놌": "和", "놖": "我", "놘": "由", "놙": "只", "놚": "要", "놛": "他",
+    "뇽": "叫", "뇾": "用", "눁": "四", "눂": "失", "눃": "生", "누": "到", "눑": "代", "눒": "作",
+    "눓": "地", "눕": "出", "늀": "就", "늁": "分", "늂": "乎", "늄": "令", "늅": "成", "늉": "句",
+    "늌": "外", "늵": "包", "덿": "主", "뎀": "市", "뎃": "年", "돗": "它", "땡": "百", "땢": "同",
+    "땣": "能", "땤": "而", "떘": "下", "떚": "子",
 }
+
 _DEOBFUSCATE = str.maketrans(_SUBSTITUTIONS)
 _HANGUL_RE = re.compile(r"[가-힣]")
 # Measured residue is 1.8-4.8% of a body, so this is ~4x the worst observation. Below it the
 # table is merely incomplete and the chapter is still worth saving; at or above, the scheme
 # itself has changed and the text cannot be trusted.
 _OBFUSCATION_ALARM_RATIO = 0.20
+# Extra draws allowed when a body comes back with characters the table did not know. Draw 2
+# clears the large majority of residue and draw 3 all but the rest; a fourth buys nothing
+# measurable and would turn a pathological chapter (or one legitimately containing Korean)
+# into a 4x request cost. See `TimotxtAdapter.fetch_chapter`.
+_RESIDUE_REFETCH_MAX = 2
 
 
 def _norm(text: str) -> str:
@@ -177,6 +209,52 @@ def deobfuscate(text: str) -> str:
 def residual_hangul(text: str) -> int:
     """How many substituted characters the table did not know. 0 on clean text."""
     return len(_HANGUL_RE.findall(text))
+
+
+def needs_refetch(text: str) -> bool:
+    """True when stored text still carries characters the table could not decode.
+
+    One is enough: feature 071 was reported because a single undecoded glyph reached the
+    translator, which emitted a plausible-looking Han character that appears nowhere in the
+    source. There is no "acceptably small" amount of residue.
+    """
+    return residual_hangul(text) > 0
+
+
+def bodies_align(a: str, b: str) -> bool:
+    """True when two draws of one chapter are the same text with different scrambling.
+
+    The substitution is strictly 1:1, so equal paragraph counts AND equal per-paragraph
+    lengths is what "same text" means here. Anything else means the chapter was edited
+    between the two requests, and any alignment would be fiction.
+    """
+    pa, pb = a.split("\n\n"), b.split("\n\n")
+    return len(pa) == len(pb) and all(len(x) == len(y) for x, y in zip(pa, pb))
+
+
+def merge_bodies(a: str, b: str) -> str:
+    """Take the readable character at EACH position — not the better of two bodies.
+
+    The two draws scramble different random subsets, so neither is "the good one": `a` may
+    be clean where `b` is garbled and vice versa, which is exactly why this is positional.
+
+    Only ever replaces a residual Hangul syllable in `a` with a non-Hangul character from
+    `b` — the same under-correct-only asymmetry `deobfuscate` guarantees, so a character
+    already readable in `a` can never be overwritten however wrong `b` is.
+
+    The replacement is unambiguous rather than a guess: the table is fixed, so a given
+    source character always becomes the SAME Hangul key. After `deobfuscate`, `b[i]` at a
+    position where `a[i]` is residual Hangul is therefore either that same unmapped Hangul
+    or the true character — there is no third case.
+
+    Returns `a` unchanged when the two do not align. Alignment by paragraph implies equal
+    total length, so the character-wise zip below is safe and the blank lines line up.
+    """
+    if not bodies_align(a, b):
+        return a
+    return "".join(
+        y if _HANGUL_RE.match(x) and not _HANGUL_RE.match(y) else x for x, y in zip(a, b)
+    )
 
 
 def parse_metadata(markup: str, url: str, site: str) -> NovelMeta:
@@ -398,10 +476,37 @@ class TimotxtAdapter(SiteAdapter):
         return refs
 
     def fetch_chapter(self, ref: ChapterRef) -> str:
+        """The chapter body, re-fetching to recover anything the table could not decode.
+
+        The first parse is deliberately OUTSIDE the try below: a wholesale table rotation
+        raises `ObfuscatedContentError` from `parse_chapter` on draw 1 and must propagate,
+        not be swallowed by the retry. Do not wrap this in one big `except ScrapeError` —
+        that would turn the loudest failure mode into a silent one.
+        """
         body = parse_chapter(self.client.get_html(ref.url), ref.title, ref.url)
         residue = residual_hangul(body)
-        if residue:
+        if not residue:
+            return body  # the normal path: exactly one request
+
+        for _attempt in range(_RESIDUE_REFETCH_MAX):
             self._status(
-                f"⚠️ timotxt: {residue} ký tự chưa giải mã được trong “{ref.title}”."
+                f"↻ timotxt: {residue} ký tự chưa giải mã trong “{ref.title}” — tải lại…"
             )
+            try:
+                other = parse_chapter(self.client.get_html(ref.url), ref.title, ref.url)
+            except ScrapeError:
+                break  # a failed retry must never lose the good draw we already hold
+            if not bodies_align(body, other):
+                # Edited between requests. Don't guess-align, and don't spend a third
+                # request: the accumulator is anchored on draw 1, so every later draw
+                # misaligns against it too.
+                break
+            body = merge_bodies(body, other)
+            residue = residual_hangul(body)
+            if not residue:
+                return body
+
+        self._status(
+            f"⚠️ timotxt: {residue} ký tự chưa giải mã được trong “{ref.title}”."
+        )
         return body
