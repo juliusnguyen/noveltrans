@@ -342,3 +342,17 @@ class TestRewriteChapter:
     def test_a_failing_chunk_propagates(self):
         with pytest.raises(TranslateError):
             rewrite_chapter(lambda _: "Hắn buồn.", "", SOURCE)
+
+
+def test_the_rewrite_prompt_does_not_carry_the_ad_rule():
+    """Feature 069's rule is deliberately absent from the rewrite pass.
+
+    `check_rewrite` rejects a rewrite whose paragraph count differs from its input, and
+    `rewrite_chunk` raises rather than returning a best effort. So telling the rewrite
+    model to drop a line would fail validation and burn all three attempts on every
+    chapter that carries a watermark. Stripping happens once, at translation time.
+    """
+    from noveltrans.translators.ads import PROMPT_RULE
+    from noveltrans.translators.rewrite import build_rewrite_prompt
+
+    assert PROMPT_RULE not in build_rewrite_prompt("Một đoạn văn.")
