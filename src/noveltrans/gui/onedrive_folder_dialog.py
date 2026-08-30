@@ -114,6 +114,9 @@ class OneDriveFolderDialog(QDialog):
         self._set_busy(False, "")
         for name in folders:
             self.list.addItem(QListWidgetItem(f"📁 {name}"))
+        # Alphabetical: a OneDrive folder listing arrives in the order the page happened
+        # to render it, which is not an order anyone can scan for a name.
+        self.list.sortItems()
         if not folders:
             self.status.setText(
                 "Thư mục này không có thư mục con nào — vẫn có thể chọn nó."

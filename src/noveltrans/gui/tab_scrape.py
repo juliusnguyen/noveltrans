@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QProgressBar,
+    QInputDialog,
     QPushButton,
     QSpinBox,
     QTableView,
@@ -29,12 +30,16 @@ from noveltrans.gui.jobs import job_registry
 from noveltrans.gui.keep_awake import track_worker
 from noveltrans.gui.local_novel_dialog import AddChaptersDialog, LocalNovelDialog
 from noveltrans.gui.notify import clear_dock_badge, request_attention, set_dock_badge
+from noveltrans.gui.rename_novel import rename_novel
 from noveltrans.gui.widgets import (
     PauseButton,
     CellEditorDelegate,
     ChapterTableModel,
     ProjectPicker,
     enable_cell_copy,
+    sorting_proxy,
+    enable_table_sorting,
+    source_index,
 )
 from noveltrans.gui.workers import DownloadWorker, ScanWorker, UnlockWorker, _drop_cues
 from noveltrans.models import LOCAL_URL_PREFIX
@@ -130,9 +135,20 @@ class ScrapeTab(QWidget):
         )
         for _label in (self.title_label, self.author_label, self.count_label, self.desc_label):
             _label.setTextInteractionFlags(_selectable)
+        # Renaming the NOVEL sits on the same row that shows its name — and one form row
+        # below where renaming a CHAPTER already lives (`set_title_editable`), so the two
+        # renames are found in the same place rather than one here and one in the Video tab.
+        self.rename_button = QPushButton("✏️ Đổi tên")
+        self.rename_button.setToolTip("Đổi tên truyện (tên hiển thị ở mọi nơi)")
+        self.rename_button.setEnabled(False)
+        self.rename_button.clicked.connect(self._rename_novel)
+        title_row = QHBoxLayout()
+        title_row.addWidget(self.title_label, stretch=1)
+        title_row.addWidget(self.rename_button)
+
         meta_box = QGroupBox("Thông tin truyện")
         meta_form = QFormLayout(meta_box)
-        meta_form.addRow("Tên truyện:", self.title_label)
+        meta_form.addRow("Tên truyện:", title_row)
         meta_form.addRow("Tác giả:", self.author_label)
         meta_form.addRow("Số chương:", self.count_label)
         meta_form.addRow("Mô tả:", self.desc_label)
@@ -144,7 +160,13 @@ class ScrapeTab(QWidget):
         self.model.set_title_editable(True)
         self.model.title_edited.connect(self._on_title_edited)
         self.table = QTableView()
-        self.table.setModel(self.model)
+        # A proxy, so the header sorts the view without ever reordering the chapter list
+        # itself. Every read of a row goes through source_index / source_rows — a view row
+        # is a position on screen, a chapter is a row in the model, and they are the same
+        # number only until the user clicks a header.
+        self.proxy = sorting_proxy(self.model, self)
+        self.table.setModel(self.proxy)
+        enable_table_sorting(self.table, config=config, list_id="chapters.scrape")
         # Without this the styled QLineEdit editor is taller than the row and the title
         # is clipped mid-glyph while you type.
         self.table.setItemDelegate(CellEditorDelegate(self.table))
@@ -404,8 +426,11 @@ class ScrapeTab(QWidget):
         self._reload_table()
         row = self.model.row_for_index(indices[0])
         if row is not None:
-            self.table.selectRow(row)
-            self.table.scrollTo(self.model.index(row, self.model.TITLE_COLUMN))
+            # selectRow/scrollTo speak VIEW rows: under a sort the new chapter is wherever
+            # the current ordering puts it, not at the bottom.
+            view_index = self.proxy.mapFromSource(self.model.index(row, self.model.TITLE_COLUMN))
+            self.table.selectRow(view_index.row())
+            self.table.scrollTo(view_index)
         self.count_label.setText(str(self.project.counts()["total"]))
         self.status_label.setText(
             f"Đã thêm {len(indices)} chương. Dán nội dung vào ô “Bản gốc” ở tab Dịch."
@@ -486,14 +511,16 @@ class ScrapeTab(QWidget):
 
     def _add_download_actions(self, menu: QMenu, index) -> None:
         """Append per-chapter download actions to the table's right-click menu."""
-        chapter = self.model.chapter_at(index.row())
+        source = source_index(self.table, index)
+        chapter = self.model.chapter_at(source.row())
         if chapter is None:
             return
         running = self._download_worker is not None and self._download_worker.isRunning()
         menu.addSeparator()
         rename = menu.addAction("Sửa tên chương")
+        # `index` (the view's) rather than `source`: edit() opens the editor on screen.
         rename.triggered.connect(
-            lambda: self.table.edit(self.model.index(index.row(), self.model.TITLE_COLUMN))
+            lambda: self.table.edit(index.sibling(index.row(), self.model.TITLE_COLUMN))
         )
         if chapter.title_custom:
             # Only offered once there is something to undo, and it says what it will do:
@@ -745,12 +772,62 @@ class ScrapeTab(QWidget):
 
     # ------------------------------------------------------------------ misc
 
+    def _rename_novel(self) -> None:
+        """Ask for a new name, then run the shared rename.
+
+        The prompt is seeded with the name currently in use rather than with the raw
+        override, so the box shows what the user sees everywhere else instead of being
+        empty on a novel that has never been renamed.
+        """
+        if self.project is None:
+            return
+        meta = self.project.meta
+        previous = meta.display_name()
+        wanted, ok = QInputDialog.getText(
+            self,
+            "Đổi tên truyện",
+            "Tên truyện:",
+            text=meta.display_title or previous,
+        )
+        if not ok:
+            return
+        if not rename_novel(self, self.project, wanted, busy=self._workspace_busy()):
+            return
+        # `.title.txt` still holds the OLD name on every rendered part, and only this
+        # call knows what that name was. Done here rather than in the video tab because
+        # the video tab is reached (below) without a previous name to compare against.
+        from noveltrans.rename import resync_title_sidecars
+
+        meta = self.project.meta
+        resync_title_sidecars(
+            self.project.video_dir,
+            meta.slug_name(),
+            meta.display_name(),
+            (previous, meta.display_title, meta.translated_title, meta.title),
+        )
+        self._show_meta(self.project.reload_meta())
+        # The documented fan-out: Workspace._on_scrape_project re-selects this novel in
+        # every other tab's picker, which re-labels them and makes the video tab rebuild
+        # its parts table and re-read its sidecars under the new name.
+        self.project_changed.emit(str(self.project.path))
+
+    def _workspace_busy(self) -> bool:
+        """Is any job running in this novel's workspace? See VideoTab._workspace_busy."""
+        widget = self.parent()
+        while widget is not None:
+            checker = getattr(widget, "has_running_workers", None)
+            if callable(checker):
+                return bool(checker())
+            widget = widget.parent()
+        return self.has_running_workers()
+
     def _show_meta(self, meta) -> None:
         """Fill the metadata panel; translated info shows next to the original."""
         # Same naming the picker and the novel tab bar show, formatted in one place.
         # No source here: this panel sits under the URL box the novel was scraped from,
         # so repeating the domain would only spend width on something already on screen.
         self.title_label.setText(meta.novel_label(with_source=False))
+        self.rename_button.setEnabled(self.project is not None)
         self.author_label.setText(meta.author or "—")
         if meta.translated_description:
             self.desc_label.setText(meta.translated_description)

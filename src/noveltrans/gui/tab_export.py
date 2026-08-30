@@ -39,8 +39,21 @@ from noveltrans.storage.project import slugify
 
 
 def default_export_name(meta: NovelMeta, use_translation: bool, extension: str) -> str:
-    """Default save-dialog filename — the translated title slugs far better than CJK."""
-    title = meta.translated_title if use_translation and meta.translated_title else meta.title
+    """Default save-dialog filename — the translated title slugs far better than CJK.
+
+    NOT `slug_name()`, which is the pinned stem for generated media and must stay put
+    across a rename. This is a one-off suggestion in a Save dialog for a document the
+    user then owns, so it should carry the novel's *current* name: `display_title` wins
+    when the user has set one, because that is their own name for the translated work and
+    beats a machine translation still carrying a "[ĐM/EDIT] " tag.
+
+    Still keyed to the toggle. Exporting the original text and getting a Vietnamese
+    filename would misdescribe the file.
+    """
+    if use_translation:
+        title = meta.display_title or meta.translated_title or meta.title
+    else:
+        title = meta.title
     return slugify(title) + extension
 
 

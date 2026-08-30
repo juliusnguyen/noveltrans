@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QDate, QDateTime, QObject, QSettings, QTime, Signal
+import pytest
+from PySide6.QtCore import QDate, QDateTime, QObject, QSettings, Qt, QTime, Signal
 
 from noveltrans.config import AppConfig
 from noveltrans.gui.tab_video import VideoTab
@@ -4572,4 +4573,168 @@ class TestDescriptionResync:
         window = tab._windows_for_current_selection()[0]
         request = tab._upload_request(window, "Phần 1", 1, False, publish_at=None)
         assert "Tên hoàn toàn mới" in request.description
+        tab.shutdown()
+
+
+class TestRenameFromTheVideoTab:
+    """The "Tên hiển thị" box after 074 (see TestDisplayTitle for its original contract).
+
+    Two things changed and neither is visible on screen: the stem is now *pinned*, and
+    `.title.txt` is resynced. The box itself still never asks a question — it commits on
+    focus-out, so a modal there would ambush anyone who merely tabbed past it.
+    """
+
+    _tab = TestDisplayTitleUi._tab
+    _project = TestDisplayTitleUi._project
+
+    def test_it_pins_the_stem_so_a_retranslation_cannot_move_the_files(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        before = tab.project.meta.slug_name()
+        tab.display_title_edit.setText("Tên ngắn")
+        tab._save_display_title()
+        tab.project.save_meta_translation("A Completely Different Title", "d", "en")
+        assert tab.project.meta.slug_name() == before
+        tab.shutdown()
+
+    def test_it_never_opens_a_dialog(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        """A rendered part on disk is exactly what makes the ✏️ button ask. This box
+        must not — and if it did, this test would hang rather than fail, which is why
+        `_ask` is booby-trapped instead of counted."""
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        window = tab._windows_for_current_selection()[0]
+        out = tab._part_output_path(window, whole_novel=False)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"fake mp4")
+        monkeypatch.setattr(
+            "noveltrans.gui.rename_novel._ask",
+            lambda *a: pytest.fail("the display-title box must not ask"),
+        )
+        tab.display_title_edit.setText("Tên ngắn")
+        tab._save_display_title()
+        assert tab.project.meta.display_name() == "Tên ngắn"
+        tab.shutdown()
+
+    def test_it_resyncs_the_title_sidecar_of_a_rendered_part(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """Flag 6: before this, a part rendered before the rename and uploaded after it
+        published to YouTube under the OLD name."""
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        window = tab._windows_for_current_selection()[0]
+        out = tab._part_output_path(window, whole_novel=False)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"fake mp4")
+        sidecar = out.parent / (out.stem + ".title.txt")
+        old_name = tab.project.meta.display_name()
+        sidecar.write_text(f"{old_name} - Phần 1\n", encoding="utf-8")
+
+        tab.display_title_edit.setText("Tên ngắn")
+        tab._save_display_title()
+        assert sidecar.read_text(encoding="utf-8").strip() == "Tên ngắn - Phần 1"
+        assert "tiêu đề 1 phần" in tab.status_label.text()
+        tab.shutdown()
+
+    def test_the_part_and_its_upload_record_still_do_not_move(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        from noveltrans.youtube_upload import (
+            STATE_PUBLISHED,
+            uploaded_video_id,
+            write_upload_state,
+        )
+
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        window = tab._windows_for_current_selection()[0]
+        out = tab._part_output_path(window, whole_novel=False)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"fake mp4")
+        write_upload_state(out, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
+
+        tab.display_title_edit.setText("Tên ngắn")
+        tab._save_display_title()
+
+        after = tab._part_output_path(
+            tab._windows_for_current_selection()[0], whole_novel=False
+        )
+        assert after == out and after.is_file()
+        assert uploaded_video_id(after) == "dQw4w9WgXcQ"
+        tab.shutdown()
+
+
+class TestPartsTableSorting:
+    """The parts table sorts, and the context menu still finds the right parts.
+
+    `_on_video_list_context_menu` resolved rows as `windows[row]` before 074. Sorted, that
+    sends "Tách phần" / "Gộp 2 phần liền kề" and the bulk upload toggles at whichever parts
+    happened to sit at those positions.
+    """
+
+    _tab = TestDisplayTitleUi._tab
+    _project = TestDisplayTitleUi._project
+
+    def _sorted_tab(self, tmp_path, library_dir, sample_meta, sample_refs):
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        tab.video_list.sortItems(0, Qt.SortOrder.DescendingOrder)  # last part on top
+        return tab
+
+    def test_every_row_carries_its_window(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        firsts = {
+            tab.video_list.item(r, 0).data(Qt.ItemDataRole.UserRole)
+            for r in range(tab.video_list.rowCount())
+        }
+        assert firsts == {w.first_num for w in tab._windows_for_current_selection()}
+        tab.shutdown()
+
+    def test_the_parts_column_sorts_numerically(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        from noveltrans.gui.widgets import SORT_ROLE
+
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        keys = [
+            tab.video_list.item(r, 0).data(SORT_ROLE)
+            for r in range(tab.video_list.rowCount())
+        ]
+        assert keys == sorted(keys)  # "Phần 9" / "Phần 10" would sort 10 before 9 as text
+        tab.shutdown()
+
+    def test_a_sorted_row_resolves_to_the_part_it_displays(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._sorted_tab(tmp_path, library_dir, sample_meta, sample_refs)
+        top = tab.video_list.item(0, 0)
+        windows = tab._windows_for_current_selection()
+        # Reversed, so the top row is the LAST part — `windows[0]` would be the first.
+        assert top.data(Qt.ItemDataRole.UserRole) == windows[-1].first_num
+        assert top.text() != f"Phần {tab._part_number(windows[0])}"
+        tab.shutdown()
+
+    def test_the_menu_acts_on_the_part_the_row_shows(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        """The whole point: the actions are built for the part the row *displays*, not
+        for `windows[row]`. Reversed, row 0 shows the LAST part."""
+        from PySide6.QtCore import QPoint
+
+        tab = self._sorted_tab(tmp_path, library_dir, sample_meta, sample_refs)
+        rendered: list = []
+        monkeypatch.setattr(tab, "_render_selected_parts", lambda ws: rendered.append(ws))
+        TestSplitMergeParts._FakeMenu.instances.clear()
+        monkeypatch.setattr(
+            "noveltrans.gui.tab_video.QMenu", TestSplitMergeParts._FakeMenu
+        )
+        tab.video_list.selectRow(0)
+        row_y = tab.video_list.rowViewportPosition(0) + 2
+        tab._on_video_list_context_menu(QPoint(1, row_y))
+        menu = TestSplitMergeParts._FakeMenu.instances[-1]
+        next(a for a in menu.actions if a.text == "Tạo video").trigger()
+        windows = tab._windows_for_current_selection()
+        assert rendered == [[windows[-1]]]  # the last part, which row 0 now shows
         tab.shutdown()

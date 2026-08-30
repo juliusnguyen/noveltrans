@@ -6,6 +6,8 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from urllib.parse import urlparse
 
+from noveltrans.slug import slugify
+
 # A novel the user wrote themselves — no source website, nothing to scrape.
 LOCAL_SITE = "local"
 LOCAL_URL_PREFIX = "local://"
@@ -53,6 +55,10 @@ class NovelMeta:
     # User override for how the title appears on video output — the point is dropping a
     # source tag like "[ĐM/EDIT] " without editing the scraped metadata. See display_name().
     display_title: str = ""
+    # The pinned filename stem for everything this novel generates. Empty means "still
+    # derived from the titles", which is what every project made before feature 074 has —
+    # see slug_name(), which is the ONLY thing that should ever read this.
+    slug: str = ""
     # Per-novel video export choices, remembered so switching between novels in the GUI
     # doesn't leave one novel's background image or playlist selected on another's video
     # tab — see VideoTab._on_project_selected. "" means "nothing chosen for this novel yet".
@@ -71,18 +77,36 @@ class NovelMeta:
     # rather than to whatever some OTHER novel happened to have selected last.
     upload_visibility: str = ""
 
+    def slug_name(self) -> str:
+        """The filename stem every generated file of this novel is named after.
+
+        `exports/video/<stem>/<stem>.mp4` and its whole family of sidecars — `.srt`,
+        `.jpg`, `.title.txt`, `.tags.txt`, `.upload.json`, `.created.json` — plus the
+        merged audio in `exports/audio/`. **Not** `display_name()`; see its docstring.
+
+        An empty `slug` reproduces the pre-074 rule byte for byte, so upgrading moves not
+        one file and no project needs migrating. Only an explicit rename (or the first
+        render, which pins whatever it was about to use) ever writes the field.
+
+        Pinning is the point. While the stem was *derived*, anything that touched
+        `translated_title` moved it — a re-translation into a different target language
+        would silently orphan every rendered part and every upload record, with no error
+        and no way back short of renaming files by hand. Once pinned, nothing moves the
+        stem except a deliberate rename that moves the files with it.
+        """
+        return self.slug or slugify(self.translated_title or self.title)
+
     def display_name(self) -> str:
         """The novel title as it should appear on a video, thumbnail and description.
 
         Falls back through the user's override → the translated title → the original, so
         an empty override means "whatever we'd have shown anyway".
 
-        **Not for filenames.** The video slug stays keyed to the translated/original title
-        (`slugify(meta.translated_title or meta.title)`): it decides
-        `video_dir/<stem>/<stem>.mp4` and every sidecar beside it, including
-        `<stem>.upload.json`. Deriving it from this would move all of them the moment
-        someone edits the display title — rendered parts would read as "chưa tạo", and the
-        upload records from feature 034 would point at files that no longer exist.
+        **Not for filenames.** `slug_name()` owns those, and the two are deliberately
+        allowed to disagree: renaming a novel must not move `video_dir/<stem>/<stem>.mp4`
+        or the `<stem>.upload.json` beside it unless the user explicitly asked for the
+        files to move too. Deriving the stem from this would strand every rendered part
+        (they would read as "chưa tạo") and every upload record from feature 034.
 
         Each candidate is stripped *before* the fallback, not after: a box containing
         only spaces is "I didn't set one", and stripping last would let it win the chain

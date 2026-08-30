@@ -38,6 +38,7 @@ from noveltrans.cleanup import (
     total_size,
     video_cleanup_candidates,
 )
+from noveltrans.gui.widgets import SortableItem, enable_table_sorting
 from noveltrans.gui.workers import OneDriveVerifyWorker
 from noveltrans.onedrive_upload import format_size
 
@@ -62,6 +63,9 @@ class CleanupDialog(QDialog):
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.table.setColumnWidth(_STATUS_COLUMN, 250)
         self.table.itemChanged.connect(lambda _i: self._refresh_total())
+        # Biggest first: "what do I delete to get the most space back" is the question this
+        # dialog exists to answer. Safe to sort only because rows are UserRole-keyed above.
+        enable_table_sorting(self.table, default_column=2, ascending=False)
 
         self.verify_button = QPushButton("Kiểm tra OneDrive…")
         self.verify_button.setToolTip(
@@ -131,6 +135,10 @@ class CleanupDialog(QDialog):
 
     def _add_row(self, item, *, verified: bool) -> None:
         index = self.table.rowCount()
+        # Off while filling, back on after. Otherwise every setItem re-sorts and the row
+        # being built moves out from under the next setItem call. Rows arrive one at a
+        # time as the verify worker finds them, so this brackets each insert, not a batch.
+        self.table.setSortingEnabled(False)
         self.table.insertRow(index)
 
         name = QTableWidgetItem(item.relpath)
@@ -141,13 +149,22 @@ class CleanupDialog(QDialog):
         )
         if not verified:
             name.setFlags(name.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+        # The row's data rides on the ITEM, not on its position. `self._rows[index]` was
+        # the old lookup, and it is wrong the instant a sort moves a row: `_ticked` would
+        # hand `_delete` a different file than the one the user ticked, in a dialog whose
+        # own header says "Xoá là KHÔNG khôi phục được". This is the fix, and it is worth
+        # making whether or not the table ever sorts.
+        name.setData(Qt.ItemDataRole.UserRole, item)
         self.table.setItem(index, 0, name)
         self.table.setItem(
             index, 1, QTableWidgetItem("Audio" if item.kind == KIND_AUDIO else "Video")
         )
-        self.table.setItem(index, 2, QTableWidgetItem(format_size(item.size)))
+        self.table.setItem(
+            index, 2, SortableItem(format_size(item.size), item.size)  # bytes, not "1.2 GB"
+        )
         self.table.setItem(index, _STATUS_COLUMN, QTableWidgetItem(item.reason))
         self._rows.append({"item": item, "verified": verified})
+        self.table.setSortingEnabled(True)
 
     # ---------------------------------------------------------------- verify
 
@@ -175,25 +192,34 @@ class CleanupDialog(QDialog):
         self.progress.setVisible(False)
         self.verify_button.setEnabled(False)
         ok = {item.relpath for item in confirmed}
-        for index, row in enumerate(self._rows):
-            if row["verified"] or row["item"].relpath not in ok:
+        already = {r["item"].relpath for r in self._rows if r["verified"]}
+        # Walk the ITEMS, not `enumerate(self._rows)`. The old positional walk unlocked
+        # whichever row happened to sit at that position — under a sort, a *different*
+        # file, ticked and ready to delete. Sorting is off across the loop so a setItem
+        # cannot move a row while `name.row()` is being used.
+        self.table.setSortingEnabled(False)
+        for name in self._name_items():
+            entry = name.data(Qt.ItemDataRole.UserRole)
+            if entry is None or entry.relpath in already:
                 continue
-            row["verified"] = True
-            name = self.table.item(index, 0)
-            name.setFlags(name.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            name.setCheckState(Qt.CheckState.Checked)
-            self.table.setItem(
-                index, _STATUS_COLUMN, QTableWidgetItem("đã kiểm tra: có trên OneDrive")
-            )
-        for index, row in enumerate(self._rows):
-            if row["verified"]:
-                continue
-            if row["item"].kind == KIND_VIDEO:
+            if entry.relpath in ok:
+                for row in self._rows:
+                    if row["item"].relpath == entry.relpath:
+                        row["verified"] = True
+                name.setFlags(name.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                name.setCheckState(Qt.CheckState.Checked)
                 self.table.setItem(
-                    index,
+                    name.row(),
+                    _STATUS_COLUMN,
+                    QTableWidgetItem("đã kiểm tra: có trên OneDrive"),
+                )
+            elif entry.kind == KIND_VIDEO:
+                self.table.setItem(
+                    name.row(),
                     _STATUS_COLUMN,
                     QTableWidgetItem("⚠️ KHÔNG thấy trên OneDrive — giữ lại"),
                 )
+        self.table.setSortingEnabled(True)
         message = f"Đã kiểm tra: {len(confirmed)} phần có trên OneDrive"
         if unconfirmed:
             message += (
@@ -216,23 +242,32 @@ class CleanupDialog(QDialog):
 
     # ----------------------------------------------------------------- ticks
 
+    def _name_items(self):
+        """Column 0 of every row, each carrying its own CleanupItem in UserRole."""
+        return [
+            item
+            for row in range(self.table.rowCount())
+            if (item := self.table.item(row, 0)) is not None
+        ]
+
     def _set_all(self, kind: str | None, checked: bool) -> None:
-        for index, row in enumerate(self._rows):
-            if kind is not None and row["item"].kind != kind:
+        for item in self._name_items():
+            entry = item.data(Qt.ItemDataRole.UserRole)
+            if entry is None or (kind is not None and entry.kind != kind):
                 continue
-            item = self.table.item(index, 0)
-            if item is not None and item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+            if item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
                 item.setCheckState(
                     Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
                 )
 
     def _ticked(self) -> list:
-        out = []
-        for index, row in enumerate(self._rows):
-            item = self.table.item(index, 0)
-            if item is not None and item.checkState() == Qt.CheckState.Checked:
-                out.append(row["item"])
-        return out
+        """The files the user actually ticked — read off the items, never by position."""
+        return [
+            entry
+            for item in self._name_items()
+            if item.checkState() == Qt.CheckState.Checked
+            and (entry := item.data(Qt.ItemDataRole.UserRole)) is not None
+        ]
 
     def _refresh_total(self) -> None:
         ticked = self._ticked()

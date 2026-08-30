@@ -36,6 +36,10 @@ from noveltrans.gui.widgets import (
     PauseButton,
     AudioChapterTableModel,
     ProjectPicker,
+    sorting_proxy,
+    enable_table_sorting,
+    source_index,
+    source_rows,
     RowButtonDelegate,
     enable_cell_copy,
 )
@@ -156,7 +160,14 @@ class AudioTab(QWidget):
         self.translated_radio.toggled.connect(self._on_source_changed)
         self.view_combo.currentIndexChanged.connect(self._on_view_changed)
         self.table = QTableView()
-        self.table.setModel(self.model)
+        # TWO proxies, because `_on_view_changed` swaps this one view between two models
+        # whose columns mean different things. One shared proxy would carry the chapter
+        # view's sort column into the release view, where the same number is a different
+        # field. Each side therefore keeps its own sort, which is also what a user expects.
+        self.proxy = sorting_proxy(self.model, self)
+        self.source_proxy = sorting_proxy(self.source_model, self)
+        self.table.setModel(self.proxy)
+        enable_table_sorting(self.table, config=config, list_id="chapters.audio")
         self.table.horizontalHeader().setSectionResizeMode(
             AudioChapterTableModel.TITLE_COLUMN, QHeaderView.ResizeMode.Stretch
         )
@@ -348,7 +359,7 @@ class AudioTab(QWidget):
         means a different thing on each side.
         """
         if self._in_source_view():
-            self.table.setModel(self.source_model)
+            self.table.setModel(self.source_proxy)
             self.table.setItemDelegateForColumn(
                 AudioSourceTableModel.REDOWNLOAD_COLUMN, self._redownload_delegate
             )
@@ -367,7 +378,7 @@ class AudioTab(QWidget):
             if not self.source_model.rowCount():
                 self._load_audio_manifest()
         else:
-            self.table.setModel(self.model)
+            self.table.setModel(self.proxy)
             self.table.setItemDelegateForColumn(
                 AudioSourceTableModel.REDOWNLOAD_COLUMN, self._plain_delegate
             )
@@ -619,12 +630,13 @@ class AudioTab(QWidget):
         self.pause_button.set_job(self._job.id if self._job else None)
         self._worker.start()
 
-    def _redownload_row(self, row: int) -> None:
+    def _redownload_row(self, index) -> None:
         """The per-row "⬇️ Tải lại" button: re-fetch exactly this release.
 
         Forces past the skip-what-we-have rule — that is the whole point of the button.
+        Takes the clicked INDEX, for the same reason `_regenerate_row` does.
         """
-        item = self.source_model.item_at(row)
+        item = self.source_model.item_at(source_index(self.table, index).row())
         if item is None:
             return
         self._start_audio_download([item.number], force=True)
@@ -718,8 +730,9 @@ class AudioTab(QWidget):
         if self._in_source_view():
             return  # a row here is an audio release; TTS acts on chapters
         rows = self._selected_rows()
-        if index.isValid() and index.row() not in rows:
-            rows = [index.row()]  # right-clicked away from the selection → act on that row
+        clicked = source_index(self.table, index).row() if index.isValid() else None
+        if clicked is not None and clicked not in rows:
+            rows = [clicked]  # right-clicked away from the selection → act on that row
         indices, skipped_no_text, skipped_downloaded = self._regenerable_indices(rows)
         if not indices:
             return  # nothing with source text to read — offering it would only mislead
@@ -755,8 +768,9 @@ class AudioTab(QWidget):
         if self.project is None or not self._in_source_view():
             return
         rows = self._selected_rows()
-        if index.isValid() and index.row() not in rows:
-            rows = [index.row()]
+        clicked = source_index(self.table, index).row() if index.isValid() else None
+        if clicked is not None and clicked not in rows:
+            rows = [clicked]
         numbers = [
             item.number
             for row in rows
@@ -782,15 +796,14 @@ class AudioTab(QWidget):
         action.triggered.connect(lambda: self._start_audio_download(snapshot, force=True))
 
     def _selected_rows(self) -> list[int]:
-        """The rows the user has highlighted, in table order and without duplicates.
+        """The highlighted rows as MODEL rows, ascending, without duplicates.
 
-        selectedIndexes() yields one index per selected *cell*; with SelectRows that is
-        every column of every row, hence the dedup.
+        Model rather than view rows: under a sort the two part ways, and everything
+        downstream of this converts a row to a `chapter.index` or a release number.
+        `source_rows` also does the dedup selectedIndexes() needs (one index per selected
+        *cell*, so every column of every row).
         """
-        selection = self.table.selectionModel()
-        if selection is None:
-            return []
-        return sorted({index.row() for index in selection.selectedIndexes()})
+        return source_rows(self.table)
 
     def _regenerable_indices(self, rows: list[int]) -> tuple[list[int], int, int]:
         """(indices to re-voice, dropped for no text, dropped as downloaded) for `rows`.
@@ -826,9 +839,13 @@ class AudioTab(QWidget):
             indices.append(chapter.index)
         return sorted(dict.fromkeys(indices)), skipped_no_text, skipped_downloaded
 
-    def _regenerate_row(self, row: int) -> None:
-        """The per-row 🔊 button — one chapter, no confirmation, as before."""
-        self._regenerate_rows([row])
+    def _regenerate_row(self, index) -> None:
+        """The per-row 🔊 button — one chapter, no confirmation, as before.
+
+        Takes the clicked INDEX: under a sort its row is a screen position, and acting on
+        that would re-voice a different chapter.
+        """
+        self._regenerate_rows([source_index(self.table, index).row()])
 
     def _regenerate_rows(self, rows: list[int]) -> None:
         """Re-voice exactly the given rows, whether that is one or a hundred.
@@ -913,11 +930,12 @@ class AudioTab(QWidget):
     # --------------------------------------------------------------- helpers
 
     def _on_row_double_clicked(self, index) -> None:
+        row = source_index(self.table, index).row()
         if self._in_source_view():
-            item = self.source_model.item_at(index.row())
+            item = self.source_model.item_at(row)
             chapter = item.chapter if item is not None else None
         else:
-            chapter = self.model.chapter_at(index.row())
+            chapter = self.model.chapter_at(row)
         if chapter is None or self.project is None or not chapter.has_audio:
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.project.path / chapter.audio_path)))
@@ -953,7 +971,11 @@ class AudioTab(QWidget):
             )
             return
         index = self.table.currentIndex()
-        chapter = self.model.chapter_at(index.row()) if index.isValid() else None
+        chapter = (
+            self.model.chapter_at(source_index(self.table, index).row())
+            if index.isValid()
+            else None
+        )
         if chapter is None:
             QMessageBox.information(
                 self, "Chưa chọn chương", "Hãy chọn một chương trong bảng để xem trước."

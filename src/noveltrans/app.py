@@ -14,6 +14,7 @@ from noveltrans.gui import keep_awake
 from noveltrans.gui.dock import POLICY_REGULAR, current_policy
 from noveltrans.gui.icons import load_pixmap
 from noveltrans.gui.main_window import MainWindow
+from noveltrans.gui.shortcuts import EditShortcutFilter
 from noveltrans.gui.style import apply_theme
 from noveltrans.gui.tray import TrayController
 from noveltrans.runtime_env import augment_tool_path, ensure_std_streams
@@ -81,6 +82,11 @@ def main() -> int:
     tray = TrayController(window)  # a no-op where there is no system tray
     dock_filter = DockActivateFilter(window)
     app.installEventFilter(dock_filter)
+    # ⌘C/⌘V/⌘A for whatever has focus. On the application rather than the window because
+    # a modally-blocked window's shortcuts do not fire — this is what reaches a table
+    # inside CleanupDialog or the OneDrive picker. See gui/shortcuts.py.
+    edit_filter = EditShortcutFilter()
+    app.installEventFilter(edit_filter)
 
     # Order matters: joining the workers can take a while, and killing `caffeinate` first
     # would let the Mac sleep mid-teardown. Slots fire in connection order.
@@ -89,7 +95,7 @@ def main() -> int:
 
     window.show()
     exit_code = app.exec()
-    del tray, dock_filter
+    del tray, dock_filter, edit_filter
     return exit_code
 
 

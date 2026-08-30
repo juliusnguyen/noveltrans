@@ -405,3 +405,80 @@ class TestResidueRepair:
 
         assert launched == []
         assert shown and "Không có gì cần sửa" in shown[0][1]
+
+
+class TestRenameNovel:
+    """The ✏️ button on the "Thông tin truyện" panel (074).
+
+    QInputDialog is patched out in every case — a real one blocks the suite forever.
+    """
+
+    def _tab(self, qapp, library_dir):
+        return _tab_with_project(qapp, library_dir)
+
+    def test_the_button_is_disabled_until_a_novel_is_open(self, qapp):
+        assert not ScrapeTab(AppConfig()).rename_button.isEnabled()
+
+    def test_it_is_enabled_once_a_novel_is_open(self, qapp, library_dir):
+        assert self._tab(qapp, library_dir).rename_button.isEnabled()
+
+    def test_renaming_updates_the_panel_and_the_tab_label(
+        self, qapp, library_dir, monkeypatch
+    ):
+        tab = self._tab(qapp, library_dir)
+        titles = []
+        tab.title_changed.connect(titles.append)
+        monkeypatch.setattr(
+            "noveltrans.gui.tab_scrape.QInputDialog.getText",
+            lambda *a, **k: ("Trọng Sinh", True),
+        )
+        tab._rename_novel()
+        assert tab.project.meta.display_name() == "Trọng Sinh"
+        assert "Trọng Sinh" in tab.title_label.text()
+        assert titles and "Trọng Sinh" in titles[-1]
+
+    def test_cancelling_the_prompt_changes_nothing(self, qapp, library_dir, monkeypatch):
+        tab = self._tab(qapp, library_dir)
+        monkeypatch.setattr(
+            "noveltrans.gui.tab_scrape.QInputDialog.getText",
+            lambda *a, **k: ("Trọng Sinh", False),
+        )
+        tab._rename_novel()
+        assert tab.project.meta.display_title == ""
+
+    def test_it_tells_the_other_tabs_to_refresh(self, qapp, library_dir, monkeypatch):
+        # Workspace._on_scrape_project is what re-labels the pickers and makes the video
+        # tab rebuild its parts table under the new name.
+        tab = self._tab(qapp, library_dir)
+        changed = []
+        tab.project_changed.connect(changed.append)
+        monkeypatch.setattr(
+            "noveltrans.gui.tab_scrape.QInputDialog.getText",
+            lambda *a, **k: ("Trọng Sinh", True),
+        )
+        tab._rename_novel()
+        assert changed == [str(tab.project.path)]
+
+    def test_a_rendered_part_keeps_its_old_title_sidecar_in_step(
+        self, qapp, library_dir, monkeypatch
+    ):
+        """The flag-6 fix, reached through the button a user actually presses."""
+        tab = self._tab(qapp, library_dir)
+        stem = f"{tab.project.meta.slug_name()}-0001-0005"
+        part = tab.project.video_dir / stem
+        part.mkdir(parents=True)
+        (part / f"{stem}.mp4").write_bytes(b"mp4")
+        (part / f"{stem}.title.txt").write_text("T - Phần 1\n", encoding="utf-8")
+        monkeypatch.setattr(
+            "noveltrans.gui.tab_scrape.QInputDialog.getText",
+            lambda *a, **k: ("Trọng Sinh", True),
+        )
+        # A rendered part means the consequences dialog opens; answer "keep the files".
+        monkeypatch.setattr(
+            "noveltrans.gui.rename_novel._ask", lambda parent, plan, busy: ("keep", False)
+        )
+        tab._rename_novel()
+        assert (part / f"{stem}.title.txt").read_text(
+            encoding="utf-8"
+        ).strip() == "Trọng Sinh - Phần 1"
+        assert (part / f"{stem}.mp4").is_file()  # kept, as chosen

@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from noveltrans.config import AppConfig
+from noveltrans.gui import shortcuts
 from noveltrans.gui.dock import hide_dock_icon, show_dock_icon
 from noveltrans.gui.notify import clear_dock_badge
 from noveltrans.gui.settings_dialog import SettingsDialog
@@ -181,6 +182,11 @@ class MainWindow(QMainWindow):
         menu.addAction(library_action)
         menu.addSeparator()
         menu.addAction(self.quit_action)
+
+        # Kept on self so tests can reach it. Must come with the removal of the per-table
+        # QShortcut in widgets.enable_cell_copy: two owners of ⌘C in one window is an
+        # ambiguous overload, and Qt then fires neither.
+        self.edit_menu = shortcuts.build_edit_menu(self)
 
     # ----------------------------------------------------------- workspaces
 

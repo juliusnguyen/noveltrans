@@ -60,11 +60,15 @@ from noveltrans.config import LLM_ENGINES, AppConfig, translator_labels
 from noveltrans.gui.job_popup import BROWSER_PAUSE_HINT
 from noveltrans.gui.jobs import job_registry
 from noveltrans.gui.keep_awake import track_worker
+from noveltrans.gui.rename_novel import rename_novel
 from noveltrans.gui.widgets import (
+    SORT_ROLE,
     CheckableHeaderView,
     PauseButton,
     ProjectPicker,
+    SortableItem,
     audio_source_label,
+    enable_table_sorting,
 )
 from noveltrans.gui.workers import (
     CompletionWorker,
@@ -388,6 +392,12 @@ class VideoTab(QWidget):
         self.upload_header = CheckableHeaderView(5, self.video_list)
         self.video_list.setHorizontalHeader(self.upload_header)
         self.upload_header.toggled.connect(self._on_upload_header_toggled)
+        # AFTER setHorizontalHeader, which resets the sort indicator along with the resize
+        # modes. Part order by default — `_part_number` is derived from the chapter range,
+        # and a sort must never look like it renumbered anything. Safe now that rows carry
+        # their window's `first_num`; the "Thao tác" cell widgets follow their items
+        # through a sort in Qt 6.11 (measured), so column 6 needs nothing.
+        enable_table_sorting(self.video_list, config=self.config, list_id="video.parts")
         header = self.video_list.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -718,14 +728,13 @@ class VideoTab(QWidget):
         see `plan_locked_video_windows` for why a locked window's part number can deviate
         from plain grid arithmetic.
         """
-        from noveltrans.storage.project import slugify
         from noveltrans.tts.video import (
             discover_committed_video_windows,
             plan_locked_video_windows,
         )
         from noveltrans.video_windows import read_manual_windows
 
-        slug = slugify(self.project.meta.translated_title or self.project.meta.title)
+        slug = self.project.meta.slug_name()
         committed = (
             discover_committed_video_windows(self.project.video_dir, slug)
             if honor_committed
@@ -794,13 +803,12 @@ class VideoTab(QWidget):
         """
         from pathlib import Path
 
-        from noveltrans.storage.project import slugify
         from noveltrans.tts.video import video_part_name
 
-        # NOT display_name(): the slug decides <stem>.mp4 and every sidecar beside it
-        # (including <stem>.upload.json), so keying it to an editable title would
-        # strand every rendered part and orphan its upload record.
-        slug = slugify(self.project.meta.translated_title or self.project.meta.title)
+        # slug_name(), not display_name(): the stem decides <stem>.mp4 and every sidecar
+        # beside it (including <stem>.upload.json), so renaming the novel leaves them
+        # where they are unless the user asked for the files to move too.
+        slug = self.project.meta.slug_name()
         name = video_part_name(
             slug, window.first_num, window.last_num,
             whole_novel=whole_novel, source_audio=self._is_source_edition(),
@@ -828,9 +836,8 @@ class VideoTab(QWidget):
         numbers are releases, so rebuilding its `.txt` from chapters by number would
         describe the wrong content entirely. `_part_dir_name` applies the edition itself.
         """
-        from noveltrans.storage.project import slugify
 
-        return slugify(self.project.meta.translated_title or self.project.meta.title)
+        return self.project.meta.slug_name()
 
     def _part_dir_name(self, window, whole_novel: bool = False) -> str:
         """This part's folder name — the key `_stale_descriptions` is stored under.
@@ -871,9 +878,22 @@ class VideoTab(QWidget):
             selected_rows = [row]
 
         windows = self._windows_for_current_selection()
-        if not selected_rows or any(r >= len(windows) for r in selected_rows):
+        # By `first_num`, not by row. `windows[r]` was right only while the table could
+        # not be sorted; a sorted table would have sent "Tách phần" and the bulk upload
+        # toggles at whichever parts happened to sit at those positions.
+        by_first = {w.first_num: w for w in windows}
+        selected_windows = []
+        for r in selected_rows:
+            item = self.video_list.item(r, 0)
+            window = by_first.get(item.data(Qt.ItemDataRole.UserRole)) if item else None
+            if window is None:
+                return  # the table is out of step with the plan; do nothing rather than guess
+            selected_windows.append(window)
+        if not selected_windows:
             return
-        selected_windows = [windows[r] for r in selected_rows]
+        # Split/merge below reads these as "the first" and "the second" part, so they have
+        # to be in part order regardless of how the user sorted the view.
+        selected_windows.sort(key=lambda w: w.first_num)
         mode = self.video_mode.currentData()
         whole_novel = mode == "all" and len(windows) == 1
         paths = [self._part_output_path(w, whole_novel=whole_novel) for w in selected_windows]
@@ -1115,7 +1135,8 @@ class VideoTab(QWidget):
     def _duration_item(self, window) -> QTableWidgetItem:
         """A table item with the part's total audio duration, flagged red past YouTube's 12h."""
         seconds = sum(c.audio_seconds for c in window.chapters)
-        item = QTableWidgetItem(self._format_hms(seconds))
+        # Keyed on seconds: "1:05:03" and "58:20" do not compare as text.
+        item = SortableItem(self._format_hms(seconds), seconds)
         if seconds > self._YOUTUBE_MAX_SECONDS:
             item.setForeground(QColor("#e06c75"))
             item.setText("⚠️ " + item.text())
@@ -1335,13 +1356,18 @@ class VideoTab(QWidget):
             part_num = None if whole_novel else self._part_number(window)
             exists = self._part_output_path(window, whole_novel=whole_novel).is_file()
             label = "Toàn bộ" if whole_novel else f"Phần {part_num}"
-            self.video_list.setItem(i, 0, QTableWidgetItem(label))
-            self.video_list.setItem(
-                i, 1,
-                self._chapter_range_item(
-                    window, mode, total_chapters, novel_title, whole_novel
-                ),
+            # `first_num` on column 0, so the context menu can find this row's window
+            # without counting rows: after a sort, row *i* is no longer `windows[i]`, and
+            # "Tách phần" / "Gộp 2 phần" would act on the wrong parts. The sort key is the
+            # part NUMBER — "Phần 9" / "Phần 10" / "Phần 100" sort as text in that order.
+            part_item = SortableItem(label, part_num if part_num is not None else 0)
+            part_item.setData(Qt.ItemDataRole.UserRole, window.first_num)
+            self.video_list.setItem(i, 0, part_item)
+            range_item = self._chapter_range_item(
+                window, mode, total_chapters, novel_title, whole_novel
             )
+            range_item.setData(SORT_ROLE, window.first_num)
+            self.video_list.setItem(i, 1, range_item)
             self.video_list.setItem(i, 2, self._duration_item(window))
             self.video_list.setItem(i, 3, QTableWidgetItem(self._part_title(part_num)))
             self.video_list.setItem(i, 4, self._created_item(window, whole_novel))
@@ -2675,9 +2701,12 @@ class VideoTab(QWidget):
         if self.project is None:
             return
         rewritten, customised = self._resync_description_sidecars()
+        retitled = self._resync_title_sidecars()
         notes = []
         if rewritten:
             notes.append(f"đã cập nhật mô tả {rewritten} phần")
+        if retitled:
+            notes.append(f"đã cập nhật tiêu đề {retitled} phần")
         if customised:
             notes.append(f"⚠️ {customised} phần có mô tả rút gọn đã cũ")
         if notes:
@@ -2699,17 +2728,30 @@ class VideoTab(QWidget):
         )
 
     def _save_display_title(self) -> None:
-        """Persist the title override and re-render the parts table's titles."""
+        """Rename the novel from this box.
+
+        Deliberately the display-only half: this box commits on focus-out, and it says
+        "Tên hiển thị", so it keeps every rendered file exactly where it is — the
+        invariant feature 025 turned on. The ✏️ button on the Tải truyện tab is the
+        deliberate rename, and it is the one that offers to move files too.
+
+        What it gains over the old `save_display_title` call: the stem is now *pinned*
+        rather than left to drift with `translated_title`, and `.title.txt` is resynced.
+        Before this, renaming here left every rendered part scheduled to publish to
+        YouTube under the old name.
+        """
         if self.project is None:
             return
+        previous = self.project.meta.display_name()
         wanted = self.display_title_edit.text().strip()
-        if wanted == self.project.meta.display_title:
+        if not rename_novel(self, self.project, wanted, offer_migration=False):
             return
-        self.project.save_display_title(wanted)
+        retitled = self._resync_title_sidecars(previous)
         self._sync_display_title()
         self._refresh_video_list()  # the "Tiêu đề" column is built from display_name()
+        note = f" Đã cập nhật tiêu đề {retitled} phần đã tạo." if retitled else ""
         self.status_label.setText(
-            f"Tên hiển thị: “{self.project.meta.display_name()}”. Bấm “Tạo lại tất cả "
+            f"Tên truyện: “{self.project.meta.display_name()}”.{note} Bấm “Tạo lại tất cả "
             "ảnh bìa” để áp dụng lên ảnh bìa đã tạo."
         )
 
@@ -2778,6 +2820,25 @@ class VideoTab(QWidget):
             sidecar.write_text(tags + "\n", encoding="utf-8")
             updated += 1
         return updated
+
+    def _resync_title_sidecars(self, previous_name: str = "") -> int:
+        """Fix any `.title.txt` still carrying an old name. See rename.resync_title_sidecars.
+
+        Called on project open as well as after a rename, so a novel renamed in a previous
+        session (or by an older build, which had no resync at all) is repaired the next
+        time its video tab is looked at.
+        """
+        if self.project is None:
+            return 0
+        from noveltrans.rename import resync_title_sidecars
+
+        meta = self.project.meta
+        return resync_title_sidecars(
+            self.project.video_dir,
+            self._novel_slug(),
+            meta.display_name(),
+            (previous_name, meta.display_title, meta.translated_title, meta.title),
+        )
 
     # ------------------------------------------------- keep descriptions fresh
 

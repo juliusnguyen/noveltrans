@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QDialogButtonBox, QMessageBox
 import noveltrans.gui.cleanup_dialog as cd
 from noveltrans.cleanup import KIND_AUDIO, KIND_VIDEO, Removable
 from noveltrans.gui.cleanup_dialog import CleanupDialog
+from noveltrans.gui.widgets import SORT_ROLE
 
 
 @pytest.fixture
@@ -161,9 +162,7 @@ class TestVideoIsLockedUntilVerified:
         worker.emit("done", [], worker.candidates)  # none found on OneDrive
         video = next(i for n, i in _rows(dialog).items() if n.endswith(".mp4"))
         assert not video.flags() & Qt.ItemFlag.ItemIsUserCheckable
-        assert "KHÔNG thấy trên OneDrive" in dialog.table.item(
-            list(_rows(dialog)).index(video.text()), cd._STATUS_COLUMN
-        ).text()
+        assert "KHÔNG thấy trên OneDrive" in dialog.table.item(video.row(), cd._STATUS_COLUMN).text()
 
     def test_a_failed_check_leaves_everything_locked(self, qapp, project, fake_verify):
         dialog = CleanupDialog(project, "Truyện")
@@ -267,3 +266,57 @@ def test_removable_is_what_the_dialog_hands_to_the_deleter(qapp, project, fake_v
     dialog = CleanupDialog(project, "Truyện")
     assert all(isinstance(i, Removable) for i in dialog._ticked())
     assert {i.kind for i in dialog._ticked()} <= {KIND_AUDIO, KIND_VIDEO}
+
+
+class TestSorting:
+    """The row→file map must survive a sort.
+
+    Before 074 both `_ticked` and `_on_verified` walked `enumerate(self._rows)` and read
+    `self.table.item(index, 0)`. Sorting the table made row *i* stop being `_rows[i]`, so
+    ticking one file would have deleted **a different one** — in a dialog whose own header
+    says deletion cannot be undone. These fail against that code.
+    """
+
+    def test_ticking_a_row_after_a_sort_returns_the_file_that_row_shows(
+        self, qapp, project, fake_verify
+    ):
+        dialog = CleanupDialog(project, "Truyện")
+        dialog._set_all(None, False)
+        dialog.table.sortItems(0, Qt.SortOrder.DescendingOrder)  # by name, reversed
+        item = dialog.table.item(0, 0)
+        if not item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(Qt.CheckState.Checked)
+        assert [i.relpath for i in dialog._ticked()] == [item.text()]
+
+    def test_size_sorts_on_bytes_not_on_its_own_text(self, qapp, project, fake_verify):
+        dialog = CleanupDialog(project, "Truyện")
+        keys = [
+            dialog.table.item(r, 2).data(SORT_ROLE) for r in range(dialog.table.rowCount())
+        ]
+        assert all(isinstance(k, int) for k in keys)
+
+    def test_select_audio_still_ticks_only_audio_after_a_sort(
+        self, qapp, project, fake_verify
+    ):
+        dialog = CleanupDialog(project, "Truyện")
+        dialog._set_all(None, False)
+        dialog.table.sortItems(0, Qt.SortOrder.DescendingOrder)
+        dialog._set_all(KIND_AUDIO, True)
+        assert dialog._ticked()
+        assert all(i.kind == KIND_AUDIO for i in dialog._ticked())
+
+    def test_verifying_unlocks_the_row_that_shows_the_verified_file(
+        self, qapp, project, fake_verify
+    ):
+        dialog = CleanupDialog(project, "Truyện")
+        dialog.table.sortItems(0, Qt.SortOrder.DescendingOrder)
+        dialog._verify()
+        worker = fake_verify.instances[0]
+        worker.emit("done", worker.candidates, [])
+        for row in range(dialog.table.rowCount()):
+            item = dialog.table.item(row, 0)
+            entry = item.data(Qt.ItemDataRole.UserRole)
+            if entry.kind == KIND_VIDEO:
+                assert item.flags() & Qt.ItemFlag.ItemIsUserCheckable
+                assert "có trên OneDrive" in dialog.table.item(row, cd._STATUS_COLUMN).text()

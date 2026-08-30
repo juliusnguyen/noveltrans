@@ -1456,7 +1456,6 @@ class MergeWorker(PausableWorker):
 
     def run(self) -> None:
         from noveltrans.errors import TtsError
-        from noveltrans.storage.project import slugify
         from noveltrans.tts.merge import (
             MergeCancelled,
             MergeSegment,
@@ -1489,9 +1488,11 @@ class MergeWorker(PausableWorker):
                 self.failed.emit(self._nothing_message())
                 return
             project.audio_dir.mkdir(parents=True, exist_ok=True)
-            # NOT display_name(): the slug keys <stem>.mp4 and its sidecars, so an
-            # editable title must never move them. See NovelMeta.display_name().
-            slug = slugify(project.meta.translated_title or project.meta.title)
+            # slug_name(), not display_name(): the stem keys the merged file, so
+            # renaming the novel must not move it. Pinned before the first write, so a
+            # later re-translation cannot move it either. See NovelMeta.slug_name().
+            slug = project.meta.slug_name()
+            project.pin_slug(slug)
             ext = "m4b" if self.fmt == "m4b" else "mp3"
             total = len(windows)
             written = 0
@@ -1632,7 +1633,6 @@ class VideoWorker(PausableWorker):
 
     def run(self) -> None:
         from noveltrans.errors import TtsError
-        from noveltrans.storage.project import slugify
         from noveltrans.tts.merge import (
             MergeCancelled,
             MergeSegment,
@@ -1663,9 +1663,11 @@ class VideoWorker(PausableWorker):
         project = NovelProject.open(self.project_path)
         try:
             project.video_dir.mkdir(parents=True, exist_ok=True)
-            # NOT display_name(): the slug keys <stem>.mp4 and its sidecars, so an
-            # editable title must never move them. See NovelMeta.display_name().
-            slug = slugify(project.meta.translated_title or project.meta.title)
+            # slug_name(), not display_name(): the stem keys <stem>.mp4 and every
+            # sidecar beside it, so renaming the novel must not move them. Pinned before
+            # the first write, so a later re-translation cannot move them either.
+            slug = project.meta.slug_name()
+            project.pin_slug(slug)
             novel_title = project.meta.display_name()
 
             # Batch mode always honors manual split/merge boundaries (see
@@ -2025,7 +2027,6 @@ class SubtitleWorker(PausableWorker):
         return True
 
     def run(self) -> None:
-        from noveltrans.storage.project import slugify
         from noveltrans.tts.merge import (
             MergeSegment,
             chapter_marker_title,
@@ -2047,8 +2048,9 @@ class SubtitleWorker(PausableWorker):
             if not windows:
                 self.failed.emit("Không có chương nào có audio giọng này trong phạm vi đã chọn.")
                 return
-            # Same slug rule as the render: NOT display_name(). See NovelMeta.display_name().
-            slug = slugify(project.meta.translated_title or project.meta.title)
+            # Same stem as the render that produced these files. No pin_slug here: this
+            # worker only ever writes beside parts that already exist.
+            slug = project.meta.slug_name()
             total = len(windows)
             written = backfilled = skipped = 0
 

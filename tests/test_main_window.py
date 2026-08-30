@@ -10,7 +10,12 @@ from __future__ import annotations
 
 import pytest
 from PySide6.QtCore import QEvent
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtGui import QCloseEvent, QKeySequence, QShortcut
+from PySide6.QtWidgets import (
+    QApplication,
+    QTableWidget,
+    QTableWidgetItem,
+)
 
 from noveltrans.app import DockActivateFilter
 from noveltrans.config import AppConfig
@@ -558,3 +563,60 @@ class TestWorkspaceTabOrientation:
             assert window.workspaces.tabToolTip(0) == ""
         finally:
             window.close()
+
+
+class TestEditMenu:
+    """The Edit menu, and the ambiguity it must not create.
+
+    `test_no_table_owns_a_copy_shortcut` is the important one: a QShortcut and a QAction
+    on the same StandardKey inside one window make Qt log "Ambiguous shortcut overload:
+    ⌘C" and fire NEITHER. That failure is invisible except as a line on stderr, so it
+    gets a structural assertion rather than a manual check.
+    """
+
+    def _actions(self, main) -> dict:
+        return {a.text().replace("&", ""): a for a in main.edit_menu.actions() if a.text()}
+
+    def test_the_menu_offers_the_standard_edit_commands(self, main):
+        assert set(self._actions(main)) == {
+            "Hoàn tác",
+            "Làm lại",
+            "Cắt",
+            "Sao chép",
+            "Dán",
+            "Chọn tất cả",
+        }
+
+    def test_every_shortcut_comes_from_a_standard_key(self, main):
+        # Never a literal "Ctrl+C": one code path has to give macOS ⌘ and Windows Ctrl.
+        for name, key in (
+            ("Sao chép", QKeySequence.StandardKey.Copy),
+            ("Dán", QKeySequence.StandardKey.Paste),
+            ("Cắt", QKeySequence.StandardKey.Cut),
+            ("Chọn tất cả", QKeySequence.StandardKey.SelectAll),
+            ("Hoàn tác", QKeySequence.StandardKey.Undo),
+            ("Làm lại", QKeySequence.StandardKey.Redo),
+        ):
+            assert self._actions(main)[name].shortcut() == QKeySequence(key)
+
+    def test_no_table_owns_a_copy_shortcut(self, main):
+        # The ambiguity guard. enable_cell_copy used to install one of these per table.
+        copy_sequence = QKeySequence(QKeySequence.StandardKey.Copy)
+        owned = [
+            s
+            for s in main.findChildren(QShortcut)
+            if s.key() == copy_sequence
+        ]
+        assert owned == []
+
+    def test_copy_acts_on_whatever_has_focus(self, main, qapp):
+        table = QTableWidget(1, 1)
+        table.setItem(0, 0, QTableWidgetItem("một dòng"))
+        table.show()
+        QApplication.setActiveWindow(table)
+        table.setFocus()
+        table.setCurrentCell(0, 0)
+        QApplication.clipboard().clear()
+        self._actions(main)["Sao chép"].trigger()
+        assert QApplication.clipboard().text() == "một dòng"
+        table.close()

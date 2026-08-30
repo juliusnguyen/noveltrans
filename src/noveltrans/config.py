@@ -734,5 +734,38 @@ class AppConfig:
     def window_geometry(self, value) -> None:
         self._s.setValue("window_geometry", value)
 
+    def sort_state(self, list_id: str, column_count: int):
+        """The remembered `(column, ascending)` for one list, or None.
+
+        A **pair** of settings per list rather than a property per list: there are eight
+        sortable lists and `config.py` is long enough.
+
+        Per user, not per novel. A sort preference is about how someone reads a table, not
+        about the novel — storing it in `meta.json` would make the video tab re-sort itself
+        every time you switched novels. (Contrast `video_settings`, which is per-novel for
+        exactly the opposite reason.)
+
+        `column_count` is a shape check, not decoration: the stored value is a column
+        *index*, so inserting a column in a future release would silently re-point every
+        saved sort at a different meaning. A changed count drops the saved state and falls
+        back to the list's default — cheap insurance against a bug nobody could see.
+        """
+        raw = self._s.value(f"sort/{list_id}", "")
+        parts = str(raw).split(",")
+        if len(parts) != 3:
+            return None
+        try:
+            column, ascending, saved_count = int(parts[0]), parts[1] == "1", int(parts[2])
+        except ValueError:
+            return None
+        if saved_count != column_count or not 0 <= column < column_count:
+            return None
+        return column, ascending
+
+    def set_sort_state(self, list_id: str, column: int, ascending: bool, column_count: int) -> None:
+        self._s.setValue(
+            f"sort/{list_id}", f"{int(column)},{1 if ascending else 0},{int(column_count)}"
+        )
+
     def sync(self) -> None:
         self._s.sync()

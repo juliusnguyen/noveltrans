@@ -30,6 +30,10 @@ from noveltrans.gui.widgets import (
     PauseButton,
     ChapterTableModel,
     ProjectPicker,
+    sorting_proxy,
+    enable_table_sorting,
+    source_index,
+    source_rows,
     CellEditorDelegate,
     RetranslateButtonDelegate,
     enable_cell_copy,
@@ -111,7 +115,11 @@ class TranslateTab(QWidget):
         # --- chapter table + side-by-side preview
         self.model = ChapterTableModel(self)
         self.table = QTableView()
-        self.table.setModel(self.model)
+        # See ScrapeTab: the proxy sorts the view, never the chapter list. Row reads go
+        # through source_index / source_rows.
+        self.proxy = sorting_proxy(self.model, self)
+        self.table.setModel(self.proxy)
+        enable_table_sorting(self.table, config=config, list_id="chapters.translate")
         for column in (ChapterTableModel.TITLE_COLUMN, ChapterTableModel.TRANSLATED_TITLE_COLUMN):
             self.table.horizontalHeader().setSectionResizeMode(
                 column, QHeaderView.ResizeMode.Stretch
@@ -342,7 +350,11 @@ class TranslateTab(QWidget):
     def _on_row_selected(self, current, _previous) -> None:
         self._save_preview_edits()
         self._save_original_edits()
-        chapter = self.model.chapter_at(current.row()) if current.isValid() else None
+        chapter = (
+            self.model.chapter_at(source_index(self.table, current).row())
+            if current.isValid()
+            else None
+        )
         if chapter is None or self.project is None:
             return
         self._load_preview(self.project.chapter(chapter.index))
@@ -506,9 +518,13 @@ class TranslateTab(QWidget):
         self.pause_button.set_job(self._job.id if self._job else None)
         self._worker.start()
 
-    def _retranslate_row(self, row: int) -> None:
-        """Re-translate exactly one chapter (the per-row '↻ Dịch lại' button)."""
-        chapter = self.model.chapter_at(row)
+    def _retranslate_row(self, index) -> None:
+        """Re-translate exactly one chapter (the per-row '↻ Dịch lại' button).
+
+        Takes the clicked INDEX, not a row number: under a sort the button's row is a
+        screen position, and acting on it would re-translate a different chapter.
+        """
+        chapter = self.model.chapter_at(source_index(self.table, index).row())
         if chapter is None or self.project is None or not chapter.content:
             return
         if self._busy():
@@ -584,8 +600,10 @@ class TranslateTab(QWidget):
         if row is None:
             return  # deleted since the preview — nothing to open
         was_open = self._preview_idx
-        self.table.selectRow(row)  # → _on_row_selected loads the preview panes
-        self.table.scrollTo(self.model.index(row, 0))
+        # VIEW rows: under a sort the chapter is wherever the current ordering puts it.
+        view_index = self.proxy.mapFromSource(self.model.index(row, 0))
+        self.table.selectRow(view_index.row())  # → _on_row_selected loads the preview panes
+        self.table.scrollTo(view_index)
         view = (
             self.translated_view
             if field in (FIELD_TRANSLATED, FIELD_TRANSLATED_TITLE)
@@ -793,10 +811,10 @@ class TranslateTab(QWidget):
         """
         if self.project is None:
             return
-        selection = self.table.selectionModel()
-        rows = sorted({i.row() for i in selection.selectedIndexes()}) if selection else []
-        if index.isValid() and index.row() not in rows:
-            rows = [index.row()]  # right-clicked away from the selection → act on that row
+        rows = source_rows(self.table)
+        clicked = source_index(self.table, index).row() if index.isValid() else None
+        if clicked is not None and clicked not in rows:
+            rows = [clicked]  # right-clicked away from the selection → act on that row
         chapters = [c for c in (self.model.chapter_at(row) for row in rows) if c is not None]
         rewritable = [c.index for c in chapters if c.translated]
         undoable = [c.index for c in chapters if c.is_rewritten]
