@@ -489,3 +489,53 @@ class TestProjectPickerLabel:
 
         meta = self._meta(url=new_local_url(), site="local", title="Truyện tự soạn")
         assert meta.novel_label() == "Truyện tự soạn"
+
+
+class TestProjectPickerOrdering:
+    """The picker lists novels by what it SHOWS, not by folder name (074).
+
+    `Library.list_projects` sorts on the folder, which is `slugify(meta.title)-<hash>` —
+    the ORIGINAL title — while every row shows the translation first. So the dropdown
+    looked unsorted: the only key the user could see was never the key it was ordered by.
+    """
+
+    def _library(self, tmp_path):
+        from noveltrans.models import ChapterRef, NovelMeta
+        from noveltrans.storage import NovelProject
+
+        root = tmp_path / "library"
+        root.mkdir()
+        # Folder order (by original title's slug) is the reverse of label order.
+        for original, translated in (
+            ("Zhu Ben", "Ánh Sáng"),
+            ("Ai Ben", "Zô Cuối"),
+            ("Mo Ben", "Muôn Trùng"),
+        ):
+            meta = NovelMeta(url=f"https://x/{original}", site="x", title=original)
+            project = NovelProject.create(
+                root, meta, [ChapterRef(index=0, title="C1", url="https://x/1")]
+            )
+            project.save_meta_translation(translated, "mô tả", "vi")
+            project.close()
+        return root
+
+    def test_rows_are_ordered_by_their_label(self, qapp, tmp_path):
+        from noveltrans.gui.widgets import ProjectPicker
+
+        picker = ProjectPicker()
+        picker.refresh(self._library(tmp_path), default_to_first=False)
+        from noveltrans.gui.widgets import _fold
+
+        labels = [picker.itemText(i) for i in range(picker.count())]
+        # Folded, not raw: "Ánh" sorts after "Z" by codepoint, which is the very thing
+        # _fold exists to prevent.
+        assert labels == sorted(labels, key=_fold)
+        assert labels[0].startswith("Ánh Sáng")  # not "Ai Ben", whose folder sorts first
+        assert labels[-1].startswith("Zô Cuối")
+
+    def test_diacritics_file_beside_their_base_letter(self, qapp, tmp_path):
+        # "Ánh" belongs next to "A", not after "Z".
+        from noveltrans.gui.widgets import _fold
+
+        assert _fold("Ánh Sáng") < _fold("Bản")
+        assert _fold("Đấu La") < _fold("Muôn")

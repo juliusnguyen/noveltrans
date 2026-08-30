@@ -118,7 +118,7 @@ def _select_rows(tab: AudioTab, rows: list[int]) -> None:
     selection.clearSelection()
     for row in rows:
         selection.select(
-            tab.model.index(row, 0),
+            tab.table.model().index(row, 0),
             selection.SelectionFlag.Select | selection.SelectionFlag.Rows,
         )
 
@@ -148,7 +148,7 @@ class TestRegenerateSkipsDownloaded:
         tab = _tab(qapp, tmp_path, chapters)
         _select_rows(tab, [0, 1, 2])
         menu = QMenu()
-        tab._add_regenerate_actions(menu, tab.model.index(0, 0))
+        tab._add_regenerate_actions(menu, tab.table.model().index(0, 0))
         assert menu.actions() == []
 
     def test_menu_explains_both_skip_reasons(self, qapp, tmp_path):
@@ -158,7 +158,7 @@ class TestRegenerateSkipsDownloaded:
         tab = _tab(qapp, tmp_path, chapters)
         _select_rows(tab, [0, 1, 2, 3])
         menu = QMenu()
-        tab._add_regenerate_actions(menu, tab.model.index(0, 0))
+        tab._add_regenerate_actions(menu, tab.table.model().index(0, 0))
         tip = [a for a in menu.actions() if a.text().startswith("🔊")][0].toolTip()
         assert "chưa có nội dung" in tip
         assert "audio tải về" in tip  # the protected rows get their own wording
@@ -376,11 +376,11 @@ class TestViewToggle:
 
     def test_switching_swaps_the_table_model(self, qapp, tmp_path):
         tab = _tab(qapp, tmp_path, _chapters(), TTM_URL, releases=[_release(1)])
-        assert tab.table.model() is tab.model
+        assert tab.table.model().sourceModel() is tab.model
         tab.view_combo.setCurrentIndex(1)
-        assert tab.table.model() is tab.source_model
+        assert tab.table.model().sourceModel() is tab.source_model
         tab.view_combo.setCurrentIndex(0)
-        assert tab.table.model() is tab.model
+        assert tab.table.model().sourceModel() is tab.model
 
     def test_the_tts_buttons_are_off_while_the_audio_list_shows(self, qapp, tmp_path):
         tab = _tab(qapp, tmp_path, _chapters(), TTM_URL, releases=[_release(1)])
@@ -399,7 +399,7 @@ class TestViewToggle:
         tab = _tab(qapp, tmp_path, _chapters(), TTM_URL, releases=[_release(1)])
         tab.view_combo.setCurrentIndex(1)
         menu = QMenu()
-        tab._add_regenerate_actions(menu, tab.source_model.index(0, 0))
+        tab._add_regenerate_actions(menu, tab.table.model().index(0, 0))
         assert not [a for a in menu.actions() if a.text()]
 
     def test_leaving_an_unsupported_source_returns_to_the_chapter_view(self, qapp, tmp_path):
@@ -408,7 +408,7 @@ class TestViewToggle:
         tab.project = _FakeProject(_chapters())
         tab._sync_download_button()
         assert not tab._in_source_view()
-        assert tab.table.model() is tab.model
+        assert tab.table.model().sourceModel() is tab.model
 
 
 class TestDownloadWiring:
@@ -484,7 +484,7 @@ class TestPerRowRedownloadButton:
             "noveltrans.gui.tab_audio.AudioDownloadWorker",
             lambda *a, **kw: _StubWorker(started, *a, **kw),
         )
-        tab._redownload_row(1)
+        tab._redownload_row(tab.table.model().index(1, 0))
         assert started[0]["numbers"] == [11]
         assert started[0]["skip_downloaded"] is False
 
@@ -493,12 +493,12 @@ class TestPerRowRedownloadButton:
     ):
         tab = _tab(qapp, tmp_path, _chapters(3), TTM_URL, releases=[_release(1)])
         chapter_menu = QMenu()
-        tab._add_download_actions(chapter_menu, tab.model.index(0, 0))
+        tab._add_download_actions(chapter_menu, tab.table.model().index(0, 0))
         assert not [a for a in chapter_menu.actions() if a.text()], "no release behind a chapter"
 
         tab.view_combo.setCurrentIndex(1)
         menu = QMenu()
-        tab._add_download_actions(menu, tab.source_model.index(0, 0))
+        tab._add_download_actions(menu, tab.table.model().index(0, 0))
         started: list = []
         monkeypatch.setattr(
             "noveltrans.gui.tab_audio.AudioDownloadWorker",

@@ -1,4 +1,6 @@
 
+import json
+
 import pytest
 
 from noveltrans.models import (
@@ -819,3 +821,102 @@ class TestDisplayTitle:
         path = project.path
         project.close()
         assert NovelProject.open(path).meta.display_title == ""
+
+
+class TestSlugName:
+    """The pinned filename stem (074).
+
+    `slug_name()` is what every generated file is named after. The first test is the
+    no-migration guarantee: an unpinned novel must resolve to exactly the pre-074 stem, or
+    upgrading the app silently orphans every rendered part on disk.
+    """
+
+    def test_an_unpinned_novel_resolves_to_the_pre_074_stem(self, sample_meta):
+        from noveltrans.slug import slugify
+
+        assert sample_meta.slug == ""
+        assert sample_meta.slug_name() == slugify(sample_meta.title)
+        sample_meta.translated_title = "Tiểu Thuyết Thử Nghiệm"
+        assert sample_meta.slug_name() == slugify("Tiểu Thuyết Thử Nghiệm")
+
+    def test_a_cjk_only_title_still_falls_back_to_novel(self):
+        from noveltrans.models import NovelMeta
+
+        assert NovelMeta(url="u", site="s", title="测试小说").slug_name() == "novel"
+
+    def test_a_pinned_stem_survives_a_later_retranslation(self, library_dir, sample_meta):
+        """The hazard the pin exists to remove.
+
+        Before 074 the stem was derived from `translated_title`, so re-translating into a
+        different language moved it — orphaning every rendered part and every
+        `.upload.json` with no error and no way back short of renaming files by hand.
+        """
+        project = NovelProject.create(library_dir, sample_meta, [])
+        project.pin_slug("tieu-thuyet-thu-nghiem")
+        project.save_meta_translation("A Completely Different Title", "desc", "en")
+        assert project.meta.slug_name() == "tieu-thuyet-thu-nghiem"
+        assert NovelProject.open(project.path).meta.slug_name() == "tieu-thuyet-thu-nghiem"
+        project.close()
+
+    def test_pin_slug_never_repoints_an_already_pinned_stem(self, library_dir, sample_meta):
+        project = NovelProject.create(library_dir, sample_meta, [])
+        project.pin_slug("first")
+        project.pin_slug("second")
+        assert project.meta.slug == "first"
+        project.close()
+
+    def test_an_old_meta_json_without_the_key_still_loads(self, library_dir, sample_meta):
+        project = NovelProject.create(library_dir, sample_meta, [])
+        path = project.path / "meta.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        del data["slug"]
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        project.close()
+        assert NovelProject.open(path.parent).meta.slug == ""
+
+
+class TestRenameNovel:
+    def test_it_writes_the_name_and_the_stem_together(self, library_dir, sample_meta):
+        project = NovelProject.create(library_dir, sample_meta, [])
+        project.rename_novel("Trọng Sinh", pin_slug="trong-sinh")
+        # One meta.json write, not two: a crash between them would leave the novel named
+        # but stemless, and every rendered part looking for a stem nobody records.
+        data = json.loads((project.path / "meta.json").read_text(encoding="utf-8"))
+        assert data["display_title"] == "Trọng Sinh"
+        assert data["slug"] == "trong-sinh"
+        project.close()
+
+    def test_save_display_title_pins_the_stem_the_novel_already_uses(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_meta_translation("[ĐM/EDIT] Tên Truyện", "mô tả", "vi")
+        before = project.meta.slug_name()
+        project.save_display_title("Tên Truyện")
+        assert project.meta.slug_name() == before  # files stay exactly where they are
+        assert project.meta.display_name() == "Tên Truyện"
+        project.close()
+
+    def test_it_leaves_the_scraped_and_translated_titles_alone(
+        self, library_dir, sample_meta
+    ):
+        project = NovelProject.create(library_dir, sample_meta, [])
+        project.save_meta_translation("Tên đã dịch", "mô tả", "vi")
+        project.rename_novel("Tên mới", pin_slug="ten-moi")
+        assert project.meta.title == sample_meta.title
+        assert project.meta.translated_title == "Tên đã dịch"
+        project.close()
+
+    def test_a_rescan_does_not_undo_a_rename(self, library_dir, sample_meta):
+        """`refresh_meta` overwrites `title` on every re-scan — which is exactly why the
+        editable name is `display_title` and not `title`."""
+        from noveltrans.models import NovelMeta
+
+        project = NovelProject.create(library_dir, sample_meta, [])
+        project.rename_novel("Tên mới", pin_slug="ten-moi")
+        project.refresh_meta(
+            NovelMeta(url=sample_meta.url, site="fake", title="新标题", author="tác giả")
+        )
+        assert project.meta.display_title == "Tên mới"
+        assert project.meta.slug == "ten-moi"
+        project.close()

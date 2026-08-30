@@ -11,6 +11,7 @@ from PySide6.QtCore import (
     QModelIndex,
     QPoint,
     QRect,
+    QSortFilterProxyModel,
     Qt,
     Signal,
 )
@@ -25,10 +26,12 @@ from PySide6.QtWidgets import (
     QStyleOptionButton,
     QPushButton,
     QTableView,
+    QTableWidgetItem,
 )
 
-from PySide6.QtGui import QColor, QKeySequence, QShortcut
+from PySide6.QtGui import QColor
 
+from noveltrans.gui import shortcuts
 from noveltrans.gui.jobs import job_registry
 from noveltrans.models import (
     SourceAudio,
@@ -40,6 +43,122 @@ from noveltrans.models import (
     Chapter,
 )
 from noveltrans.storage import Library
+
+# The sort key a cell offers, distinct from what it displays: "3m05s" and "Đã dịch" do
+# not sort as text, and `#` sorts 1, 10, 2 as a string. UserRole is already taken — the
+# button columns use it to mean "this row is eligible" — so the key gets its own role.
+SORT_ROLE = Qt.ItemDataRole.UserRole + 1
+
+# Pipeline order, not alphabetical order. "Lỗi" belongs beside "Chưa tải" (both mean
+# "this chapter is not done"), never between "Đã tải" and "Đã dịch".
+_STATUS_RANK = {
+    STATUS_ERROR: 0,
+    STATUS_PENDING: 1,
+    STATUS_DOWNLOADED: 2,
+    STATUS_TRANSLATED: 3,
+}
+_AUDIO_RANK = {"Lỗi": 0, "Chưa dịch": 1, "Chưa tải": 1, "Chưa tạo": 2, "Đã tạo": 3, "Đã tải": 4}
+
+
+def sorting_proxy(model, parent=None) -> QSortFilterProxyModel:
+    """A proxy that sorts on SORT_ROLE, for the four QTableViews.
+
+    `setDynamicSortFilter(False)` is deliberate. These models emit `dataChanged` per
+    chapter while a run is in progress, and with dynamic sorting on, a chapter that
+    finishes translating **jumps out from under the cursor** mid-run. Off, the order holds
+    until the next header click or `set_chapters` reset.
+    """
+    proxy = QSortFilterProxyModel(parent)
+    proxy.setSourceModel(model)
+    proxy.setSortRole(SORT_ROLE)
+    proxy.setDynamicSortFilter(False)
+    return proxy
+
+
+def enable_table_sorting(
+    table, *, config=None, list_id: str = "", default_column: int = 0, ascending: bool = True
+) -> None:
+    """Turn on header-click sorting, apply the remembered order, and remember changes.
+
+    **`sortByColumn` is not optional.** `setSortingEnabled(True)` alone leaves the header's
+    indicator at its default — which is *Descending* — so every table would open backwards,
+    chapter 6 above chapter 1. Measured, and caught only because the multi-select tests
+    assert on real row numbers.
+
+    The default is always `#` ascending: chapter order is the data, not a presentation
+    choice, and a table that opens in any other order is lying about the novel.
+
+    `config`/`list_id` are optional so a table can sort without persisting (the picker, and
+    every test that builds a bare tab). The column *count* travels with the saved value —
+    see `AppConfig.sort_state` for why.
+    """
+    from PySide6.QtCore import Qt as _Qt
+
+    model = table.model()
+    column_count = model.columnCount() if model is not None else 0
+    column, asc = default_column, ascending
+    if config is not None and list_id:
+        saved = config.sort_state(list_id, column_count)
+        if saved is not None:
+            column, asc = saved
+    table.setSortingEnabled(True)
+    table.sortByColumn(
+        column, _Qt.SortOrder.AscendingOrder if asc else _Qt.SortOrder.DescendingOrder
+    )
+    if config is not None and list_id:
+        table.horizontalHeader().sortIndicatorChanged.connect(
+            lambda c, o: config.set_sort_state(
+                list_id, c, o == _Qt.SortOrder.AscendingOrder, column_count
+            )
+        )
+
+
+def source_index(view, index):
+    """`index` in the SOURCE model's coordinates. Identity when the view has no proxy.
+
+    Every read of a row has to come through here or through `source_rows`. A view row is a
+    position on screen; a chapter is a row in the model. They are the same number only
+    until someone clicks a header — and then "Tạo lại 30 chương" acts on the wrong
+    chapters, silently.
+    """
+    model = view.model()
+    if isinstance(model, QSortFilterProxyModel) and index.model() is model:
+        return model.mapToSource(index)
+    return index
+
+
+def source_rows(view) -> list[int]:
+    """The selected rows, as SOURCE row numbers, ascending.
+
+    Ascending in *chapter* order rather than in screen order, which is what every caller
+    actually wants: they feed these to a worker that walks the novel forwards.
+    """
+    selection = view.selectionModel()
+    if selection is None:
+        return []
+    return sorted({source_index(view, i).row() for i in selection.selectedIndexes()})
+
+
+class SortableItem(QTableWidgetItem):
+    """A QTableWidget cell that sorts by an explicit key instead of by its own text.
+
+    For the tables built out of items rather than a model. Python's `__lt__` **is**
+    honoured by `QTableWidget.sortItems` (measured), so "Phần 9" / "Phần 10" / "Phần 100"
+    come back in that order rather than 10, 100, 9.
+    """
+
+    def __init__(self, text: str, key=None):
+        super().__init__(text)
+        if key is not None:
+            self.setData(SORT_ROLE, key)
+
+    def __lt__(self, other) -> bool:
+        mine = self.data(SORT_ROLE)
+        theirs = other.data(SORT_ROLE) if isinstance(other, QTableWidgetItem) else None
+        if mine is None or theirs is None:
+            return super().__lt__(other)
+        return mine < theirs
+
 
 STATUS_LABELS = {
     STATUS_PENDING: "Chưa tải",
@@ -69,6 +188,20 @@ STATUS_COLORS = {
     STATUS_TRANSLATED: QColor("#1565c0"),  # blue
     STATUS_ERROR: QColor("#c62828"),  # red
 }
+
+
+def _fold(text: str) -> str:
+    """A case- and diacritic-insensitive sort key, so "Ấ" files beside "A" not after "Z".
+
+    `đ` is spelled out because it has **no NFKD decomposition** — it is its own letter, not
+    a d with a mark — so stripping combining characters leaves it, and its codepoint sorts
+    it after "z". `slugify` carries the same special case for the same reason.
+    """
+    import unicodedata
+
+    text = (text or "").replace("đ", "d").replace("Đ", "D")
+    stripped = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in stripped if not unicodedata.combining(c)).casefold()
 
 
 def _picker_label(meta) -> str:
@@ -106,9 +239,17 @@ class ProjectPicker(QComboBox):
         library = Library(self._library_dir)
         self.blockSignals(True)
         self.clear()
-        for path in library.list_projects():
-            meta = library.project_meta(path)
-            self.addItem(_picker_label(meta), str(path))
+        # By the label, not by folder name. `Library.list_projects` sorts on the folder,
+        # which is `slugify(meta.title)-<hash>` — the ORIGINAL title — while every row
+        # here shows the translation first. So the list looked unsorted: the key the user
+        # could see was never the key it was ordered by.
+        rows = [
+            (_picker_label(meta := library.project_meta(path)) or "", str(path), meta)
+            for path in library.list_projects()
+        ]
+        rows.sort(key=lambda row: _fold(row[0]))
+        for label, path, _meta in rows:
+            self.addItem(label, path)
         index = self.findData(current)
         if index < 0 and default_to_first and self.count():
             index = 0
@@ -231,7 +372,10 @@ class RowButtonDelegate(QStyledItemDelegate):
     The button shows only when the cell's UserRole data is truthy.
     """
 
-    clicked = Signal(int)  # table row
+    # The INDEX, not a row number. A row number is a position on screen, and once a proxy
+    # sorts the view those stop being chapter numbers — the button would then act on
+    # whatever chapter happens to sit at that position. Slots call `source_index`.
+    clicked = Signal(QModelIndex)
 
     def __init__(self, text: str, parent=None):
         super().__init__(parent)
@@ -259,7 +403,7 @@ class RowButtonDelegate(QStyledItemDelegate):
             and index.data(Qt.ItemDataRole.UserRole)
             and option.rect.contains(event.position().toPoint())
         ):
-            self.clicked.emit(index.row())
+            self.clicked.emit(index)
             return True
         return False
 
@@ -364,6 +508,27 @@ class AudioChapterTableModel(QAbstractTableModel):
             and chapter.audio_error
         ):
             return chapter.audio_error  # full text on hover (cell is truncated)
+        if role == SORT_ROLE:
+            # The displayed strings do not sort: "3m05s" < "10s" as text, and the status
+            # words are alphabetical nonsense. Every key here is comparable.
+            if column == 0:
+                return chapter.index
+            if column == self.TITLE_COLUMN:
+                title = chapter.translated_title or chapter.title
+                return (title if self._use_translation else chapter.title).casefold()
+            if column == self.CHARS_COLUMN:
+                text = chapter.translated if self._use_translation else chapter.content
+                return len(text or "")
+            if column == self.STATUS_COLUMN:
+                return _AUDIO_RANK.get(self._audio_status(chapter)[0], 9)
+            if column == self.DURATION_COLUMN:
+                return chapter.audio_seconds or 0.0
+            if column == self.VOICE_COLUMN:
+                return (chapter.audio_voice or "").casefold()
+            if column == self.ERROR_COLUMN:
+                # "Which rows failed" is the question, and it is one click.
+                return (bool(chapter.audio_error), (chapter.audio_error or "").casefold())
+            return None  # the button column has no key; its header is not clickable
         if role == Qt.ItemDataRole.ForegroundRole and column == self.STATUS_COLUMN:
             return self._audio_status(chapter)[1]
         if role == Qt.ItemDataRole.TextAlignmentRole and column in (
@@ -475,6 +640,18 @@ class AudioSourceTableModel(QAbstractTableModel):
                 return item.error
         if role == Qt.ItemDataRole.ToolTipRole and column == self.ERROR_COLUMN:
             return item.error
+        if role == SORT_ROLE:
+            if column == 0:
+                return item.ord or index.row() + 1
+            if column == self.TITLE_COLUMN:
+                return (item.title or "").casefold()
+            if column == self.STATUS_COLUMN:
+                return _AUDIO_RANK.get(self._status(item)[0], 9)
+            if column == self.DURATION_COLUMN:
+                return item.seconds or 0.0
+            if column == self.ERROR_COLUMN:
+                return (bool(item.error), (item.error or "").casefold())
+            return None
         if role == Qt.ItemDataRole.ForegroundRole and column == self.STATUS_COLUMN:
             return self._status(item)[1]
         if role == Qt.ItemDataRole.TextAlignmentRole and column == self.DURATION_COLUMN:
@@ -616,6 +793,22 @@ class ChapterTableModel(QAbstractTableModel):
             if self._title_editable:
                 return f"{chapter.title}\nNháy đúp để sửa tên chương"
             return chapter.title
+        if role == SORT_ROLE:
+            if column == 0:
+                return chapter.index
+            if column == self.TITLE_COLUMN:
+                return (chapter.title or "").casefold()
+            if column == self.TRANSLATED_TITLE_COLUMN:
+                return (chapter.translated_title or "").casefold()
+            if column == self.STATUS_COLUMN:
+                return _STATUS_RANK.get(chapter.status, 9)
+            if column == self.TRANSLATOR_COLUMN:
+                return (chapter.translator or "").casefold()
+            if column == self.DURATION_COLUMN:
+                return chapter.translate_seconds or 0.0
+            if column == self.ERROR_COLUMN:
+                return (bool(chapter.error), (chapter.error or "").casefold())
+            return None
         if role == Qt.ItemDataRole.ForegroundRole and column == self.STATUS_COLUMN:
             return STATUS_COLORS.get(chapter.status)
         if role == Qt.ItemDataRole.TextAlignmentRole and column == self.DURATION_COLUMN:
@@ -665,17 +858,6 @@ class ChapterTableModel(QAbstractTableModel):
         return True
 
 
-def _copy_index_text(index) -> None:
-    """Put a cell's text on the clipboard (its tooltip if longer than the display)."""
-    if not index.isValid():
-        return
-    display = index.data(Qt.ItemDataRole.DisplayRole)
-    tooltip = index.data(Qt.ItemDataRole.ToolTipRole)
-    text = tooltip if tooltip else display
-    if text:
-        QApplication.clipboard().setText(str(text))
-
-
 def focus_index_keeping_selection(table: QTableView, index) -> None:
     """Make `index` the current cell without throwing away a multi-row selection.
 
@@ -699,8 +881,13 @@ def focus_index_keeping_selection(table: QTableView, index) -> None:
 
 
 def enable_cell_copy(table: QTableView, extra_actions=None) -> None:
-    """Let the user copy a table cell (e.g. a long error message) via Ctrl+C or a
-    right-click "Sao chép" menu, so it's easy to paste elsewhere.
+    """Give a table its right-click "Sao chép" menu and multi-row selection.
+
+    The **keyboard** half no longer lives here. A `QShortcut(StandardKey.Copy, table)` and
+    an Edit-menu `QAction` on the same key cannot coexist — Qt logs "Ambiguous shortcut
+    overload: ⌘C" and fires *neither*, so the shortcut moved to `gui.shortcuts`, which
+    serves every list in the app (including the five that never called this function)
+    from one place. This is now menu-only; ⌘C arrives via `EditShortcutFilter`.
 
     `extra_actions`, if given, is called as `extra_actions(menu, index)` while the
     right-click menu is being built, so a caller can append its own actions (e.g.
@@ -709,22 +896,18 @@ def enable_cell_copy(table: QTableView, extra_actions=None) -> None:
     table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
     table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
-    def copy_current() -> None:
-        _copy_index_text(table.currentIndex())
-
     def show_menu(pos: QPoint) -> None:
         index = table.indexAt(pos)
         if not index.isValid():
             return
+        # Before the menu is built, so "Sao chép" copies the same selection ⌘C would.
         focus_index_keeping_selection(table, index)
         menu = QMenu(table)
-        menu.addAction("Sao chép", lambda: _copy_index_text(index))
+        menu.addAction("Sao chép", lambda: shortcuts.copy_from(table))
         if extra_actions is not None:
             extra_actions(menu, index)
         menu.exec(table.viewport().mapToGlobal(pos))
 
-    shortcut = QShortcut(QKeySequence.StandardKey.Copy, table)
-    shortcut.activated.connect(copy_current)
     table.customContextMenuRequested.connect(show_menu)
 
 

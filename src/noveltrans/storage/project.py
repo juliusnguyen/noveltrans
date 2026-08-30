@@ -13,10 +13,10 @@ import hashlib
 import json
 import re
 import sqlite3
-import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
+from noveltrans.slug import slugify  # re-exported: many modules import it from here
 from noveltrans.models import (
     AUDIO_SOURCE_DOWNLOADED,
     STATUS_DOWNLOADED,
@@ -85,15 +85,6 @@ CREATE TABLE IF NOT EXISTS source_audio (
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def slugify(text: str, max_len: int = 40) -> str:
-    """ASCII-safe folder slug; CJK titles fall back to 'novel'."""
-    text = text.replace("đ", "d").replace("Đ", "D")  # đ has no NFKD decomposition
-    text = unicodedata.normalize("NFKD", text)
-    text = text.encode("ascii", "ignore").decode("ascii")
-    text = re.sub(r"[^a-zA-Z0-9]+", "-", text).strip("-").lower()
-    return text[:max_len] or "novel"
 
 
 def _row_to_chapter(row: sqlite3.Row) -> Chapter:
@@ -908,17 +899,55 @@ class NovelProject:
             json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
-    def save_display_title(self, title: str) -> None:
-        """Persist the title override used on video output into meta.json.
+    def rename_novel(self, title: str, *, pin_slug: str) -> None:
+        """Give the novel a new name, and say what its files are called from now on.
 
-        Deliberately does NOT touch `translated_title`: that one still keys the video
-        filename slug, and moving it would strand every rendered part and upload record.
+        The name is `display_title` — already what `display_name()` and `novel_label()`
+        put on the video, the thumbnail, the description, the YouTube title, the tab and
+        the picker. Renaming is therefore mostly a matter of *stopping* the filename stem
+        from following along, which is what `pin_slug` is for.
+
+        Both fields in **one** write. Two writes leave a window in which the name has
+        changed and the stem has not; a crash there would leave every rendered part
+        looking for a stem nobody records any more.
+
+        Deliberately does NOT touch `title` or `translated_title`. `refresh_meta` rewrites
+        `title` on every re-scan, so an edit there would not survive the day, and
+        `translated_title` is the fallback `slug_name()` reads for an unpinned novel.
         """
         title = (title or "").strip()
         self.meta.display_title = title
+        self.meta.slug = pin_slug
         meta_path = self.path / META_FILE
         data = json.loads(meta_path.read_text(encoding="utf-8"))
-        data.update(display_title=title)
+        data.update(display_title=title, slug=pin_slug)
+        meta_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    def save_display_title(self, title: str) -> None:
+        """Rename the novel, keeping its files exactly where they are.
+
+        The display-only half of `rename_novel`: it pins whatever stem the novel resolves
+        to *right now*, so the new name reaches every screen while `<stem>.mp4` and its
+        `<stem>.upload.json` stay put and stay findable.
+        """
+        self.rename_novel(title, pin_slug=self.meta.slug_name())
+
+    def pin_slug(self, slug: str) -> None:
+        """Record the stem this novel's files are named after, if it has none yet.
+
+        Called by the workers just before the first render or merge writes anything. From
+        that moment the novel's filenames are anchored: a later re-translation can change
+        `translated_title` freely without moving `<stem>.mp4` out from under the upload
+        record that names it. A no-op once set — only a rename repoints a pinned stem.
+        """
+        if self.meta.slug or not slug:
+            return
+        self.meta.slug = slug
+        meta_path = self.path / META_FILE
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+        data.update(slug=slug)
         meta_path.write_text(
             json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
         )

@@ -39,6 +39,7 @@ from noveltrans.name_glossary import (
     read_names,
     write_names,
 )
+from noveltrans.gui.widgets import SortableItem, enable_table_sorting
 from noveltrans.gui.workers import NameScanWorker
 from noveltrans.storage import NovelProject
 from noveltrans.translators.names import to_hanviet
@@ -81,6 +82,9 @@ class NameGlossaryDialog(QDialog):
             _COL_READING, QHeaderView.ResizeMode.Stretch
         )
         self.table.itemChanged.connect(self._on_item_changed)
+        # Most-seen first, which is the order `_reload_table` already builds — so turning
+        # sorting on changes nothing until the user clicks a header.
+        enable_table_sorting(self.table, default_column=_COL_COUNT, ascending=False)
 
         self.scan_button = QPushButton("🔍 Dò lại từ bản gốc")
         self.scan_button.setToolTip(
@@ -118,9 +122,14 @@ class NameGlossaryDialog(QDialog):
     # ------------------------------------------------------------------ table
 
     def _reload_table(self) -> None:
+        # Sorting off while filling: every setItem would otherwise re-sort and move the
+        # row being built. `_rows()` reads the table by walking it, and each row carries
+        # its entry in UserRole, so the order it comes back in does not matter.
+        self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
         for entry in sorted(self._entries, key=lambda e: (-e.count, e.source)):
             self._insert_row(entry)
+        self.table.setSortingEnabled(True)
         self._refresh_header()
 
     def _insert_row(self, entry: NameEntry) -> None:
@@ -144,7 +153,8 @@ class NameGlossaryDialog(QDialog):
         auto.setFlags(auto.flags() & ~Qt.ItemFlag.ItemIsEditable)
         self.table.setItem(row, _COL_AUTO, auto)
 
-        count = QTableWidgetItem(str(entry.count) if entry.count else "—")
+        # Keyed on the number: "—" and "12" and "9" do not sort as text.
+        count = SortableItem(str(entry.count) if entry.count else "—", entry.count or 0)
         count.setFlags(count.flags() & ~Qt.ItemFlag.ItemIsEditable)
         self.table.setItem(row, _COL_COUNT, count)
 

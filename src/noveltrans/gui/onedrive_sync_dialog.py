@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
 
 from noveltrans.gui.jobs import job_registry
 from noveltrans.gui.keep_awake import track_worker
-from noveltrans.gui.widgets import PauseButton
+from noveltrans.gui.widgets import PauseButton, SortableItem, enable_table_sorting
 from noveltrans.gui.workers import OneDriveSyncScanWorker, OneDriveSyncWorker
 from noveltrans.onedrive_upload import PushRequest, format_size
 
@@ -57,6 +57,8 @@ class OneDriveSyncPickerDialog(QDialog):
             0, QHeaderView.ResizeMode.Stretch
         )
         self.table.itemChanged.connect(self._on_tick)
+        # Biggest upload first: that is the row a user checks before starting a long push.
+        enable_table_sorting(self.table, default_column=2, ascending=False)
 
         self.scan_progress = QProgressBar()
         self.status = QLabel("Đang xem thư viện…")
@@ -108,6 +110,9 @@ class OneDriveSyncPickerDialog(QDialog):
 
     def _on_scanned(self, path: str, title: str, files: int, size: int, error: str) -> None:
         index = self.table.rowCount()
+        # Off while filling, on after — rows arrive one at a time from the scan worker,
+        # and a re-sort mid-insert moves the row being built. Same bracket as CleanupDialog.
+        self.table.setSortingEnabled(False)
         self.table.insertRow(index)
 
         name_item = QTableWidgetItem(title)
@@ -128,12 +133,17 @@ class OneDriveSyncPickerDialog(QDialog):
             detail, amount = f"{files} file", format_size(size)
         else:
             detail, amount = "đã đồng bộ", "—"
-        self.table.setItem(index, 1, QTableWidgetItem(detail))
-        self.table.setItem(index, 2, QTableWidgetItem(amount))
+        self.table.setItem(index, 1, SortableItem(detail, (bool(error), files)))
+        # Sorts on bytes, not on "1.2 GB" — which as text puts 900 MB above 1.2 GB.
+        self.table.setItem(index, 2, SortableItem(amount, size))
 
-        self._rows.append(
-            {"path": path, "title": title, "files": files, "size": size, "error": error}
-        )
+        row = {"path": path, "title": title, "files": files, "size": size, "error": error}
+        # The row rides on the item. `self._rows[index]` was the old lookup and it is
+        # wrong the moment a sort moves a row — `_ticked` would have handed the push the
+        # wrong novel. Fixed whether or not this table ever sorts.
+        name_item.setData(Qt.ItemDataRole.UserRole, row)
+        self._rows.append(row)
+        self.table.setSortingEnabled(True)
         self._refresh_total()
 
     def _on_scan_done(self) -> None:
@@ -161,10 +171,14 @@ class OneDriveSyncPickerDialog(QDialog):
         self._refresh_total()
 
     def _ticked(self) -> list[dict]:
+        """The novels the user actually ticked — read off the items, never by position."""
         out = []
-        for index, row in enumerate(self._rows):
+        for index in range(self.table.rowCount()):
             item = self.table.item(index, 0)
-            if item is not None and item.checkState() == Qt.CheckState.Checked:
+            if item is None or item.checkState() != Qt.CheckState.Checked:
+                continue
+            row = item.data(Qt.ItemDataRole.UserRole)
+            if row is not None:
                 out.append(row)
         return out
 

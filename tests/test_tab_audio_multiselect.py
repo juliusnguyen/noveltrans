@@ -58,11 +58,18 @@ def _tab(qapp, tmp_path, *, count: int = 6, translated: bool = True) -> AudioTab
 
 
 def _select_rows(tab: AudioTab, rows: list[int]) -> None:
+    """Select model rows through the VIEW.
+
+    `tab.table.model()` is a QSortFilterProxyModel since 074, and a selection model only
+    understands indices from its own model — handing it `tab.table.model().index(...)` selects
+    silently wrong rows. Unsorted, the proxy maps 1:1, so these are the same rows.
+    """
     selection = tab.table.selectionModel()
     selection.clearSelection()
+    view_model = tab.table.model()
     for row in rows:
         selection.select(
-            tab.model.index(row, 0),
+            view_model.index(row, 0),
             selection.SelectionFlag.Select | selection.SelectionFlag.Rows,
         )
 
@@ -86,7 +93,7 @@ def test_menu_action_names_the_selected_count(qapp, tmp_path):
     tab = _tab(qapp, tmp_path)
     _select_rows(tab, [0, 2, 5])
     menu = QMenu()
-    tab._add_regenerate_actions(menu, tab.model.index(2, 0))
+    tab._add_regenerate_actions(menu, tab.table.model().index(2, 0))
     labels = [a.text() for a in menu.actions() if a.text()]
     assert labels == ["🔊 Tạo lại 3 chương"]
 
@@ -95,7 +102,7 @@ def test_menu_action_is_singular_for_one_row(qapp, tmp_path):
     tab = _tab(qapp, tmp_path)
     _select_rows(tab, [4])
     menu = QMenu()
-    tab._add_regenerate_actions(menu, tab.model.index(4, 0))
+    tab._add_regenerate_actions(menu, tab.table.model().index(4, 0))
     assert [a.text() for a in menu.actions() if a.text()] == ["🔊 Tạo lại chương này"]
 
 
@@ -103,7 +110,7 @@ def test_menu_falls_back_to_the_clicked_row_when_nothing_selected(qapp, tmp_path
     tab = _tab(qapp, tmp_path)
     tab.table.selectionModel().clearSelection()
     menu = QMenu()
-    tab._add_regenerate_actions(menu, tab.model.index(3, 0))
+    tab._add_regenerate_actions(menu, tab.table.model().index(3, 0))
     assert [a.text() for a in menu.actions() if a.text()] == ["🔊 Tạo lại chương này"]
 
 
@@ -113,7 +120,7 @@ def test_menu_offers_nothing_when_no_chapter_has_source_text(qapp, tmp_path):
     tab = _tab(qapp, tmp_path, translated=False)
     _select_rows(tab, [0, 1])
     menu = QMenu()
-    tab._add_regenerate_actions(menu, tab.model.index(0, 0))
+    tab._add_regenerate_actions(menu, tab.table.model().index(0, 0))
     assert [a.text() for a in menu.actions() if a.text()] == []
 
 
@@ -182,7 +189,7 @@ def test_row_button_and_batch_share_one_path(qapp, tmp_path):
     tab = _tab(qapp, tmp_path)
     started: list[list[int] | None] = []
     tab._start_generate = lambda indices=None: started.append(indices)
-    tab._regenerate_row(3)
+    tab._regenerate_row(tab.table.model().index(3, 0))
     assert started == [[3]]
 
 
@@ -202,7 +209,7 @@ def test_regenerate_refuses_while_a_job_runs(qapp, tmp_path):
 
     menu = QMenu()
     _select_rows(tab, [0, 1])
-    tab._add_regenerate_actions(menu, tab.model.index(0, 0))
+    tab._add_regenerate_actions(menu, tab.table.model().index(0, 0))
     action = next(a for a in menu.actions() if a.text())
     assert not action.isEnabled()  # offered, but greyed out with a reason
 
@@ -226,12 +233,12 @@ def test_right_click_inside_a_selection_keeps_it(qapp, tmp_path):
 
     tab = _tab(qapp, tmp_path)
     _select_rows(tab, [1, 2, 3])
-    focus_index_keeping_selection(tab.table, tab.model.index(2, 0))
+    focus_index_keeping_selection(tab.table, tab.table.model().index(2, 0))
     assert tab._selected_rows() == [1, 2, 3]  # selection survived the right-click
     assert tab.table.currentIndex().row() == 2  # but the clicked row became current
 
     menu = QMenu()
-    tab._add_regenerate_actions(menu, tab.model.index(2, 0))
+    tab._add_regenerate_actions(menu, tab.table.model().index(2, 0))
     assert "🔊 Tạo lại 3 chương" in [a.text() for a in menu.actions()]
 
 
@@ -241,11 +248,11 @@ def test_right_click_outside_a_selection_reselects_that_row(qapp, tmp_path):
 
     tab = _tab(qapp, tmp_path)
     _select_rows(tab, [1, 2])
-    focus_index_keeping_selection(tab.table, tab.model.index(5, 0))
+    focus_index_keeping_selection(tab.table, tab.table.model().index(5, 0))
     assert tab._selected_rows() == [5]
 
     menu = QMenu()
-    tab._add_regenerate_actions(menu, tab.model.index(5, 0))
+    tab._add_regenerate_actions(menu, tab.table.model().index(5, 0))
     assert "🔊 Tạo lại chương này" in [a.text() for a in menu.actions()]
 
 
@@ -257,7 +264,7 @@ def test_menu_acts_on_the_clicked_row_when_it_is_outside_the_selection(qapp, tmp
     started: list[list[int] | None] = []
     tab._start_generate = lambda indices=None: started.append(indices)
     menu = QMenu()
-    tab._add_regenerate_actions(menu, tab.model.index(4, 0))
+    tab._add_regenerate_actions(menu, tab.table.model().index(4, 0))
     next(a for a in menu.actions() if a.text()).trigger()
     assert started == [[4]]
 
@@ -270,9 +277,11 @@ def test_row_button_ignores_a_right_click(qapp, tmp_path):
 
     tab = _tab(qapp, tmp_path)
     delegate = tab._row_button_delegate
+    # The signal carries a QModelIndex since 074 — a row number is a screen position once
+    # a proxy sorts the view.
     fired: list[int] = []
-    delegate.clicked.connect(fired.append)
-    index = tab.model.index(1, tab.model.REGENERATE_COLUMN)
+    delegate.clicked.connect(lambda index: fired.append(index.row()))
+    index = tab.table.model().index(1, tab.model.REGENERATE_COLUMN)
     option = QStyleOptionViewItem()
     option.rect = QRect(0, 0, 100, 24)
 

@@ -372,3 +372,35 @@ class TestSyncWindow:
         worker.emit("needs_login", "Chưa đăng nhập.")
         assert "Settings" in window.status.text()
         assert window.close_button.isEnabled()
+
+
+class TestPickerSorting:
+    """The row→novel map must survive a sort.
+
+    `_ticked` walked `enumerate(self._rows)` before 074, so a sorted table would have
+    handed the push **a different novel** than the one the user ticked. The rows are now
+    UserRole-keyed; these fail against the old lookup.
+    """
+
+    def test_ticking_a_row_after_a_sort_returns_the_novel_that_row_shows(self, picker):
+        picker._set_all(False)
+        picker.table.sortItems(0, Qt.SortOrder.DescendingOrder)
+        item = picker.table.item(0, 0)
+        item.setCheckState(Qt.CheckState.Checked)
+        assert [r["title"] for r in picker._ticked()] == [item.text()]
+
+    def test_size_sorts_on_bytes_not_on_its_own_text(self, picker):
+        from noveltrans.gui.widgets import SORT_ROLE
+
+        keys = [
+            picker.table.item(r, 2).data(SORT_ROLE) for r in range(picker.table.rowCount())
+        ]
+        assert all(isinstance(k, int) for k in keys)
+
+    def test_it_opens_biggest_first(self, picker):
+        from noveltrans.gui.widgets import SORT_ROLE
+
+        sizes = [
+            picker.table.item(r, 2).data(SORT_ROLE) for r in range(picker.table.rowCount())
+        ]
+        assert sizes == sorted(sizes, reverse=True)
