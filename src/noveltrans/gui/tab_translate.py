@@ -48,6 +48,11 @@ from noveltrans.gui.workers import (
 from noveltrans.models import Chapter
 from noveltrans.storage import NovelProject
 
+# Batches of this many chapters or more ask before starting; smaller ones just run, so the
+# per-row "↻ Dịch lại" button stays a one-click action. Same threshold as the audio tab's
+# REGENERATE_CONFIRM_FROM — the two menus are the same gesture on the same table.
+TRANSLATE_CONFIRM_FROM = 5
+
 
 class TranslateTab(QWidget):
     def __init__(self, config: AppConfig, parent=None):
@@ -126,11 +131,15 @@ class TranslateTab(QWidget):
             )
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
+        # Redundant with enable_cell_copy below, which sets the same mode. Stated here
+        # anyway because the right-click "Dịch N chương" READS this selection — a future
+        # edit to that helper must not silently take the batch away.
+        self.table.setSelectionMode(QTableView.SelectionMode.ExtendedSelection)
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
         # Ctrl+C / right-click to copy a cell (e.g. errors); the same menu also carries
-        # the per-chapter "Viết lại" / "Hoàn tác" actions via the extra_actions hook —
-        # RETRANSLATE_COLUMN already holds the table's only row-button slot.
+        # the per-chapter "Dịch" / "Viết lại" / "Hoàn tác" actions via the extra_actions
+        # hook — RETRANSLATE_COLUMN already holds the table's only row-button slot.
         enable_cell_copy(self.table, extra_actions=self._table_context_actions)
         self.table.setMouseTracking(True)  # hover state for the row buttons
         self.model.translated_title_edited.connect(self._on_translated_title_edited)
@@ -518,19 +527,81 @@ class TranslateTab(QWidget):
         self.pause_button.set_job(self._job.id if self._job else None)
         self._worker.start()
 
+    def _selected_rows(self) -> list[int]:
+        """The highlighted rows as MODEL rows, ascending, without duplicates.
+
+        Model rather than view rows: under a sort the two part ways, and everything
+        downstream converts a row to a `chapter.index`. `source_rows` also does the dedup
+        `selectedIndexes()` needs — it yields one index per selected *cell*, so every
+        column of every row.
+        """
+        return source_rows(self.table)
+
+    def _translatable_indices(self, rows: list[int]) -> tuple[list[int], int]:
+        """(chapter indices to translate, dropped for having no source text) for `rows`.
+
+        Rows are table positions; TranslateWorker wants `chapter.index` — not the same
+        number once a novel has gaps, so this is the one place that converts. A chapter
+        with no downloaded content is dropped: the worker filters it out anyway, so
+        counting it would overstate the job and leave the progress bar's maximum lying.
+        Sorted because TranslateWorker walks `indices` in order.
+        """
+        if self.project is None:
+            return [], 0
+        indices: list[int] = []
+        skipped = 0
+        for row in rows:
+            chapter = self.model.chapter_at(row)
+            if chapter is None:
+                continue
+            if not chapter.content:
+                skipped += 1
+                continue
+            indices.append(chapter.index)
+        return sorted(dict.fromkeys(indices)), skipped
+
     def _retranslate_row(self, index) -> None:
-        """Re-translate exactly one chapter (the per-row '↻ Dịch lại' button).
+        """The per-row '↻ Dịch lại' button — one chapter, no confirmation, as before.
 
         Takes the clicked INDEX, not a row number: under a sort the button's row is a
         screen position, and acting on it would re-translate a different chapter.
         """
-        chapter = self.model.chapter_at(source_index(self.table, index).row())
-        if chapter is None or self.project is None or not chapter.content:
+        self._translate_rows([source_index(self.table, index).row()])
+
+    def _translate_rows(self, rows: list[int]) -> None:
+        """Translate exactly the given rows, whether that is one or a hundred.
+
+        Shared by the per-row button and the context menu so the two paths cannot drift
+        apart on the guards. No `clear_translations()` call is needed: TranslateWorker
+        with an explicit `indices` list re-translates those chapters regardless of an
+        existing translation (unlike the pending-only pass it makes when indices is
+        None). Clearing first would blank good rows that then fail, and the
+        `set_chapters()` reset it needs would drop the selection mid-batch.
+        """
+        if self.project is None:
+            QMessageBox.information(self, "Chưa chọn truyện", "Hãy tải một truyện ở Tab 1 trước.")
             return
         if self._busy():
             self.status_label.setText(self._busy_message())
             return
-        self._start_translate(indices=[chapter.index])
+        indices, skipped = self._translatable_indices(rows)
+        if not indices:
+            self.status_label.setText(
+                "Chương đã chọn chưa có nội dung gốc — hãy tải nội dung ở Tab 1 trước."
+            )
+            return
+        if len(indices) >= TRANSLATE_CONFIRM_FROM:
+            answer = QMessageBox.question(
+                self,
+                "Dịch các chương đã chọn?",
+                f"Sẽ dịch {len(indices)} chương đã chọn "
+                "(ghi đè bản dịch hiện có của những chương này). Tiếp tục chứ?",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        if skipped:
+            self.status_label.setText(f"Bỏ qua {skipped} chương chưa có nội dung gốc.")
+        self._start_translate(indices=indices)
 
     def _retranslate_all(self) -> None:
         if self.project is None:
@@ -802,19 +873,67 @@ class TranslateTab(QWidget):
         for index in indices:
             self._undo_rewrite(index)
 
-    def _table_context_actions(self, menu, index) -> None:
-        """Per-chapter "Viết lại" / "Hoàn tác" on the table's right-click menu.
+    def _menu_rows(self, index) -> list[int]:
+        """The rows a right-click at `index` should act on.
 
-        Built from the *selection* rather than the row under the cursor, so one
-        right-click can act on everything highlighted; `enable_cell_copy` keeps a
-        multi-row selection alive when the click lands inside it.
+        The *selection*, so one right-click can act on everything highlighted —
+        `enable_cell_copy` keeps a multi-row selection alive when the click lands inside
+        it. A click outside the selection collapses to that row, like every desktop table.
+        """
+        rows = self._selected_rows()
+        clicked = source_index(self.table, index).row() if index.isValid() else None
+        if clicked is not None and clicked not in rows:
+            return [clicked]
+        return rows
+
+    def _table_context_actions(self, menu, index) -> None:
+        """Per-chapter "Dịch" / "Viết lại" / "Hoàn tác" on the table's right-click menu.
+
+        Translate first: it is the tab's primary verb, and the button row below lists it
+        first too.
         """
         if self.project is None:
             return
-        rows = source_rows(self.table)
-        clicked = source_index(self.table, index).row() if index.isValid() else None
-        if clicked is not None and clicked not in rows:
-            rows = [clicked]  # right-clicked away from the selection → act on that row
+        rows = self._menu_rows(index)
+        self._add_translate_action(menu, rows)
+        self._add_rewrite_actions(menu, rows)
+
+    def _add_translate_action(self, menu, rows: list[int]) -> None:
+        """Append "Dịch"/"Dịch lại" for `rows` — the batch behind this feature."""
+        indices, skipped = self._translatable_indices(rows)
+        if not indices:
+            return  # nothing downloaded here — offering it would only mislead
+        translated = {
+            c.index
+            for row in rows
+            if (c := self.model.chapter_at(row)) is not None and c.translated
+        }
+        # Say what the click will actually do. "Dịch lại" only when every target already
+        # has a translation to replace; otherwise this is a first pass for at least one
+        # of them and "Dịch lại" would be simply wrong.
+        again = all(i in translated for i in indices)
+        verb = "↻ Dịch lại" if again else "🔤 Dịch"
+        label = f"{verb} chương này" if len(indices) == 1 else f"{verb} {len(indices)} chương"
+
+        menu.addSeparator()
+        action = menu.addAction(label)
+        busy = self._busy()
+        action.setEnabled(not busy)
+        hints = []
+        if busy:
+            hints.append(self._busy_message())
+        if skipped:
+            hints.append(f"Bỏ qua {skipped} chương chưa có nội dung gốc.")
+        if hints:
+            menu.setToolTipsVisible(True)  # QMenu hides action tooltips unless asked
+            action.setToolTip(" ".join(hints))
+        # Snapshot the ROWS and re-resolve them at trigger time, so _translatable_indices
+        # stays the only authority on what is eligible.
+        rows_snapshot = list(rows)
+        action.triggered.connect(lambda: self._translate_rows(rows_snapshot))
+
+    def _add_rewrite_actions(self, menu, rows: list[int]) -> None:
+        """Append "Viết lại" / "Hoàn tác viết lại" for `rows`."""
         chapters = [c for c in (self.model.chapter_at(row) for row in rows) if c is not None]
         rewritable = [c.index for c in chapters if c.translated]
         undoable = [c.index for c in chapters if c.is_rewritten]
