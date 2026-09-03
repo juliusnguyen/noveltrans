@@ -7,7 +7,12 @@ import pytest
 
 from noveltrans.errors import TtsError
 from noveltrans.tts import get_tts_engine
-from noveltrans.tts.base import TtsEngine, merge_short_chunks, split_sentences
+from noveltrans.tts.base import (
+    TtsEngine,
+    ensure_sentence_end,
+    merge_short_chunks,
+    split_sentences,
+)
 
 
 class TestSplitSentences:
@@ -104,6 +109,112 @@ class FakeTtsEngine(TtsEngine):
         out_path.write_bytes(b"RIFF" + bytes(int(abs(s)) for s in samples[:4]))
         self.saved.append(out_path)
         self.last_samples = np.asarray(samples)  # captured so gain/gap are assertable
+
+
+class TestEnsureSentenceEnd:
+    """Feature 078. Every fixture is a real title shape from the reference library, whose
+    4331 translated titles end: 3552 alphanumeric, 489 already terminal, 278 on a closing
+    bracket or quote, 8 on a dangling clause separator."""
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "Chương 127",  # the reported case, and 82% of the library
+            "第127章",  # untranslated fallback title
+            "Chương 3【hoàn】",  # closer with no terminator behind it
+            "Chương 75: Hừng đông （3000 chữ đại chương ）",
+        ],
+    )
+    def test_an_unterminated_title_gains_a_period(self, title):
+        assert ensure_sentence_end(title) == f"{title}."
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "Chương 1: Kết thúc.",
+            "Chương 118: Ngươi đủ tư cách sao?",
+            "Chương 216: Lời bộc bạch!!!",
+            "Chương 20: Linh Nhi hạ dược…",
+            "Chương 138: Quang Ám (Năm chương bùng nổ!!)",  # terminator behind a closer
+            "Chương 8。",  # fullwidth: checked BEFORE clean_for_tts maps it to "."
+        ],
+    )
+    def test_an_already_finished_title_is_untouched(self, title):
+        assert ensure_sentence_end(title) == title
+
+    @pytest.mark.parametrize(
+        "title,expected",
+        [("Chương 6:", "Chương 6."), ("Chương 9 -", "Chương 9."), ("Chương 7,", "Chương 7.")],
+    )
+    def test_a_dangling_separator_is_replaced_not_stacked(self, title, expected):
+        # "Chương 6:." would be spoken badly; the period supersedes the clause mark.
+        assert ensure_sentence_end(title) == expected
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "Chương 331: Chử đội, ngươi thật bẩn a! ~~~",  # real title, caught this bug
+            "Chương 12: Xong rồi!...",
+            "Chương 13: Thật sao? -",
+        ],
+    )
+    def test_a_terminator_hiding_behind_a_decorative_tail_is_found(self, title):
+        # Found by running the helper over all 4331 real titles: peeling the dangling "~~~"
+        # revealed a "!" underneath, and the first version appended anyway -> "…bẩn a!.".
+        assert ensure_sentence_end(title) == title
+
+    @pytest.mark.parametrize("title", ["《》", "》》", "……", "---"])
+    def test_a_punctuation_only_title_never_reaches_the_engine(self, title):
+        # Whatever this helper does to such a title is moot: clean_for_tts drops
+        # speechless lines outright, so it contributes nothing to the audio. Asserted on
+        # the property that matters rather than on the intermediate string.
+        from noveltrans.tts.clean import clean_for_tts
+
+        cleaned = clean_for_tts(f"{ensure_sentence_end(title)}\n\nNội dung.", "")
+        assert cleaned == "Nội dung."
+
+    def test_it_never_doubles_a_period(self):
+        once = ensure_sentence_end("Chương 127")
+        assert ensure_sentence_end(once) == once
+
+    @pytest.mark.parametrize("title", ["", "   "])
+    def test_an_empty_title_stays_empty(self, title):
+        assert ensure_sentence_end(title).strip() == ""
+
+
+class TestTitleIsSpokenApartFromTheBody:
+    def test_the_title_no_longer_runs_into_the_first_sentence(self, tmp_path):
+        # The defect: merge_short_chunks absorbs a 10-char title into the first body
+        # chunk with only a SPACE between, so the voice reads straight through.
+        engine = FakeTtsEngine()
+        engine.max_chunk_chars = 400  # let the merge actually happen, as in production
+        engine.synthesize_chapter("Chương 127", "Tống Nam Thời trầm ngâm.", tmp_path / "x.wav")
+        spoken = " ".join(engine.chunks)
+        assert "Chương 127. Tống Nam Thời" in spoken
+        assert "Chương 127 Tống Nam Thời" not in spoken
+
+    def test_no_short_chunk_is_created_by_the_fix(self, tmp_path):
+        # The fix must NOT buy its pause by exempting the title from merge_short_chunks:
+        # a bare "Chương 127" is 10 chars, and feature 028 measured 80% drift under 10.
+        engine = FakeTtsEngine()
+        engine.max_chunk_chars = 400
+        body = "Tống Nam Thời trầm ngâm một lúc, rồi quay đầu hỏi lại lần nữa."
+        engine.synthesize_chapter("Chương 127", body, tmp_path / "x.wav")
+        assert all(len(t) >= engine.min_chunk_chars for t in engine.chunks)
+
+    def test_a_title_that_already_ends_a_sentence_is_not_changed(self, tmp_path):
+        engine = FakeTtsEngine()
+        engine.max_chunk_chars = 400
+        engine.synthesize_chapter(
+            "Ngươi đủ tư cách sao?", "Tống Nam Thời trầm ngâm.", tmp_path / "x.wav"
+        )
+        assert "cách sao?." not in " ".join(engine.chunks)
+
+    def test_a_chapter_with_no_title_is_untouched(self, tmp_path):
+        engine = FakeTtsEngine()
+        engine.max_chunk_chars = 400
+        engine.synthesize_chapter("", "Tống Nam Thời trầm ngâm một lúc rồi đi.", tmp_path / "x.wav")
+        assert " ".join(engine.chunks).startswith("Tống Nam Thời")
 
 
 class TestSynthesizeChapter:
