@@ -6,6 +6,12 @@ import re
 import time
 from abc import ABC, abstractmethod
 
+from noveltrans.chapter_titles import (
+    is_implausible_title,
+    looks_like_refusal,
+    numeric_title,
+    repaired_title,
+)
 from noveltrans.translators.ads import drop_site_ads
 from noveltrans.errors import TranslateError
 
@@ -79,6 +85,16 @@ class Translator(ABC):
                 if attempt < self.max_retries - 1:
                     time.sleep(self.retry_delay * (attempt + 1))
                 continue
+            # A refusal ("bạn chưa cung cấp nội dung…") is not a translation, and unlike a
+            # bad chunk it would be SAVED and exported — so it never becomes `best`, it
+            # only earns another attempt. Scored before the CJK check because a refusal is
+            # pure Vietnamese: `cjk_count` returns 0 and would accept it outright, which is
+            # exactly how feature 076's ten damaged titles got written.
+            if looks_like_refusal(result):
+                last_error = TranslateError("engine asked for the text instead of translating it")
+                if attempt < self.max_retries - 1:
+                    time.sleep(self.retry_delay)
+                continue
             # models occasionally leave source characters untranslated
             # (e.g. "Phó Thanh Từ皺眉") — retry for a clean output
             leftover = 0 if target.startswith("zh") else cjk_count(result)
@@ -92,11 +108,49 @@ class Translator(ABC):
             return best  # a few stray chars beat failing the whole chapter
         raise TranslateError(f"Translation failed after {self.max_retries} tries: {last_error}")
 
+    def _safe_title(self, title: str, source: str, target: str) -> str:
+        """Translate a chapter TITLE, never letting the model's own words become one.
+
+        A title is not a small chapter: it can be as little as `第127章`, a number with no
+        prose at all. Handed that through a prompt written for a chapter body, the model
+        reads it as the heading of a chapter whose content was omitted and replies asking
+        for the content — which is then saved and exported. Ten titles in the reporting
+        library were damaged that way.
+
+        Three steps, cheapest first:
+
+        1. A title carrying only a number needs no model. This alone prevents every case
+           observed, and saves one engine call per chapter on novels that number this way.
+        2. Otherwise translate, then check the result could plausibly BE the translation
+           (`is_implausible_title`). One retry, because the failure is non-deterministic —
+           only 8 of 139 bare titles in the library actually tripped it.
+        3. Still bad, or the engine errored: fall back rather than raise. A title is not
+           worth losing the body over, and the body is translated straight after this by a
+           call that will surface the real error itself if the engine is genuinely down.
+           Falling back here therefore hides nothing: it only stops a title problem from
+           masquerading as a chapter failure.
+        """
+        local = numeric_title(title, target)
+        if local:
+            return local
+        best = ""
+        for _ in range(2):
+            try:
+                result = self._translate_with_retry(title, source, target)
+            except TranslateError:
+                break  # the body call right after this reports the real problem
+            if not is_implausible_title(title, result):
+                return result
+            best = best or result
+        # `repaired_title` is shared with the storage repair so translate-time and
+        # migration-time can never disagree about what a damaged title should become.
+        return repaired_title(title, best, target) or title
+
     def translate_chapter(
         self, title: str, content: str, source: str = "zh", target: str = "vi"
     ) -> tuple[str, str]:
         """Translate a chapter title + content. Returns (title, content)."""
-        translated_title = self._translate_with_retry(title, source, target) if title else ""
+        translated_title = self._safe_title(title, source, target) if title else ""
         chunks = split_paragraph_chunks(content, self.max_chunk_chars)
         translated_chunks = [self._translate_with_retry(c, source, target) for c in chunks]
         # Source-site watermarks are stripped HERE, not inside `_translate_with_retry`:

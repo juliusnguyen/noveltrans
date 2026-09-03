@@ -16,6 +16,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
+from noveltrans.chapter_titles import is_implausible_title, repaired_title
 from noveltrans.slug import slugify  # re-exported: many modules import it from here
 from noveltrans.models import (
     AUDIO_SOURCE_DOWNLOADED,
@@ -32,6 +33,12 @@ from noveltrans.models import (
 META_FILE = "meta.json"
 DB_FILE = "chapters.db"
 EXPORTS_DIR = "exports"
+
+# `PRAGMA user_version`, previously unused (0 in every project in the library) and claimed
+# here as a one-shot repair marker. Bump it only to make an EXISTING repair run again;
+# a new repair should get its own constant and its own guard, so one being re-run cannot
+# silently drag the others along with it.
+_TITLE_REPAIR_VERSION = 1
 AUDIO_DIR = "audio"  # inside exports/
 VIDEO_DIR = "video"  # inside exports/
 
@@ -162,6 +169,48 @@ class NovelProject:
                 if name not in columns:
                     self._db.execute(f"ALTER TABLE chapters ADD COLUMN {name} {ddl}")
         self._migrate_downloaded_audio()
+        self._repair_translated_titles()
+
+    def _repair_translated_titles(self) -> None:
+        """Undo feature 076: a model's refusal saved as `translated_title`.
+
+        `translate_chapter` used to send the chapter title through the prompt written for a
+        chapter body. Given a bare `第127章` the model replied asking for the content, and
+        that reply was stored as the title and rendered above a perfectly good translation.
+        Measured across the reporting library: 14 damaged titles, 0 damaged bodies.
+
+        One-time, gated on `user_version`, because the alternative is re-reading every
+        title on every project open for a defect that no longer happens — this runs once
+        per novel and then costs a single PRAGMA read forever after.
+
+        `translated` is never touched. No re-translation either, so the repair needs no
+        engine, no API key and no network: `repaired_title` rebuilds a numeric title
+        locally and, for the "title + newline + body prose" variant, keeps the first line,
+        which is the correct title. A row it cannot repair confidently is left exactly as
+        it is rather than guessed at — the user can still see and fix it.
+        """
+        if self._db.execute("PRAGMA user_version").fetchone()[0] >= _TITLE_REPAIR_VERSION:
+            return
+        rows = list(
+            self._db.execute(
+                "SELECT idx, title, translated_title, target_lang FROM chapters"
+                " WHERE translated_title != '' AND title != ''"
+            )
+        )
+        with self._db:
+            for row in rows:
+                if not is_implausible_title(row["title"], row["translated_title"]):
+                    continue
+                fixed = repaired_title(
+                    row["title"], row["translated_title"], row["target_lang"] or "vi"
+                )
+                if not fixed or fixed == row["translated_title"]:
+                    continue
+                self._db.execute(
+                    "UPDATE chapters SET translated_title = ? WHERE idx = ?",
+                    (fixed, row["idx"]),
+                )
+            self._db.execute(f"PRAGMA user_version = {_TITLE_REPAIR_VERSION}")
 
     def _migrate_downloaded_audio(self) -> None:
         """Move site-downloaded audio off the chapter rows and into `source_audio`.
