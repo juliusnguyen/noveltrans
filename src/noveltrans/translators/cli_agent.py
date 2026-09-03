@@ -13,6 +13,7 @@ import shlex
 import subprocess
 import tempfile
 
+from noveltrans.runtime_env import no_console_kwargs
 from noveltrans.translators.ads import PROMPT_RULE
 from noveltrans.errors import TranslateError
 from noveltrans.translators.base import Translator
@@ -167,6 +168,7 @@ class CliAgentTranslator(Translator):
                     errors="replace",
                     timeout=self.timeout,
                     cwd=tempfile.gettempdir(),
+                    **no_console_kwargs(),
                 )
             except FileNotFoundError as exc:
                 raise TranslateError(

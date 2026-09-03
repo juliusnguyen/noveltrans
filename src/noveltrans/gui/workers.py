@@ -551,6 +551,8 @@ class CliModelsWorker(QThread):
     def run(self) -> None:
         import subprocess
 
+        from noveltrans.runtime_env import no_console_kwargs
+
         try:
             result = subprocess.run(
                 [self.binary, "models"],
@@ -559,6 +561,7 @@ class CliModelsWorker(QThread):
                 encoding="utf-8",
                 errors="replace",
                 timeout=15,
+                **no_console_kwargs(),
             )
             models = (
                 [line.strip() for line in result.stdout.splitlines() if line.strip()]
