@@ -834,6 +834,11 @@ class _AudioResult:
     seconds: float = 0.0
     prev_audio_path: str = ""  # chapter.audio_path, for stale-file cleanup
     prev_audio_source: str = ""  # chapter.audio_source, so cleanup can spare downloads
+    # Fingerprint of the text this thread actually voiced. Computed here rather than by the
+    # orchestrator: by the time the result is committed the orchestrator only has a row id,
+    # and re-reading the chapter to hash it could pick up an edit made mid-run — recording
+    # a fingerprint for text that was never spoken.
+    text_hash: str = ""
     error: str = ""
 
 
@@ -980,9 +985,13 @@ class AudioWorker(PausableWorker):
             project.close()
 
     def _title_text_for(self, chapter) -> tuple[str, str]:
-        if self.use_translation:
-            return chapter.translated_title or chapter.title, chapter.translated
-        return chapter.title, chapter.content
+        """The (title, text) handed to the engine.
+
+        Delegates to the model so that what gets VOICED and what gets FINGERPRINTED are
+        by construction the same pair — a second copy of this rule here is exactly how
+        staleness detection would quietly start comparing the wrong thing.
+        """
+        return chapter.audio_source_text(self.use_translation)
 
     def _run_sequential(self, project, engine, pending: list, source: str) -> None:
         """The original single-engine loop — used whenever workers == 1."""
@@ -1033,7 +1042,14 @@ class AudioWorker(PausableWorker):
                     (project.path / chapter.audio_path).unlink(missing_ok=True)
                     _drop_cues(project.path / chapter.audio_path)
                 self._write_cues(out_path, cues, raw_seconds, seconds)
-                project.save_audio(chapter.index, rel_path, self.voice, seconds, source)
+                project.save_audio(
+                    chapter.index,
+                    rel_path,
+                    self.voice,
+                    seconds,
+                    source,
+                    text_hash=chapter.audio_fingerprint(self.use_translation),
+                )
                 self.chapter_done.emit(chapter.index)
             except TtsError as exc:
                 if self._cancelled:
@@ -1120,6 +1136,7 @@ class AudioWorker(PausableWorker):
                 seconds,
                 chapter.audio_path or "",
                 chapter.audio_source or "",
+                chapter.audio_fingerprint(self.use_translation),
             )
         except TtsError as exc:
             if self._cancelled:
@@ -1198,7 +1215,12 @@ class AudioWorker(PausableWorker):
                             (project.path / result.prev_audio_path).unlink(missing_ok=True)
                             _drop_cues(project.path / result.prev_audio_path)
                         project.save_audio(
-                            result.index, result.rel_path, self.voice, result.seconds, source
+                            result.index,
+                            result.rel_path,
+                            self.voice,
+                            result.seconds,
+                            source,
+                            text_hash=result.text_hash,
                         )
                         self.chapter_done.emit(result.index)
                     else:  # "error"

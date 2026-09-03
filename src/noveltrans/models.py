@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from dataclasses import asdict, dataclass, field
 from urllib.parse import urlparse
@@ -285,6 +286,11 @@ class Chapter:
     audio_source: str = AUDIO_SOURCE_TRANSLATED  # see AUDIO_SOURCE_* above
     audio_seconds: float = 0.0  # duration of the generated audio
     audio_error: str = ""
+    # Fingerprint of the (title, text) this chapter's audio was actually voiced from, so a
+    # later edit to that text can be noticed. EMPTY MEANS "unknown", never "stale": every
+    # row in every existing library has one, and treating those as stale would tell the
+    # user their whole novel needs re-voicing. See `audio_is_stale`.
+    audio_text_hash: str = ""
     # True once the user renamed this chapter by hand; a re-scan then leaves the title
     # alone instead of overwriting it with the site's again.
     title_custom: bool = False
@@ -305,3 +311,49 @@ class Chapter:
     @property
     def has_audio(self) -> bool:
         return bool(self.audio_path)
+
+    def audio_source_text(self, use_translation: bool | None = None) -> tuple[str, str]:
+        """The (title, text) pair this chapter's audio is — or would be — voiced from.
+
+        `AudioWorker` reads BOTH: `synthesize_chapter(title, text, ...)` speaks the title
+        aloud, and `slugify(title)` is in the audio filename. So a title edit invalidates
+        a recording exactly as a body edit does.
+
+        `use_translation=None` means "whatever this row's audio was made from", read off
+        `audio_source` — that is what lets a chapter judge itself without being told which
+        radio button the tab happens to be showing.
+        """
+        if use_translation is None:
+            use_translation = self.audio_source != AUDIO_SOURCE_ORIGINAL
+        if use_translation:
+            return self.translated_title or self.title, self.translated
+        return self.title, self.content
+
+    def audio_fingerprint(self, use_translation: bool | None = None) -> str:
+        """Hash of what would be voiced now. Compare against `audio_text_hash`.
+
+        A hash rather than a "needs audio" flag set by each edit site: the text reaches the
+        DB through edit_translation, save_translation, save_rewrite, restore_translation,
+        apply_replacements, edit_content and edit_title, and the next feature will add an
+        eighth. A flag needs every one of them to remember; this needs none of them to know
+        it exists. It is also right for edit-then-undo, which a flag gets wrong.
+        """
+        title, text = self.audio_source_text(use_translation)
+        digest = hashlib.sha1()  # noqa: S324 — change detection, not security
+        digest.update(title.encode("utf-8"))
+        digest.update(b"\x00")  # separator: ("ab", "c") must not hash like ("a", "bc")
+        digest.update(text.encode("utf-8"))
+        return digest.hexdigest()
+
+    @property
+    def audio_is_stale(self) -> bool:
+        """True when the audio on disk no longer matches the text it was made from.
+
+        Narration downloaded from the source site is excluded: it is a different edition,
+        not a render of this text, so editing the translation says nothing about it.
+        """
+        if not self.has_audio or self.audio_source == AUDIO_SOURCE_DOWNLOADED:
+            return False
+        if not self.audio_text_hash:
+            return False  # generated before fingerprints existed — assume good
+        return self.audio_text_hash != self.audio_fingerprint()

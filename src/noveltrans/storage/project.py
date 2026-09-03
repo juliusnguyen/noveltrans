@@ -20,6 +20,8 @@ from noveltrans.chapter_titles import is_implausible_title, repaired_title
 from noveltrans.slug import slugify  # re-exported: many modules import it from here
 from noveltrans.models import (
     AUDIO_SOURCE_DOWNLOADED,
+    AUDIO_SOURCE_ORIGINAL,
+    AUDIO_SOURCE_TRANSLATED,
     STATUS_DOWNLOADED,
     STATUS_ERROR,
     STATUS_PENDING,
@@ -69,6 +71,9 @@ CREATE TABLE IF NOT EXISTS chapters (
   audio_source     TEXT NOT NULL DEFAULT 'translated',
   audio_seconds    REAL NOT NULL DEFAULT 0,
   audio_error      TEXT NOT NULL DEFAULT '',
+  -- fingerprint of the (title, text) the audio was voiced from; '' = made before
+  -- fingerprints existed, which counts as fresh, never as stale
+  audio_text_hash  TEXT NOT NULL DEFAULT '',
   -- 1 once the user has renamed this chapter by hand, so a re-scan leaves it alone
   title_custom     INTEGER NOT NULL DEFAULT 0,
   -- the site's own title, kept so a rename can be undone; refreshed by every scan
@@ -115,6 +120,7 @@ def _row_to_chapter(row: sqlite3.Row) -> Chapter:
         audio_source=row["audio_source"],
         audio_seconds=row["audio_seconds"],
         audio_error=row["audio_error"],
+        audio_text_hash=row["audio_text_hash"],
         title_custom=bool(row["title_custom"]),
         title_source=row["title_source"],
     )
@@ -160,6 +166,9 @@ class NovelProject:
             "audio_source": "TEXT NOT NULL DEFAULT 'translated'",
             "audio_seconds": "REAL NOT NULL DEFAULT 0",
             "audio_error": "TEXT NOT NULL DEFAULT ''",
+            # existing audio predates fingerprinting; empty reads as "unknown, assume
+            # fresh", so upgrading never re-queues a novel that is already voiced
+            "audio_text_hash": "TEXT NOT NULL DEFAULT ''",
             # existing titles all came from a scan, so none of them is a manual rename
             "title_custom": "INTEGER NOT NULL DEFAULT 0",
             "title_source": "TEXT NOT NULL DEFAULT ''",
@@ -510,7 +519,33 @@ class NovelProject:
             """,
             params,
         ).fetchall()
-        return [_row_to_chapter(r) for r in rows]
+        pending = [_row_to_chapter(r) for r in rows]
+        return sorted(
+            {c.index: c for c in pending + self._stale_audio(use_translation)}.values(),
+            key=lambda c: c.index,
+        )
+
+    def _stale_audio(self, use_translation: bool) -> list[Chapter]:
+        """Chapters whose audio no longer matches the text it was voiced from.
+
+        A separate pass because the check is a hash comparison and SQL cannot do it. The
+        query is narrowed to rows that HAVE audio and a recorded fingerprint, so a row with
+        no audio (already pending by the clause above) and a legacy row made before
+        fingerprints existed are both skipped without loading their text.
+
+        `audio_source` is what decides which text each row is compared against — a chapter
+        voiced from the original must not be called stale because its *translation*
+        changed. `use_translation` only gates whether the row is a candidate at all, so
+        the caller looking at "Bản dịch" is not handed original-voiced rows.
+        """
+        wanted = AUDIO_SOURCE_TRANSLATED if use_translation else AUDIO_SOURCE_ORIGINAL
+        rows = self._db.execute(
+            "SELECT * FROM chapters"
+            " WHERE audio_path != '' AND audio_text_hash != '' AND audio_source = ?"
+            " ORDER BY idx",
+            (wanted,),
+        ).fetchall()
+        return [c for c in (_row_to_chapter(r) for r in rows) if c.audio_is_stale]
 
     def errored(self) -> list[Chapter]:
         rows = self._db.execute(
@@ -768,12 +803,21 @@ class NovelProject:
         voice: str,
         seconds: float,
         source: str = "translated",
+        text_hash: str = "",
     ) -> None:
+        """Record a generated (or downloaded) audio file against a chapter.
+
+        `text_hash` fingerprints the exact text that was voiced, so a later edit to that
+        text can be noticed — see `Chapter.audio_is_stale`. Narration DOWNLOADED from the
+        source site passes nothing: it is a different edition rather than a render of this
+        text, so no edit here can make it wrong.
+        """
         with self._db:
             self._db.execute(
                 "UPDATE chapters SET audio_path = ?, audio_voice = ?, audio_source = ?,"
-                " audio_seconds = ?, audio_error = '', updated_at = ? WHERE idx = ?",
-                (rel_path, voice, source, seconds, _now(), idx),
+                " audio_seconds = ?, audio_error = '', audio_text_hash = ?, updated_at = ?"
+                " WHERE idx = ?",
+                (rel_path, voice, source, seconds, text_hash, _now(), idx),
             )
 
     # ------------------------------------------------------- source audio (059)
@@ -850,10 +894,12 @@ class NovelProject:
         deliberate "forget the downloads too".
 
         `indices` narrows it to specific chapters; None means the whole novel. The narrow
-        form is what makes a source repair complete (feature 071): `pending_audio` re-queues
-        on an empty `audio_path`, a voice mismatch or a source mismatch — never on the
-        translation changing — so audio voiced from a bad translation would otherwise
-        survive a repair and be consumed by the video pipeline as if it were fine.
+        form is what made a source repair complete in feature 071, when `pending_audio`
+        re-queued only on an empty `audio_path`, a voice mismatch or a source mismatch.
+        Feature 077 added the fingerprint arm, so a repair that changes the text now
+        re-queues the affected chapters on its own — but this stays the explicit way to
+        say "forget this audio", and it is still what clears a row whose recording predates
+        fingerprints and therefore cannot be judged stale.
         """
         clauses, params = [], [_now()]
         if not include_downloaded:
@@ -868,7 +914,8 @@ class NovelProject:
         with self._db:
             return self._db.execute(
                 "UPDATE chapters SET audio_path = '', audio_voice = '',"
-                " audio_seconds = 0, audio_error = '', updated_at = ?" + where,
+                " audio_seconds = 0, audio_error = '', audio_text_hash = '',"
+                " updated_at = ?" + where,
                 tuple(params),
             ).rowcount
 

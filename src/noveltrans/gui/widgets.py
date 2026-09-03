@@ -57,7 +57,17 @@ _STATUS_RANK = {
     STATUS_DOWNLOADED: 2,
     STATUS_TRANSLATED: 3,
 }
-_AUDIO_RANK = {"Lỗi": 0, "Chưa dịch": 1, "Chưa tải": 1, "Chưa tạo": 2, "Đã tạo": 3, "Đã tải": 4}
+# "Cần tạo lại" sits with "Chưa tạo", not with "Đã tạo": both mean "this chapter still
+# needs a TTS run", and sorting by status exists to gather exactly those together.
+_AUDIO_RANK = {
+    "Lỗi": 0,
+    "Chưa dịch": 1,
+    "Chưa tải": 1,
+    "Chưa tạo": 2,
+    "Cần tạo lại": 3,
+    "Đã tạo": 4,
+    "Đã tải": 5,
+}
 
 
 def sorting_proxy(model, parent=None) -> QSortFilterProxyModel:
@@ -464,6 +474,11 @@ class AudioChapterTableModel(QAbstractTableModel):
             # Narration fetched from the source site, not synthesised here — worth its
             # own label so the user can see at a glance what a re-voice would destroy.
             return "Đã tải", STATUS_COLORS[STATUS_TRANSLATED]
+        if chapter.audio_is_stale:
+            # The text was edited after this was voiced, so the file narrates the old
+            # version. Coloured as actionable rather than as an error: nothing is broken,
+            # the recording is just out of date, and it stays playable until re-voiced.
+            return "Cần tạo lại", STATUS_COLORS[STATUS_DOWNLOADED]
         if chapter.has_audio:
             return "Đã tạo", STATUS_COLORS[STATUS_TRANSLATED]
         return "Chưa tạo", STATUS_COLORS[STATUS_DOWNLOADED]

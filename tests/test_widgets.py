@@ -38,6 +38,36 @@ class TestAudioChapterTableModel:
         assert m.data(m.index(0, m.REGENERATE_COLUMN), Qt.ItemDataRole.UserRole) is False
         assert m.data(m.index(1, m.REGENERATE_COLUMN), Qt.ItemDataRole.UserRole) is True
 
+    def test_edited_text_shows_as_needing_a_rebuild(self, qapp):
+        # Feature 077. Row 2 has audio; fingerprint it, then edit the text underneath it.
+        m = self._model(qapp)
+        chapter = m.chapter_at(2)
+        chapter.audio_text_hash = chapter.audio_fingerprint(True)
+        assert m.data(m.index(2, m.STATUS_COLUMN)) == "Đã tạo"
+
+        chapter.translated = "dịch đã sửa"
+        assert m.data(m.index(2, m.STATUS_COLUMN)) == "Cần tạo lại"
+
+    def test_audio_made_before_fingerprints_still_reads_as_done(self, qapp):
+        # Row 2 has audio and no hash, exactly like every row in an existing library.
+        m = self._model(qapp)
+        m.chapter_at(2).translated = "dịch đã sửa"
+        assert m.data(m.index(2, m.STATUS_COLUMN)) == "Đã tạo"
+
+    def test_needing_a_rebuild_sorts_with_the_unfinished_rows(self, qapp):
+        # "Cần tạo lại" and "Chưa tạo" both mean "still needs a TTS run", and gathering
+        # those is the reason to sort by status at all.
+        from noveltrans.gui.widgets import SORT_ROLE
+
+        m = self._model(qapp)
+        chapter = m.chapter_at(2)
+        chapter.audio_text_hash = chapter.audio_fingerprint(True)
+        done = m.data(m.index(2, m.STATUS_COLUMN), SORT_ROLE)
+        chapter.translated = "dịch đã sửa"
+        stale = m.data(m.index(2, m.STATUS_COLUMN), SORT_ROLE)
+        pending = m.data(m.index(1, m.STATUS_COLUMN), SORT_ROLE)  # "Chưa tạo"
+        assert pending < stale < done
+
     def test_original_source_status_and_title(self, qapp):
         from PySide6.QtCore import Qt
 
