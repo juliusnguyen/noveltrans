@@ -182,6 +182,29 @@ class TestCliAgent:
         engine = get_translator("cli", cli_command="agy -p", model="Claude Sonnet 4.6 (Thinking)")
         assert engine.args == ["agy", "--model", "Claude Sonnet 4.6 (Thinking)", "-p"]
 
+    def test_passes_no_console_kwargs_on_windows(self, monkeypatch):
+        import subprocess
+
+        from noveltrans import runtime_env
+
+        monkeypatch.setattr(runtime_env.sys, "platform", "win32")
+        create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        with patch("noveltrans.translators.cli_agent.subprocess.run") as mock_run:
+            mock_run.return_value = self._result(stdout="Chào.\n")
+            engine = get_translator("cli", cli_command="claude -p")
+            engine.translate("你好", target="vi")
+            assert mock_run.call_args.kwargs["creationflags"] == create_no_window
+
+    def test_no_console_kwargs_empty_on_other_platforms(self, monkeypatch):
+        from noveltrans import runtime_env
+
+        monkeypatch.setattr(runtime_env.sys, "platform", "darwin")
+        with patch("noveltrans.translators.cli_agent.subprocess.run") as mock_run:
+            mock_run.return_value = self._result(stdout="Chào.\n")
+            engine = get_translator("cli", cli_command="claude -p")
+            engine.translate("你好", target="vi")
+            assert "creationflags" not in mock_run.call_args.kwargs
+
     def test_model_overrides_command_model(self):
         engine = get_translator("cli", cli_command="agy -p --model 'Old Model'", model="New Model")
         assert engine.args == ["agy", "--model", "New Model", "-p"]
