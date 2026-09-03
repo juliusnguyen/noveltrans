@@ -13,6 +13,59 @@ from noveltrans.tts.clean import clean_for_tts
 # sentence enders (incl. Vietnamese usage of …), keeping the delimiter attached
 _SENTENCE_RE = re.compile(r"[^.!?…]*[.!?…]+[\"'”’)]*\s*|[^.!?…]+$")
 
+# Sentence enders as they may appear in a chapter TITLE, which is inspected BEFORE
+# clean_for_tts runs — so the fullwidth forms are still fullwidth here. Without them a
+# title already ending in 。 would be judged unterminated and end up spelled "。." once
+# the cleaner maps it to a period.
+_TITLE_ENDERS = frozenset(".!?…。！？")
+
+# Closing marks that can sit AFTER the real terminator: "…cầu phiếu tháng!!)" is already
+# a finished sentence, and 214 titles in the reference library end this way.
+_TITLE_CLOSERS = '"\'”’»）)】》》'
+
+# Clause separators a full stop supersedes. A title ending "Chương 6:" should be read as
+# "Chương 6." rather than "Chương 6:." — rare (8 rows in the reference library) but there
+# is no reason to speak it badly.
+_TITLE_CLAUSE_ENDS = ",;:-–—~"
+
+
+def ensure_sentence_end(title: str) -> str:
+    """Give a chapter title a terminator, so TTS pauses before the body.
+
+    Chapter titles almost never carry punctuation — 3552 of the 4331 translated titles in
+    the reference library end in a plain letter or digit. `synthesize_chapter` joins the
+    title and body with a blank line, and `split_sentences` duly makes the title its own
+    chunk; but `merge_short_chunks` then glues it onto the first body sentence with a bare
+    SPACE, because "Chương 127" is 10 characters against a 30-character floor. The result
+    is one chunk reading "Chương 127 Tống Nam Thời trầm ngâm…", spoken without a break.
+
+    The obvious fix — keep the title as its own chunk — is not available. That merge is
+    feature 028's measured fix for autoregressive drift: 80% of chunks under 10 characters
+    babble, 0% at 40+. A bare "Chương 127" sits exactly in the worst band, so exempting it
+    would trade this defect for that one.
+
+    So the pause is bought with punctuation instead, which costs nothing and applies at
+    every title length: the model reads a real sentence boundary and pauses on its own.
+    """
+    title = title.rstrip()
+    if not title:
+        return title
+    # Peel back to the character that actually ends the sentence, remembering the closing
+    # quotes/brackets so they can be put back: "…bùng nổ!!)" is already finished, and
+    # "…đại chương ）" is not.
+    unclosed = title.rstrip(_TITLE_CLOSERS).rstrip()
+    closers = title[len(unclosed):].lstrip()
+    # Then peel any dangling clause separator, because a terminator can hide behind one
+    # too — "…thật bẩn a! ~~~" is a finished sentence wearing a decorative tail.
+    stem = unclosed.rstrip(_TITLE_CLAUSE_ENDS).rstrip()
+    if not stem:
+        return title  # nothing but punctuation; there is no sentence to finish
+    if stem[-1] in _TITLE_ENDERS:
+        return title  # already a finished sentence
+    if stem != unclosed:
+        return f"{stem}.{closers}"  # replace the dangling separator, never stack on it
+    return f"{title}."
+
 
 def split_sentences(text: str, max_chars: int = 400) -> list[str]:
     """Split text into chunks of <= max_chars without breaking sentences.
@@ -133,7 +186,10 @@ class TtsEngine(ABC):
         from noveltrans.tts.subtitles import Cue
         import numpy as np
 
-        text = f"{title}\n\n{body}" if title else body
+        # The title gets a terminator first: without one the model runs it straight into
+        # the body, because merge_short_chunks absorbs a short title into the first body
+        # chunk with only a space between. See ensure_sentence_end.
+        text = f"{ensure_sentence_end(title)}\n\n{body}" if title else body
         if clean:
             text = clean_for_tts(text, clean_extra_remove)
         chunks = split_sentences(text, self.max_chunk_chars)
