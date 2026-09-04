@@ -66,6 +66,10 @@ class VieneuEngine(TtsEngine):
         self.temperature = temperature
         # ONNX/CPU graph: "int8" (fast, default) or "fp32" (higher quality, slower and a
         # larger one-time download). Set at model construction, not per-chunk.
+        # NOTE: vieneu 3.4.0 flipped its *own* default from int8 to fp32, because int8
+        # can distort on CPUs without VNNI. We keep int8 as our default (it is a user
+        # setting — Cài đặt → Chất lượng giọng) and always pass it explicitly, so the
+        # upstream flip does not silently change anyone's audio.
         self.precision = precision
         # Reading style (tu_nhien / doc_truyen / tin_tuc), independent of voice. Empty =
         # pass nothing → the model's own default (tu_nhien).
