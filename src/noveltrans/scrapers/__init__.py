@@ -24,6 +24,7 @@ def _import_adapters() -> None:
     """Import all adapter modules so their @register decorators run."""
     from noveltrans.scrapers import (  # noqa: F401
         bookqq,
+        bqg5,
         giatocvuongtai,
         ixdzs,
         medoctruyen,
