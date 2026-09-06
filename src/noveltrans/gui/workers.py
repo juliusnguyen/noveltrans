@@ -877,6 +877,7 @@ class AudioWorker(PausableWorker):
         temperature: float = 0.0,  # VieNeu expressiveness (0.0 = model default)
         precision: str = "int8",  # VieNeu ONNX graph: "int8" (fast) or "fp32" (accurate)
         style: str = "",  # reading style ("" = model default), independent of voice
+        device: str = "cpu",  # "cpu" (default) or "cuda" — see noveltrans.tts.gpu
         parent=None,
     ):
         super().__init__(parent)
@@ -885,7 +886,12 @@ class AudioWorker(PausableWorker):
         self.out_format = out_format
         self.indices = indices  # None = all pending; else re-generate exactly these
         self.use_translation = use_translation
-        self.workers = max(1, int(workers))
+        self.device = device
+        # A consumer GPU cannot hold N independent model copies the way N CPU workers
+        # can — clamp here, authoritatively, regardless of what the caller passes (the
+        # Settings UI also clamps its spinner, but this is the guard that actually
+        # matters if a stale tts_workers survives from a previous CPU session).
+        self.workers = 1 if device == "cuda" else max(1, int(workers))
         self.clean_text = clean_text
         self.clean_extra_remove = clean_extra_remove
         self.gap_seconds = gap_seconds
@@ -948,6 +954,7 @@ class AudioWorker(PausableWorker):
                 temperature=self._effective_temperature(),
                 precision=self.precision,
                 style=self.style,
+                device=self.device,
             )
             self.progress.emit(0, 0, "Đang tải model VieNeu (~330 MB lần đầu)…")
             probe.load()
@@ -1088,6 +1095,7 @@ class AudioWorker(PausableWorker):
                     temperature=self._effective_temperature(),
                     precision=self.precision,
                     style=self.style,
+                    device=self.device,
                 )
                 engine.load()  # lazy: only when a new thread actually starts
             tl.engine = engine

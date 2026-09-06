@@ -39,6 +39,7 @@ from noveltrans.gui.workers import (
     YouTubeLoginWorker,
 )
 from noveltrans.tts.convert import ffmpeg_available
+from noveltrans.tts.gpu import cuda_available, cuda_device_name
 
 _MEDOCTRUYEN_LOGIN_URL = "https://medoctruyen.vn/auth/login"
 
@@ -476,6 +477,38 @@ class SettingsDialog(QDialog):
         )
         form.addRow("Chất lượng giọng:", self.tts_precision_combo)
 
+        # Inference backend: CPU (ONNX, works everywhere) or GPU (NVIDIA CUDA, needs
+        # the optional `tts-gpu` extra + a real NVIDIA GPU — see tts/gpu.py). GPU
+        # forces tts_workers to 1: a consumer GPU cannot hold N independent model
+        # copies the way N CPU workers can (see the handler wired below).
+        self.tts_device_combo = QComboBox()
+        self.tts_device_combo.addItem("CPU (mặc định)", "cpu")
+        self.tts_device_combo.addItem("GPU — NVIDIA CUDA", "cuda")
+        gpu_ok = cuda_available()
+        if gpu_ok:
+            self.tts_device_combo.setToolTip(
+                f"CPU: dùng được trên mọi máy.\n"
+                f"GPU (CUDA): nhanh hơn trên máy có card NVIDIA phù hợp — đã phát hiện "
+                f"{cuda_device_name() or 'GPU tương thích'} trên máy này. Chỉ chạy 1 "
+                f"luồng (số luồng bên dưới sẽ bị khoá về 1 khi chọn GPU)."
+            )
+        else:
+            gpu_index = self.tts_device_combo.findData("cuda")
+            self.tts_device_combo.model().item(gpu_index).setEnabled(False)
+            self.tts_device_combo.setToolTip(
+                "CPU: dùng được trên mọi máy.\n"
+                "GPU (CUDA): cần card NVIDIA + 2 lệnh cài thêm — xem mục \"GPU (NVIDIA "
+                "CUDA)\" trong README (chỉ cài extra tts-gpu KHÔNG đủ, vẫn ra bản torch "
+                "CPU-only, cần thêm lệnh trỏ tới kho wheel CUDA của PyTorch). Không tìm "
+                "thấy GPU tương thích trên máy này, nên bị tắt."
+            )
+        wanted_device = config.tts_device if gpu_ok else "cpu"
+        didx = self.tts_device_combo.findData(wanted_device)
+        self.tts_device_combo.setCurrentIndex(didx if didx >= 0 else 0)
+        self.tts_device_combo.currentIndexChanged.connect(self._on_tts_device_changed)
+        form.addRow("Chạy TTS bằng:", self.tts_device_combo)
+        self._on_tts_device_changed()  # apply the initial clamp/tooltip state above
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -731,6 +764,22 @@ class SettingsDialog(QDialog):
         if path:
             self.library_edit.setCurrentText(path)
 
+    def _on_tts_device_changed(self) -> None:
+        """GPU forces sequential audio: a consumer GPU can't hold N model copies the
+        way N CPU workers can (the worker itself enforces this too — see AudioWorker —
+        this is just the visible UI reflection of that rule)."""
+        on_gpu = self.tts_device_combo.currentData() == "cuda"
+        if on_gpu:
+            self.tts_workers_spin.setValue(1)
+        self.tts_workers_spin.setEnabled(not on_gpu)
+        self.tts_workers_spin.setToolTip(
+            "Chạy GPU chỉ dùng 1 luồng — đổi về CPU để bật lại nhiều luồng."
+            if on_gpu else
+            "Số luồng tạo audio song song. Mỗi luồng nạp một model VieNeu riêng "
+            "(~334 MB RAM/luồng) và dùng thêm CPU. 1 = tuần tự (mặc định). "
+            "Chỉ tăng nếu máy nhiều RAM/nhân."
+        )
+
     def accept(self) -> None:
         self.config.library_dir = self.library_edit.currentText()
         self.config.request_delay = self.delay_spin.value()
@@ -773,5 +822,6 @@ class SettingsDialog(QDialog):
         self.config.tts_volume = self.tts_volume_spin.value()
         self.config.tts_temperature = self.tts_temperature_spin.value()
         self.config.tts_precision = self.tts_precision_combo.currentData()
+        self.config.tts_device = self.tts_device_combo.currentData()
         self.config.sync()
         super().accept()
