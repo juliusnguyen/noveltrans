@@ -30,6 +30,22 @@ dev = [
 tts = [
     "vieneu>=3.4",  # VieNeu-TTS, torch-free ONNX runtime (~334 MB model on first run)
 ]
+tts-gpu = [
+    # PyTorch+CUDA path for VieNeu-TTS v3 Turbo on NVIDIA GPUs (opt-in: multi-GB
+    # download, source-install only -- not bundled in the packaged .exe). Needs
+    # >=3.6.1: earlier vieneu releases (including the >=3.4 floor of the `tts`
+    # extra above) already have the device="cuda" code path but no formal `cuda`
+    # extra to pull torch/transformers/safetensors. Installing this extra
+    # resolves `vieneu` to a version satisfying both extras at once (pip picks
+    # one version per package) -- expected to upgrade vieneu project-wide, not a bug.
+    #
+    # VERIFIED: installing this alone gets a CPU-ONLY torch wheel from PyPI's default
+    # index (confirmed on Windows) -- it does NOT pull CUDA automatically. Follow up
+    # with `uv pip install torch --index-url https://download.pytorch.org/whl/cu128`
+    # (or the matching build for your driver) to actually get GPU support. See the
+    # "GPU (NVIDIA CUDA)" section in README.md.
+    "vieneu[cuda]>=3.6.1",
+]
 browser = [
     # Features that drive a real browser: medoctruyen's Discord auto-unlock, and
     # reading 69shuba (which sits behind a Cloudflare challenge only a real browser

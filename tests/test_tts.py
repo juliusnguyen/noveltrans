@@ -368,10 +368,32 @@ class TestVieneuEngine:
         engine = get_tts_engine("vieneu", voice="V", precision="fp32")
         with patch.dict(sys.modules, {"vieneu": mock_module}):
             engine.load()
-        assert mock_module.Vieneu.call_args.kwargs == {"precision": "fp32"}
+        assert mock_module.Vieneu.call_args.kwargs == {"precision": "fp32", "device": "cpu"}
 
     def test_precision_defaults_to_int8(self):
         assert get_tts_engine("vieneu").precision == "int8"
+
+    def test_device_defaults_to_cpu(self):
+        assert get_tts_engine("vieneu").device == "cpu"
+
+    def test_load_passes_the_chosen_device_to_the_model(self):
+        # device="cpu" must resolve to vieneu's own ONNX branch unchanged — passing it
+        # explicitly rather than omitting it must not change which path vieneu takes.
+        mock_tts = MagicMock()
+        mock_module = MagicMock()
+        mock_module.Vieneu.return_value = mock_tts
+        engine = get_tts_engine("vieneu", voice="V", device="cuda")
+        with patch.dict(sys.modules, {"vieneu": mock_module}):
+            engine.load()
+        assert mock_module.Vieneu.call_args.kwargs == {"precision": "int8", "device": "cuda"}
+
+    def test_a_cuda_init_failure_raises_a_clear_tts_error_not_a_crash(self):
+        mock_module = MagicMock()
+        mock_module.Vieneu.side_effect = RuntimeError("CUDA out of memory")
+        engine = get_tts_engine("vieneu", voice="V", device="cuda")
+        with patch.dict(sys.modules, {"vieneu": mock_module}):
+            with pytest.raises(TtsError, match="CUDA out of memory"):
+                engine.load()
 
     def test_synthesize_passes_style_when_set(self):
         engine, mock_tts = self._engine_with_mock(voice="V")
@@ -591,6 +613,39 @@ class TestAudioWorker:
         assert factory.call_count == 1
 
 
+class TestAudioWorkerDevice:
+    """GPU forces sequential audio: a consumer GPU cannot hold N independent model
+    copies the way N CPU workers can (see 027/082's investigation)."""
+
+    def test_defaults_to_cpu_with_workers_unclamped(self):
+        from noveltrans.gui.workers import AudioWorker
+
+        worker = AudioWorker("x", voice="V", workers=4)
+        assert worker.device == "cpu"
+        assert worker.workers == 4
+
+    def test_cuda_clamps_workers_to_one_regardless_of_the_requested_count(self):
+        from noveltrans.gui.workers import AudioWorker
+
+        worker = AudioWorker("x", voice="V", device="cuda", workers=6)
+        assert worker.workers == 1
+
+    def test_device_is_passed_through_to_the_engine_factory(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        from noveltrans.gui.workers import AudioWorker
+        from noveltrans.storage import NovelProject
+
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_content(0, "原文")
+        project.save_translation(0, "Chương 1", "bản dịch dài.", "vi")
+        factory = MagicMock(side_effect=lambda *a, **k: FakeTtsEngine())
+        worker = AudioWorker(project.path, voice="Ngọc Lan", device="cuda")
+        with patch("noveltrans.tts.get_tts_engine", factory):
+            worker.run()
+        assert factory.call_args.kwargs["device"] == "cuda"
+
+
 class TestAudioWorkerParallel:
     """workers > 1: a fresh FakeTtsEngine per pool thread (via a factory), so each
     thread mutates only its own chunk/save lists — assert on final DB state."""
@@ -763,6 +818,14 @@ class TestConfigTtsAdjust:
         assert c.tts_precision == "fp32"
         c.tts_precision = "int4"  # not a real option → falls back
         assert c.tts_precision == "int8"
+
+    def test_device_default_and_validation(self, tmp_path):
+        c = self._config(tmp_path)
+        assert c.tts_device == "cpu"
+        c.tts_device = "cuda"
+        assert c.tts_device == "cuda"
+        c.tts_device = "mps"  # not a real option → falls back
+        assert c.tts_device == "cpu"
 
     def test_style_default_and_validation(self, tmp_path):
         c = self._config(tmp_path)
@@ -981,10 +1044,12 @@ class TestConvert:
 
         real_engine.synthesize_chapter = spy
 
-        def fake_get(name, *, voice="", temperature=None, precision="int8", style=""):
+        def fake_get(name, *, voice="", temperature=None, precision="int8", style="",
+                     device="cpu"):
             captured["temperature"] = temperature
             captured["precision"] = precision
             captured["style"] = style
+            captured["device"] = device
             return real_engine
 
         with (
@@ -995,6 +1060,7 @@ class TestConvert:
         assert captured["temperature"] is None  # unset → model default
         assert captured["precision"] == "int8"  # fast default
         assert captured["style"] == ""  # unset → model default (tu_nhien)
+        assert captured["device"] == "cpu"  # unset → CPU default
         assert captured["gap_seconds"] is None and captured["volume"] == 1.0
         run.assert_not_called()  # speed 1.0 → ffmpeg never invoked
 

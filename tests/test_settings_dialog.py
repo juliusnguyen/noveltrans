@@ -169,6 +169,51 @@ def test_precision_dropdown_loads_and_saves(qapp, tmp_path):
     assert SettingsDialog(config).tts_precision_combo.currentData() == "int8"
 
 
+def test_device_dropdown_loads_and_saves(qapp, tmp_path, monkeypatch):
+    monkeypatch.setattr("noveltrans.gui.settings_dialog.cuda_available", lambda: True)
+    config = _isolated_config(tmp_path)
+    config.tts_device = "cuda"
+    dialog = SettingsDialog(config)
+    assert dialog.tts_device_combo.currentData() == "cuda"
+
+    dialog.tts_device_combo.setCurrentIndex(dialog.tts_device_combo.findData("cpu"))
+    dialog.accept()
+    assert config.tts_device == "cpu"
+    assert SettingsDialog(config).tts_device_combo.currentData() == "cpu"
+
+
+def test_gpu_device_option_disabled_when_cuda_is_unavailable(qapp, tmp_path, monkeypatch):
+    monkeypatch.setattr("noveltrans.gui.settings_dialog.cuda_available", lambda: False)
+    dialog = SettingsDialog(_isolated_config(tmp_path))
+    gpu_index = dialog.tts_device_combo.findData("cuda")
+    assert not dialog.tts_device_combo.model().item(gpu_index).isEnabled()
+
+
+def test_a_stored_gpu_device_does_not_stick_without_cuda(qapp, tmp_path, monkeypatch):
+    """A settings file carried over from a GPU machine must not land the combo on a
+    disabled item here."""
+    monkeypatch.setattr("noveltrans.gui.settings_dialog.cuda_available", lambda: False)
+    config = _isolated_config(tmp_path)
+    config.tts_device = "cuda"
+    dialog = SettingsDialog(config)
+    assert dialog.tts_device_combo.currentData() == "cpu"
+
+
+def test_selecting_gpu_device_clamps_workers_to_one(qapp, tmp_path, monkeypatch):
+    monkeypatch.setattr("noveltrans.gui.settings_dialog.cuda_available", lambda: True)
+    config = _isolated_config(tmp_path)
+    config.tts_workers = 5
+    dialog = SettingsDialog(config)
+    assert dialog.tts_workers_spin.value() == 5  # CPU: untouched
+
+    dialog.tts_device_combo.setCurrentIndex(dialog.tts_device_combo.findData("cuda"))
+    assert dialog.tts_workers_spin.value() == 1
+    assert dialog.tts_workers_spin.isEnabled() is False
+
+    dialog.tts_device_combo.setCurrentIndex(dialog.tts_device_combo.findData("cpu"))
+    assert dialog.tts_workers_spin.isEnabled() is True
+
+
 class TestLibraryDirHistory:
     """Feature 045 — remember previously-used library folders so they can be switched to."""
 

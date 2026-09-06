@@ -59,6 +59,7 @@ class VieneuEngine(TtsEngine):
         temperature: float | None = None,
         precision: str = "int8",
         style: str = "",
+        device: str = "cpu",
     ):
         self.voice = (voice or "").strip()
         # None = pass nothing to infer() → the model's own default. Keeps byte-for-byte
@@ -78,6 +79,11 @@ class VieneuEngine(TtsEngine):
         # reference voice itself (see the "Phong cách đọc truyện" presets added in
         # 3.3.0). Kept here so older builds and other modes still honour it.
         self.style = (style or "").strip()
+        # "cpu" (default) → the torch-free ONNX path, unchanged from before this was a
+        # setting. "cuda" → vieneu's own PyTorch/GPU path (needs the `tts-gpu` extra —
+        # see tts/gpu.py's cuda_available()). Passed straight through; vieneu resolves
+        # it internally (device="cpu" always takes the ONNX branch regardless of backend).
+        self.device = device
         # Set by load() when the requested voice was substituted; a human-readable
         # notice the caller can surface (empty means the voice was used as-is).
         self.voice_notice = ""
@@ -89,7 +95,7 @@ class VieneuEngine(TtsEngine):
         except ImportError as exc:
             raise TtsError(INSTALL_HINT) from exc
         try:
-            self._tts = Vieneu(precision=self.precision)
+            self._tts = Vieneu(precision=self.precision, device=self.device)
         except Exception as exc:
             raise TtsError(f"Không khởi tạo được VieNeu-TTS: {exc}") from exc
         self._resolve_voice()

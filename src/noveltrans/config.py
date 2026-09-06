@@ -47,6 +47,8 @@ DEFAULT_TTS_VOLUME = 1.0  # linear gain; 1.0 = unchanged
 DEFAULT_TTS_TEMPERATURE = 0.0  # 0.0 = unset (pass nothing → the model's own default)
 DEFAULT_TTS_PRECISION = "int8"  # VieNeu ONNX/CPU graph: "int8" (fast) or "fp32" (accurate)
 TTS_PRECISIONS = ("int8", "fp32")
+DEFAULT_TTS_DEVICE = "cpu"  # VieNeu inference backend: "cpu" (ONNX) or "cuda" (needs tts-gpu)
+TTS_DEVICES = ("cpu", "cuda")
 # Reading style, independent of voice. Default "tu_nhien" reproduces today's output
 # (the engine's own default). Ordered (id, label) for the audio-tab dropdown.
 DEFAULT_TTS_STYLE = "tu_nhien"
@@ -429,6 +431,21 @@ class AppConfig:
     def tts_precision(self, value: str) -> None:
         self._s.setValue(
             "tts_precision", value if value in TTS_PRECISIONS else DEFAULT_TTS_PRECISION
+        )
+
+    @property
+    def tts_device(self) -> str:
+        """VieNeu inference backend: "cpu" (ONNX, works everywhere) or "cuda" (needs
+        an NVIDIA GPU + the optional `tts-gpu` extra). Unknown values → cpu -- callers
+        must not assume a stored "cuda" is still usable on this machine (see
+        `noveltrans.tts.gpu.cuda_available`)."""
+        value = str(self._s.value("tts_device", DEFAULT_TTS_DEVICE))
+        return value if value in TTS_DEVICES else DEFAULT_TTS_DEVICE
+
+    @tts_device.setter
+    def tts_device(self, value: str) -> None:
+        self._s.setValue(
+            "tts_device", value if value in TTS_DEVICES else DEFAULT_TTS_DEVICE
         )
 
     @property

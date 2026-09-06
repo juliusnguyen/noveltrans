@@ -15,18 +15,22 @@ def get_tts_engine(
     temperature: float | None = None,
     precision: str = "int8",
     style: str = "",
+    device: str = "cpu",
 ) -> TtsEngine:
     """Build a TTS engine by name. Imports lazily — the heavy TTS dependency
     is optional and only needed when audio generation is actually used.
 
     `temperature` (None = the model's own default) sets VieNeu's expressiveness;
     `precision` ("int8" = fast, "fp32" = higher quality) selects its ONNX/CPU graph;
-    `style` ("" = the model default) sets the reading style independent of voice.
+    `style` ("" = the model default) sets the reading style independent of voice;
+    `device` ("cpu" default, or "cuda" — needs the optional `tts-gpu` extra and an
+    NVIDIA GPU, see `noveltrans.tts.gpu.cuda_available`) selects the inference backend.
     """
     if name == "vieneu":
         from noveltrans.tts.vieneu import VieneuEngine
 
         return VieneuEngine(
-            voice=voice, temperature=temperature, precision=precision, style=style
+            voice=voice, temperature=temperature, precision=precision, style=style,
+            device=device,
         )
     raise TtsError(f"Unknown TTS engine: {name!r}")

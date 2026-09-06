@@ -233,6 +233,26 @@ uv pip install -e ".[tts]"    # cài vieneu (ONNX, không cần PyTorch)
 - Chạy nhiều luồng song song được (mỗi luồng ~334 MB RAM) để tạo audio nhanh hơn.
 - File nằm trong `exports/audio/` của từng truyện; đã tạo rồi thì lần sau chỉ tạo chương còn thiếu.
 
+### GPU (NVIDIA CUDA) — tuỳ chọn, chỉ chạy từ source
+
+Trên máy có card NVIDIA, VieNeu-TTS chạy được qua PyTorch/CUDA thay vì ONNX/CPU
+(bật ở **Cài đặt → Chạy TTS bằng → GPU**). Cần hai bước — bước 2 hay bị bỏ sót:
+
+```bash
+uv pip install -e ".[tts-gpu]"    # kéo theo torch, nhưng bản mặc định từ PyPI là CPU-only
+uv pip install torch --index-url https://download.pytorch.org/whl/cu128  # bản CUDA thật
+```
+
+Bước đầu chỉ cài `torch` bản thường (CPU) — **đã kiểm chứng thật**: `pip`/`uv` lấy
+bản CPU-only từ PyPI mặc định trên Windows, không phải bản CUDA như đôi khi vẫn
+đồn. Muốn card NVIDIA chạy thật phải chạy thêm lệnh thứ hai, trỏ tới kho wheel
+CUDA riêng của PyTorch (`cu128` ứng với driver hỗ trợ CUDA 12.8+; xem
+[pytorch.org/get-started](https://pytorch.org/get-started/locally/) nếu driver
+cũ hơn). Sau đó **Cài đặt** sẽ tự bật được mục GPU (dò bằng `torch.cuda.is_available()`
+thật, không đoán). Chạy GPU tự khoá về **1 luồng** (không chạy song song nhiều
+engine trên cùng một card). Chưa đóng gói vào bản `.exe` — chỉ dùng khi chạy từ
+source.
+
 ## Sao lưu lên OneDrive
 
 Tab 3 có nhóm **Sao lưu OneDrive**: đẩy **toàn bộ thư mục truyện** lên OneDrive để công
