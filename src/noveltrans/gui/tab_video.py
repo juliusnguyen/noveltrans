@@ -221,7 +221,7 @@ class VideoTab(QWidget):
     def _build_video_box(self) -> QGroupBox:
         """The 'Xuất video' controls: mode + quality + font + background image + buttons."""
         from noveltrans.tts.convert import ffmpeg_available
-        from noveltrans.tts.video import VIDEO_FONTS
+        from noveltrans.tts.video import VIDEO_FONTS, nvenc_available
 
         self.video_mode = QComboBox()
         self.video_mode.addItem("Toàn bộ", "all")
@@ -245,6 +245,32 @@ class VideoTab(QWidget):
         idx = self.video_quality.findData(self.config.video_quality)
         self.video_quality.setCurrentIndex(idx if idx >= 0 else 0)
         self.video_quality.currentIndexChanged.connect(self._on_video_quality_changed)
+
+        self.video_encoder = QComboBox()
+        self.video_encoder.addItem("CPU (libx264)", "libx264")
+        self.video_encoder.addItem("GPU — NVIDIA NVENC", "h264_nvenc")
+        gpu_ok = nvenc_available()
+        if gpu_ok:
+            self.video_encoder.setToolTip(
+                "CPU: dùng được trên mọi máy.\n"
+                "GPU (NVENC): nhanh hơn nhiều trên máy có card NVIDIA — đã phát hiện GPU "
+                "tương thích trên máy này. Nếu encode GPU lỗi giữa chừng, sẽ tự thử lại "
+                "bằng CPU."
+            )
+        else:
+            gpu_index = self.video_encoder.findData("h264_nvenc")
+            self.video_encoder.model().item(gpu_index).setEnabled(False)
+            self.video_encoder.setToolTip(
+                "CPU: dùng được trên mọi máy.\n"
+                "GPU (NVENC): cần card NVIDIA + driver hỗ trợ NVENC — không tìm thấy trên "
+                "máy này, nên bị ẩn/tắt."
+            )
+        # A stored "h264_nvenc" from a machine that had a GPU doesn't apply here — don't
+        # land on a disabled item.
+        wanted = self.config.video_encoder if gpu_ok else "libx264"
+        eidx = self.video_encoder.findData(wanted)
+        self.video_encoder.setCurrentIndex(eidx if eidx >= 0 else 0)
+        self.video_encoder.currentIndexChanged.connect(self._on_video_encoder_changed)
 
         self.video_font = QComboBox()
         for key, spec in VIDEO_FONTS.items():
@@ -340,6 +366,8 @@ class VideoTab(QWidget):
         row.addWidget(self.video_batch_label)
         row.addWidget(QLabel("Chất lượng:"))
         row.addWidget(self.video_quality)
+        row.addWidget(QLabel("Encode:"))
+        row.addWidget(self.video_encoder)
         row.addWidget(QLabel("Phông chữ:"))
         row.addWidget(self.video_font)
         row.addWidget(QLabel("Màu nền:"))
@@ -2445,11 +2473,19 @@ class VideoTab(QWidget):
         blocked per-widget: the handlers do more than save — `_on_video_mode_changed` also
         shows/hides the range and batch controls — and that work still needs to happen.
         """
+        from noveltrans.tts.video import nvenc_available
+
         self._video_settings = dict(values)
         self._loading_video_settings = True
         try:
             self._set_combo(self.video_mode, values["video_mode"], fallback="batch")
             self._set_combo(self.video_quality, values["video_quality"])
+            # A novel's saved "h264_nvenc" doesn't apply on a machine with no compatible
+            # GPU — land on the CPU item rather than a disabled one.
+            encoder = values["video_encoder"]
+            if encoder == "h264_nvenc" and not nvenc_available():
+                encoder = "libx264"
+            self._set_combo(self.video_encoder, encoder, fallback="libx264")
             self._set_combo(self.video_font, values["video_font"])
             self._set_combo(self.thumb_font, values["video_thumbnail_font"])
             self.video_batch_size.setValue(int(values["video_batch_size"]))
@@ -2511,6 +2547,9 @@ class VideoTab(QWidget):
 
     def _on_video_quality_changed(self) -> None:
         self._save_video_setting("video_quality", self.video_quality.currentData())
+
+    def _on_video_encoder_changed(self) -> None:
+        self._save_video_setting("video_encoder", self.video_encoder.currentData())
 
     def _on_video_font_changed(self) -> None:
         self._save_video_setting("video_font", self.video_font.currentData())
@@ -3404,6 +3443,7 @@ class VideoTab(QWidget):
             source_audio=voice == SOURCE_AUDIO_KEY,
             width=preset["width"], height=preset["height"], fps=preset["fps"],
             spin_vinyl=preset["spin_vinyl"], font=font_family, font_key=font_key,
+            encoder=self.video_encoder.currentData(),
             thumb_font_key=self._video_settings["video_thumbnail_font"],
             thumb_title_pos=self._video_settings["video_thumbnail_title_pos"],
             thumb_part_pos=self._video_settings["video_thumbnail_part_pos"],

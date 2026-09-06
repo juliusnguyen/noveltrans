@@ -23,6 +23,7 @@ boxes — the bundled font is Latin/Vietnamese only (documented limit).
 
 from __future__ import annotations
 
+import functools
 import re
 import subprocess
 import tempfile
@@ -36,7 +37,7 @@ from pathlib import Path
 from noveltrans.errors import TtsError
 from noveltrans.tts.convert import probe_duration
 from noveltrans.runtime_env import no_console_kwargs
-from noveltrans.tts.convert import ffmpeg_available  # noqa: F401 (re-exported for callers)
+from noveltrans.tts.convert import ffmpeg_available  # used here (nvenc_available) and re-exported
 from noveltrans.tts.subtitles import part_cues, part_srt
 from noveltrans.tts.description import (  # noqa: F401 (re-exported for video callers)
     YOUTUBE_DESCRIPTION_CHAR_LIMIT,
@@ -86,6 +87,48 @@ DEFAULT_VIDEO_QUALITY = "high"
 def video_preset(key: str) -> dict:
     """Return the preset params for `key`, falling back to the default if unknown."""
     return VIDEO_QUALITY_PRESETS.get(key, VIDEO_QUALITY_PRESETS[DEFAULT_VIDEO_QUALITY])
+
+
+# Encoder choice for the final render, independent of the quality preset above (resolution/
+# fps/vinyl-spin vs codec are orthogonal). `libx264` is the original CPU behaviour, unchanged.
+# `h264_nvenc` needs an NVIDIA GPU + driver — see `nvenc_available()`. NVENC's presets are
+# named p1-p7 (not libx264's "veryfast"), and its rate control defaults to a fixed bitrate,
+# so `-cq` is added for a quality target closer to libx264's default CRF behaviour.
+VIDEO_ENCODERS: dict[str, list[str]] = {
+    "libx264": ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p"],
+    "h264_nvenc": ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "23", "-pix_fmt", "yuv420p"],
+}
+DEFAULT_VIDEO_ENCODER = "libx264"
+
+
+def video_encoder_args(key: str) -> list[str]:
+    """Return the ffmpeg codec args for `key`, falling back to the CPU default if unknown."""
+    return VIDEO_ENCODERS.get(key, VIDEO_ENCODERS[DEFAULT_VIDEO_ENCODER])
+
+
+@functools.lru_cache(maxsize=1)
+def nvenc_available() -> bool:
+    """True if this machine can actually encode with NVENC right now.
+
+    Not just "is h264_nvenc listed in `ffmpeg -encoders`" — a universal ffmpeg build lists
+    it regardless of hardware, but the encoder still fails at runtime with no NVIDIA driver
+    present (e.g. "Cannot load nvcuda.dll"). Runs a real, sub-second encode instead. Cached
+    for the process lifetime — the answer can't change while the app is running.
+    """
+    if not ffmpeg_available():
+        return False
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error",
+             "-f", "lavfi", "-i", "nullsrc=s=256x256:d=0.1",
+             "-c:v", "h264_nvenc", "-f", "null", "-"],
+            capture_output=True,
+            timeout=15,
+            **no_console_kwargs(),
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
 
 
 # Selectable title fonts — all bundled in assets/ (OFL, full Vietnamese coverage). libass
@@ -829,6 +872,7 @@ def render_video(
     font_name: str = FONT_NAME,
     bg_color: tuple[int, int, int] | None = None,
     burn_subtitles: bool = False,
+    encoder: str = DEFAULT_VIDEO_ENCODER,
     cancelled: Callable[[], bool] | None = None,
 ) -> Path:
     """Render `segments` into an MP4 at `out_path`; also write the YouTube description.
@@ -838,8 +882,11 @@ def render_video(
     titles as the "now playing" text (chapter fading on change), an audio-driven bar
     spectrum, and a real progress bar whose playhead slides with playback. The concatenated
     chapter audio plays and `-shortest` ends the video with it. A `<out>.txt` description
-    with clickable timestamps is written next to the video. Raises TtsError on ffmpeg
-    failure, MergeCancelled if cancelled.
+    with clickable timestamps is written next to the video. `encoder` picks the codec
+    (`libx264` CPU, or `h264_nvenc` on a supported NVIDIA GPU — see `nvenc_available()`);
+    if a non-default encoder fails partway through, the render is retried once with
+    `libx264` before raising. Raises TtsError on ffmpeg failure, MergeCancelled if
+    cancelled.
     """
     if not segments:
         raise TtsError("Không có chương nào có audio để tạo video.")
@@ -888,18 +935,32 @@ def render_video(
 
         # 2) Loop the skin/vinyl/knob, spin the vinyl + slide the playhead + draw the bars,
         #    burn the titles, mux the audio, end with it. No -tune stillimage: it animates.
-        _run_ffmpeg(
-            ["ffmpeg", "-y",
-             "-loop", "1", "-framerate", str(fps), "-i", str(skin_file),
-             "-i", str(audio_file),
-             "-loop", "1", "-i", str(vinyl_file),
-             "-loop", "1", "-i", str(knob_file),
-             "-filter_complex", _filtergraph(width, height, subs_file, font_dir, total, spin_vinyl),
-             "-map", "[v]", "-map", "1:a",
-             "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-r", str(fps),
-             "-c:a", "copy", "-shortest", str(out_path)],
-            err_file, cancelled, deadline, "tạo video",
-        )
+        def _encode_cmd(enc: str) -> list[str]:
+            return [
+                "ffmpeg", "-y",
+                "-loop", "1", "-framerate", str(fps), "-i", str(skin_file),
+                "-i", str(audio_file),
+                "-loop", "1", "-i", str(vinyl_file),
+                "-loop", "1", "-i", str(knob_file),
+                "-filter_complex", _filtergraph(width, height, subs_file, font_dir, total, spin_vinyl),
+                "-map", "[v]", "-map", "1:a",
+                *video_encoder_args(enc), "-r", str(fps),
+                "-c:a", "copy", "-shortest", str(out_path),
+            ]
+
+        try:
+            _run_ffmpeg(_encode_cmd(encoder), err_file, cancelled, deadline, "tạo video")
+        except TtsError:
+            # A GPU encoder can fail mid-run (driver hiccup, VRAM contention with another
+            # GPU app, NVENC session limit) even though it passed the capability check —
+            # one retry on CPU beats losing the whole render.
+            if encoder == DEFAULT_VIDEO_ENCODER:
+                raise
+            out_path.unlink(missing_ok=True)
+            _run_ffmpeg(
+                _encode_cmd(DEFAULT_VIDEO_ENCODER), err_file, cancelled, deadline,
+                "tạo video (đã thử lại bằng CPU sau khi GPU lỗi)",
+            )
 
         # Companion subtitle track, timed from the TTS run itself (feature 040). Written
         # only when some chapter in this part actually has cues: an empty .srt beside a

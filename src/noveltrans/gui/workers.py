@@ -1607,6 +1607,7 @@ class VideoWorker(PausableWorker):
         thumb_tagline_scale: float | None = None,
         thumb_title_align: str = "",  # cover title flush edge; "" → the renderer's "left"
         burn_subtitles: bool = False,  # also burn the narration into the video
+        encoder: str = "libx264",  # video codec: "libx264" (CPU) | "h264_nvenc" (NVIDIA GPU)
         bg_color: str = "",  # background hex "#rrggbb"; "" → the default pastel gradient
         skip_existing: bool = False,  # skip parts whose .mp4 already exists (batch "continue")
         part_num: int | None = None,  # explicit part # for a single range-mode re-render;
@@ -1647,6 +1648,7 @@ class VideoWorker(PausableWorker):
         self.thumb_tagline_scale = thumb_tagline_scale
         self.thumb_title_align = thumb_title_align
         self.burn_subtitles = burn_subtitles
+        self.encoder = encoder
         self.bg_color = bg_color
         self.skip_existing = skip_existing
         self.part_num = part_num
@@ -1836,6 +1838,7 @@ class VideoWorker(PausableWorker):
                             width=self.width, height=self.height, fps=self.fps,
                             spin_vinyl=self.spin_vinyl, font_name=self.font or FONT_NAME,
                             bg_color=bg_rgb, burn_subtitles=self.burn_subtitles,
+                            encoder=self.encoder,
                             # Cancel only — do NOT gate pause here. This callback is polled inside a
                             # deadline-bounded ffmpeg/TTS wait; holding it would trip the timeout, and
                             # synthesize_chapter buffers the whole chapter in RAM until it writes.

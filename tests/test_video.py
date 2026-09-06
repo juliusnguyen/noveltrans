@@ -310,6 +310,96 @@ class TestVideoPresets:
         assert video_preset("high_static") == VIDEO_QUALITY_PRESETS["high_static"]
 
 
+class TestVideoEncoders:
+    def test_libx264_is_unchanged_from_the_original_hardcoded_args(self):
+        from noveltrans.tts.video import video_encoder_args
+
+        assert video_encoder_args("libx264") == [
+            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+        ]
+
+    def test_nvenc_uses_its_own_preset_naming_not_libx264s(self):
+        from noveltrans.tts.video import video_encoder_args
+
+        args = video_encoder_args("h264_nvenc")
+        assert "-c:v" in args and "h264_nvenc" in args
+        assert "veryfast" not in args  # NVENC presets are p1-p7, not libx264 names
+        assert "-cq" in args  # quality-based rate control, not NVENC's default fixed bitrate
+
+    def test_unknown_encoder_falls_back_to_libx264(self):
+        from noveltrans.tts.video import DEFAULT_VIDEO_ENCODER, video_encoder_args
+
+        assert DEFAULT_VIDEO_ENCODER == "libx264"
+        assert video_encoder_args("nope") == video_encoder_args("libx264")
+
+
+class TestNvencAvailable:
+    def test_false_when_ffmpeg_itself_is_missing(self, monkeypatch):
+        import noveltrans.tts.video as video
+
+        video.nvenc_available.cache_clear()
+        monkeypatch.setattr(video, "ffmpeg_available", lambda: False)
+        assert video.nvenc_available() is False
+
+    def test_true_when_the_probe_encode_succeeds(self, monkeypatch):
+        import noveltrans.tts.video as video
+
+        video.nvenc_available.cache_clear()
+        monkeypatch.setattr(video, "ffmpeg_available", lambda: True)
+
+        class _Result:
+            returncode = 0
+
+        monkeypatch.setattr(video.subprocess, "run", lambda *a, **k: _Result())
+        assert video.nvenc_available() is True
+
+    def test_false_when_the_probe_encode_fails(self, monkeypatch):
+        """The encoder can be *listed* by a universal ffmpeg build yet still fail at
+        runtime with no NVIDIA driver present — a real probe catches that, a static
+        `-encoders` grep would not."""
+        import noveltrans.tts.video as video
+
+        video.nvenc_available.cache_clear()
+        monkeypatch.setattr(video, "ffmpeg_available", lambda: True)
+
+        class _Result:
+            returncode = 1
+
+        monkeypatch.setattr(video.subprocess, "run", lambda *a, **k: _Result())
+        assert video.nvenc_available() is False
+
+    def test_false_on_timeout_rather_than_raising(self, monkeypatch):
+        import noveltrans.tts.video as video
+
+        video.nvenc_available.cache_clear()
+        monkeypatch.setattr(video, "ffmpeg_available", lambda: True)
+
+        def _raise(*a, **k):
+            raise video.subprocess.TimeoutExpired(cmd="ffmpeg", timeout=15)
+
+        monkeypatch.setattr(video.subprocess, "run", _raise)
+        assert video.nvenc_available() is False
+
+    def test_result_is_cached(self, monkeypatch):
+        import noveltrans.tts.video as video
+
+        video.nvenc_available.cache_clear()
+        monkeypatch.setattr(video, "ffmpeg_available", lambda: True)
+        calls = []
+
+        class _Result:
+            returncode = 0
+
+        def _run(*a, **k):
+            calls.append(1)
+            return _Result()
+
+        monkeypatch.setattr(video.subprocess, "run", _run)
+        assert video.nvenc_available() is True
+        assert video.nvenc_available() is True
+        assert len(calls) == 1
+
+
 class TestVideoFonts:
     def test_registry_shape_and_default(self):
         from noveltrans.tts.video import (
@@ -458,6 +548,118 @@ class TestRenderArgv:
             video.render_video(segs, tmp_path / "bg.png", tmp_path / "out.mp4",
                                font_dir, "Truyện", width=640, height=360, font_name="Lora")
         assert captured["font_name"] == "Lora"
+
+    def test_encoder_defaults_to_libx264(self, tmp_path, monkeypatch):
+        import noveltrans.tts.video as video
+
+        cmds = []
+
+        class _FakeProc:
+            returncode = 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        monkeypatch.setattr(video.subprocess, "Popen", lambda cmd, **kw: (cmds.append(cmd), _FakeProc())[1])
+        monkeypatch.setattr(video, "_with_real_durations", lambda segs: segs)
+        monkeypatch.setattr(video, "_concat_audio", lambda *a, **k: None)
+
+        segs = [MergeSegment(path=tmp_path / "a.wav", seconds=3.0, title="C1")]
+        with video.font_dir_context() as font_dir:
+            video.render_video(segs, tmp_path / "bg.png", tmp_path / "out.mp4",
+                               font_dir, "Truyện", width=640, height=360)
+
+        render = next(c for c in cmds if any("showfreqs" in a for a in c))
+        assert "libx264" in render and "h264_nvenc" not in render
+
+    def test_encoder_param_selects_nvenc_args(self, tmp_path, monkeypatch):
+        import noveltrans.tts.video as video
+
+        cmds = []
+
+        class _FakeProc:
+            returncode = 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        monkeypatch.setattr(video.subprocess, "Popen", lambda cmd, **kw: (cmds.append(cmd), _FakeProc())[1])
+        monkeypatch.setattr(video, "_with_real_durations", lambda segs: segs)
+        monkeypatch.setattr(video, "_concat_audio", lambda *a, **k: None)
+
+        segs = [MergeSegment(path=tmp_path / "a.wav", seconds=3.0, title="C1")]
+        with video.font_dir_context() as font_dir:
+            video.render_video(segs, tmp_path / "bg.png", tmp_path / "out.mp4",
+                               font_dir, "Truyện", width=640, height=360,
+                               encoder="h264_nvenc")
+
+        render = next(c for c in cmds if any("showfreqs" in a for a in c))
+        assert "h264_nvenc" in render and "libx264" not in render
+
+    def test_falls_back_to_libx264_when_the_gpu_encode_fails(self, tmp_path, monkeypatch):
+        """A GPU encoder can fail mid-run (driver hiccup, VRAM contention, session limit)
+        even though the capability probe passed — one CPU retry beats losing the render."""
+        import noveltrans.tts.video as video
+
+        cmds = []
+
+        class _FakeProc:
+            def __init__(self, cmd):
+                self.returncode = 1 if "h264_nvenc" in cmd else 0
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        def fake_popen(cmd, **kw):
+            cmds.append(cmd)
+            return _FakeProc(cmd)
+
+        monkeypatch.setattr(video.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(video, "_with_real_durations", lambda segs: segs)
+        monkeypatch.setattr(video, "_concat_audio", lambda *a, **k: None)
+
+        segs = [MergeSegment(path=tmp_path / "a.wav", seconds=3.0, title="C1")]
+        with video.font_dir_context() as font_dir:
+            out = video.render_video(segs, tmp_path / "bg.png", tmp_path / "out.mp4",
+                                     font_dir, "Truyện", width=640, height=360,
+                                     encoder="h264_nvenc")
+
+        renders = [c for c in cmds if any("showfreqs" in a for a in c)]
+        assert len(renders) == 2  # the failed GPU attempt, then a CPU retry
+        assert "h264_nvenc" in renders[0]
+        assert "libx264" in renders[1]
+        assert out == tmp_path / "out.mp4"
+
+    def test_libx264_failure_raises_without_retrying(self, tmp_path, monkeypatch):
+        """The CPU encoder is already the fallback — a failure there has nowhere left to
+        retry to, so it must surface as an error instead of looping."""
+        from noveltrans.errors import TtsError
+        import noveltrans.tts.video as video
+
+        cmds = []
+
+        class _FakeProc:
+            returncode = 1
+
+            def wait(self, timeout=None):
+                return 1
+
+        def fake_popen(cmd, **kw):
+            cmds.append(cmd)
+            return _FakeProc()
+
+        monkeypatch.setattr(video.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(video, "_with_real_durations", lambda segs: segs)
+        monkeypatch.setattr(video, "_concat_audio", lambda *a, **k: None)
+
+        segs = [MergeSegment(path=tmp_path / "a.wav", seconds=3.0, title="C1")]
+        with video.font_dir_context() as font_dir:
+            with pytest.raises(TtsError):
+                video.render_video(segs, tmp_path / "bg.png", tmp_path / "out.mp4",
+                                   font_dir, "Truyện", width=640, height=360)
+
+        renders = [c for c in cmds if any("showfreqs" in a for a in c)]
+        assert len(renders) == 1  # no retry loop
 
 
 class TestPreviewFrame:
