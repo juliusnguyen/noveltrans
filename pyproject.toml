@@ -28,7 +28,7 @@ dev = [
     "ruff>=0.4",
 ]
 tts = [
-    "vieneu>=3.3",  # VieNeu-TTS, torch-free ONNX runtime (~334 MB model on first run)
+    "vieneu>=3.4",  # VieNeu-TTS, torch-free ONNX runtime (~334 MB model on first run)
 ]
 browser = [
     # Features that drive a real browser: medoctruyen's Discord auto-unlock, and

@@ -926,19 +926,19 @@ resolution-markers = [
     "python_full_version < '3.12' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 dependencies = [
-    { name = "audioread" },
-    { name = "decorator" },
-    { name = "joblib" },
-    { name = "lazy-loader" },
-    { name = "msgpack" },
-    { name = "numba" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" } },
-    { name = "pooch" },
-    { name = "scikit-learn" },
-    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" } },
-    { name = "soundfile" },
-    { name = "soxr" },
-    { name = "typing-extensions" },
+    { name = "audioread", marker = "python_full_version < '3.12'" },
+    { name = "decorator", marker = "python_full_version < '3.12'" },
+    { name = "joblib", marker = "python_full_version < '3.12'" },
+    { name = "lazy-loader", marker = "python_full_version < '3.12'" },
+    { name = "msgpack", marker = "python_full_version < '3.12'" },
+    { name = "numba", marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "pooch", marker = "python_full_version < '3.12'" },
+    { name = "scikit-learn", marker = "python_full_version < '3.12'" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "soundfile", marker = "python_full_version < '3.12'" },
+    { name = "soxr", marker = "python_full_version < '3.12'" },
+    { name = "typing-extensions", marker = "python_full_version < '3.12'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/64/36/360b5aafa0238e29758729e9486c6ed92a6f37fa403b7875e06c115cdf4a/librosa-0.11.0.tar.gz", hash = "sha256:f5ed951ca189b375bbe2e33b2abd7e040ceeee302b9bbaeeffdfddb8d0ace908", size = 327001, upload-time = "2025-03-11T15:09:54.884Z" }
 wheels = [
@@ -961,17 +961,17 @@ resolution-markers = [
     "python_full_version == '3.12.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 dependencies = [
-    { name = "decorator" },
-    { name = "joblib" },
-    { name = "lazy-loader" },
-    { name = "msgpack" },
-    { name = "numba" },
-    { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" } },
-    { name = "pooch" },
-    { name = "scikit-learn" },
-    { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" } },
-    { name = "soundfile" },
-    { name = "soxr" },
+    { name = "decorator", marker = "python_full_version >= '3.12'" },
+    { name = "joblib", marker = "python_full_version >= '3.12'" },
+    { name = "lazy-loader", marker = "python_full_version >= '3.12'" },
+    { name = "msgpack", marker = "python_full_version >= '3.12'" },
+    { name = "numba", marker = "python_full_version >= '3.12'" },
+    { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "pooch", marker = "python_full_version >= '3.12'" },
+    { name = "scikit-learn", marker = "python_full_version >= '3.12'" },
+    { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "soundfile", marker = "python_full_version >= '3.12'" },
+    { name = "soxr", marker = "python_full_version >= '3.12'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/8e/c1/ce66b20953b7370421dd13d22b4e04e401346c824ceacb9f4e722eec84dc/librosa-1.0.0.tar.gz", hash = "sha256:73ed480d4022e436e85dfa6f6b06ff38a259b9210039ac99939cd64854b61a57", size = 377965, upload-time = "2026-08-11T15:37:37.013Z" }
 wheels = [
@@ -1114,7 +1114,7 @@ name = "macholib"
 version = "1.16.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "altgraph" },
+    { name = "altgraph", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/10/2f/97589876ea967487978071c9042518d28b958d87b17dceb7cdc1d881f963/macholib-1.16.4.tar.gz", hash = "sha256:f408c93ab2e995cd2c46e34fe328b130404be143469e41bc366c807448979362", size = 59427, upload-time = "2025-11-22T08:28:38.373Z" }
 wheels = [
@@ -1344,7 +1344,7 @@ requires-dist = [
     { name = "requests", specifier = ">=2.31" },
     { name = "responses", marker = "extra == 'dev'", specifier = ">=0.25" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4" },
-    { name = "vieneu", marker = "extra == 'tts'", specifier = ">=3.3" },
+    { name = "vieneu", marker = "extra == 'tts'", specifier = ">=3.4" },
 ]
 provides-extras = ["dev", "tts", "browser", "discord", "build"]
 
@@ -1721,12 +1721,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/03/4f/2750f7f6f025a1507
 wheels = [
     { url = "https://files.pythonhosted.org/packages/54/16/12b82f791c7f50ddec566873d5bdd245baa1491bac11d15ffb98aecc8f8b/pefile-2024.8.26-py3-none-any.whl", hash = "sha256:76f8b485dcd3b1bb8166f1128d395fa3d87af26360c2358fb75b80019b957c6f", size = 74766, upload-time = "2024-08-26T21:01:02.632Z" },
 ]
-
-[[package]]
-name = "perth"
-version = "1.0.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/49/ca/3bfa6b12f28b30ef64a2e63405f9008ae50c014ffd5ef85a4ec00245b29c/perth-1.0.0.tar.gz", hash = "sha256:7a39f7e4b051e670e7667a0b495b3535c550838df6d972352a7126b17849f169", size = 1724, upload-time = "2015-07-24T14:50:30.385Z" }
 
 [[package]]
 name = "pillow"
@@ -2382,7 +2376,7 @@ resolution-markers = [
     "python_full_version < '3.12' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 dependencies = [
-    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" } },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/7a/97/5a3609c4f8d58b039179648e62dd220f89864f56f7357f5d4f45c29eb2cc/scipy-1.17.1.tar.gz", hash = "sha256:95d8e012d8cb8816c226aef832200b1d45109ed4464303e997c5b13122b297c0", size = 30573822, upload-time = "2026-02-23T00:26:24.851Z" }
 wheels = [
@@ -2464,7 +2458,7 @@ resolution-markers = [
     "python_full_version == '3.12.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 dependencies = [
-    { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" } },
+    { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/7e/74/66de6258867beb2ef08f35f9f2ac017a52cacd5081714d239ff1a442d458/scipy-1.18.1.tar.gz", hash = "sha256:52c4b7422442aba924d03ad4019852b08a92e64ea187b933135687bfe2747307", size = 30781235, upload-time = "2026-08-21T23:28:50.599Z" }
 wheels = [
@@ -2532,16 +2526,16 @@ wheels = [
 
 [[package]]
 name = "sea-g2p"
-version = "0.9.0"
+version = "0.9.1"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/78/18/9324ed64195d23a27e8b099d8025ac79c413b2ce691605e7302c6cb8f415/sea_g2p-0.9.0.tar.gz", hash = "sha256:c61e2efa55050d27b271044fb6809b24f9c7475e605cf496fdab0a8a46c5cf8f", size = 29830802, upload-time = "2026-08-18T08:28:27.86Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4a/b7/e1b8ea81f220a719a57c2e1da439cf0396f36f257bf145ba4502554f0823/sea_g2p-0.9.1.tar.gz", hash = "sha256:9ecb286442c34c96b8a2f20bf32196c168271600a8bad1cf23825d0e1b8fb3da", size = 29833348, upload-time = "2026-08-26T01:51:22.546Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/96/57/36cb086ca717e874fc9324e9413b5f056fd1a79d125e4bb705aeeb816553/sea_g2p-0.9.0-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:c22d167920ffc887d032ab0ca70477df1a35a20d07c2472ff30759c8acb0edd7", size = 27687259, upload-time = "2026-08-18T08:28:08.843Z" },
-    { url = "https://files.pythonhosted.org/packages/36/d5/57feb132834cef04ee0fbae1161793deeeeda104c5e55adee5ad585595d9/sea_g2p-0.9.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:3682d4d19aca0242450f90d33d00118b538791c87750bfde0d7c7231a86d403e", size = 27756537, upload-time = "2026-08-18T08:28:11.437Z" },
-    { url = "https://files.pythonhosted.org/packages/91/42/afa6c44b24c0263dfd473092ece7f3089c68bb74ee92527d097f9cfe0e36/sea_g2p-0.9.0-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:b25c136d8207e34cd1ab60a943ef85d8515c123bc104c18f25be0f8d18b68bdf", size = 27971782, upload-time = "2026-08-18T08:28:13.99Z" },
-    { url = "https://files.pythonhosted.org/packages/b2/23/ec98298ba0a1226df954b211ec6ca39d8e3fd67c738da2adaa8064d5944c/sea_g2p-0.9.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:3595f04415992bb06eb8aaecbd032e920b59a5f038c7184a9c6c17f0da113d12", size = 27865083, upload-time = "2026-08-18T08:28:16.491Z" },
-    { url = "https://files.pythonhosted.org/packages/93/62/3de7a619e5671008aa9958df799afd94b3dd8052e890a0d55c66903b56d5/sea_g2p-0.9.0-cp310-abi3-win32.whl", hash = "sha256:e7d8c5249ec3bf1d5e5b19df5231ec664e9e42ed01ccaaf4d2a32b649e05508c", size = 27440519, upload-time = "2026-08-18T08:28:23.337Z" },
-    { url = "https://files.pythonhosted.org/packages/3f/e9/db4c2698b01591536338cadc133c71f78162214f31a9d0a61f983653197c/sea_g2p-0.9.0-cp310-abi3-win_amd64.whl", hash = "sha256:a463f9b412c91f58de4d93d604cc2c849eb3709b7456710c3f6c53b391a87ee8", size = 27525566, upload-time = "2026-08-18T08:28:25.744Z" },
+    { url = "https://files.pythonhosted.org/packages/19/c5/0b1d3f831d4d872040150ce5e73daf69650ac8319f3e2a222c78c06d2f24/sea_g2p-0.9.1-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:80c1bac1c791f6d92a0f82e14bcd390dfc96538202b70bcd843c0103c9c760b2", size = 27690025, upload-time = "2026-08-26T01:51:06.694Z" },
+    { url = "https://files.pythonhosted.org/packages/24/6a/b5141611390a4dbac56ee9c06f1c364239e364022580d93ed5e76559a563/sea_g2p-0.9.1-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:685c906b47d420c1e212afb1fad1bc3c36aa9f6729e3e72d2e0aa38fc78e4f44", size = 27760277, upload-time = "2026-08-26T01:51:09.498Z" },
+    { url = "https://files.pythonhosted.org/packages/8f/f3/6ad06ab44c872d7d07266965682067e89b8a79eb96ece78e5393792e886b/sea_g2p-0.9.1-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:47d01f303093a287e63de9bfb067593425ef65a161c16532c41f45afbcd93fd2", size = 27974285, upload-time = "2026-08-26T01:51:12.168Z" },
+    { url = "https://files.pythonhosted.org/packages/b1/71/0878a2f3fd3f827dc95c859e25d042bd98698f60d639e44405ac3f7adc68/sea_g2p-0.9.1-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:d80682d652f080e0b3c3c33096e18823f98d1238a26805792443732286d2accf", size = 27870760, upload-time = "2026-08-26T01:51:14.696Z" },
+    { url = "https://files.pythonhosted.org/packages/7f/3f/dd035cfc623add72c81838490b01fda2c8f78df9de31d1ada74603ab9c18/sea_g2p-0.9.1-cp310-abi3-win32.whl", hash = "sha256:3273e36cf2ff1883b88ed53dfe24d682c30b4d3efc6fe91d53acb0ff29f2f4ba", size = 27441135, upload-time = "2026-08-26T01:51:17.787Z" },
+    { url = "https://files.pythonhosted.org/packages/98/2d/4553efd8f340f332eb5976118e441b09ec95cf60d27fd1ad04240d885905/sea_g2p-0.9.1-cp310-abi3-win_amd64.whl", hash = "sha256:b6d7c09afb83750abe61735ad2e60f5c20b4cdfac30b1b9b1904de9f64f10c32", size = 27531798, upload-time = "2026-08-26T01:51:20.231Z" },
 ]
 
 [[package]]
@@ -2798,7 +2792,7 @@ wheels = [
 
 [[package]]
 name = "vieneu"
-version = "3.3.0"
+version = "3.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "gradio" },
@@ -2809,14 +2803,13 @@ dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "onnxruntime" },
-    { name = "perth" },
     { name = "pyyaml" },
     { name = "sea-g2p" },
     { name = "soundfile" },
     { name = "soxr" },
     { name = "tokenizers" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/50/e5/a718669c40f8f43bc89637f88460af0e7c9efd34050533072dc1c7cdb530/vieneu-3.3.0.tar.gz", hash = "sha256:c13946e04a2a42c68f873643b273b536b671c3154a1d4f4ae766ab53b18e7a7e", size = 1189024, upload-time = "2026-08-20T01:22:46.438Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e7/8e/f62e69932d94c4326a242cf041f3e4188145f48ca1a0c680e14494718163/vieneu-3.4.0.tar.gz", hash = "sha256:92132511d5997e2bee2b422662491a4d22416f5a20d23f97cb68f3bcd6508bea", size = 1190591, upload-time = "2026-09-02T11:47:01.176Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e6/b4/1e32385cf64c28858c9c39390abcefcedbda507a0a12e98307183ef7b80d/vieneu-3.3.0-py3-none-any.whl", hash = "sha256:794c30cbda2adc9a0cb09375f3c071e5b4901edf5d1a11fb3d50061149fc7320", size = 1186070, upload-time = "2026-08-20T01:22:44.686Z" },
+    { url = "https://files.pythonhosted.org/packages/31/7a/698d23881f59bd5f65cbc813b631f0bb0580dcfcea3bb9ea33d6ae024e95/vieneu-3.4.0-py3-none-any.whl", hash = "sha256:0a308ff363839964743b344499e722cea7e9a75c45c34cfd4dea77d25e533690", size = 1187181, upload-time = "2026-09-02T11:46:59.391Z" },
 ]
