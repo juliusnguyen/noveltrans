@@ -88,6 +88,28 @@ class _ClearingPage(_FakePage):
         super().wait_for_timeout(ms)
 
 
+class _NavigatingPage(_ClearingPage):
+    """A page whose content() throws while the challenge is mid-navigation.
+
+    Playwright raises "Unable to retrieve content because the page is navigating and
+    changing the content" when the document is being replaced — which is exactly what a
+    challenge does as it clears. The real error text is used so the test would still pass
+    if the guard were narrowed to match on it.
+    """
+
+    def __init__(self, challenge: str, cleared: str, clears_after: int, throws_on: set[int]):
+        super().__init__(challenge, cleared, clears_after)
+        self.throws_on = throws_on
+
+    def content(self):
+        if self.polls in self.throws_on:
+            raise RuntimeError(
+                "Page.content: Unable to retrieve content because the page is "
+                "navigating and changing the content."
+            )
+        return super().content()
+
+
 class _FakeContext:
     def __init__(self, page):
         self.pages = [page]
@@ -209,6 +231,37 @@ class TestChallengeAndFailure:
         with pytest.raises(BrowserSessionError, match="challenge"):
             session.get_html("https://www.69shuba.com/txt/59024/38369377")
         assert len(page.waits) == 3  # bounded; does not hang the download forever
+
+    def test_a_poll_that_throws_mid_navigation_is_not_a_failure(self, tmp_path):
+        # ★ Found on novel543 (feature 081): page.content() throws while the document is
+        # being replaced, and that IS the challenge clearing. Letting it escape aborted the
+        # whole download on the moment of success — and made _settle_challenge's own
+        # "never raises" untrue. twkan and 69shuba are exposed to the same race.
+        page = _NavigatingPage(
+            challenge=load_fixture("69shuba", "challenge.html"),
+            cleared=load_fixture("69shuba", "chapter.html"),
+            clears_after=3,
+            throws_on={1, 2},
+        )
+        session, _fake = make_session(tmp_path, page=page)
+        markup = session.get_html("https://www.69shuba.com/txt/59024/38369377")
+        assert "txtnav" in markup
+        # Waited it out in place rather than re-navigating into a rate-limited host.
+        assert page.goto_urls == ["https://www.69shuba.com/txt/59024/38369377"]
+
+    def test_a_poll_that_always_throws_still_gives_up_at_the_deadline(self, tmp_path):
+        # The guard must not turn a dead page into an infinite wait, and the caller must
+        # still see a challenge rather than empty markup parsed as "layout changed".
+        page = _NavigatingPage(
+            challenge=load_fixture("69shuba", "challenge.html"),
+            cleared=load_fixture("69shuba", "chapter.html"),
+            clears_after=99,
+            throws_on=set(range(1, 99)),
+        )
+        session, _fake = make_session(tmp_path, page=page, challenge_wait_seconds=3)
+        with pytest.raises(BrowserSessionError, match="challenge"):
+            session.get_html("https://www.69shuba.com/txt/59024/38369377")
+        assert len(page.waits) == 3
 
     def test_navigation_failure_closes_the_session(self, tmp_path):
         # User closed the window / browser crashed: don't let 198 more chapters retry

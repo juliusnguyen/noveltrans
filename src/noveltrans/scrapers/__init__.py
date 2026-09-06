@@ -28,6 +28,7 @@ def _import_adapters() -> None:
         giatocvuongtai,
         ixdzs,
         medoctruyen,
+        novel543,
         shuba69,
         sto9,
         tieuthuyetmang,

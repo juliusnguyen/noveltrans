@@ -170,7 +170,7 @@ class BrowserSession:
             self._page.goto(url, wait_until="domcontentloaded")
             markup = self._page.content()
             if looks_like_challenge(markup):
-                markup = self._settle_challenge()
+                markup = self._settle_challenge(markup)
         except Exception as exc:  # closed window, crash, navigation timeout
             self.close()  # the session is dead; don't let 198 more chapters retry it
             raise BrowserSessionError(f"Browser navigation failed: {exc}") from exc
@@ -181,19 +181,29 @@ class BrowserSession:
             raise BrowserSessionError(f"Cloudflare returned a challenge for {url}")
         return markup
 
-    def _settle_challenge(self) -> str:
+    def _settle_challenge(self, markup: str) -> str:
         """Sit on an interstitial until it clears, or until the deadline. Never raises.
 
         Polls the live DOM instead of re-navigating: the challenge resolves itself in
         place, and a second navigation into a rate-limited host is exactly the wrong move.
-        Returns the last markup seen, which the caller re-checks.
+        Returns the last markup seen, which the caller re-checks — so `markup`, the
+        challenge the caller already read, is the right thing to fall back to.
+
+        **A poll that throws means "not settled yet", never "failed".** `page.content()`
+        raises `Unable to retrieve content because the page is navigating` while the document
+        is being replaced — which is precisely the event this loop exists to wait for. Letting
+        that escape aborted a whole download on the moment of success, and it is how the
+        "never raises" above came to be untrue (found on novel543, which challenges often
+        enough to hit the race; twkan and 69shuba are exposed to the same one).
         """
         waited = 0.0
-        markup = self._page.content()
         while waited < self.challenge_wait_seconds:
             self._page.wait_for_timeout(_CHALLENGE_POLL_MS)
             waited += _CHALLENGE_POLL_MS / 1000.0
-            markup = self._page.content()
+            try:
+                markup = self._page.content()
+            except Exception:
+                continue  # mid-navigation: the challenge is clearing. Keep waiting.
             if not looks_like_challenge(markup):
                 return markup
         return markup
