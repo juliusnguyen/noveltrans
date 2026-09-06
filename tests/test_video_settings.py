@@ -32,6 +32,23 @@ class TestKeySplit:
         assert set(video_settings.identity_defaults()) == set(video_settings.IDENTITY_KEYS)
 
 
+class TestVideoEncoderConfig:
+    def test_defaults_to_cpu(self, tmp_path):
+        assert _config(tmp_path).video_encoder == "libx264"
+
+    def test_accepts_nvenc(self, tmp_path):
+        config = _config(tmp_path)
+        config.video_encoder = "h264_nvenc"
+        assert config.video_encoder == "h264_nvenc"
+
+    def test_unknown_value_falls_back_to_cpu(self, tmp_path):
+        # A value from a future/other build (or hand-edited settings file) must not wedge
+        # the renderer into an encoder name ffmpeg won't recognise.
+        config = _config(tmp_path)
+        config.video_encoder = "vp9_vaapi"
+        assert config.video_encoder == "libx264"
+
+
 class TestEffective:
     def test_identity_ignores_the_global_value(self, tmp_path):
         """The bug in one line: a novel with no image of its own must not get the last

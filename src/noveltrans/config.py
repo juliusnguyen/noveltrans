@@ -51,6 +51,8 @@ TTS_PRECISIONS = ("int8", "fp32")
 # (the engine's own default). Ordered (id, label) for the audio-tab dropdown.
 DEFAULT_TTS_STYLE = "tu_nhien"
 DEFAULT_VIDEO_QUALITY = "high"  # video export preset: high (1080p) | fast (720p) | fastest
+DEFAULT_VIDEO_ENCODER = "libx264"  # video export codec: libx264 (CPU) | h264_nvenc (NVIDIA GPU)
+VIDEO_ENCODERS = ("libx264", "h264_nvenc")
 TTS_STYLES = (
     ("tu_nhien", "Tự nhiên"),
     ("doc_truyen", "Kể chuyện"),
@@ -461,6 +463,20 @@ class AppConfig:
     @video_quality.setter
     def video_quality(self, value: str) -> None:
         self._s.setValue("video_quality", value)
+
+    @property
+    def video_encoder(self) -> str:
+        """Video export codec: "libx264" (CPU, default) or "h264_nvenc" (NVIDIA GPU).
+        Unknown values fall back to libx264 -- callers must not assume the stored value
+        is still usable on this machine (see `noveltrans.tts.video.nvenc_available`)."""
+        value = str(self._s.value("video_encoder", DEFAULT_VIDEO_ENCODER))
+        return value if value in VIDEO_ENCODERS else DEFAULT_VIDEO_ENCODER
+
+    @video_encoder.setter
+    def video_encoder(self, value: str) -> None:
+        self._s.setValue(
+            "video_encoder", value if value in VIDEO_ENCODERS else DEFAULT_VIDEO_ENCODER
+        )
 
     @property
     def video_mode(self) -> str:

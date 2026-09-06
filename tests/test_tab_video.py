@@ -281,6 +281,50 @@ class TestVideoTab:
         tab.shutdown()
 
 
+class TestVideoEncoderCombo:
+    def test_gpu_option_disabled_when_nvenc_is_unavailable(self, qapp, tmp_path, monkeypatch):
+        import noveltrans.tts.video as video
+
+        monkeypatch.setattr(video, "nvenc_available", lambda: False)
+        tab = VideoTab(_config(tmp_path))
+        gpu_index = tab.video_encoder.findData("h264_nvenc")
+        assert not tab.video_encoder.model().item(gpu_index).isEnabled()
+        tab.shutdown()
+
+    def test_gpu_option_enabled_when_nvenc_is_available(self, qapp, tmp_path, monkeypatch):
+        import noveltrans.tts.video as video
+
+        monkeypatch.setattr(video, "nvenc_available", lambda: True)
+        tab = VideoTab(_config(tmp_path))
+        gpu_index = tab.video_encoder.findData("h264_nvenc")
+        assert tab.video_encoder.model().item(gpu_index).isEnabled()
+        tab.shutdown()
+
+    def test_a_stored_gpu_choice_does_not_stick_on_a_machine_without_one(
+        self, qapp, tmp_path, monkeypatch
+    ):
+        """A settings file carried over from a GPU machine (or a novel that saved its
+        choice there) must not land the combo on a disabled item here."""
+        import noveltrans.tts.video as video
+
+        monkeypatch.setattr(video, "nvenc_available", lambda: False)
+        config = _config(tmp_path)
+        config.video_encoder = "h264_nvenc"
+        tab = VideoTab(config)
+        assert tab.video_encoder.currentData() == "libx264"
+        tab.shutdown()
+
+    def test_changing_the_encoder_saves_as_the_users_habit(self, qapp, tmp_path, monkeypatch):
+        import noveltrans.tts.video as video
+
+        monkeypatch.setattr(video, "nvenc_available", lambda: True)
+        config = _config(tmp_path)
+        tab = VideoTab(config)
+        tab.video_encoder.setCurrentIndex(tab.video_encoder.findData("h264_nvenc"))
+        assert config.video_encoder == "h264_nvenc"
+        tab.shutdown()
+
+
 class TestVideoPartsList:
     def _project_with_audio(self, library_dir, sample_meta, sample_refs):
         project = NovelProject.create(library_dir, sample_meta, sample_refs)  # 5 chapters

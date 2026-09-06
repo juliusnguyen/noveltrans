@@ -50,6 +50,7 @@ IDENTITY_KEYS: tuple[str, ...] = (
 WORKFLOW_KEYS: tuple[str, ...] = (
     "video_mode",
     "video_quality",
+    "video_encoder",
     "video_batch_size",
     "video_burn_subtitles",
     "video_ai_engine",
