@@ -23,7 +23,12 @@ from noveltrans.errors import (
     UnsupportedSiteError,
 )
 from noveltrans.gui.pause import PauseGate
-from noveltrans.models import AUDIO_SOURCE_DOWNLOADED, ChapterRef
+from noveltrans.models import (
+    AUDIO_SOURCE_DOWNLOADED,
+    QC_STATUS_FAIL,
+    QC_STATUS_OK,
+    ChapterRef,
+)
 from noveltrans.scrapers import adapter_for_url
 from noveltrans.scrapers.base import HttpClient
 from noveltrans.storage import Library, NovelProject
@@ -42,6 +47,13 @@ class PausableWorker(QThread):
     so nothing is ever half-written and resuming costs nothing. The price is that pause
     is not instant: a TTS chapter takes ~a minute, and a single ffmpeg merge or video
     encode can take far longer (see the `cancelled=` hand-offs, which must NOT gate).
+
+    Translation QC (`translators/qc.py`) refines this ONE step further without breaking it:
+    its retry loop also polls `should_stop` BETWEEN attempts, never mid-request. With QC on,
+    "one item" can be eight engine calls and ten minutes, and a Dừng that takes that long
+    reads as a hang — so the invariant is kept at the request level (nothing half-written)
+    while cancel stays roughly as responsive as it has always felt. The chapter-boundary
+    checkpoint below, which is also where pause holds, is unchanged.
 
     `cancel()` resumes the gate. That one line is why quitting with a paused job works:
     every tab's `shutdown()` calls `cancel()` and then `wait()` on the thread for up to
@@ -138,6 +150,123 @@ class ScanWorker(QThread):
                 adapter.close()  # 69shuba holds a browser; don't leak it
 
 
+def engine_label(engine_name: str, model: str = "", cli_command: str = "") -> str:
+    """Human-readable record of what translated a chapter, e.g. 'CLI (agy)'.
+
+    One definition, shared by `TranslateWorker` and every engine in a QC chain — the label
+    is written into `chapters.translator`, so two spellings of the same engine would show up
+    in the user's own table as two different engines.
+    """
+    if engine_name == "google":
+        return "Google Translate"
+    if engine_name == "claude":
+        return f"Claude API ({model})" if model else "Claude API"
+    if engine_name == "lmstudio":
+        return f"LM Studio ({model})" if model else "LM Studio"
+    parts = (cli_command or "").split()
+    binary = parts[0] if parts else engine_name
+    return f"CLI ({binary}, {model})" if model else f"CLI ({binary})"
+
+
+@dataclass
+class QcEngineSpec:
+    """One engine a QC chain may use, with everything needed to build it.
+
+    Carries its own credentials because a chain mixes engines: "agy twice, then Claude API"
+    needs the CLI command for one and the API key for the other.
+    """
+
+    engine_name: str
+    model: str = ""
+    attempts: int = 2
+    api_key: str = ""
+    cli_command: str = ""
+    base_url: str = ""
+
+    @property
+    def label(self) -> str:
+        return engine_label(self.engine_name, self.model, self.cli_command)
+
+    def build(self, request_delay: float = 1.0):
+        """Construct the translator. Raises `NovelTransError` if it cannot be built."""
+        from noveltrans.translators import get_translator
+
+        return get_translator(
+            self.engine_name,
+            api_key=self.api_key,
+            model=self.model,
+            request_delay=request_delay,
+            cli_command=self.cli_command,
+            base_url=self.base_url,
+        )
+
+
+@dataclass
+class QcSettings:
+    """What a QC run should do: which engines retry, and who judges the prose.
+
+    `judge` is None for the free, offline, heuristics-only mode.
+    """
+
+    chain: list[QcEngineSpec]
+    judge: QcEngineSpec | None = None
+
+
+def qc_settings_from_config(config, fallback: QcEngineSpec) -> QcSettings:
+    """Resolve the user's saved QC settings into buildable engine specs.
+
+    `fallback` is the engine the Translate tab is currently set to; an empty chain means
+    exactly that engine, which is the obvious reading of "QC on, chain not configured".
+    """
+    chain: list[QcEngineSpec] = []
+    for engine_name, model, attempts in config.qc_engine_chain:
+        chain.append(
+            QcEngineSpec(
+                engine_name=engine_name,
+                model=model,
+                attempts=attempts,
+                api_key=config.claude_api_key,
+                cli_command=config.cli_command_for(engine_name),
+                base_url=config.lmstudio_url if engine_name == "lmstudio" else "",
+            )
+        )
+    if not chain:
+        chain = [fallback]
+    judge = None
+    if config.qc_use_llm_judge:
+        judge_engine = config.qc_ai_engine
+        judge = QcEngineSpec(
+            engine_name=judge_engine,
+            model=config.qc_ai_model,
+            api_key=config.claude_api_key,
+            cli_command=config.cli_command_for(judge_engine),
+            base_url=config.lmstudio_url if judge_engine == "lmstudio" else "",
+        )
+    return QcSettings(chain=chain, judge=judge)
+
+
+def build_qc_judge(spec: QcEngineSpec | None):
+    """A `judge(body) -> QcVerdict` callable, or None when there is no usable judge.
+
+    An engine that cannot be built or cannot run a free-form prompt yields None rather than
+    an error: the deterministic layer still works, and a missing judge must never turn into
+    a failed chapter.
+    """
+    if spec is None:
+        return None
+    from noveltrans.translators.qc import judge_translation
+
+    try:
+        translator = spec.build()
+    except NovelTransError:
+        return None
+    if not translator.supports_completion:
+        return None
+    # `complete` is called with ONE positional argument and no system prompt — the only
+    # signature all three LLM engines share.
+    return lambda body: judge_translation(translator.complete, body)
+
+
 class TranslateWorker(PausableWorker):
     """Translate pending chapters of a project (or specific ones), resumably."""
 
@@ -159,6 +288,7 @@ class TranslateWorker(PausableWorker):
         cli_command: str = "",
         base_url: str = "",
         indices: list[int] | None = None,
+        qc: QcSettings | None = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -171,19 +301,39 @@ class TranslateWorker(PausableWorker):
         self.cli_command = cli_command
         self.base_url = base_url
         self.indices = indices  # None = all pending; else re-translate exactly these
-
+        # None = the path this worker has always taken: one engine, one attempt per chunk,
+        # no checking, no extra calls. Everything QC does is behind this being set.
+        self.qc = qc
 
     def engine_label(self) -> str:
         """Human-readable record of what translated a chapter, e.g. 'CLI (agy)'."""
-        if self.engine_name == "google":
-            return "Google Translate"
-        if self.engine_name == "claude":
-            return f"Claude API ({self.model})" if self.model else "Claude API"
-        if self.engine_name == "lmstudio":
-            return f"LM Studio ({self.model})" if self.model else "LM Studio"
-        parts = (self.cli_command or "").split()
-        binary = parts[0] if parts else self.engine_name
-        return f"CLI ({binary}, {self.model})" if self.model else f"CLI ({binary})"
+        return engine_label(self.engine_name, self.model, self.cli_command)
+
+    def _build_qc_plans(self, source_lang: str) -> list:
+        """One `QcAttemptPlan` per usable engine in the chain, in order.
+
+        An engine that will not build is skipped rather than fatal — that is what makes a
+        fallback chain safe to configure with an engine you have not set up yet.
+        """
+        from noveltrans.translators.qc import QcAttemptPlan
+
+        plans = []
+        for spec in self.qc.chain:
+            try:
+                translator = spec.build(self.request_delay)
+            except NovelTransError:
+                continue
+            plans.append(
+                QcAttemptPlan(
+                    label=spec.label,
+                    translate=lambda title, content, hint, t=translator: t.translate_chapter(
+                        title, content, source=source_lang, target=self.target_lang,
+                        retry_hint=hint,
+                    ),
+                    attempts=spec.attempts,
+                )
+            )
+        return plans
 
     def _run_identity(self, project: NovelProject, pending: list) -> None:
         """Passthrough 'translation' when source_lang == target_lang: copy the
@@ -221,6 +371,7 @@ class TranslateWorker(PausableWorker):
             write_names,
         )
         from noveltrans.translators.names import apply_glossary
+        from noveltrans.translators.qc import Policy, translate_with_qc
 
         project = NovelProject.open(self.project_path)
         try:
@@ -307,6 +458,21 @@ class TranslateWorker(PausableWorker):
                 except Exception:  # noqa: BLE001 — non-fatal, chapters still translate
                     pass
 
+            # QC's engine chain is built ONCE, lazily and per engine: a chain entry that
+            # cannot be constructed (no API key, unknown command) must not abort a batch
+            # that may never reach it, so it is dropped with the rest of the chain intact.
+            qc_plans = None
+            qc_judge = None
+            if self.qc is not None:
+                qc_plans = self._build_qc_plans(project.meta.source_lang)
+                if not qc_plans:
+                    self.failed.emit(
+                        "Không dựng được engine nào để kiểm tra chất lượng — kiểm tra "
+                        "lại cấu hình engine trong hộp thoại Kiểm tra chất lượng."
+                    )
+                    return
+                qc_judge = build_qc_judge(self.qc.judge)
+
             for chapter in pending:
                 if self._checkpoint():
                     break
@@ -315,20 +481,56 @@ class TranslateWorker(PausableWorker):
                     source_title = apply_glossary(chapter.title, glossary)
                     source_content = apply_glossary(chapter.content, glossary)
                     started = time.monotonic()
-                    title, text = translator.translate_chapter(
-                        source_title,
-                        source_content,
-                        source=project.meta.source_lang,
-                        target=self.target_lang,
-                    )
-                    project.save_translation(
-                        chapter.index,
-                        title,
-                        text,
-                        self.target_lang,
-                        self.engine_label(),
-                        seconds=time.monotonic() - started,
-                    )
+                    if qc_plans is None:
+                        title, text = translator.translate_chapter(
+                            source_title,
+                            source_content,
+                            source=project.meta.source_lang,
+                            target=self.target_lang,
+                        )
+                        project.save_translation(
+                            chapter.index, title, text, self.target_lang,
+                            self.engine_label(), seconds=time.monotonic() - started,
+                        )
+                    else:
+                        outcome = translate_with_qc(
+                            qc_plans,
+                            source_title,
+                            source_content,
+                            judge=qc_judge,
+                            policy=Policy.KEEP_BEST,
+                            target=self.target_lang,
+                            on_attempt=lambda n, label, verdict, ch=chapter: self.progress.emit(
+                                done, total,
+                                f"{ch.title} — thử lần {n} ({label})"
+                                + (f": {verdict.reason}" if not verdict.ok else ""),
+                            ),
+                            should_stop=lambda: self._cancelled,
+                        )
+                        # `save_translation` first: it forces status=translated and clears
+                        # `error`, so marking a failure before it would wipe the mark.
+                        project.save_translation(
+                            chapter.index, outcome.title, outcome.body, self.target_lang,
+                            outcome.engine_label, seconds=time.monotonic() - started,
+                        )
+                        fresh = project.chapter(chapter.index)
+                        text_hash = fresh.qc_fingerprint() if fresh else ""
+                        if outcome.ok:
+                            project.save_qc_verdict(
+                                chapter.index, QC_STATUS_OK, "", "", text_hash,
+                                outcome.attempts_used,
+                            )
+                        else:
+                            # Kept, not discarded — see `qc.Policy`. The row goes red so the
+                            # user can find it, and the text is there to salvage.
+                            errors += 1
+                            project.mark_qc_failed(
+                                chapter.index, outcome.verdict.code, outcome.verdict.reason,
+                                text_hash, outcome.attempts_used,
+                            )
+                            self.chapter_error.emit(chapter.index, outcome.verdict.reason)
+                            done += 1
+                            continue
                     self.chapter_done.emit(chapter.index)
                 except NovelTransError as exc:
                     errors += 1
@@ -508,6 +710,120 @@ class RewriteWorker(PausableWorker):
         if not self.dry_run:
             project.mark_error(idx, message)
         self.chapter_error.emit(idx, message)
+
+
+def chapters_to_qc(
+    project: NovelProject,
+    target_lang: str,
+    *,
+    indices: list[int] | None = None,
+    start_idx: int = 0,
+    end_idx: int | None = None,
+    force: bool = False,
+) -> list:
+    """Chapters a quality check would look at, in reading order.
+
+    Only chapters that HAVE a translation — there is nothing to judge otherwise. Without
+    `force`, chapters already judged as they currently stand are skipped, so an interrupted
+    scan resumes for free and a second run costs nothing.
+
+    Shared with `QcDialog` on purpose, exactly as `chapters_to_rewrite` is: the count the
+    dialog shows before the user spends quota has to be the set the worker then processes.
+    """
+    if indices is not None:
+        chapters = (project.chapter(i) for i in indices)
+        return [c for c in chapters if c is not None and c.translated]
+    return project.pending_qc(target_lang, start_idx, end_idx, force=force)
+
+
+class QcScanWorker(PausableWorker):
+    """Judge the quality of already-translated chapters. Writes verdicts, never text.
+
+    Deliberately separate from re-translating. The user asked to *review* the failures and
+    choose which to redo, so this pass forms opinions and stops: the result view then hands
+    the chosen chapters to a normal `TranslateWorker` run. That also makes the scan safe to
+    run on a whole library — the worst it can do is be wrong in a column.
+
+    Signals mirror `TranslateWorker`'s so the tab reuses its handlers, plus `verdict` for
+    the result view.
+    """
+
+    progress = Signal(int, int, str)  # done, total, chapter title
+    chapter_done = Signal(int)
+    chapter_error = Signal(int, str)
+    verdict = Signal(int, str, str)  # chapter index, QC code, Vietnamese reason
+    failed = Signal(str)
+    finished_ok = Signal(int, int)  # checked count, failed count
+
+    def __init__(
+        self,
+        project_path: Path,
+        settings: QcSettings,
+        target_lang: str = "vi",
+        *,
+        indices: list[int] | None = None,
+        start_idx: int = 0,
+        end_idx: int | None = None,
+        force: bool = False,
+        limit: int = 0,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.project_path = Path(project_path)
+        self.settings = settings
+        self.target_lang = target_lang
+        self.indices = indices
+        self.start_idx = start_idx
+        self.end_idx = end_idx
+        self.force = force  # re-check chapters already judged
+        self.limit = limit  # >0: the dialog's dry run — check this many and stop
+
+    def run(self) -> None:
+        from noveltrans.translators.qc import check_translation
+
+        project = NovelProject.open(self.project_path)
+        try:
+            pending = chapters_to_qc(
+                project,
+                self.target_lang,
+                indices=self.indices,
+                start_idx=self.start_idx,
+                end_idx=self.end_idx,
+                force=self.force,
+            )
+            if self.limit > 0:
+                pending = pending[: self.limit]
+            judge = build_qc_judge(self.settings.judge)
+            total = len(pending)
+            done = 0
+            failed = 0
+            for chapter in pending:
+                if self._checkpoint():
+                    break
+                title = chapter.translated_title or chapter.title
+                self.progress.emit(done, total, title)
+                result = check_translation(
+                    chapter.content, chapter.translated_title, chapter.translated,
+                    target=self.target_lang,
+                )
+                # The judge is asked only about a chapter the cheap checks cleared: there is
+                # nothing to ask about one they already failed, and the call costs quota.
+                if result.ok and judge is not None:
+                    result = judge(chapter.translated)
+                status = QC_STATUS_OK if result.ok else QC_STATUS_FAIL
+                project.save_qc_verdict(
+                    chapter.index, status, result.code, result.reason,
+                    chapter.qc_fingerprint(),
+                )
+                self.verdict.emit(chapter.index, result.code, result.reason)
+                self.chapter_done.emit(chapter.index)
+                if not result.ok:
+                    failed += 1
+                done += 1
+            self.progress.emit(done, total, "")
+            self.finished_ok.emit(done, failed)
+        finally:
+            project.close()
 
 
 class NameScanWorker(QThread):

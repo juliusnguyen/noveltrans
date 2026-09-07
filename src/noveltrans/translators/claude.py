@@ -22,7 +22,12 @@ _SYSTEM_PROMPT = (
     "Translate every word — leave NO Chinese characters in the output. "
     f"{PROMPT_RULE}"
     "Output ONLY the translation — no notes, no explanations, no preamble."
+    "{retry_note}"
 )
+
+# Appended only when translation QC is retrying a chapter (`translators/qc.py`), naming what
+# the previous attempt got measurably wrong.
+_RETRY_NOTE = " LƯU Ý — {hint}."
 
 _NAME_RULES = {
     "vi": (
@@ -42,6 +47,7 @@ class ClaudeTranslator(Translator):
     # A whole chapter usually fits one request; chunk only very long ones.
     max_chunk_chars = 12000
     supports_completion = True
+    supports_retry_hint = True
 
     def __init__(self, api_key: str, model: str = "claude-haiku-4-5-20251001"):
         if not api_key:
@@ -51,10 +57,14 @@ class ClaudeTranslator(Translator):
         self.model = model
         self._client = anthropic.Anthropic(api_key=api_key)
 
-    def translate(self, text: str, source: str = "zh", target: str = "vi") -> str:
+    def translate(
+        self, text: str, source: str = "zh", target: str = "vi", *, retry_hint: str = ""
+    ) -> str:
         language = _LANG_NAMES.get(target, target)
         system = _SYSTEM_PROMPT.format(
-            language=language, name_rule=_NAME_RULES.get(target, "")
+            language=language,
+            name_rule=_NAME_RULES.get(target, ""),
+            retry_note=_RETRY_NOTE.format(hint=retry_hint) if retry_hint else "",
         )
         result = self.complete(text, system=system)
         if not result:

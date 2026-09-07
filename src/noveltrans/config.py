@@ -82,6 +82,13 @@ TRANSLATORS = {
 # the style rewrite. Google is translate-only and is deliberately absent.
 LLM_ENGINES = ("cli", "claude_cli", "claude", "lmstudio")
 
+# Translation QC (feature 084): how many times ONE engine in the chain may retry a chapter
+# before the next engine takes over. The default is deliberately small — a retry costs a
+# whole chapter's translation, and an engine that failed twice with the reason spelled out
+# is unlikely to be talked round on a third go.
+DEFAULT_QC_ATTEMPTS = 2
+MAX_QC_ATTEMPTS = 5
+
 
 def translator_labels(config: "AppConfig | None" = None) -> dict[str, str]:
     """Engine labels for combo boxes; CLI entries show their actual command."""
@@ -600,6 +607,97 @@ class AppConfig:
     @rewrite_ai_model.setter
     def rewrite_ai_model(self, value: str) -> None:
         self._s.setValue("rewrite_ai_model", value.strip())
+
+    # ---- translation quality control (feature 084) ------------------------
+
+    @property
+    def qc_enabled(self) -> bool:
+        """Check every fresh translation and re-translate the failures automatically.
+
+        **Off by default, and that matters.** With it off, `TranslateWorker` takes exactly
+        the path it always did — no detector runs, no verdict is written, and a chapter that
+        translates acceptably today cannot start failing. Turning it on also turns on a cost:
+        see `qc_use_llm_judge`.
+        """
+        return self._s.value("qc_enabled", False, type=bool)
+
+    @qc_enabled.setter
+    def qc_enabled(self, value: bool) -> None:
+        self._s.setValue("qc_enabled", bool(value))
+
+    @property
+    def qc_use_llm_judge(self) -> bool:
+        """Ask an LLM whether the prose reads as everyday Vietnamese, not "convert".
+
+        On by default because dense Hán-Việt is the failure that prompted the feature, and
+        no cheap signal can catch it (`translators/qc.py` explains why). The price is one
+        extra engine call per chapter — turn it off for a free, offline check that still
+        catches English, leftover Chinese, empty, truncated and refused translations.
+        """
+        return self._s.value("qc_use_llm_judge", True, type=bool)
+
+    @qc_use_llm_judge.setter
+    def qc_use_llm_judge(self, value: bool) -> None:
+        self._s.setValue("qc_use_llm_judge", bool(value))
+
+    @property
+    def qc_ai_engine(self) -> str:
+        """LLM engine that judges the prose. Separate from the translator, like
+        `rewrite_ai_engine`: judging with a second opinion is the point of the feature."""
+        return str(self._s.value("qc_ai_engine", self._llm_engine_default))
+
+    @qc_ai_engine.setter
+    def qc_ai_engine(self, value: str) -> None:
+        self._s.setValue("qc_ai_engine", value)
+
+    @property
+    def qc_ai_model(self) -> str:
+        """Optional model override for the QC judge ("" = engine default)."""
+        return str(self._s.value("qc_ai_model", ""))
+
+    @qc_ai_model.setter
+    def qc_ai_model(self, value: str) -> None:
+        self._s.setValue("qc_ai_model", value.strip())
+
+    @property
+    def qc_engine_chain(self) -> list[tuple[str, str, int]]:
+        """Which engines re-translate a failed chapter, in order, and how many tries each.
+
+        `[("cli", "", 2), ("claude_cli", "sonnet", 2)]` means "agy twice, then Claude CLI on
+        sonnet twice". An empty list means "just the engine the Translate tab is set to",
+        which is the obvious behaviour for someone who switched QC on without configuring
+        anything.
+
+        Entries carry a MODEL as well as an engine key because `cli` and `claude_cli` are the
+        same class over different commands and each has its own model box — without it,
+        "sonnet then haiku" would be inexpressible.
+
+        Validated on read, like every other list here: a stale or hand-edited entry degrades
+        to a shorter chain, never to a crash.
+        """
+        raw = self._s.value("qc_engine_chain", [])
+        if isinstance(raw, str):  # QSettings collapses a one-item list to a bare string
+            raw = [raw]
+        chain: list[tuple[str, str, int]] = []
+        for item in list(raw or []):
+            parts = str(item).split("|")
+            engine = parts[0].strip() if parts else ""
+            if engine not in TRANSLATORS:
+                continue  # an engine this build does not have is dropped, not fatal
+            model = parts[1].strip() if len(parts) > 1 else ""
+            try:
+                attempts = int(parts[2]) if len(parts) > 2 and parts[2].strip() else DEFAULT_QC_ATTEMPTS
+            except ValueError:
+                attempts = DEFAULT_QC_ATTEMPTS
+            chain.append((engine, model, int(_clamp(attempts, 1, MAX_QC_ATTEMPTS))))
+        return chain
+
+    @qc_engine_chain.setter
+    def qc_engine_chain(self, value) -> None:
+        self._s.setValue(
+            "qc_engine_chain",
+            [f"{engine}|{model}|{int(attempts)}" for engine, model, attempts in (value or [])],
+        )
 
     @property
     def video_font(self) -> str:

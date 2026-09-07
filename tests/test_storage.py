@@ -312,6 +312,10 @@ class TestApplyReplacements:
             "errors": 1,
             "audio": 0,
             "downloaded_audio": 0,
+            # a translation nobody has checked is "chưa kiểm tra", never a failure
+            "qc_ok": 0,
+            "qc_failed": 0,
+            "qc_unchecked": 1,
         }
 
 
@@ -335,6 +339,11 @@ class TestMigration:
             "audio_voice",
             "audio_seconds",
             "audio_error",
+            "qc_status",
+            "qc_code",
+            "qc_reason",
+            "qc_text_hash",
+            "qc_attempts",
         ):
             db.execute(f"ALTER TABLE chapters DROP COLUMN {column}")
         db.commit()
@@ -354,6 +363,13 @@ class TestMigration:
         reopened.save_rewrite(0, "t", "dịch lại")
         assert reopened.chapter(0).is_rewritten
         assert reopened.chapter(0).translated_raw == "dịch"
+        # A library that predates QC opens with every chapter UNCHECKED — not failed. This
+        # is the whole backward-compatibility guarantee: upgrading marks nothing.
+        assert reopened.chapter(0).qc_status == ""
+        assert not reopened.chapter(0).qc_failed
+        assert not reopened.chapter(0).qc_is_stale
+        reopened.save_qc_verdict(0, "ok", "", "", reopened.chapter(0).qc_fingerprint(), 1)
+        assert reopened.chapter(0).qc_ok
 
 
 class TestRewriteState:

@@ -5,7 +5,7 @@
 | Tab | Chức năng |
 |---|---|
 | **1. Tải truyện** | Dán URL truyện → Quét metadata (tên, tác giả, mô tả, mục lục) → Tải toàn bộ chương về máy. Sau khi dịch, tên dịch hiện kế bên tên gốc và mô tả hiển thị bản dịch (rê chuột xem bản gốc). Ô **Truyện gần đây** (có ở cả 5 tab) cũng hiện `tên gốc  —  tên dịch — trang nguồn`, nên nhận ra truyện mà không cần nhớ tên Hán. Có progress bar, nút Dừng, và tự resume (chạy lại chỉ tải chương còn thiếu). Hoặc bấm **✍️ Truyện tự viết** để tạo truyện của chính bạn (không cần link nguồn): thêm chương bằng tên (mỗi dòng một tên), đổi tên chương, chuột phải để xoá chương. Có nút **⏸ Tạm dừng** cạnh nút Dừng. |
-| **2. Dịch** | Dịch Trung → Việt/Anh bằng **Google Translate (miễn phí)**, **Claude API**, **CLI Agent** (agy/claude) hoặc **LM Studio** (model local). Xem song song bản gốc/bản dịch. Resume + retry chương lỗi, dịch lại từng chương. Sửa tay cả hai ô: bấm vào ô **Bản gốc** để dán/sửa nội dung gốc (đây cũng là chỗ nhập nội dung cho truyện tự viết), bấm vào ô **Bản dịch** để sửa bản dịch — cả hai tự lưu khi rời ô, dòng đầu là tên chương. Nháy đúp cột "Tên dịch" để đổi tên chương dịch. **Tìm & thay thế** hàng loạt (một chương hoặc cả truyện) — xem trước số khớp rồi mới áp dụng; trong bảng kết quả, **nháy đúp một chương để mở chương đó và nhảy tới chỗ khớp** (nháy đúp tiếp để sang chỗ khớp kế trong cùng chương) rồi sửa tay ngay, cửa sổ tìm kiếm vẫn mở. Bản dịch mới **tự bỏ dòng quảng cáo trang nguồn** (kiểu `… xin truy cập sto9🍀.com`, kể cả khi tên miền bị chèn emoji để né bộ lọc) — chương đã dịch trước đó không đổi, dùng **Tìm & thay thế** nếu muốn dọn. **👤 Tên nhân vật**: danh sách tên riêng của truyện — app tự dò tên hay lặp lại và thay sẵn bằng âm Hán-Việt **trước khi** gửi cho AI, nên cùng một nhân vật được viết giống nhau ở mọi chương (trước đây chỉ Google mới có, các engine AI thì mỗi chương tự đoán lại). Bảng cho sửa cách viết (bảng máy tra có thể khác cách gọi quen thuộc — ví dụ `Nịnh` với `Ninh`), bỏ tick tên dò nhầm, và **＋ Thêm tên** cho tên máy không tìm ra; sửa xong máy hỏi có sửa luôn các chương đã dịch không. Lần dò sau **không ghi đè** cách viết bạn đã sửa. **✍️ Viết lại văn phong**: dùng AI sửa bản dịch kiểu "convert" (dịch từng chữ, giữ trật tự từ tiếng Trung) thành tiếng Việt xuôi tai — xem bên dưới. Có nút **⏸ Tạm dừng** cạnh nút Dừng. |
+| **2. Dịch** | Dịch Trung → Việt/Anh bằng **Google Translate (miễn phí)**, **Claude API**, **CLI Agent** (agy/claude) hoặc **LM Studio** (model local). Xem song song bản gốc/bản dịch. Resume + retry chương lỗi, dịch lại từng chương. Sửa tay cả hai ô: bấm vào ô **Bản gốc** để dán/sửa nội dung gốc (đây cũng là chỗ nhập nội dung cho truyện tự viết), bấm vào ô **Bản dịch** để sửa bản dịch — cả hai tự lưu khi rời ô, dòng đầu là tên chương. Nháy đúp cột "Tên dịch" để đổi tên chương dịch. **Tìm & thay thế** hàng loạt (một chương hoặc cả truyện) — xem trước số khớp rồi mới áp dụng; trong bảng kết quả, **nháy đúp một chương để mở chương đó và nhảy tới chỗ khớp** (nháy đúp tiếp để sang chỗ khớp kế trong cùng chương) rồi sửa tay ngay, cửa sổ tìm kiếm vẫn mở. Bản dịch mới **tự bỏ dòng quảng cáo trang nguồn** (kiểu `… xin truy cập sto9🍀.com`, kể cả khi tên miền bị chèn emoji để né bộ lọc) — chương đã dịch trước đó không đổi, dùng **Tìm & thay thế** nếu muốn dọn. **👤 Tên nhân vật**: danh sách tên riêng của truyện — app tự dò tên hay lặp lại và thay sẵn bằng âm Hán-Việt **trước khi** gửi cho AI, nên cùng một nhân vật được viết giống nhau ở mọi chương (trước đây chỉ Google mới có, các engine AI thì mỗi chương tự đoán lại). Bảng cho sửa cách viết (bảng máy tra có thể khác cách gọi quen thuộc — ví dụ `Nịnh` với `Ninh`), bỏ tick tên dò nhầm, và **＋ Thêm tên** cho tên máy không tìm ra; sửa xong máy hỏi có sửa luôn các chương đã dịch không. Lần dò sau **không ghi đè** cách viết bạn đã sửa. **✍️ Viết lại văn phong**: dùng AI sửa bản dịch kiểu "convert" (dịch từng chữ, giữ trật tự từ tiếng Trung) thành tiếng Việt xuôi tai — xem bên dưới. **🔍 Kiểm tra chất lượng**: tìm chương bị dịch ra tiếng Anh, còn nguyên chữ Hán, bị cắt ngắn hay đặc Hán-Việt, rồi cho chọn chương nào dịch lại (dịch lại kèm lời phê của lần trước, thử hết engine này sang engine khác) — xem bên dưới. Có nút **⏸ Tạm dừng** cạnh nút Dừng. |
 | **3. Xuất file** | Xuất bản dịch (hoặc bản gốc) ra **DOCX**, **Markdown**, **EPUB**. Tên file mặc định lấy theo tên truyện đã dịch. Cũng là nơi **sao lưu cả truyện lên OneDrive** (xem bên dưới). |
 | **4. Nghe audio** | Đọc bản dịch thành audio bằng **VieNeu-TTS** (chạy local, 20 giọng tiếng Việt). MP3/WAV từng chương, resume, tạo lại từng chương, double-click để nghe. Chọn **giọng** (mỗi giọng mang sẵn phong cách tự nhiên / kể chuyện / tin tức), xem trước văn bản engine sẽ đọc, và tinh chỉnh **tốc độ / âm lượng / khoảng lặng / độ biểu cảm / chất lượng** trong Cài đặt. Truyện tự viết bằng tiếng Việt thì chọn nguồn **Bản gốc** để đọc thẳng nội dung (không cần dịch). Có nút **⏸ Tạm dừng** cạnh nút Dừng. |
 | **5. Video** | Ghép audio các chương thành **video kiểu trình phát nhạc** (ảnh nền + cột sóng + tên chương) để đăng YouTube. Chọn phạm vi **Toàn bộ / khoảng chương / theo lô** (ví dụ 20 chương một video), chất lượng **1080p hoặc 720p** (có bản “không đĩa xoay” render nhanh hơn nhiều), phông chữ, ảnh nền, màu nền, và **Xem trước** trước khi render. Tạo **phụ đề `.srt`** (kể cả cho audio cũ chưa có mốc thời gian) với tuỳ chọn **chèn phụ đề cố định** vào video; **ảnh bìa (thumbnail)** có cửa sổ chỉnh tay (kéo vị trí tên truyện / PHẦN N, đổi phông, tagline) và tạo lại hàng loạt mà không phải render lại video; **tags YouTube** sinh bằng LLM như tab 2. **Mô tả** của mỗi phần luôn nằm dưới giới hạn **5000 ký tự** của YouTube — lô quá lớn thì mục lục chương bị cắt bớt (có cảnh báo ⚠️ ngay trên bảng phần, đổi số chương/video là thấy liền), và trong **Chi tiết phần** có nút **Shorten by AI** rút gọn tên từng chương (`Chương 1` → `C.1`, bỏ tên truyện/tác giả/dòng “Tạo bởi”) để nhét vừa nhiều chương hơn — rút gọn xong mà vẫn còn chỗ thì tên truyện/tác giả/“Tạo bởi” được thêm lại, nhưng chỉ khi không phải bỏ bớt chương nào. Đổi tên chương sau khi đã render thì mô tả của phần đó **tự cập nhật** lần sau mở truyện. Bảng **danh sách phần** hiện phần nào đã tạo / đã tải lên, tạo tiếp phần còn thiếu, tách hoặc gộp 2 phần liền kề, và tự đánh dấu trạng thái. **⬆️ Tải lên YouTube** chạy tự động qua một cửa sổ Chrome riêng (đăng nhập một lần trong Cài đặt): chọn chế độ hiển thị hoặc **hẹn giờ đăng** cách nhau N ngày, thêm vào **danh sách phát**, cập nhật ảnh bìa và tải phụ đề lên cho video đã đăng. Cần `ffmpeg`. Có nút **⏸ Tạm dừng** cạnh nút Dừng. |
@@ -215,6 +215,48 @@ Lưu ý:
   một chút. Muốn đổi engine thì nên Hoàn tác trước rồi viết lại.
 - Chạy được **resume** (lần sau chỉ làm chương còn thiếu) và **⏸ Tạm dừng** như mọi tác
   vụ dài khác.
+
+## Kiểm tra chất lượng dịch
+
+Cùng một engine không phải lúc nào cũng dịch tốt: có chương trả về **toàn tiếng Anh**, có
+chương **còn nguyên chữ Hán**, có chương đọc **đặc Hán-Việt** như bản convert. Nút
+**🔍 Kiểm tra chất lượng** ở tab 2 tìm những chương đó rồi cho bạn chọn chương nào dịch lại.
+
+Có hai lớp kiểm tra:
+
+- **Lớp nhanh — miễn phí, chạy offline, luôn bật.** Đo bằng máy: tỉ lệ từ có dấu tiếng Việt
+  (bắt lỗi ra tiếng Anh), tỉ lệ chữ Hán còn sót (bắt chương chưa dịch hoặc xen kẽ hai thứ
+  tiếng), độ dài so với bản gốc (bắt chương bị cắt), chương rỗng, và câu engine hỏi xin nội
+  dung thay vì dịch. Mọi ngưỡng đều đo từ thư viện thật — chạy `python scripts/qc_calibrate.py`
+  để xem lại phân bố trước khi sửa bất kỳ con số nào.
+- **Lớp AI — chấm văn phong Hán-Việt, tốn 1 lượt gọi/chương.** Lỗi này *không* đo bằng máy
+  được: truyện tiên hiệp **dùng nhiều từ Hán-Việt là đúng**, và những chương "nhiều Hán-Việt
+  nhất" trong một thư viện thật lại là chương hay. Nên phần này phải hỏi AI. Tắt được nếu
+  muốn kiểm tra hoàn toàn miễn phí.
+
+**Dịch lại có lời phê.** Chương không đạt được dịch lại kèm đúng lỗi của lần trước ("bản
+trước ra toàn tiếng Anh — lần này phải dịch sang tiếng Việt"), chứ không phải gọi lại y hệt
+và cầu may. Trong hộp thoại, mục **"Dịch lại bằng — theo thứ tự"** là danh sách engine: hết
+số lần thử của engine đầu (mặc định 2) mà vẫn hỏng thì tự chuyển sang engine sau — ví dụ
+`agy ×2 → claude ×2`.
+
+Hai chế độ, dùng chung một bộ luật:
+
+- **Tự động trong lúc dịch** (tick "Tự động kiểm tra & dịch lại ngay khi dịch"): mỗi chương
+  vừa dịch xong được kiểm tra ngay. Chương chữa mãi không đạt vẫn **được lưu bản tốt nhất**
+  và đánh dấu ⚠️ kèm lý do ở cột **Lỗi** — vì lúc đó lựa chọn còn lại là *không có chữ nào*.
+- **Kiểm tra chương đã dịch**: quét cả truyện, hoặc chọn vài chương rồi chuột phải →
+  **🔍 Kiểm tra chất lượng**. Quét xong hiện bảng các chương chưa đạt: **nháy đúp để mở
+  chương ra đọc**, bỏ tick chương nào bạn thấy vẫn ổn, rồi bấm **↻ Dịch lại chương đã chọn**.
+  Ở đường này bản dịch cũ **chỉ bị thay khi bản mới đạt** — vì lựa chọn còn lại là bản dịch
+  đang có, không phải chỗ trống.
+
+Trước khi quét cả nghìn chương, bấm **👁 Thử 3 chương** — chạy đúng quy trình thật nhưng
+**không ghi gì**, để xem AI chấm có hợp lý với truyện của bạn không.
+
+Chương đã kiểm tra có dấu **✅** (đạt) hoặc **⚠️** (chưa đạt) ở cột "Dịch bằng"; di chuột lên
+để xem lý do. Chương **chưa kiểm tra thì không có dấu gì** — bật tính năng này lên không
+đánh dấu lại thư viện cũ của bạn, và khi tắt thì việc dịch chạy y như trước.
 
 ## Nghe audio (VieNeu-TTS)
 
