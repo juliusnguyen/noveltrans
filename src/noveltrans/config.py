@@ -721,6 +721,20 @@ class AppConfig:
         self._s.setValue("video_burn_subtitles", bool(value))
 
     @property
+    def video_show_bars(self) -> bool:
+        """Draw the audio-driven "sound bars" in the player.
+
+        On by default — it is the look every video so far has had. Turning it off makes
+        the render ~10% faster and the file ~25% smaller, and hands the strip the bars
+        occupied to the chapter title, which can then wrap wider before it has to shrink.
+        """
+        return self._s.value("video_show_bars", True, type=bool)
+
+    @video_show_bars.setter
+    def video_show_bars(self, value: bool) -> None:
+        self._s.setValue("video_show_bars", bool(value))
+
+    @property
     def video_thumbnail_title_align(self) -> str:
         """Which edge the cover title's lines are flush against: "left" or "right".
 

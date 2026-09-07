@@ -327,6 +327,17 @@ class VideoTab(QWidget):
             lambda on: self._save_video_setting("video_burn_subtitles", on)
         )
 
+        self.show_bars_check = QCheckBox("Cột sóng nhạc")
+        self.show_bars_check.setChecked(self.config.video_show_bars)
+        self.show_bars_check.setToolTip(
+            "Vẽ cột sóng nhạc chạy theo tiếng đọc ở cột phải.\n\nTắt đi thì render nhanh "
+            "hơn ~10%, file nhẹ hơn ~25%, và tên chương dài có thêm chỗ để xuống dòng "
+            "trước khi bị thu nhỏ."
+        )
+        self.show_bars_check.toggled.connect(
+            lambda on: self._save_video_setting("video_show_bars", on)
+        )
+
         self.video_button = QPushButton("Tạo video")
         self.video_button.setProperty("primary", True)
         self.video_button.clicked.connect(self._start_video)
@@ -374,6 +385,7 @@ class VideoTab(QWidget):
         row.addWidget(self.bg_color_button)
         row.addWidget(self.bg_reset_button)
         row.addWidget(self.burn_subs_check)
+        row.addWidget(self.show_bars_check)
 
         row2 = QHBoxLayout()
         row2.addWidget(QLabel("Ảnh nền:"))
@@ -2490,6 +2502,7 @@ class VideoTab(QWidget):
             self._set_combo(self.thumb_font, values["video_thumbnail_font"])
             self.video_batch_size.setValue(int(values["video_batch_size"]))
             self.burn_subs_check.setChecked(bool(values["video_burn_subtitles"]))
+            self.show_bars_check.setChecked(bool(values["video_show_bars"]))
             self.video_image_edit.setText(values["video_image_path"])
             self.thumb_image_edit.setText(values["video_thumbnail_image"])
             self.tagline_edit.setText(values["video_tagline"])
@@ -3087,7 +3100,8 @@ class VideoTab(QWidget):
         self._preview_worker = VideoPreviewWorker(
             image, novel_title, "Chương 1: Chương mẫu",
             width=preset["width"], height=preset["height"],
-            spin_vinyl=preset["spin_vinyl"], font=family, bg_color=self.bg_color,
+            spin_vinyl=preset["spin_vinyl"], show_bars=self.show_bars_check.isChecked(),
+            font=family, bg_color=self.bg_color,
         )
         self._preview_worker.done.connect(self._on_preview_ready)
         self._preview_worker.failed.connect(self._on_preview_failed)
@@ -3169,7 +3183,7 @@ class VideoTab(QWidget):
     def _start_video(self) -> None:
         from pathlib import Path
 
-        from noveltrans.tts.video import video_preset
+        from noveltrans.tts.video import render_speed, video_preset
 
         if self.project is None:
             QMessageBox.information(self, "Chưa chọn truyện", "Hãy chọn một truyện trước.")
@@ -3218,7 +3232,7 @@ class VideoTab(QWidget):
         n_chapters = sum(len(w.chapters) for w in pending)
         total_secs = sum(c.audio_seconds for w in pending for c in w.chapters)
         hours = total_secs / 3600
-        render_hours = hours / preset["speed"]
+        render_hours = hours / render_speed(preset, self.show_bars_check.isChecked())
         est = f"~{render_hours * 60:.0f} phút" if render_hours < 1 else f"~{render_hours:.1f} giờ"
         skip_note = f" (bỏ qua {existing} phần đã có)" if existing else ""
         answer = QMessageBox.question(
@@ -3247,7 +3261,7 @@ class VideoTab(QWidget):
         those settings are baked into the .mp4, so the existing files are simply wrong
         and there's no per-part change to hunt for.
         """
-        from noveltrans.tts.video import video_preset
+        from noveltrans.tts.video import render_speed, video_preset
 
         if self.project is None:
             QMessageBox.information(self, "Tạo lại tất cả video", "Chọn truyện trước.")
@@ -3284,7 +3298,7 @@ class VideoTab(QWidget):
         preset = video_preset(self.video_quality.currentData())
         total_secs = sum(c.audio_seconds for w in windows for c in w.chapters)
         hours = total_secs / 3600
-        render_hours = hours / preset["speed"]
+        render_hours = hours / render_speed(preset, self.show_bars_check.isChecked())
         est = f"~{render_hours * 60:.0f} phút" if render_hours < 1 else f"~{render_hours:.1f} giờ"
 
         # Re-rendering a part that is already on YouTube does NOT change the published
@@ -3345,7 +3359,7 @@ class VideoTab(QWidget):
         """
         from pathlib import Path
 
-        from noveltrans.tts.video import video_preset
+        from noveltrans.tts.video import render_speed, video_preset
         from noveltrans.video_state import effective_created
 
         if self.project is None:
@@ -3377,7 +3391,7 @@ class VideoTab(QWidget):
         n_chapters = sum(len(w.chapters) for w in pending)
         total_secs = sum(c.audio_seconds for w in pending for c in w.chapters)
         hours = total_secs / 3600
-        render_hours = hours / preset["speed"]
+        render_hours = hours / render_speed(preset, self.show_bars_check.isChecked())
         est = f"~{render_hours * 60:.0f} phút" if render_hours < 1 else f"~{render_hours:.1f} giờ"
         skip_note = f" (bỏ qua {existing} phần đã có)" if existing else ""
         answer = QMessageBox.question(
@@ -3452,6 +3466,7 @@ class VideoTab(QWidget):
             thumb_tagline_scale=self._video_settings["video_thumbnail_tagline_scale"],
             thumb_title_align=self._video_settings["video_thumbnail_title_align"],
             burn_subtitles=self.burn_subs_check.isChecked(),
+            show_bars=self.show_bars_check.isChecked(),
             bg_color=self.bg_color, skip_existing=skip_existing, part_num=part_num,
             explicit_windows=explicit_windows, explicit_part_numbers=explicit_part_numbers,
             credit=self.credit_edit.text().strip() or "Fox Novel",

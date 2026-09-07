@@ -53,6 +53,7 @@ WORKFLOW_KEYS: tuple[str, ...] = (
     "video_encoder",
     "video_batch_size",
     "video_burn_subtitles",
+    "video_show_bars",
     "video_ai_engine",
     "video_ai_model",
 )

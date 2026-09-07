@@ -156,6 +156,130 @@ class TestBuildAssSubtitles:
         assert lay.novel_margin_v < lay.chapter_margin_v  # novel above the chapter line
 
 
+class TestFitTitle:
+    """Long titles are made to fit the player's title block instead of overflowing it."""
+
+    def _font(self):
+        from noveltrans.tts.video import font_dir_context, font_file_for
+
+        with font_dir_context() as fd:
+            return fd / font_file_for("Noto Sans")
+
+    def test_a_short_title_is_left_alone(self):
+        from noveltrans.tts.video import fit_title
+
+        lines, px = fit_title("Chương 12: Khởi đầu", self._font(), 52, 589, 158)
+        assert lines == ["Chương 12: Khởi đầu"]
+        assert px == 52  # no shrink, no wrap — the common case is untouched
+
+    def test_a_long_title_wraps_and_shrinks_but_keeps_every_word(self):
+        from noveltrans.tts.video import fit_title
+
+        title = "Chương 1234: Thiếu niên kia rốt cuộc là ai mà dám ngông cuồng như vậy"
+        lines, px = fit_title(title, self._font(), 52, 589, 158)
+        assert len(lines) > 1  # wrapped into the column
+        assert px < 52  # shrunk to fit the band…
+        assert " ".join(lines) == title  # …but nothing was dropped
+
+    def test_it_never_overflows_the_band_it_is_given(self):
+        # The whole point: a title, however long, stops above what sits below it.
+        from PIL import ImageFont
+
+        from noveltrans.tts.video import fit_title
+
+        font_path = self._font()
+        for title in ("Chương 1: Ngắn",
+                      "Chương 77: " + "một cái tên rất dài " * 3,
+                      "Chương 99: " + "cực kỳ dài dòng văn tự " * 12,
+                      "Chươngmộtchữdàikhôngcókhoảngtrắngnàocảdàikinhkhủng"):
+            lines, px = fit_title(title, font_path, 52, 589, 158)
+            font = ImageFont.truetype(str(font_path), px)
+            ascent, descent = font.getmetrics()
+            assert len(lines) * (ascent + descent) <= 158, title
+            assert all(font.getlength(line) <= 589 for line in lines), title
+
+    def test_it_ellipsises_only_when_even_the_smallest_size_will_not_fit(self):
+        from noveltrans.tts.video import fit_title
+
+        short = "Chương 5: Vừa đủ"
+        endless = "Chương 5: " + "dài " * 200
+        assert "…" not in " ".join(fit_title(short, self._font(), 52, 589, 158)[0])
+        assert " ".join(fit_title(endless, self._font(), 52, 589, 158)[0]).endswith("…")
+
+    def test_more_room_means_a_bigger_title(self):
+        # Switching the bars off widens the band, and the same title is then set larger.
+        from noveltrans.tts.video import fit_title
+
+        title = "Chương 1234: Thiếu niên kia rốt cuộc là ai mà dám ngông cuồng như vậy"
+        _, tight = fit_title(title, self._font(), 52, 589, 158)
+        _, roomy = fit_title(title, self._font(), 52, 589, 279)
+        assert roomy > tight
+
+    def test_a_hard_line_break_in_a_title_is_honoured(self):
+        from noveltrans.tts.video import fit_title
+
+        lines, _px = fit_title("Chương 3:\nHai dòng", self._font(), 52, 589, 158)
+        assert lines == ["Chương 3:", "Hai dòng"]
+
+    def test_without_a_font_the_title_is_untouched(self):
+        # The pure builders (and their tests) call this with no font: same text, same size.
+        from noveltrans.tts.video import fit_title
+
+        assert fit_title("Chương 9: bất kỳ", None, 52, 10, 10) == (["Chương 9: bất kỳ"], 52)
+        assert fit_title("   ", None, 52, 10, 10) == ([], 52)
+
+    def test_font_file_lookup_falls_back_to_the_default(self):
+        from noveltrans.tts.video import VIDEO_FONTS, font_file_for
+
+        assert font_file_for("Lora") == VIDEO_FONTS["lora"]["file"]
+        assert font_file_for("A Font Nobody Has") == VIDEO_FONTS["noto_sans"]["file"]
+
+
+class TestFittedTitlesInTheAssDocument:
+    def _doc(self, title, *, show_bars=True, novel="Truyện"):
+        from noveltrans.tts.video import (
+            build_ass_subtitles,
+            font_dir_context,
+            font_file_for,
+        )
+
+        with font_dir_context() as fd:
+            return build_ass_subtitles(
+                [_seg(10, title)], novel, width=1920, height=1080,
+                font_file=fd / font_file_for("Noto Sans"), show_bars=show_bars,
+            )
+
+    def test_a_long_chapter_title_is_broken_and_shrunk_in_the_event(self):
+        doc = self._doc("Chương 1234: Thiếu niên kia rốt cuộc là ai mà dám ngông cuồng như vậy")
+        chapter = [ln for ln in doc.splitlines() if ",Chapter,," in ln][0]
+        assert "\\N" in chapter  # explicit breaks, so libass cannot re-wrap it downward
+        assert "\\fs" in chapter  # shrunk to fit the band
+        assert chapter.count("{") == 1  # one override block: {\fad(400,400)\fs42}
+        assert "\\fad(400,400)" in chapter  # the fade survives the size override
+
+    def test_a_short_title_produces_the_same_event_as_before_fitting(self):
+        from noveltrans.tts.video import build_ass_subtitles
+
+        title = "Chương 12: Khởi đầu"
+        fitted = self._doc(title)
+        plain = build_ass_subtitles([_seg(10, title)], "Truyện", width=1920, height=1080)
+        assert fitted == plain  # nothing to fit → byte-identical output
+
+    def test_turning_the_bars_off_gives_the_title_more_room(self):
+        title = "Chương 1234: Thiếu niên kia rốt cuộc là ai mà dám ngông cuồng như vậy"
+        tight = self._doc(title, show_bars=True)
+        roomy = self._doc(title, show_bars=False)
+        assert tight != roomy  # the same title is laid out differently in the wider band
+
+    def test_a_long_novel_title_is_kept_to_one_line(self):
+        # The album line sits directly above the chapter title; wrapping it would push it
+        # into the title it labels, so it shrinks (and ellipsises) instead.
+        doc = self._doc("Chương 1: Ngắn", novel="Vạn Cổ Thần Đế Chi Tối Cường Đô Thị Hệ Thống Truyền Kỳ")
+        novel = [ln for ln in doc.splitlines() if ",Novel,," in ln][0]
+        assert "\\N" not in novel
+        assert "\\fs" in novel  # shrunk to fit the column on one line
+
+
 class TestYoutubeTimestamp:
     @pytest.mark.parametrize(
         ("secs", "expected"),
@@ -217,10 +341,22 @@ class TestFiltergraph:
 
     def test_has_the_bars_from_the_audio_input(self):
         g = self._graph()
-        assert "[1:a]showfreqs=" in g  # bars driven by the audio (input 1)
+        assert "[1:a]showfreqs=" in g  # bars driven by the audio (input 1 by default)
         assert "mode=bar" in g
         assert "[s1][viz]overlay=" in g  # bars composited over the spun-vinyl base
         assert "subtitles=" in g  # titles still burned on top
+
+    def test_bars_can_be_driven_by_another_audio_stream(self):
+        # A real render feeds the bars from a SECOND copy of the audio file so the
+        # visualiser branch is not starved by the `-c:a copy` side (frozen-bars bug).
+        from pathlib import Path
+
+        from noveltrans.tts.video import _filtergraph
+
+        g = _filtergraph(1920, 1080, Path("/tmp/s.ass"), Path("/tmp/f"), 100.0,
+                         viz_audio="4:a")
+        assert "[4:a]showfreqs=" in g
+        assert "[1:a]" not in g  # nothing else reads the copied audio stream
 
     def test_bars_are_in_the_right_column_and_purple(self):
         # The skin is pre-baked (no photo/blur here); the bars sit in the right column
@@ -256,6 +392,21 @@ class TestFiltergraph:
         assert "rotate=" not in g  # no per-frame rotate → much faster encode
         assert f"[0:v][2:v]overlay={lay.vinyl_x}:{lay.vinyl_y}" in g  # static overlay
         assert "showfreqs=" in g and "subtitles=" in g  # bars + titles still there
+
+    def test_bars_can_be_switched_off(self):
+        # The visualiser is optional: no showfreqs branch, no bars overlay, and the vinyl
+        # base feeds the playhead directly — everything else is untouched.
+        from pathlib import Path
+
+        from noveltrans.tts.player_skin import PlayerLayout
+        from noveltrans.tts.video import _filtergraph
+
+        lay = PlayerLayout.of(1920, 1080)
+        g = _filtergraph(1920, 1080, Path("/tmp/s.ass"), Path("/tmp/f"), 100.0,
+                         show_bars=False)
+        assert "showfreqs" not in g and "[viz]" not in g
+        assert f"[s1][3:v]overlay=x='{lay.track_x}" in g  # knob straight off the vinyl base
+        assert "rotate=" in g and "subtitles=" in g  # the rest of the player is unchanged
 
     def test_knob_slides_along_the_track_with_progress(self):
         # The playhead (input 3) x is a linear function of t/total across the track.
@@ -308,6 +459,15 @@ class TestVideoPresets:
         assert video_preset("nope") == VIDEO_QUALITY_PRESETS["high"]
         assert video_preset("fast") == VIDEO_QUALITY_PRESETS["fast"]
         assert video_preset("high_static") == VIDEO_QUALITY_PRESETS["high_static"]
+
+
+class TestRenderSpeed:
+    def test_dropping_the_bars_raises_the_estimated_speed(self):
+        from noveltrans.tts.video import render_speed, video_preset
+
+        preset = video_preset("high")
+        assert render_speed(preset) == preset["speed"]
+        assert render_speed(preset, show_bars=False) > preset["speed"]
 
 
 class TestVideoEncoders:
@@ -490,6 +650,68 @@ class TestRenderArgv:
         assert "copy" in render  # -c:a copy (audio filtered AND copied — the crux)
         assert any("rotate=a=" in a for a in render)  # the vinyl spins
         assert render.count("-loop") == 3  # skin + vinyl + knob are looped stills
+
+    def test_bars_read_their_own_copy_of_the_audio(self, tmp_path, monkeypatch):
+        # Regression guard for the frozen-bars bug on long videos: one shared audio input
+        # feeding both `-c:a copy` and showfreqs let the copy side race ahead until the
+        # visualiser branch stopped getting frames and overlay froze the last bars frame.
+        # The render must open the audio file twice and draw the bars from input 4.
+        import noveltrans.tts.video as video
+
+        cmds = []
+
+        class _FakeProc:
+            returncode = 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        monkeypatch.setattr(video.subprocess, "Popen",
+                            lambda cmd, **kw: (cmds.append(cmd), _FakeProc())[1])
+        monkeypatch.setattr(video, "_with_real_durations", lambda segs: segs)
+        monkeypatch.setattr(video, "_concat_audio", lambda *a, **k: None)
+
+        segs = [MergeSegment(path=tmp_path / "a.wav", seconds=3.0, title="C1")]
+        with video.font_dir_context() as font_dir:
+            video.render_video(segs, tmp_path / "bg.png", tmp_path / "out.mp4",
+                               font_dir, "Truyện", width=640, height=360, fps=25)
+
+        render = next(c for c in cmds if any("showfreqs" in a for a in c))
+        audio_inputs = [a for a in render if a.endswith("audio.m4a")]
+        assert len(audio_inputs) == 2  # copied out AND decoded again for the bars
+        graph = render[render.index("-filter_complex") + 1]
+        assert "[4:a]showfreqs=" in graph  # bars read the second, dedicated input
+        assert render[render.index("-map") + 1] == "[v]"
+        assert "1:a" in render  # the copied audio is still input 1
+
+    def test_no_bars_drops_the_visualiser_and_its_audio_input(self, tmp_path, monkeypatch):
+        # With the bars off there is nothing to feed: the second audio input goes away too.
+        import noveltrans.tts.video as video
+
+        cmds = []
+
+        class _FakeProc:
+            returncode = 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        monkeypatch.setattr(video.subprocess, "Popen",
+                            lambda cmd, **kw: (cmds.append(cmd), _FakeProc())[1])
+        monkeypatch.setattr(video, "_with_real_durations", lambda segs: segs)
+        monkeypatch.setattr(video, "_concat_audio", lambda *a, **k: None)
+
+        segs = [MergeSegment(path=tmp_path / "a.wav", seconds=3.0, title="C1")]
+        with video.font_dir_context() as font_dir:
+            video.render_video(segs, tmp_path / "bg.png", tmp_path / "out.mp4",
+                               font_dir, "Truyện", width=640, height=360, fps=25,
+                               show_bars=False)
+
+        render = next(c for c in cmds if "-filter_complex" in c)
+        graph = render[render.index("-filter_complex") + 1]
+        assert "showfreqs" not in graph
+        assert len([a for a in render if a.endswith("audio.m4a")]) == 1  # only the copy
+        assert "1:a" in render and "copy" in render  # the audio itself is unchanged
 
     def test_audio_concat_avoids_the_concat_demuxer(self, tmp_path, monkeypatch):
         # Regression guard for the >12.4h truncation bug: the concat demuxer overflows a
@@ -729,6 +951,25 @@ class TestPlayerLayout:
         # top-to-bottom on the right: chapter title, then bars, then the progress track
         assert lay.chapter_margin_v < lay.bars_y < lay.track_y
         assert lay.knob_half > lay.knob_r  # the knob PNG has room for its ring
+
+    def test_chapter_title_band_stops_above_whatever_follows_it(self):
+        # The band is what the chapter title may fill before it would collide: the bars
+        # when they are drawn, the progress track when they are not.
+        from noveltrans.tts.player_skin import PlayerLayout
+
+        lay = PlayerLayout.of(1920, 1080)
+        with_bars = lay.chapter_band_h(True)
+        without = lay.chapter_band_h(False)
+        assert lay.chapter_margin_v + with_bars < lay.bars_y  # clears the bars
+        assert lay.chapter_margin_v + without < lay.track_y  # clears the track
+        assert without > with_bars  # switching the bars off hands the title their strip
+
+    def test_the_title_block_clears_the_vinyl_above_it(self):
+        from noveltrans.tts.player_skin import PlayerLayout
+
+        lay = PlayerLayout.of(1920, 1080)
+        assert lay.vinyl_y + lay.vinyl_size < lay.novel_margin_v  # disc, then the titles
+        assert lay.novel_margin_v < lay.chapter_margin_v
 
 
 class TestPlayerSkin:
@@ -1585,6 +1826,34 @@ class TestRealRender:
         assert "codec_type=video" in probe.stdout
         assert "codec_type=audio" in probe.stdout
         assert Path(out).stat().st_size > 1000
+
+    def test_renders_without_the_visualiser(self, tmp_path):
+        # The bars-off filtergraph is a different chain (no showfreqs, no second audio
+        # input) — a real ffmpeg run is the only thing that proves it is still valid.
+        from noveltrans.tts.video import font_dir_context, render_video
+
+        wav = tmp_path / "a.wav"
+        self._tone(wav, 1.0)
+        image = tmp_path / "bg.png"
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=navy:s=640x360:d=1",
+             "-frames:v", "1", str(image)],
+            check=True, capture_output=True,
+        )
+        segs = [MergeSegment(path=wav, seconds=1.0,
+                             title="Chương 1: một tên chương rất dài để phải xuống dòng")]
+        out = tmp_path / "nobars.mp4"
+        with font_dir_context() as font_dir:
+            render_video(segs, image, out, font_dir, "Truyện thử",
+                         width=640, height=360, fps=8, show_bars=False)
+
+        assert out.exists() and out.stat().st_size > 1000
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type",
+             "-of", "default=nw=1", str(out)],
+            capture_output=True, text=True,
+        )
+        assert "codec_type=video" in probe.stdout and "codec_type=audio" in probe.stdout
 
 
 class TestBurnedNarrationSubtitles:
