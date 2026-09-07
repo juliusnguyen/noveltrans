@@ -49,6 +49,9 @@ from noveltrans.tts.player_skin import (
     build_player_skin,
     build_vinyl,
 )
+# The same greedy, metrics-based word wrap the cover art uses — one wrap for both, so a
+# title breaks the same way on the thumbnail and in the video.
+from noveltrans.tts.thumbnail import _wrap_title
 
 # Reused verbatim from merge — the selection, segment type, concat list, and cancel.
 from noveltrans.tts.merge import (  # noqa: F401
@@ -87,6 +90,17 @@ DEFAULT_VIDEO_QUALITY = "high"
 def video_preset(key: str) -> dict:
     """Return the preset params for `key`, falling back to the default if unknown."""
     return VIDEO_QUALITY_PRESETS.get(key, VIDEO_QUALITY_PRESETS[DEFAULT_VIDEO_QUALITY])
+
+
+# Leaving the visualizer out saves ~10-12% of the render on the CPU encoder (measured at
+# 1080p; more on a GPU encoder, where the filters are the bottleneck). Deliberately the
+# smallest of the measured gains, so the estimate stays conservative.
+_NO_BARS_SPEEDUP = 1.12
+
+
+def render_speed(preset: dict, show_bars: bool = True) -> float:
+    """The preset's encode rate (× real time), adjusted for the visualizer being off."""
+    return preset["speed"] * (1.0 if show_bars else _NO_BARS_SPEEDUP)
 
 
 # Encoder choice for the final render, independent of the quality preset above (resolution/
@@ -288,6 +302,11 @@ _ASS_EVENTS_HEADER = (
 
 _TRAILING_BACKSLASH = re.compile(r"\\+$")
 
+# Every chapter title fades in and out so the change of chapter reads as a transition.
+# Kept as a constant, not inlined: a backslash cannot appear inside an f-string expression
+# on the Python this ships against.
+_CHAPTER_FADE = "{\\fad(400,400)}"
+
 
 def sub_font_px(height: int) -> int:
     """Burned-narration font size — ~4.2% of the frame height (45 px at 1080p).
@@ -315,6 +334,127 @@ def _escape_ass(text: str) -> str:
     return _TRAILING_BACKSLASH.sub("", text)  # a lone trailing backslash is meaningless
 
 
+# -- fitting a title into the player's title block ----------------------------
+
+# The "now playing" titles are laid out in a fixed box (`PlayerLayout`), so a long chapter
+# name has to be made to fit rather than allowed to grow into the visualizer bars below it.
+_TITLE_MIN_SCALE = 0.62    # never shrink a title below this fraction of its layout size
+_TITLE_SHRINK_STEP = 0.06  # try the layout size, then 94%, 88%, … of it
+# libass synthesises the Chapter style's bold from the same regular TTF we measure with,
+# which renders a little wider than Pillow reports — wrap against a slightly narrower box
+# so a fitted line cannot come out one pixel too long and get re-wrapped by libass.
+_TITLE_WIDTH_SLACK = 0.94
+_ELLIPSIS = "…"
+
+
+def font_file_for(family: str) -> str:
+    """The bundled TTF whose name-table family is `family` (the default font's if unknown).
+
+    `build_ass_subtitles` is given a family name (that is what libass resolves a style by),
+    but measuring text needs the file itself.
+    """
+    for spec in VIDEO_FONTS.values():
+        if spec["family"] == family:
+            return spec["file"]
+    return VIDEO_FONTS[DEFAULT_VIDEO_FONT]["file"]
+
+
+@functools.lru_cache(maxsize=64)
+def _title_font(font_path: str, size_px: int):
+    """A cached Pillow font — a part can hold hundreds of chapters, each measured."""
+    from PIL import ImageFont
+
+    return ImageFont.truetype(font_path, size_px)
+
+
+def _ellipsise(font, text: str, max_width: int) -> str:
+    """`text` trimmed until it plus an ellipsis fits `max_width`."""
+    if font.getlength(text) <= max_width:
+        return text
+    trimmed = text
+    while trimmed and font.getlength(trimmed + _ELLIPSIS) > max_width:
+        trimmed = trimmed[:-1]
+    return (trimmed.rstrip() + _ELLIPSIS) if trimmed.strip() else _ELLIPSIS
+
+
+def fit_title(
+    text: str,
+    font_path: Path | str | None,
+    base_px: int,
+    max_width: int,
+    max_height: int | None = None,
+    *,
+    max_lines: int | None = None,
+) -> tuple[list[str], int]:
+    """Lay `text` out inside `max_width` × `max_height`, returning `(lines, font_px)`.
+
+    Shrinks before it truncates: the layout size is tried first, then progressively smaller
+    ones down to `_TITLE_MIN_SCALE`, taking the first that wraps inside the box. Only if
+    even the smallest does not fit is the text cut and ellipsised — so "Chương 1234: …"
+    stays whole and merely gets smaller, and can never run over the bars below it.
+
+    With no `font_path` (or an unreadable one) the text is returned as a single unmeasured
+    line at `base_px`, i.e. exactly the pre-fitting behaviour.
+    """
+    if font_path is None:
+        # No measurable font: hand the title back untouched (hard breaks and all) so the
+        # caller emits exactly what it did before fitting existed.
+        return ([text], base_px) if (text or "").strip() else ([], base_px)
+    # A title's own line breaks are honoured — each is wrapped on its own, so an author's
+    # break survives and only the overflow is re-wrapped.
+    paragraphs = [" ".join(part.split()) for part in re.split(r"[\r\n]+", text or "")]
+    paragraphs = [part for part in paragraphs if part]
+    if not paragraphs:
+        return [], base_px
+    budget = max(1, int(max_width * _TITLE_WIDTH_SLACK))
+    floor = max(8, round(base_px * _TITLE_MIN_SCALE))
+    step = max(1, round(base_px * _TITLE_SHRINK_STEP))
+    sizes = list(range(base_px, floor, -step)) + [floor]
+    fallback = None
+    for size in sizes:
+        try:
+            font = _title_font(str(font_path), size)
+        except (OSError, ImportError):
+            return [" ".join(paragraphs)], base_px  # unreadable font — leave it alone
+        lines = [line for part in paragraphs for line in _wrap_title(part, font, budget)]
+        ascent, descent = font.getmetrics()
+        line_h = ascent + descent
+        fits = all(font.getlength(line) <= budget for line in lines)
+        if max_lines is not None:
+            fits = fits and len(lines) <= max_lines
+        if max_height is not None:
+            fits = fits and len(lines) * line_h <= max_height
+        if fits:
+            return lines, size
+        fallback = (font, lines, line_h)
+    # Even the smallest size overflows: keep the lines the box holds, ellipsise the last.
+    font, lines, line_h = fallback
+    keep = len(lines)
+    if max_lines is not None:
+        keep = min(keep, max_lines)
+    if max_height is not None:
+        keep = min(keep, max(1, max_height // line_h))
+    kept = lines[:keep]
+    tail = " ".join(lines[keep - 1:])  # the last kept line plus everything dropped
+    kept[-1] = _ellipsise(font, tail, budget)
+    return kept, floor
+
+
+def _title_event_text(lines: list[str], size_px: int, base_px: int, prefix: str = "") -> str:
+    """One ASS Text field for a fitted title: overrides, then the lines joined by `\\N`.
+
+    The `\\fs` override is emitted ONLY when the fit shrank the title, so a title that
+    needs no shrinking produces exactly the bytes it did before fitting existed.
+    """
+    override = prefix
+    if size_px != base_px:
+        # Fold \fs into the caller's override block when there is one (`{\fad(…)\fs42}`),
+        # so an event never carries two adjacent blocks.
+        override = f"{prefix[:-1]}\\fs{size_px}}}" if prefix.endswith("}") \
+            else f"{prefix}{{\\fs{size_px}}}"
+    return override + "\\N".join(_escape_ass(line) for line in lines)
+
+
 def build_ass_subtitles(
     segments: list[MergeSegment],
     novel_title: str,
@@ -324,6 +464,8 @@ def build_ass_subtitles(
     font_name: str = FONT_NAME,
     bg_color: tuple[int, int, int] | None = None,
     narration=None,
+    font_file: Path | None = None,
+    show_bars: bool = True,
 ) -> str:
     """An ASS document: the novel title for the whole video + one event per chapter.
 
@@ -339,6 +481,13 @@ def build_ass_subtitles(
     `subtitles.part_cues`); each becomes a bottom-centre event in the `Sub` style. Passing
     `None` — the default — produces byte-identical output to before feature 041, so the
     burned-in option cannot change a video nobody asked to change.
+
+    `font_file` is the TTF behind `font_name`; given one, every title is measured and
+    FITTED to the block it belongs in — wrapped at the column width and shrunk (never
+    below `_TITLE_MIN_SCALE`, then ellipsised) so a long chapter name stops at the top of
+    the visualizer bars instead of running over them. `show_bars=False` frees the bars'
+    strip, so the chapter title gets that much more room. Without `font_file` the titles
+    are emitted unmeasured, exactly as before.
     """
     lay = PlayerLayout.of(width, height)
     palette = _text_palette(bg_color)
@@ -357,16 +506,28 @@ def build_ass_subtitles(
         ),
         "\n",
         _ASS_EVENTS_HEADER,
-        f"Dialogue: 0,{_ass_time(0)},{_ass_time(total)},Novel,,0,0,0,,{_escape_ass(novel_title)}\n",
     ]
+    # The album line is held to ONE line: it sits directly above the chapter title, so
+    # letting it wrap would push it into the title it labels.
+    novel_lines, novel_px = fit_title(
+        novel_title, font_file, lay.novel_font_px, lay.text_width, max_lines=1
+    )
+    out.append(
+        f"Dialogue: 0,{_ass_time(0)},{_ass_time(total)},Novel,,0,0,0,,"
+        f"{_title_event_text(novel_lines, novel_px, lay.novel_font_px)}\n"
+    )
+    chapter_band = lay.chapter_band_h(show_bars)
     start = 0.0
     for seg in segments:
         end = start + seg.seconds
         # The \fad override is added OUTSIDE the escaped title, so a title's own braces
         # (already neutralised by _escape_ass) can't break out of or corrupt the fade.
+        lines, size_px = fit_title(
+            seg.title, font_file, lay.chapter_font_px, lay.text_width, chapter_band
+        )
         out.append(
             f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Chapter,,0,0,0,,"
-            f"{{\\fad(400,400)}}{_escape_ass(seg.title)}\n"
+            f"{_title_event_text(lines, size_px, lay.chapter_font_px, _CHAPTER_FADE)}\n"
         )
         start = end
 
@@ -818,18 +979,23 @@ def _concat_audio(
 
 
 def _filtergraph(width: int, height: int, subs_path: Path, font_dir: Path,
-                 total_seconds: float, spin_vinyl: bool = True) -> str:
+                 total_seconds: float, spin_vinyl: bool = True,
+                 viz_audio: str = "1:a", show_bars: bool = True) -> str:
     """Overlay the animated bits onto the pre-baked player artwork.
 
     Inputs: 0 = the static skin (`build_player_skin`: gradient, framed photo, empty
-    progress track), 1 = the audio, 2 = the vinyl disc, 3 = the playhead knob. Here we add
+    progress track), 1 = the audio, 2 = the vinyl disc, 3 = the playhead knob. `viz_audio`
+    names the stream that drives the bars — a real render passes a SECOND copy of the same
+    audio file (see `render_video`) so the bars never freeze on a long video. Here we add
     the moving parts:
       * the vinyl (input 2): when `spin_vinyl`, `rotate`d by an angle that grows with time
         so it spins in place (`ow=iw:oh=ih` keeps the frame; `fillcolor=none` keeps corners
         clear); otherwise overlaid statically — skipping the per-frame rotate, the single
         biggest filter cost, for a much faster encode;
-      * the `showfreqs` bar spectrum (from the audio) in the right column (purple, so it
-        reads over the light skin — no `rate=` option, it animates at the output `-r`);
+      * the `showfreqs` bar spectrum (from `viz_audio`) in the right column (purple, so
+        it reads over the light skin — no `rate=` option, it animates at the output `-r`);
+        dropped entirely when `show_bars` is False, which also hands the strip it occupied
+        to the chapter title (see `build_ass_subtitles`);
       * the playhead knob (input 3) slid along the track, its x a linear function of
         `t / total` so it tracks real playback progress;
       * the burned-in ASS titles.
@@ -848,12 +1014,20 @@ def _filtergraph(width: int, height: int, subs_path: Path, font_dir: Path,
         )
     else:
         vinyl = f"[0:v][2:v]overlay={lay.vinyl_x}:{lay.vinyl_y}[s1];"  # static, no rotate
+    if show_bars:
+        bars = (
+            f"[{viz_audio}]showfreqs=s={lay.bars_w}x{lay.bars_h}:mode=bar:ascale=sqrt:"
+            f"fscale=log:win_size=2048:colors=0x8a52c8[viz];"
+        )
+        over_bars = f"[s1][viz]overlay={lay.bars_x}:{lay.bars_y}[s2];"
+    else:
+        bars, over_bars = "", ""  # no visualiser: the vinyl base goes straight to the knob
+    knob_in = "[s1]" if not show_bars else "[s2]"
     return (
-        f"[1:a]showfreqs=s={lay.bars_w}x{lay.bars_h}:mode=bar:ascale=sqrt:fscale=log:"
-        f"win_size=2048:colors=0x8a52c8[viz];"
+        f"{bars}"
         f"{vinyl}"
-        f"[s1][viz]overlay={lay.bars_x}:{lay.bars_y}[s2];"
-        f"[s2][3:v]overlay=x='{knob_x}':y={knob_y}[s3];"
+        f"{over_bars}"
+        f"{knob_in}[3:v]overlay=x='{knob_x}':y={knob_y}[s3];"
         f"[s3]subtitles='{subs}':fontsdir='{fonts}'[v]"
     )
 
@@ -872,6 +1046,7 @@ def render_video(
     font_name: str = FONT_NAME,
     bg_color: tuple[int, int, int] | None = None,
     burn_subtitles: bool = False,
+    show_bars: bool = True,
     encoder: str = DEFAULT_VIDEO_ENCODER,
     cancelled: Callable[[], bool] | None = None,
 ) -> Path:
@@ -885,8 +1060,9 @@ def render_video(
     with clickable timestamps is written next to the video. `encoder` picks the codec
     (`libx264` CPU, or `h264_nvenc` on a supported NVIDIA GPU — see `nvenc_available()`);
     if a non-default encoder fails partway through, the render is retried once with
-    `libx264` before raising. Raises TtsError on ffmpeg failure, MergeCancelled if
-    cancelled.
+    `libx264` before raising. `show_bars=False` leaves the spectrum out — a little faster
+    and a noticeably smaller file, and the chapter title then gets the bars' strip to wrap
+    into. Raises TtsError on ffmpeg failure, MergeCancelled if cancelled.
     """
     if not segments:
         raise TtsError("Không có chương nào có audio để tạo video.")
@@ -918,7 +1094,9 @@ def render_video(
         subs_file.write_text(
             build_ass_subtitles(segments, novel_title, width=width, height=height,
                                 narration=narration,
-                                font_name=font_name, bg_color=bg_color),
+                                font_name=font_name, bg_color=bg_color,
+                                font_file=font_dir / font_file_for(font_name),
+                                show_bars=show_bars),
             encoding="utf-8",
         )
         # Bake the three artwork layers once; ffmpeg loops each and animates them: the
@@ -935,14 +1113,27 @@ def render_video(
 
         # 2) Loop the skin/vinyl/knob, spin the vinyl + slide the playhead + draw the bars,
         #    burn the titles, mux the audio, end with it. No -tune stillimage: it animates.
+        #    The audio file is opened TWICE on purpose: input 1 is copied to the output,
+        #    input 4 feeds `showfreqs`. Sharing one input for both raced on long renders —
+        #    the `-c:a copy` side drains packets far ahead of the (much slower) video, and
+        #    somewhere past ~40 minutes the visualiser branch stopped getting frames, so
+        #    `overlay` repeated its last bars frame for the rest of the video (bars alive
+        #    at the start, frozen from the middle on). A second demuxer decouples them: the
+        #    bars read the file at their own pace. Cost is one extra AAC decode of a local
+        #    file — negligible next to the video encode.
         def _encode_cmd(enc: str) -> list[str]:
+            # Input 4 exists only to feed the bars, so it is opened only when they are on.
+            viz_input = ["-i", str(audio_file)] if show_bars else []
             return [
                 "ffmpeg", "-y",
                 "-loop", "1", "-framerate", str(fps), "-i", str(skin_file),
                 "-i", str(audio_file),
                 "-loop", "1", "-i", str(vinyl_file),
                 "-loop", "1", "-i", str(knob_file),
-                "-filter_complex", _filtergraph(width, height, subs_file, font_dir, total, spin_vinyl),
+                *viz_input,  # 4: same audio again, only to drive the bars
+                "-filter_complex", _filtergraph(width, height, subs_file, font_dir, total,
+                                                spin_vinyl, viz_audio="4:a",
+                                                show_bars=show_bars),
                 "-map", "[v]", "-map", "1:a",
                 *video_encoder_args(enc), "-r", str(fps),
                 "-c:a", "copy", "-shortest", str(out_path),
@@ -998,6 +1189,7 @@ def render_preview_frame(
     width: int = 1920,
     height: int = 1080,
     spin_vinyl: bool = True,
+    show_bars: bool = True,
     font_name: str = FONT_NAME,
     bg_color: tuple[int, int, int] | None = None,
     cancelled: Callable[[], bool] | None = None,
@@ -1026,7 +1218,9 @@ def render_preview_frame(
         sample = [MergeSegment(path="", seconds=_PREVIEW_TOTAL, title=sample_chapter_title)]
         subs_file.write_text(
             build_ass_subtitles(sample, novel_title, width=width, height=height,
-                                font_name=font_name, bg_color=bg_color),
+                                font_name=font_name, bg_color=bg_color,
+                                font_file=font_dir / font_file_for(font_name),
+                                show_bars=show_bars),
             encoding="utf-8",
         )
         build_player_skin(image_path, skin_file, width=width, height=height, bg_color=bg_color)
@@ -1041,7 +1235,8 @@ def render_preview_frame(
              "-loop", "1", "-i", str(vinyl_file),
              "-loop", "1", "-i", str(knob_file),
              "-filter_complex",
-             _filtergraph(width, height, subs_file, font_dir, _PREVIEW_TOTAL, spin_vinyl),
+             _filtergraph(width, height, subs_file, font_dir, _PREVIEW_TOTAL, spin_vinyl,
+                          show_bars=show_bars),
              "-map", "[v]", "-ss", str(_PREVIEW_GRAB_T), "-frames:v", "1", "-update", "1",
              str(out_png)],
             err_file, cancelled, deadline, "tạo ảnh xem trước",

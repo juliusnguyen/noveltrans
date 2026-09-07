@@ -70,6 +70,24 @@ class PlayerLayout:
     chapter_margin_v: int
     novel_font_px: int
     chapter_font_px: int
+    title_gap: int  # breathing room kept between the titles and whatever sits below
+
+    @property
+    def text_width(self) -> int:
+        """Width the "now playing" titles have to lay out in (the right column)."""
+        return self.width - self.text_margin_l - self.text_margin_r
+
+    def chapter_band_h(self, show_bars: bool = True) -> int:
+        """Height the chapter title may fill before it would run into the next element.
+
+        The chapter title grows DOWNWARD from `chapter_margin_v` (ASS Alignment 8), so a
+        long one used to spill over the visualizer bars. With the bars on, the band ends
+        at their top edge; with the bars off, that whole strip is free and the title may
+        run down to just above the progress track. `video.build_ass_subtitles` shrinks the
+        title to fit whichever band applies.
+        """
+        bottom = self.bars_y if show_bars else self.track_y - self.knob_half
+        return max(0, bottom - self.chapter_margin_v - self.title_gap)
 
     @classmethod
     def of(cls, width: int, height: int) -> PlayerLayout:
@@ -87,9 +105,13 @@ class PlayerLayout:
             vinyl_y=round(height * 0.231) - vinyl_r,
             vinyl_size=vinyl_r * 2,
             bars_x=round(width * 0.589),
-            bars_y=round(height * 0.555),
+            # The bars sit just above the progress track (they used to float mid-column,
+            # leaving a dead strip between them and the track while the title block above
+            # had no room to wrap). Moving them down widens the chapter title's band from
+            # ~7% to ~16% of the height, which is what a two-line title needs.
+            bars_y=round(height * 0.593),
             bars_w=round(width * 0.307),
-            bars_h=round(height * 0.111),
+            bars_h=round(height * 0.105),
             track_x=round(width * 0.589),
             track_y=round(height * 0.720),
             track_w=round(width * 0.307),
@@ -98,10 +120,16 @@ class PlayerLayout:
             knob_half=knob_r + _KNOB_PAD,
             text_margin_l=round(width * 0.589),
             text_margin_r=round(width * 0.104),
-            novel_margin_v=round(height * 0.435),
-            chapter_margin_v=round(height * 0.486),
+            # The title block sits between the vinyl (ends at 37% of the height) and the
+            # bars above. It used to start at 43.5%, which left a one-line gap under the
+            # disc and only ~7% of the height for the chapter title — a title that wrapped
+            # to two lines ran straight over the bars. Starting higher, with the bars
+            # moved down, gives the chapter title a real two-line band.
+            novel_margin_v=round(height * 0.382),
+            chapter_margin_v=round(height * 0.437),
             novel_font_px=round(height * 0.035),
             chapter_font_px=round(height * 0.048),
+            title_gap=round(height * 0.009),
         )
 
 

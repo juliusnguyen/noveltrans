@@ -3622,6 +3622,76 @@ class TestBurnSubtitlesOption:
         tab.shutdown()
 
 
+class TestShowBarsOption:
+    """The "Cột sóng nhạc" checkbox — the visualiser is optional."""
+
+    def _tab(self, tmp_path, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        for i in range(5):
+            project.save_audio(i, f"exports/audio/{i}.mp3", "V", 60.0)
+        path = project.path
+        project.close()
+        tab = VideoTab(_config(tmp_path))
+        tab.voice_combo.addItem("V", "V")
+        tab.voice_combo.setCurrentIndex(tab.voice_combo.findData("V"))
+        tab.video_mode.setCurrentIndex(tab.video_mode.findData("batch"))
+        tab.video_batch_size.setValue(2)
+        tab._on_project_selected(str(path))
+        return tab
+
+    def test_it_is_on_by_default(self, qapp, tmp_path, library_dir, sample_meta, sample_refs):
+        """The bars are what every video so far has had — off must be a deliberate choice."""
+        tab = self._tab(tmp_path, library_dir, sample_meta, sample_refs)
+        assert tab.show_bars_check.isChecked()
+        assert tab.config.video_show_bars is True
+        tab.shutdown()
+
+    def test_unticking_it_persists_and_seeds_a_new_tab(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._tab(tmp_path, library_dir, sample_meta, sample_refs)
+        tab.show_bars_check.setChecked(False)
+        assert tab.config.video_show_bars is False
+        tab2 = VideoTab(tab.config)
+        assert not tab2.show_bars_check.isChecked()
+        tab.shutdown()
+        tab2.shutdown()
+
+    def test_the_flag_reaches_the_render_worker(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from noveltrans.gui import tab_video as tab_module
+
+        tab = self._tab(tmp_path, library_dir, sample_meta, sample_refs)
+        tab.show_bars_check.setChecked(False)
+        tab.video_image_edit.setText(str(tmp_path / "bg.png"))
+        (tmp_path / "bg.png").write_bytes(b"x")
+
+        built = {}
+
+        class _Sig:
+            def connect(self, *_a):
+                pass
+
+        class _FakeWorker:
+            def __init__(self, *a, **kw):
+                built.update(kw)
+                self.progress = self.file_done = self.finished_ok = self.failed = _Sig()
+
+            def start(self):
+                pass
+
+            def isRunning(self):
+                return False
+
+        monkeypatch.setattr(tab_module, "VideoWorker", _FakeWorker)
+        monkeypatch.setattr(tab_module, "track_worker", lambda *_a: None)
+        tab._launch_video()
+        assert built["show_bars"] is False
+        tab._video_worker = None
+        tab.shutdown()
+
+
 class TestSubtitleWorker:
     """Feature 042 — writing .srt without a render, and where the file lands.
 
