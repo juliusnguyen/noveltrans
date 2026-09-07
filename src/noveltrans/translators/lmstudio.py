@@ -42,7 +42,12 @@ _SYSTEM_PROMPT = (
     "Translate every word — leave NO Chinese characters in the output. "
     f"{PROMPT_RULE}"
     "Output ONLY the translation — no notes, no explanations, no preamble."
+    "{retry_note}"
 )
+
+# Appended only when translation QC is retrying a chapter (`translators/qc.py`), naming what
+# the previous attempt got measurably wrong.
+_RETRY_NOTE = " LƯU Ý — {hint}."
 
 
 def list_models(base_url: str, timeout: float = 5.0) -> list[str]:
@@ -62,6 +67,7 @@ class LmStudioTranslator(Translator):
     # local models often run with an 8k context window; stay well under it
     max_chunk_chars = 4000
     supports_completion = True
+    supports_retry_hint = True
 
     def __init__(self, base_url: str = DEFAULT_LMSTUDIO_URL, model: str = "",
                  timeout: float = 600.0):
@@ -82,10 +88,13 @@ class LmStudioTranslator(Translator):
         self.model = models[0]
         return self.model
 
-    def translate(self, text: str, source: str = "zh", target: str = "vi") -> str:
+    def translate(
+        self, text: str, source: str = "zh", target: str = "vi", *, retry_hint: str = ""
+    ) -> str:
         system = _SYSTEM_PROMPT.format(
             language=_LANG_NAMES.get(target, target),
             name_rule=_NAME_RULES.get(target, ""),
+            retry_note=_RETRY_NOTE.format(hint=retry_hint) if retry_hint else "",
         )
         return self.complete(text, system=system)
 

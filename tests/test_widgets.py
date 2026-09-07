@@ -316,6 +316,67 @@ class TestCheckableHeaderView:
         assert self._click(header, x) == []
 
 
+class TestChapterTableModelQcMarker:
+    """Feature 084 — the QC verdict is a suffix too, for the same reason."""
+
+    def _model(self, statuses):
+        from noveltrans.gui.widgets import ChapterTableModel
+
+        model = ChapterTableModel()
+        model.set_chapters(
+            [
+                Chapter(
+                    index=i, title=f"第{i}章", url="u", content="x", translated="dịch",
+                    translator="CLI (agy)", qc_status=status,
+                    qc_reason="bản dịch ra tiếng Anh" if status == "fail" else "",
+                )
+                for i, status in enumerate(statuses)
+            ]
+        )
+        return model
+
+    def test_an_unchecked_chapter_carries_no_mark(self, qapp):
+        """The whole reason upgrading is silent: every row in an existing library reads
+        as "chưa kiểm tra", which shows nothing at all."""
+        model = self._model([""])
+        assert model.data(model.index(0, model.TRANSLATOR_COLUMN)) == "CLI (agy)"
+
+    def test_a_pass_and_a_failure_are_told_apart(self, qapp):
+        model = self._model(["ok", "fail"])
+        col = model.TRANSLATOR_COLUMN
+        assert model.data(model.index(0, col)) == "CLI (agy) ✅"
+        assert model.data(model.index(1, col)) == "CLI (agy) ⚠️"
+
+    def test_the_failure_tooltip_carries_the_reason(self, qapp):
+        from PySide6.QtCore import Qt
+
+        model = self._model(["fail"])
+        tip = model.data(model.index(0, model.TRANSLATOR_COLUMN), Qt.ItemDataRole.ToolTipRole)
+        assert "tiếng Anh" in tip
+
+    def test_it_composes_with_the_rewrite_marker(self, qapp):
+        from PySide6.QtCore import Qt
+
+        from noveltrans.gui.widgets import ChapterTableModel
+
+        model = ChapterTableModel()
+        model.set_chapters(
+            [
+                Chapter(index=0, title="t", url="u", translated="x", translated_raw="y",
+                        translator="CLI (agy)", qc_status="fail", qc_reason="lỗi"),
+            ]
+        )
+        col = model.TRANSLATOR_COLUMN
+        assert model.data(model.index(0, col)) == "CLI (agy) ✍️ ⚠️"
+        tip = model.data(model.index(0, col), Qt.ItemDataRole.ToolTipRole)
+        assert "hoàn tác" in tip and "lỗi" in tip  # both facts, one hover
+
+    def test_no_column_was_added(self, qapp):
+        from noveltrans.gui.widgets import ChapterTableModel
+
+        assert len(ChapterTableModel.COLUMNS) == 8
+
+
 class TestChapterTableModelHelpers:
     def _model(self, qapp):
         from noveltrans.gui.widgets import ChapterTableModel

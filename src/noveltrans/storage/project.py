@@ -22,6 +22,8 @@ from noveltrans.models import (
     AUDIO_SOURCE_DOWNLOADED,
     AUDIO_SOURCE_ORIGINAL,
     AUDIO_SOURCE_TRANSLATED,
+    QC_STATUS_FAIL,
+    QC_STATUS_OK,
     STATUS_DOWNLOADED,
     STATUS_ERROR,
     STATUS_PENDING,
@@ -77,7 +79,14 @@ CREATE TABLE IF NOT EXISTS chapters (
   -- 1 once the user has renamed this chapter by hand, so a re-scan leaves it alone
   title_custom     INTEGER NOT NULL DEFAULT 0,
   -- the site's own title, kept so a rename can be undone; refreshed by every scan
-  title_source     TEXT NOT NULL DEFAULT ''
+  title_source     TEXT NOT NULL DEFAULT '',
+  -- translation quality control (translators/qc.py). '' = never checked, NOT "failed"
+  qc_status        TEXT NOT NULL DEFAULT '',
+  qc_code          TEXT NOT NULL DEFAULT '',
+  qc_reason        TEXT NOT NULL DEFAULT '',
+  -- fingerprint of the (title, text) that was judged; a later edit makes the verdict stale
+  qc_text_hash     TEXT NOT NULL DEFAULT '',
+  qc_attempts      INTEGER NOT NULL DEFAULT 0
 );
 
 -- Audio published by the source site. A SEPARATE edition of the work, not a property of
@@ -123,6 +132,11 @@ def _row_to_chapter(row: sqlite3.Row) -> Chapter:
         audio_text_hash=row["audio_text_hash"],
         title_custom=bool(row["title_custom"]),
         title_source=row["title_source"],
+        qc_status=row["qc_status"],
+        qc_code=row["qc_code"],
+        qc_reason=row["qc_reason"],
+        qc_text_hash=row["qc_text_hash"],
+        qc_attempts=row["qc_attempts"],
     )
 
 
@@ -172,6 +186,14 @@ class NovelProject:
             # existing titles all came from a scan, so none of them is a manual rename
             "title_custom": "INTEGER NOT NULL DEFAULT 0",
             "title_source": "TEXT NOT NULL DEFAULT ''",
+            # every existing translation predates QC, so none has a verdict; empty reads as
+            # "chưa kiểm tra", which is what keeps an upgrade silent instead of marking a
+            # whole finished library as broken
+            "qc_status": "TEXT NOT NULL DEFAULT ''",
+            "qc_code": "TEXT NOT NULL DEFAULT ''",
+            "qc_reason": "TEXT NOT NULL DEFAULT ''",
+            "qc_text_hash": "TEXT NOT NULL DEFAULT ''",
+            "qc_attempts": "INTEGER NOT NULL DEFAULT 0",
         }
         with self._db:
             for name, ddl in added.items():
@@ -483,6 +505,48 @@ class NovelProject:
         rows = self._db.execute(sql, params).fetchall()
         return [_row_to_chapter(r) for r in rows]
 
+    def pending_qc(
+        self,
+        target_lang: str,
+        start_idx: int = 0,
+        end_idx: int | None = None,
+        force: bool = False,
+    ) -> list[Chapter]:
+        """Translated chapters whose quality has not been judged as they stand now.
+
+        "Not judged as they stand now" is a fingerprint comparison, not a flag: a chapter
+        checked and then hand-edited needs checking again, and one checked twice does not.
+        An interrupted scan therefore resumes for free. `force=True` re-checks everything in
+        range, which is the "kiểm tra lại toàn bộ" button.
+
+        The legacy empty-`target_lang` clause is `pending_rewrite`'s, for the same reason:
+        rows translated before that column existed must not become permanently ineligible.
+        """
+        sql = (
+            "SELECT * FROM chapters"
+            " WHERE translated != ''"
+            "   AND (target_lang = ? OR target_lang = '')"
+            "   AND idx >= ?"
+        )
+        params: list = [target_lang, start_idx]
+        if end_idx is not None:
+            sql += " AND idx <= ?"
+            params.append(end_idx)
+        sql += " ORDER BY idx"
+        rows = [_row_to_chapter(r) for r in self._db.execute(sql, params).fetchall()]
+        if force:
+            return rows
+        # The staleness test lives on `Chapter` (it hashes the text), so it is applied here
+        # rather than in SQL — one definition of "already judged", shared with the table.
+        return [c for c in rows if not c.qc_checked or c.qc_is_stale]
+
+    def qc_failures(self) -> list[Chapter]:
+        """Chapters whose last quality check failed — what the result view reopens to."""
+        rows = self._db.execute(
+            "SELECT * FROM chapters WHERE qc_status = ? ORDER BY idx", (QC_STATUS_FAIL,)
+        ).fetchall()
+        return [_row_to_chapter(r) for r in rows]
+
     def pending_audio(
         self,
         voice: str = "",
@@ -578,6 +642,13 @@ class NovelProject:
             "SELECT COUNT(*) FROM chapters WHERE audio_path != '' AND audio_source = ?",
             (AUDIO_SOURCE_DOWNLOADED,),
         ).fetchone()[0]
+        # Subsets of `translated`, for the QC dialog's estimate line.
+        qc_failed = self._db.execute(
+            "SELECT COUNT(*) FROM chapters WHERE qc_status = ?", (QC_STATUS_FAIL,)
+        ).fetchone()[0]
+        qc_ok = self._db.execute(
+            "SELECT COUNT(*) FROM chapters WHERE qc_status = ?", (QC_STATUS_OK,)
+        ).fetchone()[0]
         return {
             "total": total,
             "downloaded": downloaded,
@@ -586,6 +657,9 @@ class NovelProject:
             "errors": errors,
             "audio": audio,
             "downloaded_audio": downloaded_audio,
+            "qc_ok": qc_ok,
+            "qc_failed": qc_failed,
+            "qc_unchecked": translated - qc_ok - qc_failed,
         }
 
     # ---------------------------------------------------------------- writes
@@ -613,6 +687,43 @@ class NovelProject:
                 " translator = ?, translate_seconds = ?, status = ?, error = '', updated_at = ?"
                 " WHERE idx = ?",
                 (text, title, lang, translator, seconds, STATUS_TRANSLATED, _now(), idx),
+            )
+
+    def save_qc_verdict(
+        self, idx: int, status: str, code: str, reason: str, text_hash: str,
+        attempts: int = 0,
+    ) -> None:
+        """Record a quality verdict. Touches ONLY the four `qc_*` columns.
+
+        Never `translated`, never `status`, never `error`: a quality SCAN reads a chapter
+        and forms an opinion about it, and an opinion must not be able to damage the text it
+        is about. `mark_qc_failed` is the separate, deliberate call for the one path that
+        does want a failure to reach the chapter's error column.
+        """
+        with self._db:
+            self._db.execute(
+                "UPDATE chapters SET qc_status = ?, qc_code = ?, qc_reason = ?,"
+                " qc_text_hash = ?, qc_attempts = ? WHERE idx = ?",
+                (status, code, reason, text_hash, int(attempts), idx),
+            )
+
+    def mark_qc_failed(
+        self, idx: int, code: str, reason: str, text_hash: str, attempts: int = 0
+    ) -> None:
+        """A freshly translated chapter that QC could not get right, marked visibly.
+
+        MUST be called after `save_translation`, which forces `status = translated` and
+        clears `error` — running it first would have the save wipe the mark. The verdict
+        goes into `error` as well as `qc_reason` so the row is red in the table without the
+        model needing to know QC exists.
+        """
+        with self._db:
+            self._db.execute(
+                "UPDATE chapters SET qc_status = ?, qc_code = ?, qc_reason = ?,"
+                " qc_text_hash = ?, qc_attempts = ?, status = ?, error = ?, updated_at = ?"
+                " WHERE idx = ?",
+                (QC_STATUS_FAIL, code, reason, text_hash, int(attempts), STATUS_ERROR,
+                 reason, _now(), idx),
             )
 
     def edit_translation(
@@ -1126,6 +1237,11 @@ class NovelProject:
             # leave every chapter flagged as rewritten, with an undo that restores
             # text from a translation that no longer exists
             "  translated_raw = '', translated_title_raw = '',"
+            # a verdict about a translation that no longer exists is worse than no verdict:
+            # it would keep the chapter red, and the result view would offer to re-translate
+            # a chapter that is already back in the queue
+            "  qc_status = '', qc_code = '', qc_reason = '', qc_text_hash = '',"
+            "  qc_attempts = 0,"
             "  status = CASE WHEN content = '' THEN ? ELSE ? END, updated_at = ?"
         )
         params: tuple = (STATUS_PENDING, STATUS_DOWNLOADED, _now())

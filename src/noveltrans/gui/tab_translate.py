@@ -25,6 +25,7 @@ from noveltrans.find_replace import FIELD_TRANSLATED, FIELD_TRANSLATED_TITLE
 from noveltrans.gui.find_replace_dialog import FindReplaceDialog
 from noveltrans.gui.jobs import job_registry
 from noveltrans.gui.keep_awake import track_worker
+from noveltrans.gui.qc_dialog import QcDialog, QcResultDialog
 from noveltrans.gui.rewrite_dialog import RewriteDialog
 from noveltrans.gui.widgets import (
     PauseButton,
@@ -41,9 +42,13 @@ from noveltrans.gui.widgets import (
 from noveltrans.gui.workers import (
     CliModelsWorker,
     LmStudioModelsWorker,
+    QcEngineSpec,
+    QcScanWorker,
     RewriteWorker,
     TranslateWorker,
+    chapters_to_qc,
     chapters_to_rewrite,
+    qc_settings_from_config,
 )
 from noveltrans.models import Chapter
 from noveltrans.storage import NovelProject
@@ -65,6 +70,7 @@ class TranslateTab(QWidget):
         # _cancel, _reset_buttons, has_running_workers, shutdown — has to account for it,
         # or quitting mid-rewrite abandons a running QThread.
         self._rewrite_worker: RewriteWorker | None = None
+        self._qc_worker: QcScanWorker | None = None
         self._rewrite_dialog: RewriteDialog | None = None
         self._names_dialog = None  # NameGlossaryDialog; imported lazily where used
         # Modeless, unlike the rewrite dialog: it stays up while the user fixes
@@ -204,6 +210,12 @@ class TranslateTab(QWidget):
             "word-by-word). Không đổi tên riêng, không đổi xưng hô. Có thể hoàn tác."
         )
         self.rewrite_button.clicked.connect(self._open_rewrite)
+        self.qc_button = QPushButton("🔍 Kiểm tra chất lượng")
+        self.qc_button.setToolTip(
+            "Kiểm tra bản dịch có bị ra tiếng Anh, còn nguyên chữ Hán, bị cắt ngắn hay đặc "
+            "Hán-Việt không — rồi chọn những chương hỏng để dịch lại."
+        )
+        self.qc_button.clicked.connect(self._open_qc)
         self.cancel_button = QPushButton("Dừng")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self._cancel)
@@ -217,6 +229,7 @@ class TranslateTab(QWidget):
         bottom_row.addWidget(self.find_replace_button)
         bottom_row.addWidget(self.names_button)
         bottom_row.addWidget(self.rewrite_button)
+        bottom_row.addWidget(self.qc_button)
         bottom_row.addWidget(self.cancel_button)
         bottom_row.addWidget(self.pause_button)
         bottom_row.addWidget(self.progress, stretch=1)
@@ -499,6 +512,7 @@ class TranslateTab(QWidget):
         self.retranslate_button.setEnabled(False)
         self.find_replace_button.setEnabled(False)
         self.rewrite_button.setEnabled(False)
+        self.qc_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.picker.setEnabled(False)
         self.progress.setMaximum(max(total, 1))
@@ -514,6 +528,7 @@ class TranslateTab(QWidget):
             cli_command=self.config.cli_command_for(engine),
             base_url=base_url,
             indices=indices,
+            qc=self._qc_settings(engine, model, base_url),
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.chapter_done.connect(self._on_chapter_updated)
@@ -698,6 +713,24 @@ class TranslateTab(QWidget):
         self.window().activateWindow()
         view.setFocus()
 
+    def _jump_to_chapter(self, index: int) -> None:
+        """Open a chapter in the preview panes, from a dialog's list.
+
+        The plain version of `_jump_to_match`: the QC result view has no search term, the
+        user just wants to READ the chapter a verdict is about before deciding whether to
+        believe it. Selecting the row loads the panes through the normal path, which also
+        flushes any pending edit.
+        """
+        if self.project is None:
+            return
+        row = self.model.row_for_index(index)
+        if row is None:
+            return  # deleted since the scan — nothing to open
+        # VIEW rows: under a sort the chapter is wherever the current ordering puts it.
+        view_index = self.proxy.mapFromSource(self.model.index(row, 0))
+        self.table.selectRow(view_index.row())  # → _on_row_selected loads the preview panes
+        self.table.scrollTo(view_index)
+
     @staticmethod
     def _move_to_start(view: QPlainTextEdit) -> None:
         cursor = view.textCursor()
@@ -747,6 +780,150 @@ class TranslateTab(QWidget):
         self.project.clear_translations(list(indices))
         self._reload_table()
         self._start_translate(indices=list(indices))
+
+    # ------------------------------------------------- translation QC (084)
+
+    def _qc_settings(self, engine: str, model: str, base_url: str):
+        """The QC plan for a translate run, or None when QC is switched off.
+
+        None is the whole backward-compatibility guarantee: with `qc_enabled` false the
+        worker gets exactly the arguments it has always got.
+        """
+        if not self.config.qc_enabled:
+            return None
+        fallback = QcEngineSpec(
+            engine_name=engine,
+            model=model,
+            api_key=self.config.claude_api_key,
+            cli_command=self.config.cli_command_for(engine),
+            base_url=base_url,
+        )
+        return qc_settings_from_config(self.config, fallback)
+
+    def _open_qc(self) -> None:
+        if self.project is None:
+            QMessageBox.information(self, "Chưa chọn truyện", "Hãy tải một truyện ở Tab 1 trước.")
+            return
+        if self._busy():
+            self.status_label.setText(self._busy_message())
+            return
+        # Flush half-typed edits first, so the check reads what is actually on screen.
+        self._save_preview_edits()
+        self._save_original_edits()
+
+        dialog = QcDialog(self.project, self.config, self)
+        dialog.start_requested.connect(self._start_qc)
+        dialog.results_requested.connect(self._show_qc_results)
+        dialog.exec()
+
+    def _start_qc(self, params: dict) -> None:
+        """Run a quality scan. Writes verdicts only — never a translation."""
+        if self.project is None or self._busy():
+            return
+        fallback = QcEngineSpec(
+            engine_name=self.config.translator,
+            model=self.config.cli_model_for(self.config.translator),
+            api_key=self.config.claude_api_key,
+            cli_command=self.config.cli_command_for(self.config.translator),
+            base_url=self.config.lmstudio_url,
+        )
+        worker = QcScanWorker(
+            self.project.path,
+            qc_settings_from_config(self.config, fallback),
+            params.get("target_lang", "vi"),
+            start_idx=params.get("start_idx", 0),
+            end_idx=params.get("end_idx"),
+            force=bool(params.get("force")),
+            limit=int(params.get("limit") or 0),
+            indices=params.get("indices"),
+        )
+        self._qc_worker = worker
+        total = len(
+            chapters_to_qc(
+                self.project,
+                params.get("target_lang", "vi"),
+                indices=params.get("indices"),
+                start_idx=params.get("start_idx", 0),
+                end_idx=params.get("end_idx"),
+                force=bool(params.get("force")),
+            )
+        )
+        if params.get("limit"):
+            total = min(total, int(params["limit"]))
+        self._progress_verb = "Đang kiểm tra"
+        self._close_find_replace()
+        self.translate_button.setEnabled(False)
+        self.retranslate_button.setEnabled(False)
+        self.find_replace_button.setEnabled(False)
+        self.rewrite_button.setEnabled(False)
+        self.qc_button.setEnabled(False)
+        self.cancel_button.setEnabled(True)
+        self.picker.setEnabled(False)
+        self.progress.setMaximum(max(total, 1))
+        self.progress.setValue(0)
+
+        worker.progress.connect(self._on_progress)
+        worker.chapter_done.connect(self._on_chapter_updated)
+        worker.failed.connect(self._on_failed)
+        worker.finished_ok.connect(self._on_qc_finished)
+        track_worker(worker)  # a whole novel is a long run — don't let the Mac sleep
+        self._job = job_registry.register(worker, kind="Kiểm tra dịch", novel=self._job_novel())
+        self.pause_button.set_job(self._job.id if self._job else None)
+        worker.start()
+
+    def _on_qc_finished(self, checked: int, failed: int) -> None:
+        self._reset_buttons()
+        self.status_label.setText(
+            f"Kiểm tra xong {checked} chương — {failed} chương chưa đạt."
+            if failed
+            else f"Kiểm tra xong {checked} chương — tất cả đều đạt."
+        )
+        if failed:
+            self._show_qc_results()
+
+    def _show_qc_results(self) -> None:
+        """The review step: read the failures, pick the ones worth re-translating."""
+        if self.project is None:
+            return
+        failures = self.project.qc_failures()
+        if not failures:
+            self.status_label.setText("Không có chương nào bị đánh dấu lỗi.")
+            return
+        dialog = QcResultDialog(failures, self)
+        dialog.chapter_activated.connect(self._jump_to_chapter)
+        dialog.retranslate_requested.connect(self._retranslate_indices)
+        dialog.exec()
+
+    def _add_qc_action(self, menu, rows: list[int]) -> None:
+        """Append "Kiểm tra chất lượng" for the translated chapters among `rows`."""
+        chapters = [c for c in (self.model.chapter_at(row) for row in rows) if c is not None]
+        indices = [c.index for c in chapters if c.translated]
+        if not indices:
+            return  # nothing translated here — offering it would only mislead
+
+        menu.addSeparator()
+        label = (
+            "🔍 Kiểm tra chất lượng chương này"
+            if len(indices) == 1
+            else f"🔍 Kiểm tra chất lượng {len(indices)} chương"
+        )
+        action = menu.addAction(label)
+        busy = self._busy()
+        action.setEnabled(not busy)
+        if busy:
+            menu.setToolTipsVisible(True)  # QMenu hides action tooltips unless asked
+            action.setToolTip(self._busy_message())
+        action.triggered.connect(lambda _=False, idxs=indices: self._qc_rows(idxs))
+
+    def _qc_rows(self, indices: list[int]) -> None:
+        """Check exactly these chapters (the table's right-click menu)."""
+        if not indices or self.project is None:
+            return
+        if self._busy():
+            self.status_label.setText(self._busy_message())
+            return
+        self._save_preview_edits()
+        self._start_qc({"target_lang": "vi", "indices": indices, "force": True})
 
     def _open_rewrite(self) -> None:
         if self.project is None:
@@ -826,6 +1003,7 @@ class TranslateTab(QWidget):
         self.retranslate_button.setEnabled(False)
         self.find_replace_button.setEnabled(False)
         self.rewrite_button.setEnabled(False)
+        self.qc_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.picker.setEnabled(False)
         self.progress.setMaximum(max(total, 1))
@@ -897,6 +1075,7 @@ class TranslateTab(QWidget):
         rows = self._menu_rows(index)
         self._add_translate_action(menu, rows)
         self._add_rewrite_actions(menu, rows)
+        self._add_qc_action(menu, rows)
 
     def _add_translate_action(self, menu, rows: list[int]) -> None:
         """Append "Dịch"/"Dịch lại" for `rows` — the batch behind this feature."""
@@ -988,6 +1167,8 @@ class TranslateTab(QWidget):
         the two batches take very different amounts of time to finish."""
         if self._rewrite_worker is not None and self._rewrite_worker.isRunning():
             return "Đang có phiên viết lại chạy — chờ xong rồi thử lại."
+        if self._qc_worker is not None and self._qc_worker.isRunning():
+            return "Đang kiểm tra chất lượng — chờ xong rồi thử lại."
         return "Đang có phiên dịch chạy — chờ xong rồi thử lại."
 
     def _busy(self) -> bool:
@@ -998,12 +1179,12 @@ class TranslateTab(QWidget):
         """
         return any(
             worker is not None and worker.isRunning()
-            for worker in (self._worker, self._rewrite_worker)
+            for worker in (self._worker, self._rewrite_worker, self._qc_worker)
         )
 
     def _cancel(self) -> None:
         cancelled = False
-        for worker in (self._worker, self._rewrite_worker):
+        for worker in (self._worker, self._rewrite_worker, self._qc_worker):
             if worker is not None:
                 worker.cancel()
                 cancelled = True
@@ -1041,6 +1222,7 @@ class TranslateTab(QWidget):
         self.retranslate_button.setEnabled(True)
         self.find_replace_button.setEnabled(True)
         self.rewrite_button.setEnabled(True)
+        self.qc_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
         self.picker.setEnabled(True)
 
@@ -1060,7 +1242,7 @@ class TranslateTab(QWidget):
     def shutdown(self) -> None:
         self._save_preview_edits()
         self._save_original_edits()
-        for worker in (self._worker, self._rewrite_worker):
+        for worker in (self._worker, self._rewrite_worker, self._qc_worker):
             if worker is not None and worker.isRunning():
                 worker.cancel()
                 worker.wait(60_000)

@@ -57,6 +57,12 @@ class Translator(ABC):
     # features like tag / image-prompt generation can prompt them freely. Google can only
     # translate.
     supports_completion: bool = False
+    # LLM engines also accept a `retry_hint` on `translate`: one sentence naming what the
+    # PREVIOUS attempt got measurably wrong, so translation QC (`translators/qc.py`) can
+    # retry with a specific correction instead of an identical blind re-run. Opt-in, and
+    # never passed when empty, so an engine that does not set this — Google, or any
+    # subclass written before QC existed — is called exactly as it always was.
+    supports_retry_hint: bool = False
 
     @abstractmethod
     def translate(self, text: str, source: str = "zh", target: str = "vi") -> str:
@@ -69,13 +75,20 @@ class Translator(ABC):
             f"{self.display_name or self.name} không hỗ trợ tạo nội dung tự do."
         )
 
-    def _translate_with_retry(self, text: str, source: str, target: str) -> str:
+    def _translate_with_retry(
+        self, text: str, source: str, target: str, retry_hint: str = ""
+    ) -> str:
         last_error: Exception | None = None
         best: str | None = None  # cleanest dirty attempt (fewest leftover CJK chars)
         best_leftover = 0
+        # Built once, outside the loop, so the "no hint" case is provably an empty dict and
+        # the call below is byte-identical to what it was before QC existed.
+        hint_kwarg = (
+            {"retry_hint": retry_hint} if retry_hint and self.supports_retry_hint else {}
+        )
         for attempt in range(self.max_retries):
             try:
-                result = self.translate(text, source=source, target=target)
+                result = self.translate(text, source=source, target=target, **hint_kwarg)
             except TranslateError:
                 if best is not None:
                     return best
@@ -147,12 +160,20 @@ class Translator(ABC):
         return repaired_title(title, best, target) or title
 
     def translate_chapter(
-        self, title: str, content: str, source: str = "zh", target: str = "vi"
+        self, title: str, content: str, source: str = "zh", target: str = "vi",
+        *, retry_hint: str = "",
     ) -> tuple[str, str]:
-        """Translate a chapter title + content. Returns (title, content)."""
+        """Translate a chapter title + content. Returns (title, content).
+
+        `retry_hint` names what a previous attempt got wrong (see `supports_retry_hint`).
+        It reaches the BODY only: `_safe_title` already has its own repair path, and a hint
+        about the body's language would be noise on a heading like `第127章`.
+        """
         translated_title = self._safe_title(title, source, target) if title else ""
         chunks = split_paragraph_chunks(content, self.max_chunk_chars)
-        translated_chunks = [self._translate_with_retry(c, source, target) for c in chunks]
+        translated_chunks = [
+            self._translate_with_retry(c, source, target, retry_hint) for c in chunks
+        ]
         # Source-site watermarks are stripped HERE, not inside `_translate_with_retry`:
         # that loop scores each attempt by `cjk_count(result)` to pick the cleanest one,
         # and filtering before the count would silently change which attempt wins — a

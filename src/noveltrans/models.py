@@ -257,6 +257,12 @@ AUDIO_SOURCE_TRANSLATED = "translated"
 AUDIO_SOURCE_ORIGINAL = "original"
 AUDIO_SOURCE_DOWNLOADED = "downloaded"
 
+# Translation-QC verdict stored on a chapter. A THIRD namespace, deliberately: "" is not a
+# verdict, it means the chapter has never been checked, which is what every row in every
+# existing library reads as. Never compare these against STATUS_* or AUDIO_SOURCE_*.
+QC_STATUS_OK = "ok"
+QC_STATUS_FAIL = "fail"
+
 
 @dataclass
 class Chapter:
@@ -295,6 +301,20 @@ class Chapter:
     # alone instead of overwriting it with the site's again.
     title_custom: bool = False
     title_source: str = ""  # the site's own title, kept so a rename can be undone
+    # Translation quality control (see `translators/qc.py`). EMPTY MEANS "never checked",
+    # never "failed": every row in every existing library has one, and reading those as
+    # failures would tell the user their whole finished novel is broken.
+    qc_status: str = ""  # "" | QC_STATUS_OK | QC_STATUS_FAIL
+    # WHICH failure (a `qc.QC_*` code), kept beside the prose because the result view groups
+    # by error class — deriving the class back out of a Vietnamese sentence would break the
+    # moment a reason is reworded.
+    qc_code: str = ""
+    qc_reason: str = ""  # the Vietnamese verdict, shown in the result view
+    # Fingerprint of the (title, text) that was judged — the same argument as
+    # `audio_text_hash`: a verdict is about a SPECIFIC text, and the translation reaches
+    # the DB through seven different write paths.
+    qc_text_hash: str = ""
+    qc_attempts: int = 0  # engine calls this chapter's last QC run cost
 
     @property
     def is_downloaded(self) -> bool:
@@ -307,6 +327,36 @@ class Chapter:
     @property
     def is_rewritten(self) -> bool:
         return bool(self.translated_raw)
+
+    @property
+    def qc_checked(self) -> bool:
+        return bool(self.qc_status)
+
+    @property
+    def qc_ok(self) -> bool:
+        return self.qc_status == QC_STATUS_OK
+
+    @property
+    def qc_failed(self) -> bool:
+        return self.qc_status == QC_STATUS_FAIL
+
+    def qc_fingerprint(self) -> str:
+        """Hash of the translation as it stands now. Compare against `qc_text_hash`."""
+        digest = hashlib.sha1()  # noqa: S324 — change detection, not security
+        digest.update((self.translated_title or "").encode("utf-8"))
+        digest.update(b"\x00")  # separator: ("ab", "c") must not hash like ("a", "bc")
+        digest.update((self.translated or "").encode("utf-8"))
+        return digest.hexdigest()
+
+    @property
+    def qc_is_stale(self) -> bool:
+        """True when the translation has changed since it was judged.
+
+        A never-checked chapter is NOT stale — it is unchecked, which the scan treats as
+        "needs checking" and the table treats as "say nothing". Keeping those two apart is
+        what stops an upgrade from marking a whole library.
+        """
+        return bool(self.qc_status) and self.qc_text_hash != self.qc_fingerprint()
 
     @property
     def has_audio(self) -> bool:
