@@ -296,6 +296,68 @@ thật, không đoán). Chạy GPU tự khoá về **1 luồng** (không chạy 
 engine trên cùng một card). Chưa đóng gói vào bản `.exe` — chỉ dùng khi chạy từ
 source.
 
+## Theo dõi tiến độ trên điện thoại (Telegram)
+
+Dịch cả truyện, kiểm tra chất lượng, tạo audio hay render video đều mất hàng giờ. Bật phần
+này thì app **tự báo tiến độ về Telegram**, và bạn **nhắn hỏi ngược lại được** — không cần
+ngồi trước máy.
+
+**Cài trong 2 phút** (Cài đặt → mục *Telegram*):
+
+1. Trên Telegram, nhắn cho **@BotFather** → `/newbot` → đặt tên → chép **token** vào ô
+   *Bot token*.
+2. Mở bot vừa tạo, **nhắn cho nó một câu bất kỳ**.
+3. Bấm **Lấy chat id** — app tự điền. Rồi bấm **Gửi thử** để chắc chắn chạy được.
+
+**Nó gửi gì:**
+
+- mỗi tác vụ dài được báo bằng **một tin nhắn duy nhất, tự cập nhật tại chỗ** —
+  `⏳ Dịch — Vạn Cổ Thần Đế` / `340/1200 (28%) · còn ~1,7 giờ`. Không phải năm mươi thông báo;
+- khi xong thì gửi **một tin mới** (sửa tin cũ thì điện thoại không rung):
+  `✅ Xong: Dịch — Vạn Cổ Thần Đế`;
+- tác vụ **ngắn dưới 1 phút thì không báo gì cả** — xuất file 20 giây không đáng làm phiền.
+
+**Nhắn cho bot để hỏi hoặc điều khiển:**
+
+| Lệnh | Tác dụng |
+| --- | --- |
+| `/status` | đang chạy gì, tới đâu rồi, còn bao lâu |
+| `/pause` | tạm dừng mọi tác vụ (dừng ở ranh giới chương — không mất gì) |
+| `/resume` | chạy tiếp |
+| `/help` | bảng này |
+
+Không có `/stop`: bấm nhầm trên điện thoại mà mất hàng giờ quota đã chạy thì quá đắt — muốn
+huỷ vẫn phải ngồi vào máy.
+
+⚠️ **Chat id là hàng rào bảo mật, không chỉ là địa chỉ nhận tin.** Bot của bạn ai tìm ra
+cũng nhắn được, nên app **chỉ nghe lệnh từ đúng chat id đã cấu hình**, mọi tin nhắn khác bị
+bỏ qua. Đừng chia sẻ token.
+
+Vài điều nên biết:
+
+- **Máy phải thức và app phải đang mở.** Lúc có tác vụ chạy thì app đã tự giữ máy không ngủ,
+  nên hỏi lúc đó luôn có trả lời; máy rảnh và đã ngủ thì bot im cho tới khi máy thức.
+- App gọi ra ngoài (long polling), **không cần mở cổng, không cần IP tĩnh**, chạy sau NAT
+  bình thường. Lúc rảnh tốn khoảng 2 request/phút.
+- **Hai máy dùng chung một bot thì được** — nhưng chỉ một máy được *nhận lệnh*. Xem bên dưới.
+- Mất mạng thì chỉ mất một dòng trạng thái: mọi lỗi gửi tin đều bị nuốt, **không bao giờ làm
+  gãy tác vụ đang chạy**.
+
+### Dùng một bot cho hai máy
+
+Được, và khá hợp lý nếu bạn chạy app trên cả Mac lẫn PC:
+
+- **Gửi tin thì không giới hạn.** Cả hai máy cùng báo tiến độ vào một chat bằng một token,
+  không xung đột gì. Mỗi tin nhắn có **tên máy ở đầu** (`🖥 Mac mini · ⏳ Dịch — …`), lấy
+  theo tên máy, sửa được ở ô *Tên máy*.
+- **Nhận lệnh thì chỉ MỘT máy.** Telegram chỉ cho một chỗ `getUpdates` cùng lúc; hai chỗ
+  cùng nhận sẽ đá nhau (lỗi 409) và cả hai đều chập chờn. Nên: bật **“Nhận lệnh”** ở máy
+  chính, **tắt** ở máy kia — máy kia vẫn báo tiến độ đầy đủ.
+- Nếu lỡ bật cả hai, app **tự phát hiện và nhường**: máy bị đá sẽ nhắn một câu báo rồi thôi
+  không nhận lệnh nữa, thay vì im lặng tranh nhau mãi.
+- Muốn **cả hai máy đều trả lời lệnh** thì tạo **hai bot** (mỗi máy một token) và cho cả hai
+  vào cùng một nhóm chat — lúc đó `/status` sẽ được cả hai trả lời.
+
 ## Sao lưu lên OneDrive
 
 Tab 3 có nhóm **Sao lưu OneDrive**: đẩy **toàn bộ thư mục truyện** lên OneDrive để công
