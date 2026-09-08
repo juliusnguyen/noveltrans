@@ -367,6 +367,7 @@ class TranslateWorker(PausableWorker):
         from noveltrans.name_glossary import (
             applied_glossary,
             build_from_project,
+            confirmed_glossary,
             read_names,
             write_names,
         )
@@ -463,7 +464,9 @@ class TranslateWorker(PausableWorker):
             # that may never reach it, so it is dropped with the rest of the chain intact.
             qc_plans = None
             qc_judge = None
+            qc_glossary: dict[str, str] = {}
             if self.qc is not None:
+                qc_glossary = confirmed_glossary(read_names(project.path))
                 qc_plans = self._build_qc_plans(project.meta.source_lang)
                 if not qc_plans:
                     self.failed.emit(
@@ -500,6 +503,10 @@ class TranslateWorker(PausableWorker):
                             judge=qc_judge,
                             policy=Policy.KEEP_BEST,
                             target=self.target_lang,
+                            # Only reviewed names (see `confirmed_glossary`): the
+                            # substitution above may use every auto-detected entry, but a
+                            # verdict that triggers a re-translation needs better evidence.
+                            glossary=qc_glossary,
                             on_attempt=lambda n, label, verdict, ch=chapter: self.progress.emit(
                                 done, total,
                                 f"{ch.title} — thử lần {n} ({label})"
@@ -779,10 +786,24 @@ class QcScanWorker(PausableWorker):
         self.limit = limit  # >0: the dialog's dry run — check this many and stop
 
     def run(self) -> None:
-        from noveltrans.translators.qc import check_translation
+        from noveltrans.name_glossary import applied_glossary, confirmed_glossary, read_names
+        from noveltrans.translators.qc import build_name_profile, check_translation
 
         project = NovelProject.open(self.project_path)
         try:
+            entries = read_names(project.path)
+            # Only the names the user has reviewed — see `confirmed_glossary`. Failing a
+            # chapter over an auto-detected "name" that was never a name would flag most of
+            # a novel. Read once: it does not change mid-scan.
+            glossary = confirmed_glossary(entries)
+            # A scan, unlike a live translation, has the WHOLE novel in front of it — so it
+            # can learn how this book actually spells each character and flag the chapter
+            # that disagrees. That needs no review step and no trust in the glossary's own
+            # spelling; see `build_name_profile`.
+            profile = build_name_profile(
+                (c.translated for c in project.chapters() if c.translated),
+                applied_glossary(entries).values(),
+            )
             pending = chapters_to_qc(
                 project,
                 self.target_lang,
@@ -804,7 +825,7 @@ class QcScanWorker(PausableWorker):
                 self.progress.emit(done, total, title)
                 result = check_translation(
                     chapter.content, chapter.translated_title, chapter.translated,
-                    target=self.target_lang,
+                    target=self.target_lang, glossary=glossary, profile=profile,
                 )
                 # The judge is asked only about a chapter the cheap checks cleared: there is
                 # nothing to ask about one they already failed, and the call costs quota.

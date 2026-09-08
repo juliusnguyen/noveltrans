@@ -30,7 +30,16 @@ _DOUBLE_SURNAMES = (
     "独孤", "獨孤", "司徒", "诸葛", "諸葛", "皇甫", "尉迟", "尉遲", "令狐", "轩辕", "軒轅",
 )
 
-# Readings that differ when the character is used as a SURNAME.
+# Characters whose reading AS A SURNAME differs from their ordinary reading. Applied only
+# to the first character of a name, so 任何 ("any") keeps its ordinary "nhâm" while the
+# surname 任 becomes "Nhậm".
+#
+# Grown from evidence, not from a dictionary sweep: each entry below is a surname that
+# actually occurs in real novels and whose ordinary reading is demonstrably wrong for a
+# person. 尹 and 任 were added after a reader reported the protagonist of one novel coming
+# out as "Duẫn Chí Bình" — the surname 尹 is Doãn (measured: 19078 occurrences as a surname
+# across the reporting library; the novel's own translations already said "Doãn" 14364
+# times against 350 for "Duẫn").
 _SURNAME_READING_OVERRIDES = {
     "沈": "thẩm",
     "单": "thiện",
@@ -38,6 +47,16 @@ _SURNAME_READING_OVERRIDES = {
     "解": "giải",
     "曾": "tăng",
     "查": "tra",
+    "李": "lý",     # the table reads "lí"; Vietnamese writes the surname Lý (nhà Lý, Lý Bạch).
+                    # Measured in the reporting library: the engines' own output used
+                    # "Lý Mạc Sầu" 3881 times against 19 for "Lí" — the glossary was
+                    # substituting a spelling the engine then corrected back.
+    "尹": "doãn",   # ordinary reading duẫn; the surname is Doãn (Doãn Chí Bình)
+    "任": "nhậm",   # ordinary reading nhâm; the surname is Nhậm (Nhậm Ngã Hành)
+    "区": "âu",     # ordinary reading khu; the surname is Âu
+    "區": "âu",
+    "缪": "mậu",    # ordinary reading mâu; the surname is Mậu
+    "繆": "mậu",
 }
 
 # Function/grammar characters that never appear inside given names. A candidate
@@ -167,9 +186,23 @@ def extract_names(corpus: str, min_count: int = 5) -> dict[str, int]:
             continue
         if given_part in _TITLE_WORDS:
             continue
-        # ordinary vocabulary whose first char happens to be a surname
-        # (安全, 高興, 許多…) or whose "given name" is a common noun (孫媳婦)
-        if _is_common_word(candidate, min_freq=50):
+        # Ordinary vocabulary whose first char happens to be a surname (安全, 高興, 許多…).
+        #
+        # ONLY for two-character candidates. A longer one has already had to survive the
+        # 80%-extension test, the varied-preceder test and the varied-follower test, and
+        # that is stronger evidence than a dictionary lookup — which actively misleads
+        # here, because a FAMOUS person is a dictionary entry. 尹志平 scores 367 and was
+        # being discarded as ordinary vocabulary while the purely fictional 郭靖 (score 0)
+        # passed: the better known the character, the more likely they were dropped.
+        # Measured over the reporting library, restricting this gate recovers 54 real
+        # names (李莫愁 ×3931, 張無忌 ×1790, 朱元璋 ×1149, 歐陽鋒 ×704…) and lets through
+        # 4 non-names, none of them appearing more than 11 times — which the review
+        # dialog exists to untick.
+        #
+        # Trusting jieba's own `nr` (person-name) tag instead was tried and measured to be
+        # WORSE: it tags 武功, 熊貓, 王八 and 謝謝 as person names, which would substitute
+        # invented names over ordinary words throughout a novel.
+        if len(candidate) <= 2 and _is_common_word(candidate, min_freq=50):
             continue
         if len(given_part) >= 2 and _is_common_word(given_part, min_freq=200):
             continue

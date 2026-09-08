@@ -79,3 +79,62 @@ class TestGlossary:
     def test_longest_name_replaced_first(self):
         glossary = {"林城": "Lâm Thành", "林城安": "Lâm Thành An"}
         assert apply_glossary("林城安在林城。", glossary) == "Lâm Thành An在Lâm Thành。"
+
+
+class TestFamousNamesAreNotDroppedAsVocabulary:
+    """Feature 086 — the dictionary gate was discarding names for being well known.
+
+    `_is_common_word` asks jieba's frequency dictionary, and a REAL historical person is a
+    dictionary entry: 尹志平 scores 367 and was rejected as ordinary vocabulary, while the
+    purely fictional 郭靖 (score 0) passed. The better known the character, the more likely
+    they were dropped — and in the reporting novel that was the protagonist, 14847 times.
+    """
+
+    def _corpus(self, name: str, times: int = 40) -> str:
+        # varied context on both sides, so the preceder/follower gates do not fire
+        return "".join(f"「{name}說道，這是第{i}次了。」\n那天晚上，{name}走了。\n" for i in range(times))
+
+    def test_a_famous_three_character_name_is_kept(self):
+        from noveltrans.translators.names import extract_names
+
+        assert "尹志平" in extract_names(self._corpus("尹志平"))
+
+    def test_a_fictional_name_still_works(self):
+        from noveltrans.translators.names import extract_names
+
+        assert "郭靖" in extract_names(self._corpus("郭靖"))
+
+    def test_ordinary_two_character_vocabulary_is_still_rejected(self):
+        """The gate still does its job where it was aimed: 安全 ("safety"), 高興 ("happy")
+        and 任何 ("any") all begin with a surname and none of them is a person."""
+        from noveltrans.translators.names import extract_names
+
+        for word in ("安全", "高興", "任何"):
+            assert word not in extract_names(self._corpus(word)), word
+
+    def test_jiebas_own_person_tag_is_not_trusted(self):
+        """Measured and rejected as the fix: jieba tags 武功 ("martial arts"), 熊貓
+        ("panda") and 謝謝 ("thank you") as person names, so believing it would substitute
+        invented names over ordinary words throughout a novel."""
+        from noveltrans.translators.names import extract_names
+
+        for word in ("武功", "熊貓", "謝謝"):
+            assert word not in extract_names(self._corpus(word)), word
+
+
+class TestSurnameReadings:
+    def test_the_surname_reading_wins_over_the_ordinary_one(self):
+        from noveltrans.translators.names import to_hanviet
+
+        # Reported: the protagonist came out as "Duẫn Chí Bình"; 尹 as a surname is Doãn.
+        assert to_hanviet("尹志平") == "Doãn Chí Bình"
+        assert to_hanviet("任我行") == "Nhậm Ngã Hành"
+        # 李 is written Lý in Vietnamese; the table's "lí" was being corrected by the
+        # engines anyway (measured 3881 uses of "Lý Mạc Sầu" against 19 of "Lí").
+        assert to_hanviet("李莫愁") == "Lý Mạc Sầu"
+
+    def test_it_applies_only_to_the_first_character(self):
+        from noveltrans.translators.names import to_hanviet
+
+        # 任 inside a word keeps its ordinary reading — the override is positional.
+        assert to_hanviet("任何", as_name=False) == "Nhâm Hà"

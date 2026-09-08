@@ -62,6 +62,7 @@ QC_SOURCE_LEFTOVER = "source_leftover"
 QC_REFUSAL = "refusal"
 QC_TRUNCATED = "truncated"
 QC_HAN_VIET = "han_viet"
+QC_NAME_DRIFT = "name_drift"
 
 # Vietnamese labels for the result view. One per code, checked by a test, so a new code
 # cannot ship without a name the user can read.
@@ -73,6 +74,7 @@ QC_LABELS: dict[str, str] = {
     QC_REFUSAL: "Engine hỏi lại thay vì dịch",
     QC_TRUNCATED: "Bản dịch bị cắt ngắn",
     QC_HAN_VIET: "Đặc Hán-Việt (giọng convert)",
+    QC_NAME_DRIFT: "Tên riêng viết sai",
 }
 
 # Worst first. Used to pick which failing attempt to keep under `Policy.KEEP_BEST`: a
@@ -85,6 +87,7 @@ QC_SEVERITY: tuple[str, ...] = (
     QC_SOURCE_LEFTOVER,
     QC_REFUSAL,
     QC_TRUNCATED,
+    QC_NAME_DRIFT,
     QC_HAN_VIET,
     QC_OK,
 )
@@ -221,7 +224,83 @@ class QcVerdict:
 OK_VERDICT = QcVerdict()
 
 
-def check_translation(source: str, title: str, body: str, *, target: str = "vi") -> QcVerdict:
+# How many missing names a verdict names before it stops listing them. The point is to
+# tell the user what to look for, not to reproduce the glossary.
+_MAX_REPORTED_NAMES = 3
+
+# Vietnamese writes several syllables with either i or y — Lý/Lí, Kỳ/Kì, Kỵ/Kị, Sỹ/Sĩ — and
+# both are correct. The Hán-Việt table picks one, engines often pick the other, and a name
+# check that treated them as different flagged 95% of chapters in a real library. Names are
+# therefore compared with the two folded together.
+_ORTHOGRAPHY = str.maketrans("yýỳỷỹỵYÝỲỶỸỴ", "iíìỉĩịIÍÌỈĨỊ")
+
+
+def fold_orthography(text: str) -> str:
+    """i/y folded, CASE PRESERVED — for finding names in running text.
+
+    Case is the signal that separates a name from an ordinary word: "giữ Chí Bình" is
+    "keep Chí Bình", not a person called Giữ. Folding case before matching loses that and
+    took a measured 0.5% flag rate to 36%.
+    """
+    return text.translate(_ORTHOGRAPHY)
+
+
+def fold_name(text: str) -> str:
+    """A name reduced to the form used for comparison: case- and i/y-insensitive."""
+    return fold_orthography(text).casefold()
+
+
+def check_names(source: str, body: str, glossary: dict[str, str]) -> QcVerdict:
+    """Every glossary name in the SOURCE must appear, spelled that way, in the translation.
+
+    This is the check that was missing when a reader found `尹志平` translated as "Yin Chí
+    Bình" in one chapter and "Doãn Chí Bình" in the rest — QC passed it, because every other
+    test asks about language and length and that string is perfectly good Vietnamese.
+
+    It works because the app already substitutes each glossary name into the text BEFORE
+    sending it to the engine: the correct spelling is in the prompt, so the engine's only
+    job is to leave it alone. A name that comes back missing was changed, not translated.
+
+    A name counts as present in the source under EITHER spelling, because the two callers
+    see different text: a QC scan reads the raw Chinese off the chapter, while a live
+    translation has already had the glossary applied and passes text in which the name is
+    the Vietnamese reading. One rule covers both without either caller having to say which
+    it is.
+
+    Deliberately lenient in one direction: ONE occurrence of the reading is enough, however
+    many times the source names the character, because a translation may legitimately use a
+    pronoun after the first mention. An empty glossary checks nothing.
+    """
+    if not glossary or not source:
+        return OK_VERDICT
+    folded_source, folded_body = fold_name(source), fold_name(body)
+    missing = [
+        reading
+        for chinese, reading in glossary.items()
+        if reading
+        and (chinese in source or fold_name(reading) in folded_source)
+        and fold_name(reading) not in folded_body
+    ]
+    if not missing:
+        return OK_VERDICT
+    shown = ", ".join(sorted(missing)[:_MAX_REPORTED_NAMES])
+    more = f" (và {len(missing) - _MAX_REPORTED_NAMES} tên khác)" if len(missing) > _MAX_REPORTED_NAMES else ""
+    return QcVerdict(
+        QC_NAME_DRIFT,
+        f"tên riêng bị viết khác: {shown}{more}",
+        {"missing_names": float(len(missing))},
+    )
+
+
+def check_translation(
+    source: str,
+    title: str,
+    body: str,
+    *,
+    target: str = "vi",
+    glossary: dict[str, str] | None = None,
+    profile: NameProfile | None = None,
+) -> QcVerdict:
     """The deterministic layer: the first failure found, cheapest check first.
 
     `source` is the original chapter (used only for the truncation ratio; pass `""` when it
@@ -277,7 +356,170 @@ def check_translation(source: str, title: str, body: str, *, target: str = "vi")
                 f"bản dịch ra tiếng Anh — chỉ {diacritics:.0%} từ có dấu tiếng Việt",
                 {"diacritic_ratio": diacritics, "english_word_rate": english},
             )
-    return OK_VERDICT
+
+    # Last of the deterministic checks, and the most specific: a chapter that came back in
+    # the wrong language entirely should be reported as that, not as a name problem. The
+    # consistency check runs first of the two — it needs no glossary to be trusted, because
+    # the novel's own usage is the evidence.
+    verdict = check_name_consistency(text, profile)
+    return verdict if not verdict.ok else check_names(source, text, glossary or {})
+
+
+# -- how this novel spells its own names --------------------------------------
+#
+# The strongest signal for a wrong name is not a glossary — it is the novel disagreeing with
+# itself. "Yin Chí Bình" is catchable because 14838 other occurrences say "Doãn Chí Bình".
+#
+# That framing is what makes the check usable at all. Comparing chapters against the
+# auto-detected glossary flagged 38-94% of them per novel, because a detected "name" like
+# 武者 ("martial artist") or 尹府 ("the Yin residence") is not a person and so never appears
+# in any translation. A CONSISTENCY check cannot make that mistake: a non-name has no
+# competing spellings, so it never has a minority variant to flag. Measured on the reporting
+# novel: 7 chapters of 1276 (0.5%), including the one the reader reported.
+
+# A name must have at least this many syllables to be profiled. With a one-syllable stem
+# ("Quách Tĩnh" → "Tĩnh") every other name ending in that syllable collides with it;
+# measured on real data, that alone produced hundreds of phantom variants.
+MIN_PROFILED_SYLLABLES = 3
+# A spelling used at least this often novel-wide is an established variant, not a slip.
+# 2% of the dominant spelling: on the reporting novel that keeps 350 legacy uses of an older
+# reading out of the results while still catching variants used 30, 21, 13, 12 and 9 times.
+VARIANT_SHARE = 0.02
+# Below this the novel has not said the name often enough for "how it is usually spelled" to
+# mean anything, and one early chapter would define the canon for the whole book.
+MIN_CANONICAL_USES = 20
+
+_PREFIX_RE_CACHE: dict[str, "re.Pattern[str]"] = {}
+
+
+def _stem_pattern(stem: str):
+    """Matches `<word> <stem>` in orthography-folded, case-PRESERVED text.
+
+    The capitalisation test is applied to the captured word by `_prefixes_in`, not here, so
+    the pattern stays simple and the rule lives in one place.
+    """
+    if stem not in _PREFIX_RE_CACHE:
+        _PREFIX_RE_CACHE[stem] = re.compile(
+            r"([^\W\d_]+)\s+" + re.escape(stem), re.IGNORECASE
+        )
+    return _PREFIX_RE_CACHE[stem]
+
+
+# A capital letter only means "name" in the MIDDLE of a sentence. After any of these, it
+# means "start of a sentence" and says nothing at all — "Còn Kiếm Tiên…" is "As for the
+# sword immortal…", not a person called Còn. Ignoring this was worth 3 points of false
+# positives on the reporting novel.
+_SENTENCE_END = set('.!?…:;"“”«»()[]-—\n\r\t')
+
+# Vietnamese addresses people by an honorific or diminutive before the name — "Tiểu Vô Kỵ"
+# is "little Wuji", not a character called Tiểu. Capitalised mid-sentence like a surname, so
+# only a word list separates them; these were the last false positives left on the reporting
+# novel after the sentence-start rule.
+_HONORIFICS = frozenset(
+    "tiểu lão đại a anh chị em cô chú bác ông bà thầy sư ngài nàng hắn cậu mợ dì cụ".split()
+)
+
+
+def _prefixes_in(text: str, stem: str) -> list[str]:
+    """Folded first syllables written before `stem`, mid-sentence and capitalised.
+
+    Both conditions carry weight. A name's first syllable is capitalised, which is what
+    keeps "theo Chí Thường" ("follow Chí Thường") from reading as a person called Theo —
+    and it must not be the first word of a sentence, where every word is capitalised.
+    """
+    found = []
+    for match in _stem_pattern(stem).finditer(text):
+        word = match.group(1)
+        if not word[:1].isupper() or word.casefold() in _HONORIFICS:
+            continue
+        before = text[: match.start(1)].rstrip(" ")
+        if not before or before[-1] in _SENTENCE_END:
+            continue  # sentence-initial: the capital is orthography, not evidence
+        found.append(word.casefold())
+    return found
+
+
+@dataclass(frozen=True)
+class NameProfile:
+    """How this novel actually spells each character, learned from its own translations.
+
+    `canonical` maps a folded name stem ("chí bình") to the folded first syllable the novel
+    overwhelmingly uses for it ("doãn"), and `display` keeps a readable form for the message.
+    `minority` is the set of (stem, prefix) pairs rare enough to be mistakes.
+    """
+
+    canonical: dict[str, str] = field(default_factory=dict)
+    display: dict[str, str] = field(default_factory=dict)
+    minority: set = field(default_factory=set)
+
+    @property
+    def empty(self) -> bool:
+        return not self.canonical
+
+    def variants_in(self, text: str) -> list[str]:
+        """The odd spellings this text uses, as `"Yin Chí Bình"` ready to show the user."""
+        found = []
+        folded = fold_orthography(text)
+        for stem, canon in self.canonical.items():
+            for prefix in set(_prefixes_in(folded, stem)):
+                if prefix != canon and (stem, prefix) in self.minority:
+                    found.append(f"{prefix} {stem} (thường viết {canon} {stem})")
+        return sorted(found)
+
+
+def build_name_profile(translations, readings) -> NameProfile:
+    """Learn each name's usual spelling from the translations the novel already has.
+
+    `readings` are the glossary's Vietnamese names — used only to know which stems to look
+    for. Their spelling is NOT taken as correct: the novel's own usage decides, because the
+    engine's convention beats the Hán-Việt table often enough that trusting the table was
+    itself a source of false alarms (it reads 李 as "Lí" where the translations say "Lý").
+    """
+    stems: dict[str, str] = {}
+    for reading in readings:
+        parts = (reading or "").split()
+        if len(parts) < MIN_PROFILED_SYLLABLES:
+            continue
+        stem = fold_name(" ".join(parts[1:]))
+        stems[stem] = " ".join(parts[1:])
+    if not stems:
+        return NameProfile()
+
+    counts: dict[str, dict[str, int]] = {stem: {} for stem in stems}
+    for text in translations:
+        folded = fold_orthography(text or "")
+        for stem in stems:
+            for prefix in _prefixes_in(folded, stem):
+                counts[stem][prefix] = counts[stem].get(prefix, 0) + 1
+
+    canonical, minority = {}, set()
+    for stem, prefixes in counts.items():
+        if not prefixes:
+            continue
+        canon, canon_uses = max(prefixes.items(), key=lambda kv: kv[1])
+        if canon_uses < MIN_CANONICAL_USES:
+            continue
+        canonical[stem] = canon
+        for prefix, uses in prefixes.items():
+            if prefix != canon and uses <= VARIANT_SHARE * canon_uses:
+                minority.add((stem, prefix))
+    return NameProfile(canonical=canonical, display=stems, minority=minority)
+
+
+def check_name_consistency(body: str, profile: NameProfile | None) -> QcVerdict:
+    """Flag a chapter that spells a character differently from the rest of the novel."""
+    if profile is None or profile.empty or not body:
+        return OK_VERDICT
+    variants = profile.variants_in(body)
+    if not variants:
+        return OK_VERDICT
+    shown = "; ".join(variants[:_MAX_REPORTED_NAMES])
+    more = f" (và {len(variants) - _MAX_REPORTED_NAMES} chỗ khác)" if len(variants) > _MAX_REPORTED_NAMES else ""
+    return QcVerdict(
+        QC_NAME_DRIFT,
+        f"tên riêng viết khác cả truyện: {shown}{more}",
+        {"variants": float(len(variants))},
+    )
 
 
 # -- the LLM judge ------------------------------------------------------------
@@ -394,6 +636,10 @@ _RETRY_HINTS: dict[str, str] = {
         "lần trước bản dịch bị cắt ngắn, thiếu nội dung — lần này phải dịch ĐẦY ĐỦ từ đầu "
         "đến cuối, không tóm tắt"
     ),
+    QC_NAME_DRIFT: (
+        "lần trước viết SAI tên riêng — phải giữ nguyên chính xác tên đã có trong văn bản "
+        "đưa vào, không được đổi cách viết, không được chuyển sang phiên âm pinyin"
+    ),
     QC_HAN_VIET: (
         "lần trước văn phong đặc Hán-Việt, đọc như truyện convert — lần này dùng tiếng Việt "
         "phổ thông, sắp xếp lại theo trật tự từ tiếng Việt; chỉ giữ Hán-Việt cho tên riêng "
@@ -459,6 +705,7 @@ def translate_with_qc(
     judge: Callable[[str], QcVerdict] | None = None,
     policy: Policy = Policy.KEEP_BEST,
     target: str = "vi",
+    glossary: dict[str, str] | None = None,
     on_attempt: Callable[[int, str, QcVerdict], None] | None = None,
     should_stop: Callable[[], bool] = lambda: False,
 ) -> QcOutcome:
@@ -499,7 +746,9 @@ def translate_with_qc(
                 last_error = exc
                 history.append(QcVerdict(QC_EMPTY, f"{plan.label}: {exc}"))
                 break
-            verdict = check_translation(content, new_title, new_body, target=target)
+            verdict = check_translation(
+                content, new_title, new_body, target=target, glossary=glossary
+            )
             if verdict.ok and judge is not None:
                 verdict = judge(new_body)
             history.append(verdict)

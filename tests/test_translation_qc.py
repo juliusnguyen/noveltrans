@@ -16,6 +16,7 @@ from noveltrans.translators.qc import (
     QC_EMPTY,
     QC_HAN_VIET,
     QC_LABELS,
+    QC_NAME_DRIFT,
     QC_NOT_VIETNAMESE,
     QC_OK,
     QC_REFUSAL,
@@ -26,6 +27,8 @@ from noveltrans.translators.qc import (
     QcAttemptPlan,
     QcVerdict,
     build_judge_prompt,
+    build_name_profile,
+    check_name_consistency,
     check_translation,
     diacritic_ratio,
     english_word_rate,
@@ -123,6 +126,149 @@ class TestDetectors:
     def test_measurements_are_reported_for_the_result_view(self):
         verdict = check_translation(SOURCE, "Chapter 1", ENGLISH)
         assert verdict.measured["diacritic_ratio"] < 0.1
+
+
+class TestNameCheck:
+    """Feature 086 — the gap that let a chapter pass with the wrong character name.
+
+    Every other check asks about language and length, and a mis-spelled name is perfectly
+    good Vietnamese of the right length.
+    """
+
+    def _body(self, name: str) -> str:
+        return f"{name} nhìn nàng một cái rồi quay đầu bỏ đi, trong lòng buồn khó tả. " * 12
+
+    GLOSSARY = {"尹志平": "Doãn Chí Bình"}
+
+    def test_the_right_name_passes(self):
+        verdict = check_translation(
+            "尹志平" * 40, "Chương 1", self._body("Doãn Chí Bình"), glossary=self.GLOSSARY
+        )
+        assert verdict.code == QC_OK
+
+    def test_a_changed_name_is_caught(self):
+        """The reported case: 尹志平 came back as "Yin Chí Bình" — pinyin surname, Hán-Việt
+        given name — and QC passed the chapter."""
+        verdict = check_translation(
+            "尹志平" * 40, "Chương 1", self._body("Yin Chí Bình"), glossary=self.GLOSSARY
+        )
+        assert verdict.code == QC_NAME_DRIFT
+        assert "Doãn Chí Bình" in verdict.reason  # tells the user what to look for
+
+    def test_i_and_y_are_the_same_name(self):
+        """Vietnamese writes Lý or Lí, Kỳ or Kì, and both are correct. Treating them as
+        different flagged 95% of chapters in a real library."""
+        verdict = check_translation(
+            "李莫愁" * 40, "Chương 1", self._body("Lí Mạc Sầu"),
+            glossary={"李莫愁": "Lý Mạc Sầu"},
+        )
+        assert verdict.code == QC_OK
+
+    def test_it_works_on_an_already_substituted_source(self):
+        """A live translation passes source text in which the glossary has ALREADY replaced
+        the Chinese, so the name is matched under either spelling."""
+        verdict = check_translation(
+            "Doãn Chí Bình đi tới. " * 40, "Chương 1", self._body("Yin Chí Bình"),
+            glossary=self.GLOSSARY,
+        )
+        assert verdict.code == QC_NAME_DRIFT
+
+    def test_a_name_the_chapter_never_mentions_is_not_required(self):
+        verdict = check_translation(
+            "他走了。" * 60, "Chương 1", self._body("Ai đó"), glossary=self.GLOSSARY
+        )
+        assert verdict.code == QC_OK
+
+    def test_one_mention_is_enough(self):
+        # A translation may use a pronoun after the first mention.
+        body = "Doãn Chí Bình đi tới. " + "Hắn nhìn nàng rồi quay đầu bỏ đi buồn bã. " * 20
+        assert check_translation("尹志平" * 40, "C1", body, glossary=self.GLOSSARY).code == QC_OK
+
+    def test_no_glossary_means_no_name_check(self):
+        # The behaviour before this feature, preserved for every caller that passes none.
+        assert check_translation(
+            "尹志平" * 40, "Chương 1", self._body("Yin Chí Bình")
+        ).code == QC_OK
+
+
+class TestNameConsistency:
+    """The check that actually catches a wrong name: the novel disagreeing with itself.
+
+    It asks about CONSISTENCY, not correctness, which is what makes it usable — comparing
+    chapters against the auto-detected glossary instead flagged 38-94% of them per novel,
+    because a detected "name" that is not a person can never appear in any translation.
+    A non-name has no competing spellings, so it never has a minority variant.
+    """
+
+    READING = "Doãn Chí Bình"
+
+    def _novel(self, canonical_uses: int = 60) -> list[str]:
+        return [f"Hôm nay {self.READING} đi tới. Hắn nhìn quanh." for _ in range(canonical_uses)]
+
+    def _profile(self, extra: list[str] | None = None):
+        return build_name_profile(self._novel() + (extra or []), [self.READING])
+
+    def test_the_odd_chapter_out_is_found(self):
+        """The reported case: one chapter says "Yin Chí Bình" where 14838 others say
+        "Doãn Chí Bình", and every other QC check passes it."""
+        odd = "Hôm nay Yin Chí Bình đi tới. Hắn nhìn quanh."
+        verdict = check_name_consistency(odd, self._profile([odd]))
+        assert verdict.code == QC_NAME_DRIFT
+        assert "doãn chí bình" in verdict.reason  # tells the user what it should be
+
+    def test_the_usual_spelling_passes(self):
+        assert check_name_consistency(self._novel()[0], self._profile()).code == QC_OK
+
+    def test_an_ordinary_word_before_the_name_is_not_a_spelling(self):
+        """"theo Chí Bình" is "follow Chí Bình" — lowercase, so not a name."""
+        text = "Hắn đi theo Chí Bình ra ngoài."
+        assert check_name_consistency(text, self._profile([text])).code == QC_OK
+
+    def test_a_sentence_initial_capital_is_not_a_spelling(self):
+        """Every word is capitalised at the start of a sentence, so a capital there is
+        orthography and says nothing. Ignoring this was worth 3 points of false positives."""
+        text = "Còn Chí Bình thì sao? Anh ấy đã đi rồi."
+        assert check_name_consistency(text, self._profile([text])).code == QC_OK
+
+    def test_an_honorific_is_not_a_spelling(self):
+        """"Tiểu Chí Bình" is "little Chí Bình", an address, not a different name."""
+        text = "Hôm nay Tiểu Chí Bình đi tới đây."
+        assert check_name_consistency(text, self._profile([text])).code == QC_OK
+
+    def test_an_established_alternative_is_left_alone(self):
+        """A spelling used through a fifth of the novel is a legacy convention, not a slip;
+        flagging those would bury the real mistakes."""
+        common = ["Hôm nay Duẫn Chí Bình đi tới. Hắn nhìn quanh." for _ in range(20)]
+        verdict = check_name_consistency(common[0], self._profile(common))
+        assert verdict.code == QC_OK
+
+    def test_a_name_the_novel_barely_uses_is_not_profiled(self):
+        """Two mentions cannot establish "how this novel spells it", and one early chapter
+        must not define the canon for a whole book."""
+        profile = build_name_profile(self._novel(3), [self.READING])
+        assert profile.empty
+
+    def test_a_two_syllable_name_is_not_profiled(self):
+        """With a one-syllable stem ("Quách Tĩnh" → "Tĩnh") every other name ending in that
+        syllable collides with it."""
+        profile = build_name_profile(["Quách Tĩnh đi tới."] * 60, ["Quách Tĩnh"])
+        assert profile.empty
+
+    def test_no_profile_means_no_check(self):
+        assert check_name_consistency("bất kỳ điều gì", None).code == QC_OK
+        assert check_name_consistency("bất kỳ điều gì", build_name_profile([], [])).code == QC_OK
+
+    def test_it_runs_inside_check_translation(self):
+        # ONE odd mention among ordinary prose: enough words for the rate-based checks to
+        # apply, and rare enough novel-wide to read as a slip rather than a convention.
+        odd = (
+            "Hôm nay Yin Chí Bình đi tới đó. "
+            + "Hắn nhìn quanh rồi lặng lẽ quay đầu bỏ đi trong lòng buồn khó tả. " * 12
+        )
+        verdict = check_translation(
+            "尹志平" * 40, "Chương 1", odd, profile=self._profile([odd])
+        )
+        assert verdict.code == QC_NAME_DRIFT
 
 
 class TestSeverityAndHints:

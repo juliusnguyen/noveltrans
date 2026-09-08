@@ -774,12 +774,20 @@ class TranslateTab(QWidget):
             self._names_dialog = None
 
     def _retranslate_indices(self, indices: list) -> None:
-        """Drop the translations of `indices` and queue exactly those for another pass."""
+        """Drop the translations of `indices` and queue exactly those for another pass.
+
+        The refresh goes through `_on_replacements_applied` rather than repeating its two
+        lines: clearing a translation changes the table AND, if that chapter is the one
+        open, the preview panes — which is exactly what that handler already gets right.
+        (It called a `_reload_table` that has never existed, since feature 072; the crash
+        needed the Name Glossary dialog's re-translate button to reach it.)
+        """
         if self.project is None or not indices:
             return
-        self.project.clear_translations(list(indices))
-        self._reload_table()
-        self._start_translate(indices=list(indices))
+        indices = list(indices)
+        self.project.clear_translations(indices)
+        self._on_replacements_applied(set(indices))
+        self._start_translate(indices=indices)
 
     # ------------------------------------------------- translation QC (084)
 
