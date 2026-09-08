@@ -47,6 +47,11 @@ class MainWindow(QMainWindow):
         # the app running with no window and no way to get back to it.
         self.hide_to_tray_enabled = False
         self._shut_down = False
+        # Reports long jobs to Telegram and answers commands from it. Created here rather
+        # than per workspace: `job_registry` is app-wide, so one notifier covers every
+        # novel open in every tab. Does nothing at all until configured.
+        self._notifier = None
+        self._start_notifier()
 
         # one shared state file across all workspaces; a project path may be open in at
         # most one workspace at a time (the guard below enforces it)
@@ -296,11 +301,39 @@ class MainWindow(QMainWindow):
         if self.config.library_dir != before:
             self._reload_library()
         self._apply_tab_orientation()  # idempotent — cheaper than tracking the old value
+        self._start_notifier()  # pick up a new token/chat id without restarting the app
         # A multi-novel OneDrive sync is started from Settings but must not run inside it:
         # Settings is modal and a sync takes hours. It hands the chosen novels over here,
         # where the run gets its own modeless window and the app stays usable.
         if getattr(dialog, "sync_requests", None):
             self._start_onedrive_sync(dialog.sync_requests)
+
+    def _start_notifier(self) -> None:
+        """(Re)start Telegram reporting from the current settings. Safe to call any time."""
+        from noveltrans.gui.jobs import job_registry
+        from noveltrans.gui.notifier import JobNotifier
+        from noveltrans.notify import TelegramCredentials
+
+        if self._notifier is not None:
+            self._notifier.stop()
+            self._notifier = None
+        if not self.config.telegram_enabled:
+            return
+        credentials = TelegramCredentials(
+            token=self.config.telegram_token, chat_id=self.config.telegram_chat_id
+        )
+        if not credentials.configured:
+            return
+        self._notifier = JobNotifier(
+            job_registry,
+            credentials,
+            update_seconds=self.config.telegram_update_seconds,
+            announce_after=self.config.telegram_announce_after,
+            machine=self.config.telegram_machine_name,
+            accept_commands=self.config.telegram_accept_commands,
+            parent=self,
+        )
+        self._notifier.start()
 
     def _start_onedrive_sync(self, requests: list) -> None:
         from noveltrans.gui.onedrive_sync_dialog import OneDriveSyncWindow
@@ -363,6 +396,8 @@ class MainWindow(QMainWindow):
         if self._shut_down:
             return
         self._shut_down = True
+        if self._notifier is not None:
+            self._notifier.stop()
         if self.isVisible():
             # A hidden window has a meaningless geometry; the hide already saved the
             # real one.

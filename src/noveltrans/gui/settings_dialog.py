@@ -267,6 +267,63 @@ class SettingsDialog(QDialog):
         discord_hint.setWordWrap(True)
         form.addRow("", discord_hint)
 
+        # Telegram progress reporting: a long batch is invisible unless you are at this
+        # machine. See `noveltrans/notify.py` for why polling and not a webhook.
+        self.telegram_enable = QCheckBox("Báo tiến độ các tác vụ dài về Telegram")
+        self.telegram_enable.setChecked(config.telegram_enabled)
+        self.telegram_enable.setToolTip(
+            "Mỗi tác vụ dài được báo bằng MỘT tin nhắn tự cập nhật tại chỗ, và một tin "
+            "mới khi xong.\n\nNhắn cho bot /status để hỏi tiến độ bất cứ lúc nào, "
+            "/pause và /resume để tạm dừng hoặc chạy tiếp."
+        )
+        form.addRow("Telegram:", self.telegram_enable)
+
+        self.telegram_token_edit = QLineEdit(config.telegram_token)
+        self.telegram_token_edit.setPlaceholderText("token lấy từ @BotFather")
+        self.telegram_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        form.addRow("Bot token:", self.telegram_token_edit)
+
+        self.telegram_chat_edit = QLineEdit(config.telegram_chat_id)
+        self.telegram_chat_edit.setPlaceholderText("chat id của bạn — bấm 'Lấy chat id'")
+        telegram_test = QPushButton("Gửi thử")
+        telegram_test.setToolTip("Gửi một tin nhắn thử tới chat này để kiểm tra cấu hình.")
+        telegram_test.clicked.connect(self._telegram_test)
+        telegram_chat_button = QPushButton("Lấy chat id")
+        telegram_chat_button.setToolTip(
+            "Nhắn cho bot của bạn một câu bất kỳ trên điện thoại TRƯỚC, rồi bấm nút này."
+        )
+        telegram_chat_button.clicked.connect(self._telegram_fetch_chat_id)
+        telegram_row = QHBoxLayout()
+        telegram_row.addWidget(self.telegram_chat_edit, stretch=1)
+        telegram_row.addWidget(telegram_chat_button)
+        telegram_row.addWidget(telegram_test)
+        form.addRow("Chat id:", telegram_row)
+
+        self.telegram_machine_edit = QLineEdit(config.telegram_machine_name)
+        self.telegram_machine_edit.setPlaceholderText("tên máy này, hiện trước mỗi tin nhắn")
+        self.telegram_accept_check = QCheckBox("Nhận lệnh (/status, /pause, /resume) ở máy này")
+        self.telegram_accept_check.setChecked(config.telegram_accept_commands)
+        self.telegram_accept_check.setToolTip(
+            "Telegram chỉ cho MỘT máy nhận lệnh của một bot. Dùng chung bot trên hai máy "
+            "thì bật ở một máy thôi — máy kia vẫn báo tiến độ bình thường."
+        )
+        machine_row = QHBoxLayout()
+        machine_row.addWidget(self.telegram_machine_edit, stretch=1)
+        machine_row.addWidget(self.telegram_accept_check)
+        form.addRow("Tên máy:", machine_row)
+
+        telegram_hint = QLabel(
+            "Cách lấy: nhắn @BotFather → /newbot → chép token vào ô trên. Rồi mở bot vừa "
+            "tạo, nhắn cho nó một câu, và bấm “Lấy chat id”.\n"
+            "⚠️ Chat id cũng là hàng rào bảo mật: bot chỉ nghe lệnh từ đúng chat này, "
+            "mọi tin nhắn khác bị bỏ qua. Không chia sẻ token.\n"
+            "Dùng chung một bot cho nhiều máy được — cả hai đều báo tiến độ (có tên máy ở "
+            "đầu tin nhắn), nhưng chỉ bật “Nhận lệnh” ở MỘT máy."
+        )
+        telegram_hint.setProperty("muted", True)
+        telegram_hint.setWordWrap(True)
+        form.addRow("", telegram_hint)
+
         # YouTube upload: the Video tab drives Studio in a dedicated browser profile.
         # Only the one-time login lives here; everything else about a run (visibility,
         # schedule) is per-run and belongs next to the parts list in the Video tab.
@@ -562,6 +619,62 @@ class SettingsDialog(QDialog):
         if box.clickedButton() is open_login:
             QDesktopServices.openUrl(QUrl(_TIEUTHUYETMANG_LOGIN_URL))
 
+    def _telegram_credentials(self):
+        """What the boxes currently hold — not what is saved, so a test uses live edits."""
+        from noveltrans.notify import TelegramCredentials
+
+        return TelegramCredentials(
+            token=self.telegram_token_edit.text().strip(),
+            chat_id=self.telegram_chat_edit.text().strip(),
+        )
+
+    def _telegram_fetch_chat_id(self) -> None:
+        """Read the chat id off the most recent message sent TO the bot.
+
+        Far kinder than telling someone to visit an API URL and read raw JSON, which is the
+        usual instruction for this. Needs the user to have messaged the bot first, so that
+        is exactly what the failure message says.
+        """
+        from noveltrans.notify import TelegramClient, TelegramCredentials
+
+        token = self.telegram_token_edit.text().strip()
+        if not token:
+            QMessageBox.information(self, "Chưa có token", "Điền Bot token trước đã.")
+            return
+        client = TelegramClient(TelegramCredentials(token=token))
+        # A short poll: the id is already waiting if the user has messaged the bot, and a
+        # 30-second block would look like the app had frozen.
+        updates = client.poll(timeout=1)
+        if not updates:
+            QMessageBox.information(
+                self,
+                "Chưa thấy tin nhắn nào",
+                "Mở Telegram trên điện thoại, nhắn cho bot của bạn một câu bất kỳ, "
+                "rồi bấm lại nút này.",
+            )
+            return
+        self.telegram_chat_edit.setText(updates[-1].chat_id)
+
+    def _telegram_test(self) -> None:
+        """Send one real message with the values currently in the boxes."""
+        from noveltrans.notify import TelegramClient
+
+        credentials = self._telegram_credentials()
+        if not credentials.configured:
+            QMessageBox.information(
+                self, "Chưa đủ thông tin", "Cần cả Bot token và Chat id."
+            )
+            return
+        client = TelegramClient(credentials)
+        if client.send("✅ NovelTrans đã kết nối. Nhắn /status để hỏi tiến độ."):
+            QMessageBox.information(self, "Đã gửi", "Kiểm tra Telegram trên điện thoại.")
+        else:
+            QMessageBox.warning(
+                self,
+                "Không gửi được",
+                "Telegram không nhận. Kiểm tra lại token, chat id và kết nối mạng.",
+            )
+
     def _discord_login(self) -> None:
         """Open the one-time Discord login window for the throwaway account."""
         self._login_worker = DiscordLoginWorker(self)
@@ -806,6 +919,11 @@ class SettingsDialog(QDialog):
                 "(chuột phải kênh → Copy Link). Tự mở khoá sẽ không chạy tới khi link "
                 "đúng.",
             )
+        self.config.telegram_enabled = self.telegram_enable.isChecked()
+        self.config.telegram_token = self.telegram_token_edit.text()
+        self.config.telegram_chat_id = self.telegram_chat_edit.text()
+        self.config.telegram_machine_name = self.telegram_machine_edit.text()
+        self.config.telegram_accept_commands = self.telegram_accept_check.isChecked()
         self.config.discord_autounlock_enabled = self.discord_enable.isChecked()
         self.config.discord_channel_url = channel_url
         self.config.onedrive_root = self.onedrive_root_edit.text()

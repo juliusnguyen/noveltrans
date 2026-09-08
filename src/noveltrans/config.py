@@ -699,6 +699,94 @@ class AppConfig:
             [f"{engine}|{model}|{int(attempts)}" for engine, model, attempts in (value or [])],
         )
 
+    # ---- Telegram progress reporting (feature 085) ------------------------
+
+    @property
+    def telegram_enabled(self) -> bool:
+        """Report long jobs to a Telegram bot, and answer commands sent back to it."""
+        return self._s.value("telegram_enabled", False, type=bool)
+
+    @telegram_enabled.setter
+    def telegram_enabled(self, value: bool) -> None:
+        self._s.setValue("telegram_enabled", bool(value))
+
+    @property
+    def telegram_token(self) -> str:
+        """The bot token from @BotFather. Empty = the feature cannot run."""
+        return str(self._s.value("telegram_token", "")).strip()
+
+    @telegram_token.setter
+    def telegram_token(self, value: str) -> None:
+        self._s.setValue("telegram_token", str(value or "").strip())
+
+    @property
+    def telegram_chat_id(self) -> str:
+        """The ONE chat that may command this app.
+
+        Not merely where messages go: `notify.Update.authorised` refuses every command from
+        any other chat. A bot is reachable by anyone who finds it, so this is the security
+        boundary, and an empty value disables commands entirely rather than allowing all.
+        """
+        return str(self._s.value("telegram_chat_id", "")).strip()
+
+    @telegram_chat_id.setter
+    def telegram_chat_id(self, value: str) -> None:
+        self._s.setValue("telegram_chat_id", str(value or "").strip())
+
+    @property
+    def telegram_machine_name(self) -> str:
+        """Which machine a message came from — defaults to this computer's own name.
+
+        Sending is NOT exclusive on the Bot API, so two machines can report into one chat
+        with one token. Without a label those two streams are unreadable.
+        """
+        from noveltrans.notify import default_machine_name
+
+        stored = str(self._s.value("telegram_machine_name", "")).strip()
+        return stored or default_machine_name()
+
+    @telegram_machine_name.setter
+    def telegram_machine_name(self, value: str) -> None:
+        self._s.setValue("telegram_machine_name", str(value or "").strip())
+
+    @property
+    def telegram_accept_commands(self) -> bool:
+        """Whether THIS machine listens for /status, /pause and /resume.
+
+        `getUpdates` allows exactly one consumer per bot, so two machines sharing a token
+        would knock each other off (HTTP 409) and neither would answer reliably. Turn this
+        off on the second machine: it still reports progress — sending has no such limit —
+        and the first machine keeps answering commands.
+        """
+        return self._s.value("telegram_accept_commands", True, type=bool)
+
+    @telegram_accept_commands.setter
+    def telegram_accept_commands(self, value: bool) -> None:
+        self._s.setValue("telegram_accept_commands", bool(value))
+
+    @property
+    def telegram_update_seconds(self) -> int:
+        """How often a running job's message is refreshed. Clamped: an edit per second
+        would hit Telegram's rate limit and tell the user nothing new."""
+        return int(_clamp(int(self._s.value("telegram_update_seconds", 120)), 30, 3600))
+
+    @telegram_update_seconds.setter
+    def telegram_update_seconds(self, value: int) -> None:
+        self._s.setValue("telegram_update_seconds", int(_clamp(int(value), 30, 3600)))
+
+    @property
+    def telegram_announce_after(self) -> int:
+        """A job must run this long before it is announced at all.
+
+        This is what keeps a twenty-second export from buzzing a phone, without a per-job
+        allow-list that every new worker would have to be added to.
+        """
+        return int(_clamp(int(self._s.value("telegram_announce_after", 60)), 0, 3600))
+
+    @telegram_announce_after.setter
+    def telegram_announce_after(self, value: int) -> None:
+        self._s.setValue("telegram_announce_after", int(_clamp(int(value), 0, 3600)))
+
     @property
     def video_font(self) -> str:
         """Video title font key (see VIDEO_FONTS). Unknown/stale values → default."""
