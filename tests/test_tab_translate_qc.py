@@ -254,6 +254,45 @@ class TestResultView:
         assert activated == [1]  # read it before believing the verdict
 
 
+class TestRetranslateFromTheResultView:
+    """The path from "chọn chương lỗi" to an actual re-translation.
+
+    It crashed in the real app on `self._reload_table()` — a method that has never existed
+    (feature 072 wrote the call; nothing had exercised it since). No test reached this
+    handler, so nothing caught it.
+    """
+
+    def test_it_clears_the_translations_and_queues_exactly_those_chapters(
+        self, qapp, tmp_path, monkeypatch
+    ):
+        tab, project = _tab(qapp, tmp_path, monkeypatch)
+        started: list = []
+        monkeypatch.setattr(tab, "_start_translate", lambda **kw: started.append(kw))
+
+        tab._retranslate_indices([1])
+
+        assert started == [{"indices": [1]}]
+        assert project.chapter(1).translated == ""  # dropped, ready to redo
+        assert project.chapter(0).translated == GOOD_VI  # the others are untouched
+
+    def test_it_refreshes_the_table_the_user_is_looking_at(
+        self, qapp, tmp_path, monkeypatch
+    ):
+        tab, project = _tab(qapp, tmp_path, monkeypatch)
+        monkeypatch.setattr(tab, "_start_translate", lambda **kw: None)
+        tab._retranslate_indices([0])
+        row = tab.model.row_for_index(0)
+        assert tab.model.chapter_at(row).translated == ""
+
+    def test_nothing_happens_without_a_selection(self, qapp, tmp_path, monkeypatch):
+        tab, project = _tab(qapp, tmp_path, monkeypatch)
+        started: list = []
+        monkeypatch.setattr(tab, "_start_translate", lambda **kw: started.append(kw))
+        tab._retranslate_indices([])
+        assert started == []
+        assert project.chapter(0).translated == GOOD_VI
+
+
 class TestQcDialog:
     def test_google_is_never_offered_as_a_judge(self, qapp, tmp_path, monkeypatch):
         tab, project = _tab(qapp, tmp_path, monkeypatch)

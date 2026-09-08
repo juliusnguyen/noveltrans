@@ -154,3 +154,39 @@ class TestTheReportedSymptomShape:
                             auto="Hạ Trữ Thất", edited=True, count=500)]
         merged = _by_source(merge_detected(stored, [("夏宁七", "Hạ Trữ Thất", 640)]))
         assert merged["夏宁七"].reading == "Hạ Ninh Thất"
+
+
+class TestConfirmedGlossary:
+    """Feature 086 — QC is held to a higher standard of evidence than the substitution."""
+
+    def _entry(self, source, reading, **kw):
+        from noveltrans.name_glossary import NameEntry
+
+        return NameEntry(source=source, reading=reading, **kw)
+
+    def test_auto_detected_names_are_excluded(self):
+        """Checking against every auto entry flagged 38-94% of chapters per novel in a real
+        library: a detected "name" like 武者 can never appear in a translation."""
+        from noveltrans.name_glossary import applied_glossary, confirmed_glossary
+
+        entries = [self._entry("武者", "Vũ Giả", auto="Vũ Giả", enabled=True)]
+        assert applied_glossary(entries) == {"武者": "Vũ Giả"}  # still substituted
+        assert confirmed_glossary(entries) == {}  # but never used to fail a chapter
+
+    def test_an_edited_reading_is_trusted(self):
+        from noveltrans.name_glossary import confirmed_glossary
+
+        entries = [self._entry("尹志平", "Doãn Chí Bình", enabled=True, edited=True)]
+        assert confirmed_glossary(entries) == {"尹志平": "Doãn Chí Bình"}
+
+    def test_a_hand_added_name_is_trusted(self):
+        from noveltrans.name_glossary import ORIGIN_MANUAL, confirmed_glossary
+
+        entries = [self._entry("尹志平", "Doãn Chí Bình", enabled=True, origin=ORIGIN_MANUAL)]
+        assert confirmed_glossary(entries) == {"尹志平": "Doãn Chí Bình"}
+
+    def test_a_disabled_name_is_never_checked(self):
+        from noveltrans.name_glossary import confirmed_glossary
+
+        entries = [self._entry("尹志平", "Doãn Chí Bình", enabled=False, edited=True)]
+        assert confirmed_glossary(entries) == {}

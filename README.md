@@ -229,6 +229,16 @@ Có hai lớp kiểm tra:
   tiếng), độ dài so với bản gốc (bắt chương bị cắt), chương rỗng, và câu engine hỏi xin nội
   dung thay vì dịch. Mọi ngưỡng đều đo từ thư viện thật — chạy `python scripts/qc_calibrate.py`
   để xem lại phân bố trước khi sửa bất kỳ con số nào.
+- **Kiểm tra tên riêng — so với chính truyện, không so với từ điển.** Khi quét cả truyện,
+  app học xem mỗi nhân vật thường được viết thế nào, rồi báo chương nào viết khác. Đây là
+  lỗi kiểu 尹志平 thành "Yin Chí Bình" ở một chương trong khi 14.838 chỗ khác viết "Doãn Chí
+  Bình" — mọi phép kiểm tra khác đều cho qua, vì đó vẫn là tiếng Việt có dấu, đủ dài.
+
+  Điểm mấu chốt là hỏi về **tính nhất quán**, không phải tính đúng: một "tên" máy dò nhầm
+  (như 武者 "võ giả" hay 尹府 "phủ họ Doãn") thì không có cách viết nào cạnh tranh, nên không
+  bao giờ bị báo. So thẳng với danh sách tên máy dò thì 38–94% số chương bị báo oan; cách này
+  đo trên thư viện thật chỉ **0,7%**. Chỉ áp dụng cho tên từ 3 âm tiết trở lên và tên xuất
+  hiện đủ nhiều để biết đâu là cách viết chuẩn.
 - **Lớp AI — chấm văn phong Hán-Việt, tốn 1 lượt gọi/chương.** Lỗi này *không* đo bằng máy
   được: truyện tiên hiệp **dùng nhiều từ Hán-Việt là đúng**, và những chương "nhiều Hán-Việt
   nhất" trong một thư viện thật lại là chương hay. Nên phần này phải hỏi AI. Tắt được nếu
