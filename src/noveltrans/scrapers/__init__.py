@@ -33,6 +33,7 @@ def _import_adapters() -> None:
         sto9,
         tieuthuyetmang,
         timotxt,
+        ttks,
         twkan,
         webtruyendich,
         xbanxia,
