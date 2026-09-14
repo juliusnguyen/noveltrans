@@ -96,6 +96,15 @@ class RewriteDialog(QDialog):
         self.engine_combo.currentIndexChanged.connect(self._refresh_estimate)
         self.model_edit = QLineEdit(config.rewrite_ai_model)
         self.model_edit.setPlaceholderText("model mặc định của engine")
+        # `rewrite_ai_model` is ONE string shared across whichever engine this box is set
+        # to, so without this a `sonnet` left over from Claude CLI would be handed to Codex
+        # — a hard 400, every chapter. Connected after the saved value is in, so opening
+        # the dialog never rewrites it.
+        self.engine_combo.currentIndexChanged.connect(
+            lambda: self.model_edit.setText(
+                self.config.model_for_engine(self.engine_combo.currentData() or "")
+            )
+        )
         engine_row.addWidget(self.engine_combo, stretch=1)
         engine_row.addWidget(QLabel("Model:"))
         engine_row.addWidget(self.model_edit, stretch=1)
