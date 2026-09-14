@@ -340,6 +340,56 @@ class TestQcDialog:
         dialog._move_chain_row(-1)
         assert dialog._chain() == [("claude_cli", "sonnet", 3), ("cli", "", 2)]
 
+    def test_switching_a_chain_row_engine_drops_the_old_engine_model(
+        self, qapp, tmp_path, monkeypatch
+    ):
+        """`sonnet` handed to Codex is a hard 400 from the backend, not a fallback — every
+        chapter in the chain fails with "model is not supported". Switching the engine must
+        take that engine's own model, not leave the previous one's behind."""
+        tab, project = _tab(qapp, tmp_path, monkeypatch)
+        tab.config.qc_engine_chain = [("claude_cli", "sonnet", 2)]
+        tab.config.set_cli_model_for("codex_cli", "gpt-5.6-luna")
+        dialog = QcDialog(project, tab.config)
+        combo = dialog.chain_table.cellWidget(0, 0)
+        combo.setCurrentIndex(combo.findData("codex_cli"))
+        assert dialog._chain() == [("codex_cli", "gpt-5.6-luna", 2)]
+
+    def test_an_engine_with_no_remembered_model_clears_the_box(
+        self, qapp, tmp_path, monkeypatch
+    ):
+        """Empty means "the CLI's own default", which always works — far better than
+        keeping a model that belongs to a different tool."""
+        tab, project = _tab(qapp, tmp_path, monkeypatch)
+        tab.config.qc_engine_chain = [("claude_cli", "sonnet", 2)]
+        dialog = QcDialog(project, tab.config)
+        combo = dialog.chain_table.cellWidget(0, 0)
+        combo.setCurrentIndex(combo.findData("codex_cli"))
+        assert dialog._chain() == [("codex_cli", "", 2)]
+
+    def test_building_a_chain_row_keeps_its_saved_model(self, qapp, tmp_path, monkeypatch):
+        """The reset is wired after the widgets carry their values, so merely opening the
+        dialog — or reordering, which rebuilds every row — never rewrites a model."""
+        tab, project = _tab(qapp, tmp_path, monkeypatch)
+        tab.config.set_cli_model_for("claude_cli", "haiku")
+        tab.config.qc_engine_chain = [("cli", "", 2), ("claude_cli", "sonnet", 3)]
+        dialog = QcDialog(project, tab.config)
+        assert dialog._chain() == [("cli", "", 2), ("claude_cli", "sonnet", 3)]
+        dialog.chain_table.setCurrentCell(1, 0)
+        dialog._move_chain_row(-1)
+        assert dialog._chain() == [("claude_cli", "sonnet", 3), ("cli", "", 2)]
+
+    def test_switching_the_judge_engine_drops_the_old_engine_model(
+        self, qapp, tmp_path, monkeypatch
+    ):
+        tab, project = _tab(qapp, tmp_path, monkeypatch)
+        tab.config.qc_ai_engine = "claude_cli"
+        tab.config.qc_ai_model = "sonnet"
+        tab.config.set_cli_model_for("codex_cli", "gpt-5.6-luna")
+        dialog = QcDialog(project, tab.config)
+        assert dialog.model_edit.text() == "sonnet"  # untouched on open
+        dialog.engine_combo.setCurrentIndex(dialog.engine_combo.findData("codex_cli"))
+        assert dialog.model_edit.text() == "gpt-5.6-luna"
+
     def test_a_chain_row_is_tall_enough_to_read(self, qapp, tmp_path, monkeypatch):
         """A cell widget does not drive the row height, so the default section size clipped
         the engine combo and cut its text in half."""
