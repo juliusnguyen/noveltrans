@@ -5,7 +5,9 @@ from __future__ import annotations
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QTextCursor, QTextDocument
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
+    QDialog,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -31,7 +33,7 @@ from noveltrans.find_replace import FIELD_TRANSLATED, FIELD_TRANSLATED_TITLE
 from noveltrans.gui.find_replace_dialog import FindReplaceDialog
 from noveltrans.gui.jobs import job_registry
 from noveltrans.gui.keep_awake import track_worker
-from noveltrans.gui.qc_dialog import QcDialog, QcResultDialog
+from noveltrans.gui.qc_dialog import NameFixReviewDialog, QcDialog, QcResultDialog
 from noveltrans.gui.rewrite_dialog import RewriteDialog
 from noveltrans.gui.widgets import (
     PauseButton,
@@ -480,7 +482,12 @@ class TranslateTab(QWidget):
     # ------------------------------------------------------------- translate
 
     def _start_translate(
-        self, indices: list[int] | None = None, title_only: set[int] | None = None
+        self,
+        indices: list[int] | None = None,
+        title_only: set[int] | None = None,
+        name_fix: set[int] | None = None,
+        approved_names: set | None = None,
+        name_profile=None,
     ) -> None:
         self._save_preview_edits()
         if self.project is None:
@@ -541,6 +548,9 @@ class TranslateTab(QWidget):
             indices=indices,
             qc=self._qc_settings(engine, model, base_url),
             title_only=title_only or frozenset(),
+            name_fix=name_fix or frozenset(),
+            approved_names=approved_names or frozenset(),
+            name_profile=name_profile,
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.chapter_done.connect(self._on_chapter_updated)
@@ -915,20 +925,83 @@ class TranslateTab(QWidget):
         dialog.exec()
 
     def _retranslate_qc_failures(self, indices: list) -> None:
-        """Re-translate chapters picked in the QC result view — the title alone where the
-        title was the only failure, the whole chapter otherwise (feature 094).
+        """Fix chapters picked in the QC result view by the cheapest route that works —
+        the title alone, names corrected in place, or the whole chapter (features 094, 095;
+        see `split_retranslation`).
 
-        Title-only chapters are NOT cleared: their body is kept, and clearing it first would
-        throw away exactly the text this path exists to protect.
+        Only full re-translations are cleared: the other two keep their body, and clearing
+        it first would throw away exactly the text those paths exist to protect.
         """
         if self.project is None or not indices:
             return
         chapters = [c for c in (self.project.chapter(i) for i in indices) if c is not None]
-        title_only, full = split_retranslation(chapters)
-        if full:
-            self.project.clear_translations(full)
-            self._on_replacements_applied(set(full))
-        self._start_translate(indices=list(indices), title_only=set(title_only))
+        plan = split_retranslation(chapters)
+
+        # Name slips are fixed only as far as a person approves, pair by pair — see
+        # `NameFixReviewDialog`. Asked BEFORE anything is cleared, so cancelling it leaves
+        # every chapter exactly as it was.
+        name_fix: set[int] = set()
+        approved: set = set()
+        profile = None
+        if plan.name_fix:
+            profile, proposals = self._name_fix_proposals(plan.name_fix)
+            if proposals:
+                dialog = NameFixReviewDialog(proposals, self)
+                if not self._exec_name_fix_review(dialog):
+                    self.status_label.setText("Đã huỷ dịch lại.")
+                    return
+                approved = dialog.approved_keys()
+                name_fix = dialog.approved_chapters() & set(plan.name_fix)
+            else:
+                # Nothing left to propose (the novel changed since the scan): re-checking
+                # is free, and it clears a verdict that no longer holds.
+                name_fix = set(plan.name_fix)
+
+        skipped = set(plan.name_fix) - name_fix  # unapproved: left as they are, still marked
+        run = [i for i in indices if i not in skipped]
+        if not run:
+            self.status_label.setText("Không sửa cặp tên nào — các chương giữ nguyên.")
+            return
+        if plan.full:
+            self.project.clear_translations(plan.full)
+            self._on_replacements_applied(set(plan.full))
+        self._start_translate(
+            indices=run,
+            title_only=set(plan.title_only),
+            name_fix=name_fix,
+            approved_names=approved,
+            name_profile=profile,
+        )
+
+    def _name_fix_proposals(self, indices: list[int]):
+        """`(profile, proposals)` for the name-slip chapters among a QC re-translation.
+
+        The profile is learned from the whole novel, as the scan learns it, and handed to
+        the worker afterwards so the edits applied are exactly the ones reviewed.
+        """
+        from noveltrans.name_glossary import applied_glossary, read_names
+        from noveltrans.translators.qc import build_name_profile, propose_name_fixes
+
+        chapters = self.project.chapters()
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            profile = build_name_profile(
+                (c.translated for c in chapters if c.translated),
+                applied_glossary(read_names(self.project.path)).values(),
+            )
+            wanted = set(indices)
+            texts = [
+                (c.index, text)
+                for c in chapters if c.index in wanted
+                for text in (c.translated_title, c.translated)
+            ]
+            return profile, propose_name_fixes(texts, profile)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def _exec_name_fix_review(self, dialog) -> bool:
+        """The seam tests drive instead of a live modal. True = continue."""
+        return dialog.exec() == QDialog.DialogCode.Accepted
 
     def _add_qc_action(self, menu, rows: list[int]) -> None:
         """Append "Kiểm tra chất lượng" for the translated chapters among `rows`."""

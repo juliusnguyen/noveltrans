@@ -293,8 +293,8 @@ class TestRetranslateFromTheResultView:
         assert project.chapter(0).translated == GOOD_VI
 
 
-class TestTitleOnlyFromTheResultView:
-    """Feature 094 — a heading-only failure must not cost the chapter its body."""
+class TestCheapFixesFromTheResultView:
+    """Features 094 and 095 — a failure that a cheaper fix addresses keeps its body."""
 
     def _mark(self, project, idx, code):
         project.save_qc_verdict(
@@ -309,6 +309,7 @@ class TestTitleOnlyFromTheResultView:
         text = dialog.plan_label.text()
         assert "1 chương chỉ dịch lại tiêu đề" in text
         assert "1 chương dịch lại toàn bộ" in text
+        assert "sửa tên" not in text  # a part with nothing in it is not mentioned
 
         dialog.table.item(1, dialog.CHECK_COLUMN).setCheckState(
             dialog.table.item(1, dialog.CHECK_COLUMN).checkState().Unchecked
@@ -326,9 +327,96 @@ class TestTitleOnlyFromTheResultView:
 
         tab._retranslate_qc_failures([0, 1])
 
-        assert started == [{"indices": [0, 1], "title_only": {0}}]
+        assert started == [{
+            "indices": [0, 1], "title_only": {0}, "name_fix": set(),
+            "approved_names": set(), "name_profile": None,
+        }]
         assert project.chapter(0).translated == GOOD_VI  # kept: only its title is redone
         assert project.chapter(1).translated == ""  # dropped, as before
+
+    def _proposal(self, *chapters):
+        from noveltrans.translators.qc import NameFixProposal
+
+        return NameFixProposal(
+            key=("chí bình", "iin"), wrong="Yin Chí Bình", right="Doãn Chí Bình",
+            occurrences=len(chapters), chapters=tuple(chapters), example="…Yin Chí Bình đi…",
+        )
+
+    def _review(self, monkeypatch, tab, proposals, *, tick: bool, accept: bool = True):
+        """Stand in for the modal: tick every row (or none), then continue or cancel."""
+        profile = object()
+        monkeypatch.setattr(tab, "_name_fix_proposals", lambda _idx: (profile, proposals))
+
+        def exec_review(dialog):
+            dialog._set_all_checked(tick)
+            return accept
+
+        monkeypatch.setattr(tab, "_exec_name_fix_review", exec_review)
+        return profile
+
+    def test_the_dialog_counts_name_fixes_separately(self, qapp, tmp_path, monkeypatch):
+        tab, project = _tab(qapp, tmp_path, monkeypatch)
+        self._mark(project, 0, "name_variant")
+        dialog = QcResultDialog(project.qc_failures())
+        assert "1 chương chỉ sửa tên riêng" in dialog.plan_label.text()
+
+    def test_approved_pairs_reach_the_worker_and_nothing_is_cleared(
+        self, qapp, tmp_path, monkeypatch
+    ):
+        """Feature 095."""
+        tab, project = _tab(qapp, tmp_path, monkeypatch)
+        self._mark(project, 0, "name_variant")
+        started: list = []
+        monkeypatch.setattr(tab, "_start_translate", lambda **kw: started.append(kw))
+        profile = self._review(monkeypatch, tab, [self._proposal(0)], tick=True)
+
+        tab._retranslate_qc_failures([0])
+
+        assert started == [{
+            "indices": [0], "title_only": set(), "name_fix": {0},
+            "approved_names": {("chí bình", "iin")}, "name_profile": profile,
+        }]
+        assert project.chapter(0).translated == GOOD_VI
+
+    def test_an_unticked_pair_leaves_its_chapter_out_of_the_run(
+        self, qapp, tmp_path, monkeypatch
+    ):
+        tab, project = _tab(qapp, tmp_path, monkeypatch)
+        self._mark(project, 0, "name_variant")
+        self._mark(project, 1, "not_vietnamese")
+        started: list = []
+        monkeypatch.setattr(tab, "_start_translate", lambda **kw: started.append(kw))
+        self._review(monkeypatch, tab, [self._proposal(0)], tick=False)
+
+        tab._retranslate_qc_failures([0, 1])
+
+        assert started[0]["indices"] == [1]  # the full re-translation still goes ahead
+        assert started[0]["name_fix"] == set()
+
+    def test_cancelling_the_review_cancels_everything(self, qapp, tmp_path, monkeypatch):
+        """Asked before anything is cleared, so a cancel loses nothing at all."""
+        tab, project = _tab(qapp, tmp_path, monkeypatch)
+        self._mark(project, 0, "name_variant")
+        self._mark(project, 1, "not_vietnamese")
+        started: list = []
+        monkeypatch.setattr(tab, "_start_translate", lambda **kw: started.append(kw))
+        self._review(monkeypatch, tab, [self._proposal(0)], tick=True, accept=False)
+
+        tab._retranslate_qc_failures([0, 1])
+
+        assert started == []
+        assert project.chapter(1).translated == GOOD_VI  # not cleared
+
+    def test_the_review_starts_with_nothing_ticked(self, qapp):
+        from noveltrans.gui.qc_dialog import NAME_FIX_SKIP_LABEL, NameFixReviewDialog
+
+        dialog = NameFixReviewDialog([self._proposal(0, 2)])
+        assert dialog.approved_keys() == set()
+        assert dialog.apply_button.text() == NAME_FIX_SKIP_LABEL
+        dialog._set_all_checked(True)
+        assert dialog.approved_keys() == {("chí bình", "iin")}
+        assert dialog.approved_chapters() == {0, 2}
+        assert "1 cặp" in dialog.apply_button.text()
 
 
 class TestQcDialog:

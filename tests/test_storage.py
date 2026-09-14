@@ -137,6 +137,21 @@ class TestResumeQueries:
         assert chapter.translator == "CLI (agy)"
         assert chapter.status == STATUS_TRANSLATED and chapter.error == ""
 
+    def test_save_name_fix_keeps_the_engine_record_and_lifts_the_mark(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        """Feature 095: a string edit is not a translation run."""
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_content(0, "原文")
+        project.save_translation(0, "Chương 1", "Yin Chí Bình đi.", "vi", translator="CLI (agy)")
+        project.mark_qc_failed(0, "name_variant", "tên riêng viết khác cả truyện", "h")
+
+        project.save_name_fix(0, "Chương 1", "Doãn Chí Bình đi.")
+        chapter = project.chapter(0)
+        assert chapter.translated == "Doãn Chí Bình đi."
+        assert chapter.translator == "CLI (agy)" and chapter.target_lang == "vi"
+        assert chapter.status == STATUS_TRANSLATED and chapter.error == ""
+
     def test_edit_translation_keeps_engine_metadata(
         self, library_dir, sample_meta, sample_refs
     ):

@@ -585,21 +585,26 @@ class QcResultDialog(QDialog):
         ]
 
     def _refresh_plan(self) -> None:
-        """Say, before the click, which ticked chapters keep their body (feature 094).
+        """Say, before the click, which ticked chapters keep their body (features 094, 095).
 
         Counted by `split_retranslation`, the same function the tab hands the worker, so
         the sentence cannot promise a cheaper run than the one that happens.
         """
         chosen = [self._chapters[i] for i in self.checked_indices() if i in self._chapters]
-        title_only, full = split_retranslation(chosen)
+        plan = split_retranslation(chosen)
         parts = []
-        if title_only:
+        if plan.title_only:
             parts.append(
-                f"<b>{len(title_only)} chương chỉ dịch lại tiêu đề</b> — giữ nguyên nội dung"
+                f"<b>{len(plan.title_only)} chương chỉ dịch lại tiêu đề</b> — giữ nguyên nội dung"
             )
-        if full:
+        if plan.name_fix:
             parts.append(
-                f"<b>{len(full)} chương dịch lại toàn bộ</b> — xoá bản dịch hiện tại"
+                f"<b>{len(plan.name_fix)} chương chỉ sửa tên riêng</b> — thay tại chỗ, "
+                "không dịch lại"
+            )
+        if plan.full:
+            parts.append(
+                f"<b>{len(plan.full)} chương dịch lại toàn bộ</b> — xoá bản dịch hiện tại"
             )
         self.plan_label.setText("Sẽ dịch lại: " + "; ".join(parts) + "." if parts else "")
 
@@ -614,3 +619,123 @@ class QcResultDialog(QDialog):
             return
         self.retranslate_requested.emit(indices)
         self.accept()
+
+
+NAME_FIX_APPLY_LABEL = "✎ Sửa {n} cặp đã chọn"
+NAME_FIX_SKIP_LABEL = "Tiếp tục, không sửa tên"
+
+
+class NameFixReviewDialog(QDialog):
+    """Approve, pair by pair, which odd name spellings to correct in place (feature 095).
+
+    Nothing starts ticked, deliberately: measured on a real library, a large share of the
+    pairs are the name check's own false positives — a place or a title after an ordinary
+    capitalised word ("Nhưng Sơn Hải", "Tân Tông Chủ") — and an unreviewed edit would write
+    each one into the novel. See the comment above `qc.NAME_FIX_CONTEXT_CHARS`.
+
+    Accept continues the re-translation with `approved_keys()` (possibly none: the name
+    chapters are then left as they are). Reject cancels the whole re-translation, so a user
+    who opened this by mistake loses nothing — not even the chapters queued for a full redo.
+    """
+
+    CHECK_COLUMN = 0
+    WRONG_COLUMN = 1
+    RIGHT_COLUMN = 2
+    COUNT_COLUMN = 3
+    CHAPTERS_COLUMN = 4
+    EXAMPLE_COLUMN = 5
+
+    def __init__(self, proposals: list, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Duyệt sửa tên riêng")
+        self.setMinimumSize(860, 420)
+        self._proposals = list(proposals)
+
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "Đây là những cách viết tên <b>khác với cả truyện</b>. Sửa ở đây chỉ thay chữ "
+            "tại chỗ, không dịch lại, không tốn token.<br>"
+            "<b>Nhiều cặp là báo nhầm</b> — một địa danh, cảnh giới hay danh hiệu đứng sau "
+            "một chữ viết hoa (vd. “Nhưng Sơn Hải”, “Tân Tông Chủ”). Đọc cột Ví dụ và "
+            "<b>chỉ tích những cặp chắc chắn là tên bị viết sai</b>."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(
+            ["", "Đang viết", "Sửa thành", "Số chỗ", "Số chương", "Ví dụ"]
+        )
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.horizontalHeader().setSectionResizeMode(
+            self.EXAMPLE_COLUMN, QHeaderView.ResizeMode.Stretch
+        )
+        layout.addWidget(self.table, stretch=1)
+
+        self.table.blockSignals(True)
+        for proposal in self._proposals:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            check = QTableWidgetItem()
+            check.setFlags(check.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            check.setCheckState(Qt.CheckState.Unchecked)
+            self.table.setItem(row, self.CHECK_COLUMN, check)
+            self.table.setItem(row, self.WRONG_COLUMN, QTableWidgetItem(proposal.wrong))
+            self.table.setItem(row, self.RIGHT_COLUMN, QTableWidgetItem(proposal.right))
+            self.table.setItem(row, self.COUNT_COLUMN, QTableWidgetItem(str(proposal.occurrences)))
+            self.table.setItem(
+                row, self.CHAPTERS_COLUMN, QTableWidgetItem(str(len(proposal.chapters)))
+            )
+            example = QTableWidgetItem(proposal.example)
+            example.setToolTip(proposal.example)
+            self.table.setItem(row, self.EXAMPLE_COLUMN, example)
+        self.table.blockSignals(False)
+        self.table.resizeColumnsToContents()
+        self.table.itemChanged.connect(lambda _item: self._refresh_button())
+
+        select_all = QPushButton("Chọn tất cả")
+        select_all.clicked.connect(lambda: self._set_all_checked(True))
+        select_none = QPushButton("Bỏ chọn")
+        select_none.clicked.connect(lambda: self._set_all_checked(False))
+        self.apply_button = QPushButton()
+        self.apply_button.setProperty("primary", True)
+        self.apply_button.clicked.connect(self.accept)
+        cancel_button = QPushButton("Huỷ dịch lại")
+        cancel_button.clicked.connect(self.reject)
+        row = QHBoxLayout()
+        row.addWidget(self.apply_button)
+        row.addWidget(select_all)
+        row.addWidget(select_none)
+        row.addStretch(1)
+        row.addWidget(cancel_button)
+        layout.addLayout(row)
+        self._refresh_button()
+
+    def _set_all_checked(self, checked: bool) -> None:
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        for row in range(self.table.rowCount()):
+            self.table.item(row, self.CHECK_COLUMN).setCheckState(state)
+
+    def _checked_rows(self) -> list[int]:
+        return [
+            row for row in range(self.table.rowCount())
+            if self.table.item(row, self.CHECK_COLUMN).checkState() == Qt.CheckState.Checked
+        ]
+
+    def _refresh_button(self) -> None:
+        count = len(self._checked_rows())
+        self.apply_button.setText(
+            NAME_FIX_APPLY_LABEL.format(n=count) if count else NAME_FIX_SKIP_LABEL
+        )
+
+    def approved_keys(self) -> set:
+        """The `NameFixProposal.key`s of the ticked rows."""
+        return {self._proposals[row].key for row in self._checked_rows()}
+
+    def approved_chapters(self) -> set[int]:
+        """Chapters that at least one approved pair will edit — the only ones to run."""
+        return {
+            index for row in self._checked_rows() for index in self._proposals[row].chapters
+        }
