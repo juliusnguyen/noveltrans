@@ -464,6 +464,82 @@ class TestQcDialog:
         dialog._add_chain_row("codex_cli", "gpt-5.6-luna", 3)
         assert tab.config.qc_engine_chain == [("cli", "", 2)]
 
+    def _closable(self, dialog, monkeypatch):
+        """Intercept the close itself — `QDialog.reject` ends in `done()`."""
+        closed: list[int] = []
+        monkeypatch.setattr(dialog, "done", lambda code: closed.append(code))
+        return closed
+
+    def test_closing_an_untouched_dialog_asks_nothing(self, qapp, tmp_path, monkeypatch):
+        """The combo falls back to its first item when `qc_ai_engine` names an engine it
+        does not offer, so comparing widgets to config would prompt on a dialog the user
+        only looked at."""
+        tab, project = _tab(qapp, tmp_path, monkeypatch)
+        tab.config.qc_ai_engine = "google"  # never offered here; the combo falls back
+        dialog = QcDialog(project, tab.config)
+        closed = self._closable(dialog, monkeypatch)
+        asked: list[str] = []
+        monkeypatch.setattr(dialog, "_ask_unsaved", lambda: asked.append("asked") or "cancel")
+        dialog.reject()
+        assert not asked
+        assert closed, "an untouched dialog must just close"
+
+    def test_closing_with_a_change_offers_to_save_it(self, qapp, tmp_path, monkeypatch):
+        tab, project = _tab(qapp, tmp_path, monkeypatch)
+        tab.config.qc_engine_chain = [("cli", "", 2)]
+        dialog = QcDialog(project, tab.config)
+        closed = self._closable(dialog, monkeypatch)
+        monkeypatch.setattr(dialog, "_ask_unsaved", lambda: "save")
+        dialog._add_chain_row("codex_cli", "gpt-5.6-luna", 3)
+        dialog.reject()
+        assert tab.config.qc_engine_chain == [("cli", "", 2), ("codex_cli", "gpt-5.6-luna", 3)]
+        assert closed
+
+    def test_discarding_closes_without_writing(self, qapp, tmp_path, monkeypatch):
+        tab, project = _tab(qapp, tmp_path, monkeypatch)
+        tab.config.qc_engine_chain = [("cli", "", 2)]
+        dialog = QcDialog(project, tab.config)
+        closed = self._closable(dialog, monkeypatch)
+        monkeypatch.setattr(dialog, "_ask_unsaved", lambda: "discard")
+        dialog._add_chain_row("codex_cli", "gpt-5.6-luna", 3)
+        dialog.reject()
+        assert tab.config.qc_engine_chain == [("cli", "", 2)]
+        assert closed, "discard still closes — that is what Đóng is for"
+
+    def test_cancelling_the_prompt_keeps_the_dialog_open(self, qapp, tmp_path, monkeypatch):
+        tab, project = _tab(qapp, tmp_path, monkeypatch)
+        tab.config.qc_engine_chain = [("cli", "", 2)]
+        dialog = QcDialog(project, tab.config)
+        closed = self._closable(dialog, monkeypatch)
+        monkeypatch.setattr(dialog, "_ask_unsaved", lambda: "cancel")
+        dialog._add_chain_row("codex_cli", "gpt-5.6-luna", 3)
+        dialog.reject()
+        assert not closed, "cancel must leave the dialog open"
+        assert tab.config.qc_engine_chain == [("cli", "", 2)]  # and write nothing
+
+    def test_closing_after_saving_asks_nothing(self, qapp, tmp_path, monkeypatch):
+        tab, project = _tab(qapp, tmp_path, monkeypatch)
+        dialog = QcDialog(project, tab.config)
+        closed = self._closable(dialog, monkeypatch)
+        asked: list[str] = []
+        monkeypatch.setattr(dialog, "_ask_unsaved", lambda: asked.append("asked") or "cancel")
+        dialog._add_chain_row("codex_cli", "gpt-5.6-luna", 3)
+        dialog._save_settings()
+        dialog.reject()
+        assert not asked, "the change was saved; there is nothing left to lose"
+        assert closed
+
+    def test_starting_a_scan_never_asks(self, qapp, tmp_path, monkeypatch):
+        """`_request_start` saves and then `accept()`s — only the reject path prompts."""
+        tab, project = _tab(qapp, tmp_path, monkeypatch)
+        dialog = QcDialog(project, tab.config)
+        monkeypatch.setattr(dialog, "accept", lambda: None)
+        asked: list[str] = []
+        monkeypatch.setattr(dialog, "_ask_unsaved", lambda: asked.append("asked") or "cancel")
+        dialog._add_chain_row("codex_cli", "gpt-5.6-luna", 3)
+        dialog._request_start()
+        assert not asked
+
     def test_a_blocked_novel_disables_the_save_button_too(
         self, qapp, tmp_path, monkeypatch
     ):
