@@ -346,6 +346,192 @@ class TestCliAgent:
                 engine.translate("你好")
 
 
+class TestCodexCli:
+    """Feature 088 — Codex CLI through `CliAgentTranslator`.
+
+    Shapes measured on codex-cli 0.154.0: the answer lands in the `-o` file, stdout may
+    repeat it, stderr carries a banner plus the echoed prompt, and an API failure ends
+    with an `ERROR: {json}` line.
+    """
+
+    DEFAULT = "codex exec --skip-git-repo-check --sandbox read-only --ephemeral"
+
+    def _result(self, stdout="", stderr="", returncode=0):
+        result = MagicMock()
+        result.stdout = stdout
+        result.stderr = stderr
+        result.returncode = returncode
+        return result
+
+    def _writes_answer(self, answer, *, stdout="", stderr="", returncode=0):
+        """A fake `subprocess.run` that behaves like codex: the answer goes to the -o file."""
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            path = cmd[cmd.index("--output-last-message") + 1]
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(answer)
+            return self._result(stdout=stdout, stderr=stderr, returncode=returncode)
+
+        return fake_run, calls
+
+    def _engine(self, command=DEFAULT, model="", name="codex_cli"):
+        engine = get_translator(name, cli_command=command, model=model)
+        engine.max_retries = 1
+        engine.retry_delay = 0.0
+        return engine
+
+    # --- argv normalisation ---------------------------------------------------------
+
+    def test_default_command_is_kept_as_is(self):
+        assert self._engine().args == self.DEFAULT.split()
+
+    def test_model_goes_right_after_exec(self):
+        engine = self._engine(model="gpt-5.6-luna")
+        assert engine.args[:4] == ["codex", "exec", "-m", "gpt-5.6-luna"]
+
+    def test_gui_model_replaces_one_in_the_command(self):
+        engine = self._engine("codex exec -m old --model=older --skip-git-repo-check", "new")
+        assert engine.args.count("-m") == 1
+        assert "old" not in engine.args and "--model=older" not in engine.args
+        assert engine.args[2:4] == ["-m", "new"]
+
+    def test_missing_pieces_are_added_once(self):
+        engine = self._engine("codex")
+        assert engine.args == [
+            "codex", "exec", "--skip-git-repo-check", "--sandbox", "read-only",
+        ]
+
+    def test_exec_after_root_options_is_found_not_duplicated(self):
+        engine = self._engine("codex -c model_reasoning_effort=low exec", model="gpt-5.5")
+        assert engine.args.count("exec") == 1
+        assert engine.args[3:6] == ["exec", "-m", "gpt-5.5"]
+
+    def test_the_e_alias_counts_as_exec(self):
+        assert self._engine("codex e").args[:2] == ["codex", "e"]
+
+    def test_an_explicit_sandbox_choice_is_left_alone(self):
+        engine = self._engine("codex exec -s workspace-write")
+        assert "read-only" not in engine.args
+        assert "--sandbox" not in engine.args
+
+    def test_a_trailing_claude_style_p_is_dropped(self):
+        # in codex, -p is --profile and would swallow the next argument
+        assert "-p" not in self._engine("codex -p").args
+
+    def test_the_cli_engine_running_codex_gets_the_same_treatment(self):
+        # (a Windows path must be quoted: the command is split POSIX-style, which eats
+        # unquoted backslashes — true of every CLI engine, not just this one)
+        for command in ("codex exec", "/opt/homebrew/bin/codex", r"'C:\npm\codex.cmd' exec"):
+            engine = self._engine(command, name="cli")
+            assert "--skip-git-repo-check" in engine.args, command
+
+    def test_other_binaries_are_not_normalised(self):
+        assert get_translator("claude_cli", cli_command="claude -p").args == ["claude", "-p"]
+
+    # --- running it -----------------------------------------------------------------
+
+    def test_prompt_goes_on_stdin_and_the_answer_comes_from_the_file(self):
+        fake_run, calls = self._writes_answer(
+            "Phó Thanh Từ cười.\n",
+            stdout="OpenAI Codex v0.154.0\n--------\nworkdir: /tmp\n",  # banner noise
+        )
+        with patch("noveltrans.translators.cli_agent.subprocess.run", side_effect=fake_run):
+            assert self._engine().translate("傅清辭笑了。", target="vi") == "Phó Thanh Từ cười."
+        import tempfile
+
+        cmd, kwargs = calls[0]
+        assert cmd[-1] == "-"
+        assert all("傅清辭" not in arg for arg in cmd)  # never in argv
+        assert "傅清辭笑了。" in kwargs["input"]
+        assert "Hán-Việt" in kwargs["input"]
+        assert kwargs["cwd"] == tempfile.gettempdir()
+
+    def test_the_answer_file_is_removed_afterwards(self):
+        import os
+
+        fake_run, calls = self._writes_answer("Chào.")
+        with patch("noveltrans.translators.cli_agent.subprocess.run", side_effect=fake_run):
+            self._engine().translate("你好")
+        cmd, _ = calls[0]
+        assert not os.path.exists(cmd[cmd.index("--output-last-message") + 1])
+
+    def test_an_empty_answer_file_raises_with_the_error_line(self):
+        fake_run, _ = self._writes_answer("", stderr="user\n你好\nERROR: stream disconnected\n")
+        with patch("noveltrans.translators.cli_agent.subprocess.run", side_effect=fake_run):
+            with pytest.raises(TranslateError, match="không trả về.*stream disconnected"):
+                self._engine().translate("你好")
+
+    def test_an_api_error_shows_only_its_message(self):
+        stderr = (
+            "OpenAI Codex v0.154.0\n--------\nuser\nTranslate…\n第429章 江妤笑了。\n"
+            'ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error",'
+            '"message":"The \'gpt-x\' model is not supported when using Codex with a '
+            'ChatGPT account."}}\n'
+        )
+        fake_run, _ = self._writes_answer("", stderr=stderr, returncode=1)
+        with patch("noveltrans.translators.cli_agent.subprocess.run", side_effect=fake_run):
+            with pytest.raises(TranslateError) as excinfo:
+                self._engine().translate("第429章 江妤笑了。")
+        message = str(excinfo.value)
+        assert "đổi model" in message
+        assert "江妤" not in message  # the echoed chapter stays out of the error
+        assert "agy" not in message  # and 第429章 is not mistaken for agy's quota error
+
+    def test_an_echoed_chapter_cannot_trigger_a_canned_message(self):
+        stderr = "user\n第401章 usage limit\nERROR: stream disconnected before completion\n"
+        fake_run, _ = self._writes_answer("", stderr=stderr, returncode=1)
+        with patch("noveltrans.translators.cli_agent.subprocess.run", side_effect=fake_run):
+            with pytest.raises(TranslateError, match="stream disconnected before completion"):
+                self._engine().translate("第401章")
+
+    def test_usage_limit_and_login_failures_get_advice(self):
+        cases = [
+            ("ERROR: You've hit your usage limit. Try again later.", "hạn mức"),
+            ('ERROR: {"status":401,"error":{"message":"401 Unauthorized"}}', "codex login"),
+        ]
+        for stderr, expected in cases:
+            fake_run, _ = self._writes_answer("", stderr=stderr, returncode=1)
+            with patch("noveltrans.translators.cli_agent.subprocess.run", side_effect=fake_run):
+                with pytest.raises(TranslateError, match=expected):
+                    self._engine().translate("你好")
+
+    def test_codex_advice_is_not_given_for_claude_failures(self):
+        with patch("noveltrans.translators.cli_agent.subprocess.run") as mock_run:
+            mock_run.return_value = self._result(stderr="Not logged in", returncode=1)
+            engine = get_translator("claude_cli", cli_command="claude -p")
+            engine.max_retries = 1
+            engine.retry_delay = 0.0
+            with pytest.raises(TranslateError) as excinfo:
+                engine.translate("你好")
+        assert "codex" not in str(excinfo.value).lower()
+
+    def test_other_engines_still_get_the_prompt_in_argv_and_no_stdin(self):
+        with patch("noveltrans.translators.cli_agent.subprocess.run") as mock_run:
+            mock_run.return_value = self._result(stdout="Chào.\n")
+            get_translator("claude_cli", cli_command="claude -p").translate("你好")
+        assert "input" not in mock_run.call_args.kwargs
+        assert "你好" in mock_run.call_args.args[0][-1]
+
+    def test_windows_resolves_npm_cmd_shims(self, monkeypatch):
+        from noveltrans.translators import cli_agent
+
+        monkeypatch.setattr(cli_agent, "_ON_WINDOWS", True)
+        fake_run, calls = self._writes_answer("Chào.")
+        with patch.object(cli_agent.shutil, "which", return_value=r"C:\npm\codex.cmd"):
+            with patch("noveltrans.translators.cli_agent.subprocess.run", side_effect=fake_run):
+                self._engine().translate("你好")
+        assert calls[0][0][0] == r"C:\npm\codex.cmd"
+
+    def test_an_unresolvable_binary_is_passed_through_on_windows(self, monkeypatch):
+        from noveltrans.translators import cli_agent
+
+        monkeypatch.setattr(cli_agent, "_ON_WINDOWS", True)
+        with patch.object(cli_agent.shutil, "which", return_value=None):
+            assert cli_agent._resolve_executable("codex") == "codex"
+
+
 class TestLmStudio:
     URL = "http://127.0.0.1:1234"
 
@@ -443,6 +629,7 @@ class TestTranslateWorkerLabel:
             (dict(engine_name="claude", model="claude-haiku-4-5"), "Claude API (claude-haiku-4-5)"),
             (dict(engine_name="cli", cli_command="agy -p"), "CLI (agy)"),
             (dict(engine_name="claude_cli", cli_command="claude -p"), "CLI (claude)"),
+            (dict(engine_name="codex_cli", cli_command="codex exec"), "CLI (codex)"),
             (
                 dict(engine_name="cli", cli_command="agy -p", model="Gemini 3.1 Pro (Low)"),
                 "CLI (agy, Gemini 3.1 Pro (Low))",
@@ -463,6 +650,13 @@ class TestRegistry:
     def test_claude_cli_uses_cli_command(self):
         engine = get_translator("claude_cli", cli_command="claude -p")
         assert engine.args == ["claude", "-p"]
+
+    def test_codex_cli_is_a_cli_agent(self):
+        from noveltrans.translators.cli_agent import CliAgentTranslator
+
+        engine = get_translator("codex_cli", cli_command="codex exec")
+        assert isinstance(engine, CliAgentTranslator)
+        assert engine.args[:2] == ["codex", "exec"]
 
 
 class TestSiteAdsFilter:

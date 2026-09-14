@@ -201,3 +201,15 @@ class TestNoConsoleKwargs:
         monkeypatch.setattr(runtime_env.sys, "platform", "darwin")
 
         assert no_console_kwargs() == {}
+
+
+def test_windows_candidates_include_npm_global_shims(monkeypatch, tmp_path):
+    # `npm i -g @openai/codex` installs codex.cmd here, off the PATH Explorer launches with
+    monkeypatch.setattr(runtime_env.sys, "platform", "win32")
+    home = tmp_path / "home"
+    npm_dir = home / "AppData" / "Roaming" / "npm"
+    npm_dir.mkdir(parents=True)
+
+    parts = augment_tool_path({}, home=home).split(os.pathsep)
+
+    assert str(npm_dir) in parts

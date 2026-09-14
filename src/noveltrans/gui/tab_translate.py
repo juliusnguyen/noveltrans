@@ -20,7 +20,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from noveltrans.config import TARGET_LANGS, AppConfig, translator_labels
+from noveltrans.config import (
+    CLI_ENGINES,
+    CLI_MODEL_SUGGESTIONS,
+    TARGET_LANGS,
+    AppConfig,
+    translator_labels,
+)
 from noveltrans.find_replace import FIELD_TRANSLATED, FIELD_TRANSLATED_TITLE
 from noveltrans.gui.find_replace_dialog import FindReplaceDialog
 from noveltrans.gui.jobs import job_registry
@@ -52,6 +58,7 @@ from noveltrans.gui.workers import (
 )
 from noveltrans.models import Chapter
 from noveltrans.storage import NovelProject
+from noveltrans.translators.cli_agent import binary_name
 
 # Batches of this many chapters or more ask before starting; smaller ones just run, so the
 # per-row "↻ Dịch lại" button stays a one-click action. Same threshold as the audio tab's
@@ -266,7 +273,7 @@ class TranslateTab(QWidget):
 
     def _on_engine_changed(self, *_args) -> None:
         engine = self.engine_combo.currentData()
-        is_cli = engine in ("cli", "claude_cli")
+        is_cli = engine in CLI_ENGINES
         is_lmstudio = engine == "lmstudio"
         self.url_label.setVisible(is_lmstudio)
         self.url_edit.setVisible(is_lmstudio)
@@ -278,8 +285,9 @@ class TranslateTab(QWidget):
             source = url
         elif is_cli:
             source = self._cli_binary_for(engine)
-            if engine == "claude_cli":
-                self._model_suggestions.setdefault(source, ["haiku", "sonnet", "opus"])
+            known = CLI_MODEL_SUGGESTIONS.get(binary_name(source)) if source else None
+            if known is not None:  # seeding also stops `_fetch_models` running `<binary> models`
+                self._model_suggestions.setdefault(source, list(known))
         else:
             return
         self._set_model_items(self._model_suggestions.get(source, []))
@@ -319,7 +327,7 @@ class TranslateTab(QWidget):
         engine = self.engine_combo.currentData()
         if engine == "lmstudio":
             current = self.config.lmstudio_url
-        elif engine in ("cli", "claude_cli"):
+        elif engine in CLI_ENGINES:
             current = self._cli_binary_for(engine)
         else:
             return
@@ -494,7 +502,7 @@ class TranslateTab(QWidget):
 
         engine = self.engine_combo.currentData()
         base_url = ""
-        if engine in ("cli", "claude_cli", "lmstudio"):
+        if engine in CLI_ENGINES or engine == "lmstudio":
             model = self.model_combo.currentText().strip()
             self.config.set_cli_model_for(engine, model)
             if engine == "lmstudio":

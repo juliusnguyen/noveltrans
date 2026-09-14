@@ -37,8 +37,8 @@ way `rewrite.py` warns against harmonising its loop with `Translator._translate_
   worse than doing nothing.
 
 Prompts are **task-framed, never role-framed**, and are passed to `complete()` positionally
-with no `system=`: `CliAgentTranslator.complete` appends the prompt as the final argv entry
-of a subprocess and has no second channel. Both constraints are `rewrite.py`'s, unchanged.
+with no `system=`: `CliAgentTranslator.complete` hands the prompt to a subprocess (final argv
+entry, or stdin for Codex) and has no second channel. Both constraints are `rewrite.py`'s, unchanged.
 """
 
 from __future__ import annotations

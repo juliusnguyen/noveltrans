@@ -63,6 +63,8 @@ def _candidate_dirs(home: Path) -> list[str]:
             *_WINDOWS_TOOL_DIRS,
             str(home / "scoop" / "shims"),
             str(home / "AppData" / "Local" / "Microsoft" / "WinGet" / "Links"),
+            # `npm i -g` puts its CLI shims (codex.cmd, claude.cmd…) here
+            str(home / "AppData" / "Roaming" / "npm"),
         ]
     return [*_TOOL_DIRS, str(home / ".local" / "bin")]
 

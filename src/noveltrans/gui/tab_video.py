@@ -56,7 +56,7 @@ from PySide6.QtWidgets import (
 )
 
 from noveltrans import video_settings
-from noveltrans.config import LLM_ENGINES, AppConfig, translator_labels
+from noveltrans.config import CLI_ENGINES, LLM_ENGINES, AppConfig, translator_labels
 from noveltrans.gui.job_popup import BROWSER_PAUSE_HINT
 from noveltrans.gui.jobs import job_registry
 from noveltrans.gui.keep_awake import track_worker
@@ -2824,7 +2824,7 @@ class VideoTab(QWidget):
         if not model:
             if engine == "claude":
                 model = self.config.claude_model
-            elif engine in ("cli", "claude_cli"):
+            elif engine in CLI_ENGINES:
                 model = self.config.cli_model_for(engine)
         return {
             "engine_name": engine,
