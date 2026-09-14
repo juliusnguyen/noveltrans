@@ -107,6 +107,15 @@ def _friendly_error(detail: str) -> str:
     return ""
 
 
+# The backend names the model it rejected: `The 'sonnet' model is not supported when using
+# Codex with a ChatGPT account.` Keeping that name is the difference between an error the
+# user can act on and one that reads as "Codex is broken on this machine" — the model that
+# reaches Codex is almost always ANOTHER engine's, left behind by an engine switch, and
+# advice that only says "change the model" is useless to someone whose Model box already
+# looks right. The model can also come from the QC chain, so the advice names both places.
+_UNSUPPORTED_MODEL = re.compile(r"The '([^']{1,80})' model is not supported", re.IGNORECASE)
+
+
 def _friendly_codex_error(message: str) -> str:
     """`_friendly_error` for Codex's own failures. "" when unrecognised.
 
@@ -115,9 +124,13 @@ def _friendly_codex_error(message: str) -> str:
     """
     lowered = message.lower()
     if "not supported when using codex" in lowered:  # verbatim on codex-cli 0.154.0
+        found = _UNSUPPORTED_MODEL.search(message)
+        named = f" '{found.group(1)}'" if found else ""
         return (
-            "tài khoản ChatGPT không dùng được model này với Codex — đổi model trong ô "
-            "Model (hoặc để trống để dùng model mặc định của Codex)."
+            f"tài khoản ChatGPT không dùng được model{named} với Codex. Thường đây là model "
+            "của engine khác còn sót lại (ví dụ 'sonnet' của Claude CLI). Chọn một model "
+            "Codex (gpt-5.6-luna, gpt-5.6-terra…) hoặc để trống để dùng model mặc định — ô "
+            "Model ở tab Dịch, và cột Model trong bảng engine ở Kiểm tra chất lượng."
         )
     if "usage limit" in lowered or "usage_limit_reached" in lowered:
         return (

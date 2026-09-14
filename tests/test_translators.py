@@ -7,6 +7,7 @@ import responses
 from noveltrans.errors import TranslateError
 from noveltrans.translators import get_translator
 from noveltrans.translators.base import Translator, split_paragraph_chunks
+from noveltrans.translators.cli_agent import binary_name
 
 
 class TestChunking:
@@ -170,8 +171,11 @@ class TestCliAgent:
 
             assert mock_run.call_args.kwargs["cwd"] == tempfile.gettempdir()
             args = mock_run.call_args.args[0]
-            # agy gets a debug log for error detail; the flag must precede -p
-            assert args[0] == "agy"
+            # agy gets a debug log for error detail; the flag must precede -p.
+            # Compared by binary name, not verbatim: on a real Windows box with agy
+            # installed, `_resolve_executable` has already turned this into the full
+            # `…\agy.EXE` path — which is the point of it, and not what this asserts.
+            assert binary_name(args[0]) == "agy"
             assert args[1] == "--log-file"
             assert args[3:6] == ["-p", "--model", "Gemini 3.1 Pro (Low)"]
             assert "傅清辭笑了。" in args[-1]
@@ -475,9 +479,22 @@ class TestCodexCli:
             with pytest.raises(TranslateError) as excinfo:
                 self._engine().translate("第429章 江妤笑了。")
         message = str(excinfo.value)
-        assert "đổi model" in message
+        # Naming the rejected model is the point: the one that gets here is almost always
+        # another engine's, and "change the model" alone reads as "Codex is broken" to
+        # someone whose Model box already looks right.
+        assert "'gpt-x'" in message
+        assert "Kiểm tra chất lượng" in message  # the chain is the other place it comes from
         assert "江妤" not in message  # the echoed chapter stays out of the error
         assert "agy" not in message  # and 第429章 is not mistaken for agy's quota error
+
+    def test_an_unnamed_unsupported_model_still_advises(self):
+        """The name is a bonus, never a requirement — a reworded backend message must not
+        cost the user the advice."""
+        stderr = 'ERROR: {"error":{"message":"that model is not supported when using Codex."}}\n'
+        fake_run, _ = self._writes_answer("", stderr=stderr, returncode=1)
+        with patch("noveltrans.translators.cli_agent.subprocess.run", side_effect=fake_run):
+            with pytest.raises(TranslateError, match="gpt-5.6-luna"):
+                self._engine().translate("你好")
 
     def test_an_echoed_chapter_cannot_trigger_a_canned_message(self):
         stderr = "user\n第401章 usage limit\nERROR: stream disconnected before completion\n"

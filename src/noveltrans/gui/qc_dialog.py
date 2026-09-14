@@ -36,7 +36,14 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from noveltrans.config import DEFAULT_QC_ATTEMPTS, LLM_ENGINES, MAX_QC_ATTEMPTS, AppConfig, translator_labels
+from noveltrans.config import (
+    CLI_ENGINES,
+    DEFAULT_QC_ATTEMPTS,
+    LLM_ENGINES,
+    MAX_QC_ATTEMPTS,
+    AppConfig,
+    translator_labels,
+)
 from noveltrans.gui.workers import chapters_to_qc
 from noveltrans.storage import NovelProject
 from noveltrans.translators.qc import QC_LABELS
@@ -106,6 +113,12 @@ class QcDialog(QDialog):
         self.engine_combo.setCurrentIndex(index if index >= 0 else 0)
         self.model_edit = QLineEdit(config.qc_ai_model)
         self.model_edit.setPlaceholderText("model mặc định của engine")
+        # Connected AFTER the saved value is in, so opening the dialog never rewrites it.
+        self.engine_combo.currentIndexChanged.connect(
+            lambda _i: self.model_edit.setText(
+                self._remembered_model(self.engine_combo.currentData())
+            )
+        )
         judge_row.addWidget(self.engine_combo, stretch=1)
         judge_row.addWidget(QLabel("Model:"))
         judge_row.addWidget(self.model_edit, stretch=1)
@@ -224,6 +237,23 @@ class QcDialog(QDialog):
 
     # -------------------------------------------------------------- the chain
 
+    def _remembered_model(self, engine: str) -> str:
+        """The model this engine was last used with — "" when it has none.
+
+        A model belongs to exactly ONE engine: handing Codex a `sonnet` left behind by
+        Claude CLI is not a graceful fallback, it is a hard 400 from the backend that fails
+        every chapter ("The 'sonnet' model is not supported when using Codex with a ChatGPT
+        account"). The Translate tab already reloads the model per engine; the boxes here
+        did not, so switching an engine silently kept the previous one's model — the one
+        way this dialog could produce a chain that cannot translate anything at all.
+        """
+        engine = engine or ""
+        if engine in CLI_ENGINES or engine == "lmstudio":
+            return self.config.cli_model_for(engine)
+        if engine == "claude":
+            return self.config.claude_model
+        return ""
+
     def _add_chain_row(self, engine_name: str = "", model: str = "", attempts: int = 0) -> None:
         row = self.chain_table.rowCount()
         self.chain_table.insertRow(row)
@@ -234,7 +264,14 @@ class QcDialog(QDialog):
         index = combo.findData(engine_name or self.config.qc_ai_engine)
         combo.setCurrentIndex(index if index >= 0 else 0)
         self.chain_table.setCellWidget(row, 0, combo)
-        self.chain_table.setCellWidget(row, 1, QLineEdit(model))
+        model_edit = QLineEdit(model)
+        model_edit.setPlaceholderText("model mặc định của engine")
+        self.chain_table.setCellWidget(row, 1, model_edit)
+        # Connected after both widgets carry their saved values, so building a row (and
+        # `_move_chain_row`, which rebuilds every row) never rewrites the model.
+        combo.currentIndexChanged.connect(
+            lambda _i, c=combo, e=model_edit: e.setText(self._remembered_model(c.currentData()))
+        )
         spin = QSpinBox()
         spin.setRange(1, MAX_QC_ATTEMPTS)
         spin.setValue(attempts or DEFAULT_QC_ATTEMPTS)
