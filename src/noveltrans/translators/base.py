@@ -159,6 +159,18 @@ class Translator(ABC):
         # migration-time can never disagree about what a damaged title should become.
         return repaired_title(title, best, target) or title
 
+    def translate_title(self, title: str, source: str = "zh", target: str = "vi") -> str:
+        """Translate ONLY a chapter title, exactly as `translate_chapter` would.
+
+        For re-translating a heading without paying for the body again (feature 094): a
+        chapter whose body passed QC but whose title came back in Chinese. Same guard, same
+        watermark filter, so a title fixed this way cannot differ from one translated with
+        its chapter.
+        """
+        if not title:
+            return ""
+        return drop_site_ads(self._safe_title(title, source, target).strip())
+
     def translate_chapter(
         self, title: str, content: str, source: str = "zh", target: str = "vi",
         *, retry_hint: str = "",
@@ -169,7 +181,7 @@ class Translator(ABC):
         It reaches the BODY only: `_safe_title` already has its own repair path, and a hint
         about the body's language would be noise on a heading like `第127章`.
         """
-        translated_title = self._safe_title(title, source, target) if title else ""
+        translated_title = self.translate_title(title, source, target)
         chunks = split_paragraph_chunks(content, self.max_chunk_chars)
         translated_chunks = [
             self._translate_with_retry(c, source, target, retry_hint) for c in chunks
@@ -181,6 +193,6 @@ class Translator(ABC):
         # the joined body, so a paragraph break at a chunk seam normalises correctly.
         # `complete()` is deliberately NOT filtered: tags and image prompts go through it.
         return (
-            drop_site_ads(translated_title.strip()),
+            translated_title,
             drop_site_ads("\n\n".join(translated_chunks).strip()),
         )

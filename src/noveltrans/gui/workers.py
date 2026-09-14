@@ -289,9 +289,13 @@ class TranslateWorker(PausableWorker):
         base_url: str = "",
         indices: list[int] | None = None,
         qc: QcSettings | None = None,
+        title_only: frozenset[int] | set[int] = frozenset(),
         parent=None,
     ):
         super().__init__(parent)
+        # Chapters among `indices` whose body is kept and only the title re-translated
+        # (feature 094). A chapter with no translated body falls back to a full translation.
+        self.title_only = frozenset(title_only)
         self.project_path = Path(project_path)
         self.engine_name = engine_name
         self.target_lang = target_lang
@@ -331,9 +335,60 @@ class TranslateWorker(PausableWorker):
                         retry_hint=hint,
                     ),
                     attempts=spec.attempts,
+                    translate_title=lambda title, t=translator: t.translate_title(
+                        title, source=source_lang, target=self.target_lang,
+                    ),
                 )
             )
         return plans
+
+    def _retranslate_title(
+        self, project: NovelProject, chapter, source_title: str, plans: list, judge, glossary
+    ) -> bool:
+        """Fix one chapter's title and re-judge the chapter. False when it still fails.
+
+        The body is never sent to an engine and never written. The re-judge matters: a
+        title failure stopped the scan before the LLM judge ever read the body, so the body
+        has only passed the cheap checks — this is where it gets its first full verdict.
+        """
+        from noveltrans.translators.qc import check_translation, retranslate_title_with_qc
+
+        outcome = retranslate_title_with_qc(
+            plans, source_title, target=self.target_lang,
+            should_stop=lambda: self._cancelled,
+        )
+        if not outcome.ok:
+            if self._cancelled:
+                return True  # stopped between attempts: nothing written, nothing failed
+            # The old title stays — see `retranslate_title_with_qc`. Re-marked so the row
+            # is still red and still offered in the result view.
+            project.mark_qc_failed(
+                chapter.index, outcome.verdict.code, outcome.verdict.reason,
+                chapter.qc_fingerprint(), outcome.attempts_used,
+            )
+            self.chapter_error.emit(chapter.index, outcome.verdict.reason)
+            return False
+
+        project.save_title_translation(chapter.index, outcome.title)
+        fresh = project.chapter(chapter.index)
+        verdict = check_translation(
+            fresh.content, fresh.translated_title, fresh.translated,
+            target=self.target_lang, glossary=glossary,
+        )
+        if verdict.ok and judge is not None:
+            verdict = judge(fresh.translated)
+        if verdict.ok:
+            project.save_qc_verdict(
+                chapter.index, QC_STATUS_OK, "", "", fresh.qc_fingerprint(),
+                outcome.attempts_used,
+            )
+            return True
+        project.mark_qc_failed(
+            chapter.index, verdict.code, verdict.reason, fresh.qc_fingerprint(),
+            outcome.attempts_used,
+        )
+        self.chapter_error.emit(chapter.index, verdict.reason)
+        return False
 
     def _run_identity(self, project: NovelProject, pending: list) -> None:
         """Passthrough 'translation' when source_lang == target_lang: copy the
@@ -475,6 +530,22 @@ class TranslateWorker(PausableWorker):
                     )
                     return
                 qc_judge = build_qc_judge(self.qc.judge)
+            # Title-only chapters use the QC chain when there is one, else the tab's engine
+            # once — the same engines a full re-translation of them would have used.
+            title_plans = qc_plans
+            if title_plans is None and self.title_only:
+                from noveltrans.translators.qc import QcAttemptPlan
+
+                title_plans = [
+                    QcAttemptPlan(
+                        label=self.engine_label(),
+                        translate=lambda *_args: ("", ""),  # never called on this path
+                        attempts=1,
+                        translate_title=lambda title: translator.translate_title(
+                            title, source=project.meta.source_lang, target=self.target_lang,
+                        ),
+                    )
+                ]
 
             for chapter in pending:
                 if self._checkpoint():
@@ -484,7 +555,15 @@ class TranslateWorker(PausableWorker):
                     source_title = apply_glossary(chapter.title, glossary)
                     source_content = apply_glossary(chapter.content, glossary)
                     started = time.monotonic()
-                    if qc_plans is None:
+                    if chapter.index in self.title_only and chapter.translated:
+                        self.progress.emit(done, total, f"{chapter.title} — dịch lại tiêu đề")
+                        if not self._retranslate_title(
+                            project, chapter, source_title, title_plans, qc_judge, qc_glossary
+                        ):
+                            errors += 1
+                            done += 1
+                            continue
+                    elif qc_plans is None:
                         title, text = translator.translate_chapter(
                             source_title,
                             source_content,
@@ -741,6 +820,27 @@ def chapters_to_qc(
         chapters = (project.chapter(i) for i in indices)
         return [c for c in chapters if c is not None and c.translated]
     return project.pending_qc(target_lang, start_idx, end_idx, force=force)
+
+
+def split_retranslation(chapters: list) -> tuple[list[int], list[int]]:
+    """(title-only, full) chapter indices for re-translating QC failures, in given order.
+
+    A chapter whose ONLY failure is its title keeps its body: the body passed, and sending
+    it again costs thousands of tokens to fix a dozen characters (feature 094). It needs a
+    translated body to keep — without one there is nothing to protect and it goes full.
+
+    Shared by `QcResultDialog` and the tab for the same reason as `chapters_to_qc`: what the
+    dialog says the click will do has to be what the worker then does.
+    """
+    from noveltrans.translators.qc import QC_TITLE_UNTRANSLATED
+
+    title_only, full = [], []
+    for chapter in chapters:
+        if chapter.qc_code == QC_TITLE_UNTRANSLATED and chapter.translated:
+            title_only.append(chapter.index)
+        else:
+            full.append(chapter.index)
+    return title_only, full
 
 
 class QcScanWorker(PausableWorker):

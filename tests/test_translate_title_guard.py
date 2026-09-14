@@ -119,6 +119,25 @@ class TestTheBodyIsNeverLostToATitle:
         assert body == "Nội dung."
 
 
+class TestTranslateTitleAlone:
+    """Feature 094 — `translate_title` is the title half of `translate_chapter`, exactly."""
+
+    def test_it_never_sends_a_body(self):
+        engine = ScriptedTranslator(["Chương 1: Trọng sinh"])
+        assert engine.translate_title("第1章 重生") == "Chương 1: Trọng sinh"
+        assert engine.seen == ["第1章 重生"]
+
+    def test_it_keeps_the_same_guard(self):
+        engine = ScriptedTranslator([REFUSAL] * 4)
+        assert engine.translate_title("第268章 對不起通訊器先生") == "第268章 對不起通訊器先生"
+        assert engine.translate_title("第127章") == "Chương 127"  # still no model call
+
+    def test_an_empty_title_costs_nothing(self):
+        engine = ScriptedTranslator([])
+        assert engine.translate_title("") == ""
+        assert engine.seen == []
+
+
 class TestRefusalInABody:
     def test_a_body_refusal_is_retried_not_saved(self):
         engine = ScriptedTranslator([REFUSAL, "Nội dung thật."])

@@ -63,6 +63,7 @@ QC_REFUSAL = "refusal"
 QC_TRUNCATED = "truncated"
 QC_HAN_VIET = "han_viet"
 QC_NAME_DRIFT = "name_drift"
+QC_TITLE_UNTRANSLATED = "title_untranslated"
 
 # Vietnamese labels for the result view. One per code, checked by a test, so a new code
 # cannot ship without a name the user can read.
@@ -75,6 +76,7 @@ QC_LABELS: dict[str, str] = {
     QC_TRUNCATED: "Bản dịch bị cắt ngắn",
     QC_HAN_VIET: "Đặc Hán-Việt (giọng convert)",
     QC_NAME_DRIFT: "Tên riêng viết sai",
+    QC_TITLE_UNTRANSLATED: "Tiêu đề còn chữ Hán",
 }
 
 # Worst first. Used to pick which failing attempt to keep under `Policy.KEEP_BEST`: a
@@ -89,6 +91,9 @@ QC_SEVERITY: tuple[str, ...] = (
     QC_TRUNCATED,
     QC_NAME_DRIFT,
     QC_HAN_VIET,
+    # Mildest of all: the body passed every check, only the heading is wrong. Ranked below
+    # Hán-Việt so `KEEP_BEST` never trades a good body for a bad one to get a clean title.
+    QC_TITLE_UNTRANSLATED,
     QC_OK,
 )
 
@@ -122,6 +127,11 @@ MAX_ENGLISH_WORD_RATE = 0.05  # highest real chapter 0.0077
 # four are genuinely broken: wholly Chinese, or Chinese and Vietnamese sentence by sentence.
 MAX_CJK_RATIO = 0.01
 MIN_CJK_CHARS = 20
+# A title gets no stray-glyph allowance. Across 4607 translated titles in the library, 4593
+# carry zero CJK characters and the other 14 carry 5 or more — every one of them the source
+# title saved back unchanged (`第1756章 星降噬凡軀`) or half-translated (`第1382章 曾Lý Phàm之死`).
+# Nothing sits in between, and a single glyph in a one-line heading is plainly visible.
+MIN_TITLE_CJK_CHARS = 1
 # zh→vi expands, so a body under a third of its SOURCE length lost content. Deliberately
 # looser than `rewrite.py`'s 0.60, which compares Vietnamese with Vietnamese.
 MIN_LENGTH_RATIO_VS_SOURCE = 0.35
@@ -307,7 +317,41 @@ def check_translation(
     is unavailable and that one check is skipped). Returns `OK_VERDICT` when nothing fires —
     which does NOT mean the translation is good, only that no cheap signal says otherwise.
     `judge_translation` is what looks at style.
+
+    The title is checked LAST, only once the body has passed: a body in the wrong language
+    is the thing to report, and a heading problem must not hide it.
     """
+    verdict = _check_body(source, body, target=target, glossary=glossary, profile=profile)
+    return verdict if not verdict.ok else check_title(title, target=target)
+
+
+def check_title(title: str, *, target: str = "vi") -> QcVerdict:
+    """A translated title must carry no Chinese.
+
+    The gap a reader found: `Translator._safe_title` falls back to the SOURCE title when the
+    engine's answer is unusable, so a chapter could be saved with a perfect Vietnamese body
+    under `第1756章 星降噬凡軀` — and QC, which only ever read the body, passed it. An empty
+    title checks nothing: there is no heading to be wrong.
+    """
+    leftover = cjk_count(title or "")
+    if target.startswith("zh") or leftover < MIN_TITLE_CJK_CHARS:
+        return OK_VERDICT
+    return QcVerdict(
+        QC_TITLE_UNTRANSLATED,
+        f"tiêu đề còn {leftover} chữ Hán chưa dịch: {title.strip()}",
+        {"title_cjk_chars": float(leftover)},
+    )
+
+
+def _check_body(
+    source: str,
+    body: str,
+    *,
+    target: str,
+    glossary: dict[str, str] | None,
+    profile: NameProfile | None,
+) -> QcVerdict:
+    """Every check on the chapter BODY, in the order `check_translation` documents."""
     text = (body or "").strip()
     if not text:
         return QcVerdict(QC_EMPTY, "bản dịch rỗng")
@@ -647,12 +691,18 @@ _RETRY_HINTS: dict[str, str] = {
     ),
 }
 
+# Codes that deliberately get NO hint. The hint reaches the chapter BODY only (see
+# `Translator.translate_chapter`), so telling it "translate the title" would ask the body
+# prompt for a heading it must not write. The retry still helps: the title failure is
+# non-deterministic, and a second attempt simply asks for the title again.
+NO_HINT_CODES = frozenset({QC_TITLE_UNTRANSLATED})
+
 
 def retry_hint_for(verdict: QcVerdict) -> str:
     """The instruction handed to the NEXT attempt, naming what this one got wrong.
 
     A specific nudge is actionable where a generic "try again" just burns a call — the same
-    reasoning `rewrite.py`'s `retry_reason` states.
+    reasoning `rewrite.py`'s `retry_reason` states. Empty for `NO_HINT_CODES`.
     """
     return _RETRY_HINTS.get(verdict.code, "")
 
@@ -679,6 +729,9 @@ class QcAttemptPlan:
     label: str  # what `save_translation` records, e.g. "CLI (agy)"
     translate: Callable[[str, str, str], tuple[str, str]]  # (title, content, hint) -> (title, body)
     attempts: int = DEFAULT_QC_ATTEMPTS
+    # (title) -> title. None = this engine cannot do a title on its own, and
+    # `retranslate_title_with_qc` skips it rather than paying for a whole chapter.
+    translate_title: Callable[[str], str] | None = None
 
 
 @dataclass
@@ -771,3 +824,59 @@ def translate_with_qc(
     if policy is Policy.STRICT:
         raise TranslateError(f"Bản dịch không đạt sau {attempts_used} lần thử: {best[3].reason}")
     return QcOutcome(best[0], best[1], best[2], best[3], attempts_used, history)
+
+
+# -- re-translating only the title --------------------------------------------
+
+
+@dataclass
+class TitleOutcome:
+    """The result of `retranslate_title_with_qc`. `title` is "" when nothing passed."""
+
+    title: str
+    engine_label: str
+    verdict: QcVerdict
+    attempts_used: int
+
+    @property
+    def ok(self) -> bool:
+        return self.verdict.ok
+
+
+def retranslate_title_with_qc(
+    plans: Sequence[QcAttemptPlan],
+    title: str,
+    *,
+    target: str = "vi",
+    should_stop: Callable[[], bool] = lambda: False,
+) -> TitleOutcome:
+    """Re-translate a chapter TITLE alone, walking the same chain `translate_with_qc` walks.
+
+    For a chapter whose only failure is `QC_TITLE_UNTRANSLATED` (feature 094): its body
+    already passed, so sending the body again would spend thousands of tokens to fix a
+    heading of a dozen characters — and could come back worse.
+
+    Always `Policy.STRICT` in effect: a failing attempt is never returned, because the
+    caller has a title on disk already, and one Chinese heading is no better than another.
+    Never raises: an engine error moves on to the next plan, and exhausting the chain is a
+    verdict, not an exception.
+    """
+    attempts_used = 0
+    verdict = QcVerdict(QC_TITLE_UNTRANSLATED, "không engine nào dịch được tiêu đề")
+    for plan in plans:
+        if plan.translate_title is None:
+            continue
+        for _ in range(max(1, plan.attempts)):
+            if should_stop():
+                return TitleOutcome("", "", verdict, attempts_used)
+            attempts_used += 1
+            try:
+                new_title = plan.translate_title(title)
+            except TranslateError:
+                break  # this engine is unusable — let the next plan try
+            verdict = check_title(new_title, target=target)
+            if verdict.ok and new_title.strip():
+                return TitleOutcome(new_title, plan.label, verdict, attempts_used)
+            if verdict.ok:
+                verdict = QcVerdict(QC_TITLE_UNTRANSLATED, "engine trả về tiêu đề rỗng")
+    return TitleOutcome("", "", verdict, attempts_used)

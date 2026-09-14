@@ -121,6 +121,22 @@ class TestResumeQueries:
         project.save_translation(0, "t", "dịch 2", "vi", translator="Google Translate")
         assert project.chapter(0).translator == "Google Translate"
 
+    def test_save_title_translation_touches_only_the_title(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        """Feature 094: a title fixed on its own must not cost the body or its record."""
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.save_content(0, "原文")
+        project.save_translation(0, "第1章 孤灯", "bản dịch", "vi", translator="CLI (agy)")
+        project.mark_qc_failed(0, "title_untranslated", "tiêu đề còn chữ Hán", "h")
+
+        project.save_title_translation(0, "Chương 1: Đèn cô độc")
+        chapter = project.chapter(0)
+        assert chapter.translated_title == "Chương 1: Đèn cô độc"
+        assert chapter.translated == "bản dịch"
+        assert chapter.translator == "CLI (agy)"
+        assert chapter.status == STATUS_TRANSLATED and chapter.error == ""
+
     def test_edit_translation_keeps_engine_metadata(
         self, library_dir, sample_meta, sample_refs
     ):

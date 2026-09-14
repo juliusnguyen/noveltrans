@@ -44,7 +44,7 @@ from noveltrans.config import (
     AppConfig,
     translator_labels,
 )
-from noveltrans.gui.workers import chapters_to_qc
+from noveltrans.gui.workers import chapters_to_qc, split_retranslation
 from noveltrans.storage import NovelProject
 from noveltrans.translators.qc import QC_LABELS
 
@@ -512,11 +512,14 @@ class QcResultDialog(QDialog):
         layout.addWidget(self.table, stretch=1)
 
         layout.addWidget(
-            QLabel(
-                "Nhấp đúp vào một dòng để mở chương đó ra đọc trước khi quyết định. "
-                "Dịch lại sẽ <b>xoá bản dịch hiện tại</b> của những chương được chọn."
-            )
+            QLabel("Nhấp đúp vào một dòng để mở chương đó ra đọc trước khi quyết định.")
         )
+        # What the click will cost, recomputed as boxes are ticked — see `_refresh_plan`.
+        self.plan_label = QLabel()
+        self.plan_label.setWordWrap(True)
+        layout.addWidget(self.plan_label)
+        self._chapters: dict[int, object] = {}
+        self.table.itemChanged.connect(lambda _item: self._refresh_plan())
 
         select_all = QPushButton("Chọn tất cả")
         select_all.clicked.connect(lambda: self._set_all_checked(True))
@@ -539,6 +542,8 @@ class QcResultDialog(QDialog):
 
     def set_chapters(self, chapters: list) -> None:
         """(Re)fill the table — also used to refresh after a re-translate run."""
+        self._chapters = {chapter.index: chapter for chapter in chapters}
+        self.table.blockSignals(True)  # one plan refresh at the end, not one per cell
         self.table.setRowCount(0)
         for chapter in chapters:
             row = self.table.rowCount()
@@ -556,7 +561,9 @@ class QcResultDialog(QDialog):
             label = QC_LABELS.get(chapter.qc_code) or "Không đạt"
             self.table.setItem(row, self.ERROR_COLUMN, QTableWidgetItem(label))
             self.table.setItem(row, self.DETAIL_COLUMN, QTableWidgetItem(chapter.qc_reason))
+        self.table.blockSignals(False)
         self.table.resizeColumnsToContents()
+        self._refresh_plan()
         self.summary_label.setText(
             f"<b>{len(chapters)} chương</b> chưa đạt. Đọc lại rồi chọn những chương muốn "
             "dịch lại — bản dịch cũ của chương KHÔNG chọn vẫn giữ nguyên."
@@ -576,6 +583,25 @@ class QcResultDialog(QDialog):
             for row in range(self.table.rowCount())
             if self.table.item(row, self.CHECK_COLUMN).checkState() == Qt.CheckState.Checked
         ]
+
+    def _refresh_plan(self) -> None:
+        """Say, before the click, which ticked chapters keep their body (feature 094).
+
+        Counted by `split_retranslation`, the same function the tab hands the worker, so
+        the sentence cannot promise a cheaper run than the one that happens.
+        """
+        chosen = [self._chapters[i] for i in self.checked_indices() if i in self._chapters]
+        title_only, full = split_retranslation(chosen)
+        parts = []
+        if title_only:
+            parts.append(
+                f"<b>{len(title_only)} chương chỉ dịch lại tiêu đề</b> — giữ nguyên nội dung"
+            )
+        if full:
+            parts.append(
+                f"<b>{len(full)} chương dịch lại toàn bộ</b> — xoá bản dịch hiện tại"
+            )
+        self.plan_label.setText("Sẽ dịch lại: " + "; ".join(parts) + "." if parts else "")
 
     def _on_double_click(self, index) -> None:
         item = self.table.item(index.row(), self.CHECK_COLUMN)

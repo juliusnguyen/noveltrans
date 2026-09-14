@@ -293,6 +293,44 @@ class TestRetranslateFromTheResultView:
         assert project.chapter(0).translated == GOOD_VI
 
 
+class TestTitleOnlyFromTheResultView:
+    """Feature 094 — a heading-only failure must not cost the chapter its body."""
+
+    def _mark(self, project, idx, code):
+        project.save_qc_verdict(
+            idx, QC_STATUS_FAIL, code, "lý do", project.chapter(idx).qc_fingerprint(), 2
+        )
+
+    def test_the_dialog_says_which_chapters_keep_their_body(self, qapp, tmp_path, monkeypatch):
+        tab, project = _tab(qapp, tmp_path, monkeypatch)
+        self._mark(project, 0, "title_untranslated")
+        self._mark(project, 1, "not_vietnamese")
+        dialog = QcResultDialog(project.qc_failures())
+        text = dialog.plan_label.text()
+        assert "1 chương chỉ dịch lại tiêu đề" in text
+        assert "1 chương dịch lại toàn bộ" in text
+
+        dialog.table.item(1, dialog.CHECK_COLUMN).setCheckState(
+            dialog.table.item(1, dialog.CHECK_COLUMN).checkState().Unchecked
+        )
+        assert "toàn bộ" not in dialog.plan_label.text()  # follows the ticks live
+
+    def test_the_tab_keeps_title_only_bodies_and_clears_the_rest(
+        self, qapp, tmp_path, monkeypatch
+    ):
+        tab, project = _tab(qapp, tmp_path, monkeypatch)
+        self._mark(project, 0, "title_untranslated")
+        self._mark(project, 1, "not_vietnamese")
+        started: list = []
+        monkeypatch.setattr(tab, "_start_translate", lambda **kw: started.append(kw))
+
+        tab._retranslate_qc_failures([0, 1])
+
+        assert started == [{"indices": [0, 1], "title_only": {0}}]
+        assert project.chapter(0).translated == GOOD_VI  # kept: only its title is redone
+        assert project.chapter(1).translated == ""  # dropped, as before
+
+
 class TestQcDialog:
     def test_google_is_never_offered_as_a_judge(self, qapp, tmp_path, monkeypatch):
         tab, project = _tab(qapp, tmp_path, monkeypatch)
