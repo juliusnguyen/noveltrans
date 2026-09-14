@@ -76,13 +76,18 @@ class RewriteDialog(QDialog):
             self._blocked = "Tính năng này chỉ dành cho bản dịch tiếng Việt."
 
         layout = QVBoxLayout(self)
-        layout.addWidget(
-            QLabel(
-                "Dùng AI viết lại bản dịch cho đúng văn phong tiếng Việt — sắp xếp lại "
-                "trật tự từ,\nbỏ chỗ lặp thừa. <b>Giữ nguyên tên riêng Hán-Việt và xưng "
-                "hô</b> (hắn, nàng, y, thị…),\nkhông tóm tắt, không thêm bớt nội dung."
-            )
+        # `<br>`, not `\n`, and the format stated outright. A QLabel defaults to AutoText,
+        # and Qt's `mightBeRichText()` heuristic stops scanning at the FIRST newline — so
+        # with `\n` ahead of the markup this label decided it was plain text and drew a
+        # literal "<b>…</b>" on screen. In rich text a `\n` is whitespace anyway, so the
+        # breaks have to be tags regardless of what the heuristic would have concluded.
+        self.intro = QLabel(
+            "Dùng AI viết lại bản dịch cho đúng văn phong tiếng Việt — sắp xếp lại "
+            "trật tự từ,<br>bỏ chỗ lặp thừa. <b>Giữ nguyên tên riêng Hán-Việt và xưng "
+            "hô</b> (hắn, nàng, y, thị…),<br>không tóm tắt, không thêm bớt nội dung."
         )
+        self.intro.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(self.intro)
 
         # --- engine + model
         engine_box = QGroupBox("Viết lại bằng")
