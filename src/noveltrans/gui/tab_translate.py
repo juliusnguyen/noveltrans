@@ -55,6 +55,7 @@ from noveltrans.gui.workers import (
     chapters_to_qc,
     chapters_to_rewrite,
     qc_settings_from_config,
+    split_retranslation,
 )
 from noveltrans.models import Chapter
 from noveltrans.storage import NovelProject
@@ -478,7 +479,9 @@ class TranslateTab(QWidget):
 
     # ------------------------------------------------------------- translate
 
-    def _start_translate(self, indices: list[int] | None = None) -> None:
+    def _start_translate(
+        self, indices: list[int] | None = None, title_only: set[int] | None = None
+    ) -> None:
         self._save_preview_edits()
         if self.project is None:
             QMessageBox.information(self, "Chưa chọn truyện", "Hãy tải một truyện ở Tab 1 trước.")
@@ -537,6 +540,7 @@ class TranslateTab(QWidget):
             base_url=base_url,
             indices=indices,
             qc=self._qc_settings(engine, model, base_url),
+            title_only=title_only or frozenset(),
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.chapter_done.connect(self._on_chapter_updated)
@@ -907,8 +911,24 @@ class TranslateTab(QWidget):
             return
         dialog = QcResultDialog(failures, self)
         dialog.chapter_activated.connect(self._jump_to_chapter)
-        dialog.retranslate_requested.connect(self._retranslate_indices)
+        dialog.retranslate_requested.connect(self._retranslate_qc_failures)
         dialog.exec()
+
+    def _retranslate_qc_failures(self, indices: list) -> None:
+        """Re-translate chapters picked in the QC result view — the title alone where the
+        title was the only failure, the whole chapter otherwise (feature 094).
+
+        Title-only chapters are NOT cleared: their body is kept, and clearing it first would
+        throw away exactly the text this path exists to protect.
+        """
+        if self.project is None or not indices:
+            return
+        chapters = [c for c in (self.project.chapter(i) for i in indices) if c is not None]
+        title_only, full = split_retranslation(chapters)
+        if full:
+            self.project.clear_translations(full)
+            self._on_replacements_applied(set(full))
+        self._start_translate(indices=list(indices), title_only=set(title_only))
 
     def _add_qc_action(self, menu, rows: list[int]) -> None:
         """Append "Kiểm tra chất lượng" for the translated chapters among `rows`."""

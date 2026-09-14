@@ -689,6 +689,25 @@ class NovelProject:
                 (text, title, lang, translator, seconds, STATUS_TRANSLATED, _now(), idx),
             )
 
+    def save_title_translation(self, idx: int, title: str) -> None:
+        """Replace ONLY a chapter's translated title — the body stays byte for byte.
+
+        Feature 094: a chapter that failed QC on its heading alone gets a new title without
+        its body being cleared and paid for again. `translator` is untouched on purpose: it
+        records who translated the chapter, and the body is still that engine's work.
+
+        `error` is cleared and a chapter with a body goes back to `translated`, because the
+        mark being lifted is the QC mark `mark_qc_failed` put there. Call `save_qc_verdict`
+        or `mark_qc_failed` AFTER this, exactly as after `save_translation`.
+        """
+        with self._db:
+            self._db.execute(
+                "UPDATE chapters SET translated_title = ?,"
+                " status = CASE WHEN translated != '' THEN ? ELSE status END,"
+                " error = '', updated_at = ? WHERE idx = ?",
+                (title, STATUS_TRANSLATED, _now(), idx),
+            )
+
     def save_qc_verdict(
         self, idx: int, status: str, code: str, reason: str, text_hash: str,
         attempts: int = 0,

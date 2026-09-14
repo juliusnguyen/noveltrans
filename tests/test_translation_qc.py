@@ -13,6 +13,7 @@ import pytest
 from noveltrans.errors import TranslateError
 from noveltrans.translators.qc import (
     MIN_CJK_CHARS,
+    NO_HINT_CODES,
     QC_EMPTY,
     QC_HAN_VIET,
     QC_LABELS,
@@ -22,6 +23,7 @@ from noveltrans.translators.qc import (
     QC_REFUSAL,
     QC_SEVERITY,
     QC_SOURCE_LEFTOVER,
+    QC_TITLE_UNTRANSLATED,
     QC_TRUNCATED,
     Policy,
     QcAttemptPlan,
@@ -29,12 +31,14 @@ from noveltrans.translators.qc import (
     build_judge_prompt,
     build_name_profile,
     check_name_consistency,
+    check_title,
     check_translation,
     diacritic_ratio,
     english_word_rate,
     judge_sample,
     judge_translation,
     parse_judge_reply,
+    retranslate_title_with_qc,
     retry_hint_for,
     severity,
     translate_with_qc,
@@ -126,6 +130,49 @@ class TestDetectors:
     def test_measurements_are_reported_for_the_result_view(self):
         verdict = check_translation(SOURCE, "Chapter 1", ENGLISH)
         assert verdict.measured["diacritic_ratio"] < 0.1
+
+
+class TestTitleCheck:
+    """Feature 094 — a good body under a heading still in Chinese passed QC, because QC
+    never read the title. `_safe_title` saves the source title when the engine fails."""
+
+    def test_a_source_title_saved_back_unchanged_is_caught(self):
+        verdict = check_translation(SOURCE, "第12章 夜雨孤灯", GOOD_VI)
+        assert verdict.code == QC_TITLE_UNTRANSLATED
+        assert "第12章 夜雨孤灯" in verdict.reason  # the user sees which heading
+
+    def test_a_half_translated_title_is_caught(self):
+        verdict = check_translation(SOURCE, "Chương 12: Cái chết của Lý Phàm之死", GOOD_VI)
+        assert verdict.code == QC_TITLE_UNTRANSLATED
+
+    def test_a_short_chapter_does_not_excuse_its_title(self):
+        """The short-body exemption skips RATE checks; a heading is structural."""
+        note = "Ghi chú của tác giả: hôm nay bận quá nên chỉ ra được một chương thôi nhé."
+        assert check_translation("作者的话：今天很忙。" * 3, "作者的话", note).code == QC_TITLE_UNTRANSLATED
+
+    def test_a_body_failure_is_reported_before_the_title(self):
+        assert check_translation(SOURCE, "第一章", ENGLISH).code == QC_NOT_VIETNAMESE
+
+    def test_a_translated_or_empty_title_passes(self):
+        assert check_title("Chương 1757: Cuối cùng giải được bí ẩn Sơn Hải").ok
+        assert check_title("").ok
+
+    def test_chinese_targets_keep_chinese_titles(self):
+        assert check_title("第一章", target="zh").ok
+
+    def test_the_retry_loop_retries_a_chapter_whose_title_came_back_chinese(self):
+        titles = iter(["第12章 夜雨孤灯", "Chương 12: Đèn cô độc đêm mưa"])
+        calls = []
+
+        def engine(_title, _content, hint):
+            calls.append(hint)
+            return next(titles), GOOD_VI
+
+        outcome = translate_with_qc(
+            [QcAttemptPlan(label="agy", translate=engine)], "第12章 夜雨孤灯", SOURCE
+        )
+        assert outcome.ok and outcome.title == "Chương 12: Đèn cô độc đêm mưa"
+        assert calls == ["", ""]  # no hint: it would reach the body prompt, not the title
 
 
 class TestNameCheck:
@@ -286,8 +333,15 @@ class TestSeverityAndHints:
         for code in QC_SEVERITY:
             if code == QC_OK:
                 continue
-            assert retry_hint_for(QcVerdict(code)).strip(), code
             assert QC_LABELS.get(code), code
+            if code in NO_HINT_CODES:
+                assert retry_hint_for(QcVerdict(code)) == "", code
+                continue
+            assert retry_hint_for(QcVerdict(code)).strip(), code
+
+    def test_a_bad_title_ranks_below_every_body_failure(self):
+        """`KEEP_BEST` must never give up a good body to get a clean heading."""
+        assert severity(QC_HAN_VIET) < severity(QC_TITLE_UNTRANSLATED) < severity(QC_OK)
 
     def test_the_han_viet_hint_names_the_actual_correction(self):
         hint = retry_hint_for(QcVerdict(QC_HAN_VIET))
@@ -458,3 +512,61 @@ class TestRetryLoop:
             on_attempt=lambda n, label, verdict: seen.append((n, label, verdict.code)),
         )
         assert seen == [(1, "agy", QC_NOT_VIETNAMESE), (2, "agy", QC_OK)]
+
+
+class TestTitleOnlyLoop:
+    """Feature 094 — `retranslate_title_with_qc`, the loop behind title-only re-translation."""
+
+    def _plan(self, label, replies, attempts=2):
+        calls = []
+
+        def translate_title(title):
+            calls.append(title)
+            reply = replies[min(len(calls) - 1, len(replies) - 1)]
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+        def no_body(*_args):
+            raise AssertionError("a title-only run must never translate a body")
+
+        return QcAttemptPlan(label, no_body, attempts, translate_title), calls
+
+    def test_a_good_title_costs_one_call(self):
+        plan, calls = self._plan("agy", ["Chương 12: Đèn cô độc"])
+        outcome = retranslate_title_with_qc([plan], "第12章 孤灯")
+        assert outcome.ok and outcome.title == "Chương 12: Đèn cô độc"
+        assert outcome.engine_label == "agy" and calls == ["第12章 孤灯"]
+
+    def test_it_retries_then_falls_back_to_the_next_engine(self):
+        first, first_calls = self._plan("agy", ["第12章 孤灯"], attempts=2)
+        second, _ = self._plan("claude", ["Chương 12: Đèn cô độc"])
+        outcome = retranslate_title_with_qc([first, second], "第12章 孤灯")
+        assert outcome.ok and outcome.engine_label == "claude"
+        assert len(first_calls) == 2 and outcome.attempts_used == 3
+
+    def test_exhaustion_returns_no_title_never_a_chinese_one(self):
+        plan, _ = self._plan("agy", ["第12章 孤灯"])
+        outcome = retranslate_title_with_qc([plan], "第12章 孤灯")
+        assert not outcome.ok and outcome.title == ""
+        assert outcome.verdict.code == QC_TITLE_UNTRANSLATED
+
+    def test_an_engine_error_moves_on_instead_of_raising(self):
+        dead, dead_calls = self._plan("claude", [TranslateError("hết quota")])
+        good, _ = self._plan("agy", ["Chương 12: Đèn cô độc"])
+        outcome = retranslate_title_with_qc([dead, good], "第12章 孤灯")
+        assert outcome.ok and len(dead_calls) == 1  # one error ends that engine's turn
+
+    def test_an_empty_reply_is_not_a_fix(self):
+        plan, _ = self._plan("agy", [""])
+        assert not retranslate_title_with_qc([plan], "第12章 孤灯").ok
+
+    def test_a_plan_without_a_title_callable_is_skipped(self):
+        bodyless = QcAttemptPlan("google", lambda *_a: ("", ""))
+        good, _ = self._plan("agy", ["Chương 12"])
+        assert retranslate_title_with_qc([bodyless, good], "第12章 孤灯").engine_label == "agy"
+
+    def test_stopping_writes_nothing(self):
+        plan, calls = self._plan("agy", ["Chương 12"])
+        outcome = retranslate_title_with_qc([plan], "第12章 孤灯", should_stop=lambda: True)
+        assert not outcome.ok and calls == []

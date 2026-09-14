@@ -9,6 +9,7 @@ Two load-bearing tests, both named so a reviewer meets them first:
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ from noveltrans.gui.workers import (
     QcSettings,
     TranslateWorker,
     chapters_to_qc,
+    split_retranslation,
 )
 from noveltrans.models import ChapterRef, NovelMeta
 from noveltrans.storage import NovelProject
@@ -323,3 +325,130 @@ class TestChaptersToQc:
         # an explicit "check this one again".
         assert chapters_to_qc(project, "vi") == []
         assert [c.index for c in chapters_to_qc(project, "vi", indices=[1])] == [1]
+
+
+class _TitleEngine(_FakeEngine):
+    """Scripted TITLE replies on top of `_FakeEngine`'s body script. No retry sleep."""
+
+    retry_delay = 0.0
+
+    def __init__(self, *titles: str, bodies: tuple[str, ...] = (GOOD_VI,)):
+        super().__init__(*bodies)
+        self.titles = list(titles)
+        self.title_calls = 0
+
+    def translate(self, text, source="zh", target="vi", *, retry_hint="") -> str:
+        if text.startswith(SOURCE[:20]) or text != CHINESE_TITLE:
+            return super().translate(text, source, target, retry_hint=retry_hint)
+        self.calls.append((text, retry_hint))
+        self.title_calls += 1
+        return self.titles[min(self.title_calls - 1, len(self.titles) - 1)]
+
+
+CHINESE_TITLE = "第1章 夜雨孤灯"
+
+
+def _title_failed_project(library_dir: Path) -> Path:
+    """One chapter with a good body saved under its untranslated title, flagged by QC."""
+    meta = NovelMeta(url="https://x/t", site="x", title="Truyện", source_lang="zh")
+    project = NovelProject.create(
+        library_dir, meta, [ChapterRef(index=0, title=CHINESE_TITLE, url="https://x/1")]
+    )
+    project.save_content(0, SOURCE)
+    project.save_translation(0, CHINESE_TITLE, STORED_GOOD, "vi", "CLI (agy)")
+    project.mark_qc_failed(
+        0, "title_untranslated", "tiêu đề còn chữ Hán", project.chapter(0).qc_fingerprint(), 2
+    )
+    path = project.path
+    project.close()
+    return path
+
+
+class TestTitleOnlyRetranslation:
+    """Feature 094 — a chapter whose only failure is its title keeps its body."""
+
+    def test_only_the_title_is_sent_and_the_body_is_kept(
+        self, qapp, library_dir, monkeypatch, opened
+    ):
+        path = _title_failed_project(library_dir)
+        engine = _TitleEngine("Chương 1: Đèn cô độc đêm mưa")
+        _use(monkeypatch, engine)
+        TranslateWorker(path, "fake", "vi", indices=[0], qc=_settings(), title_only={0}).run()
+
+        chapter = opened(path).chapter(0)
+        assert engine.body_calls == []  # THE point: not one body token spent
+        assert chapter.translated_title == "Chương 1: Đèn cô độc đêm mưa"
+        assert chapter.translated == STORED_GOOD  # byte for byte
+        assert chapter.translator == "CLI (agy)"  # the body is still that engine's work
+        assert chapter.qc_ok and not chapter.qc_is_stale
+        assert chapter.error == "" and chapter.status == "translated"
+
+    def test_a_title_that_stays_chinese_keeps_the_old_one_and_stays_marked(
+        self, qapp, library_dir, monkeypatch, opened
+    ):
+        path = _title_failed_project(library_dir)
+        _use(monkeypatch, _TitleEngine(CHINESE_TITLE))
+        errors: list = []
+        worker = TranslateWorker(path, "fake", "vi", indices=[0], qc=_settings(), title_only={0})
+        worker.chapter_error.connect(lambda idx, msg: errors.append(idx))
+        worker.run()
+
+        chapter = opened(path).chapter(0)
+        assert chapter.translated == STORED_GOOD
+        assert chapter.qc_failed and chapter.qc_code == "title_untranslated"
+        assert chapter.qc_attempts == 2  # the chain's budget, spent and recorded
+        assert errors == [0]
+
+    def test_the_body_gets_the_judge_it_never_had(
+        self, qapp, library_dir, monkeypatch, opened
+    ):
+        """A title failure stopped the scan before the judge read the body."""
+
+        class _HarshJudge(_TitleEngine):
+            def complete(self, prompt: str) -> str:
+                return "LOI: han_viet — trật tự từ kiểu tiếng Trung"
+
+        path = _title_failed_project(library_dir)
+        _use(monkeypatch, _HarshJudge("Chương 1: Đèn cô độc đêm mưa"))
+        TranslateWorker(
+            path, "fake", "vi", indices=[0], qc=_settings(judge=QcEngineSpec("fake")),
+            title_only={0},
+        ).run()
+
+        chapter = opened(path).chapter(0)
+        assert chapter.translated_title == "Chương 1: Đèn cô độc đêm mưa"  # the fix stays
+        assert chapter.qc_code == "han_viet"  # …and the body's real verdict surfaces
+
+    def test_with_qc_off_the_tabs_engine_fixes_the_title(
+        self, qapp, library_dir, monkeypatch, opened
+    ):
+        path = _title_failed_project(library_dir)
+        engine = _TitleEngine("Chương 1: Đèn cô độc đêm mưa")
+        _use(monkeypatch, engine)
+        TranslateWorker(path, "fake", "vi", indices=[0], title_only={0}).run()
+
+        chapter = opened(path).chapter(0)
+        assert engine.body_calls == []
+        assert chapter.translated_title == "Chương 1: Đèn cô độc đêm mưa"
+        assert chapter.qc_ok
+
+    def test_a_chapter_without_a_body_is_translated_in_full(
+        self, qapp, library_dir, monkeypatch, opened
+    ):
+        path = _title_failed_project(library_dir)
+        project = opened(path)
+        project.clear_translations([0])
+        engine = _TitleEngine("Chương 1: Đèn cô độc đêm mưa")
+        _use(monkeypatch, engine)
+        TranslateWorker(path, "fake", "vi", indices=[0], qc=_settings(), title_only={0}).run()
+        assert len(engine.body_calls) == 1
+
+
+class TestSplitRetranslation:
+    def test_only_a_title_failure_with_a_body_is_title_only(self, library_dir, opened):
+        path = _title_failed_project(library_dir)
+        project = opened(path)
+        title_chapter = project.chapter(0)
+        body_failure = replace(title_chapter, index=1, qc_code="not_vietnamese")
+        no_body = replace(title_chapter, index=2, translated="")
+        assert split_retranslation([title_chapter, body_failure, no_body]) == ([0], [1, 2])
