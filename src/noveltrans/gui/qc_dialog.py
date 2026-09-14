@@ -37,7 +37,6 @@ from PySide6.QtWidgets import (
 )
 
 from noveltrans.config import (
-    CLI_ENGINES,
     DEFAULT_QC_ATTEMPTS,
     LLM_ENGINES,
     MAX_QC_ATTEMPTS,
@@ -238,21 +237,13 @@ class QcDialog(QDialog):
     # -------------------------------------------------------------- the chain
 
     def _remembered_model(self, engine: str) -> str:
-        """The model this engine was last used with — "" when it has none.
+        """This engine's own model — see `AppConfig.model_for_engine`.
 
-        A model belongs to exactly ONE engine: handing Codex a `sonnet` left behind by
-        Claude CLI is not a graceful fallback, it is a hard 400 from the backend that fails
-        every chapter ("The 'sonnet' model is not supported when using Codex with a ChatGPT
-        account"). The Translate tab already reloads the model per engine; the boxes here
-        did not, so switching an engine silently kept the previous one's model — the one
-        way this dialog could produce a chain that cannot translate anything at all.
+        The Translate tab has always reloaded the model per engine; the boxes here did not,
+        so switching an engine silently kept the previous one's model — the one way this
+        dialog could produce a chain that cannot translate anything at all.
         """
-        engine = engine or ""
-        if engine in CLI_ENGINES or engine == "lmstudio":
-            return self.config.cli_model_for(engine)
-        if engine == "claude":
-            return self.config.claude_model
-        return ""
+        return self.config.model_for_engine(engine or "")
 
     def _add_chain_row(self, engine_name: str = "", model: str = "", attempts: int = 0) -> None:
         row = self.chain_table.rowCount()

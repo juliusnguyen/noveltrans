@@ -12,7 +12,7 @@ from pathlib import Path
 from PySide6.QtCore import QSettings
 
 from noveltrans.storage.library import DEFAULT_LIBRARY_DIR
-from noveltrans.translators import CLI_ENGINES  # noqa: F401 — re-exported for the GUI
+from noveltrans.translators import CLI_ENGINES  # used by model_for_engine; re-exported for the GUI
 
 # How many previously-used library folders to keep. Enough for a few real libraries,
 # short enough that the dropdown stays scannable.
@@ -339,6 +339,25 @@ class AppConfig:
         if engine == "codex_cli":
             return self.codex_cli_command
         return self.cli_command
+
+    def model_for_engine(self, engine: str) -> str:
+        """The model this engine was last used with — "" when it has none.
+
+        A model belongs to exactly ONE engine. Handing Codex a `sonnet` left behind by
+        Claude CLI is not a graceful fallback, it is a hard 400 from the backend
+        ("The 'sonnet' model is not supported when using Codex with a ChatGPT account")
+        that fails every chapter. So every engine+model picker in the app resolves the
+        model through here rather than keeping whatever string was in the box, and "" —
+        the engine's own default — is always a safe answer.
+
+        Lives on the config rather than in one dialog because four pickers need it (the QC
+        judge and chain, Rewrite, and the Video tab's shared AI row) and they must agree.
+        """
+        if engine in CLI_ENGINES or engine == "lmstudio":
+            return self.cli_model_for(engine)
+        if engine == "claude":
+            return self.claude_model
+        return ""
 
     @property
     def lmstudio_url(self) -> str:

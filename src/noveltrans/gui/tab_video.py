@@ -56,7 +56,7 @@ from PySide6.QtWidgets import (
 )
 
 from noveltrans import video_settings
-from noveltrans.config import CLI_ENGINES, LLM_ENGINES, AppConfig, translator_labels
+from noveltrans.config import LLM_ENGINES, AppConfig, translator_labels
 from noveltrans.gui.job_popup import BROWSER_PAUSE_HINT
 from noveltrans.gui.jobs import job_registry
 from noveltrans.gui.keep_awake import track_worker
@@ -2379,9 +2379,7 @@ class VideoTab(QWidget):
             "Engine LLM dùng chung cho mọi tính năng AI của tab (tags, prompt ảnh bìa) — "
             "giống “2. Dịch”. Google chỉ dịch nên không dùng được ở đây."
         )
-        self.ai_engine_combo.currentIndexChanged.connect(
-            lambda: self._save_video_setting("video_ai_engine", self.ai_engine_combo.currentData())
-        )
+        self.ai_engine_combo.currentIndexChanged.connect(self._on_ai_engine_changed)
 
         self.ai_model_edit = QLineEdit(self.config.video_ai_model)
         self.ai_model_edit.setPlaceholderText("model (để trống = mặc định)")
@@ -2397,6 +2395,24 @@ class VideoTab(QWidget):
         row.addWidget(self.ai_model_edit)
         row.addStretch()
         return row
+
+    def _on_ai_engine_changed(self) -> None:
+        """Save the engine, and move the Model box onto it.
+
+        `video_ai_model` is ONE string shared across whichever engine this row is set to,
+        so without the reset a `sonnet` left over from Claude CLI gets handed to Codex —
+        a hard 400 from the backend on every AI helper, not a fallback.
+
+        Guarded like the other handlers here: `_apply_video_settings` pushes a novel's
+        saved engine and model in together, and the saved model must win over this reset.
+        """
+        engine = self.ai_engine_combo.currentData() or ""
+        self._save_video_setting("video_ai_engine", engine)
+        if self._loading_video_settings:
+            return
+        model = self.config.model_for_engine(engine)
+        self.ai_model_edit.setText(model)
+        self._save_video_setting("video_ai_model", model)
 
     def _build_image_prompt_box(self) -> QGroupBox:
         """'Tạo prompt' button + editable AI image-generation prompt for the thumbnail."""
@@ -2819,13 +2835,10 @@ class VideoTab(QWidget):
 
     def _ai_engine_params(self) -> dict:
         """Engine params for the shared AI helpers (from the top engine+model picker)."""
-        engine = self.ai_engine_combo.currentData()
-        model = self.ai_model_edit.text().strip()
-        if not model:
-            if engine == "claude":
-                model = self.config.claude_model
-            elif engine in CLI_ENGINES:
-                model = self.config.cli_model_for(engine)
+        engine = self.ai_engine_combo.currentData() or ""
+        # An empty box means "this engine's own model" — the same resolution every other
+        # picker uses, LM Studio included (it was the one engine missing here).
+        model = self.ai_model_edit.text().strip() or self.config.model_for_engine(engine)
         return {
             "engine_name": engine,
             "api_key": self.config.claude_api_key,

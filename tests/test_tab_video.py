@@ -182,6 +182,49 @@ class TestVideoTab:
         assert "lmstudio" in keys
         tab.shutdown()
 
+    def test_switching_the_ai_engine_drops_the_old_engine_model(self, qapp, tmp_path):
+        """`video_ai_model` is one string shared across engines, so a `sonnet` left over
+        from Claude CLI would be handed to Codex — a hard 400 on every AI helper."""
+        config = _config(tmp_path)
+        config.video_ai_model = "sonnet"
+        config.set_cli_model_for("codex_cli", "gpt-5.6-luna")
+        tab = VideoTab(config)
+        assert tab.ai_model_edit.text() == "sonnet"  # untouched on construction
+        tab.ai_engine_combo.setCurrentIndex(tab.ai_engine_combo.findData("codex_cli"))
+        assert tab.ai_model_edit.text() == "gpt-5.6-luna"
+        assert tab._ai_engine_params()["model"] == "gpt-5.6-luna"
+        tab.shutdown()
+
+    def test_an_ai_engine_with_no_remembered_model_clears_the_box(self, qapp, tmp_path):
+        config = _config(tmp_path)
+        config.video_ai_model = "sonnet"
+        tab = VideoTab(config)
+        tab.ai_engine_combo.setCurrentIndex(tab.ai_engine_combo.findData("codex_cli"))
+        assert tab.ai_model_edit.text() == ""  # "" = the CLI's own default, always safe
+        tab.shutdown()
+
+    def test_an_empty_ai_model_box_resolves_to_the_engines_own_model(self, qapp, tmp_path):
+        """LM Studio was the one engine this fallback used to miss."""
+        config = _config(tmp_path)
+        config.set_cli_model_for("lmstudio", "qwen3-14b")
+        tab = VideoTab(config)
+        tab.ai_engine_combo.setCurrentIndex(tab.ai_engine_combo.findData("lmstudio"))
+        assert tab._ai_engine_params()["model"] == "qwen3-14b"
+        tab.shutdown()
+
+    def test_loading_a_novels_settings_keeps_its_saved_ai_model(self, qapp, tmp_path):
+        """`_apply_video_settings` pushes a saved engine AND model in together — the
+        saved model must win over the engine-change reset."""
+        config = _config(tmp_path)
+        config.set_cli_model_for("codex_cli", "gpt-5.6-luna")
+        tab = VideoTab(config)
+        values = dict(tab._video_settings)
+        values["video_ai_engine"] = "codex_cli"
+        values["video_ai_model"] = "gpt-5.6-terra"  # what this novel was set up with
+        tab._apply_video_settings(values)
+        assert tab.ai_model_edit.text() == "gpt-5.6-terra"
+        tab.shutdown()
+
     def test_has_image_prompt_controls(self, qapp, tmp_path):
         tab = VideoTab(_config(tmp_path))
         assert hasattr(tab, "image_prompt_button")

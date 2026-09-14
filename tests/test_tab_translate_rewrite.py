@@ -118,6 +118,30 @@ class TestDialog:
         assert "google" not in engines
         assert engines  # …and something usable is offered
 
+    def test_switching_the_engine_drops_the_old_engine_model(
+        self, qapp, tmp_path, monkeypatch
+    ):
+        """`rewrite_ai_model` is one string shared across engines, so a `sonnet` left over
+        from Claude CLI would be handed to Codex — a hard 400 on every chapter."""
+        tab, project = _tab(qapp, tmp_path, monkeypatch)
+        tab.config.rewrite_ai_engine = "claude_cli"
+        tab.config.rewrite_ai_model = "sonnet"
+        tab.config.set_cli_model_for("codex_cli", "gpt-5.6-luna")
+        dialog = RewriteDialog(project, tab.config, None)
+        assert dialog.model_edit.text() == "sonnet"  # untouched on open
+        dialog.engine_combo.setCurrentIndex(dialog.engine_combo.findData("codex_cli"))
+        assert dialog.model_edit.text() == "gpt-5.6-luna"
+
+    def test_an_engine_with_no_remembered_model_clears_the_box(
+        self, qapp, tmp_path, monkeypatch
+    ):
+        tab, project = _tab(qapp, tmp_path, monkeypatch)
+        tab.config.rewrite_ai_engine = "claude_cli"
+        tab.config.rewrite_ai_model = "sonnet"
+        dialog = RewriteDialog(project, tab.config, None)
+        dialog.engine_combo.setCurrentIndex(dialog.engine_combo.findData("codex_cli"))
+        assert dialog.model_edit.text() == ""  # "" = the CLI's own default, always safe
+
     def test_it_refuses_a_translation_that_is_not_vietnamese(
         self, qapp, tmp_path, monkeypatch
     ):
