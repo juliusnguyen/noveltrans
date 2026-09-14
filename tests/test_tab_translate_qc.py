@@ -14,7 +14,7 @@ from PySide6.QtWidgets import QMenu
 
 import noveltrans.gui.tab_translate as tt
 from noveltrans.config import AppConfig
-from noveltrans.gui.qc_dialog import QcDialog, QcResultDialog
+from noveltrans.gui.qc_dialog import SAVE_LABEL, SAVED_LABEL, QcDialog, QcResultDialog
 from noveltrans.models import QC_STATUS_FAIL, ChapterRef, NovelMeta
 from noveltrans.storage import Library
 
@@ -420,6 +420,58 @@ class TestQcDialog:
         assert params and params[0]["target_lang"] == "vi"
         assert tab.config.qc_enabled is True
         assert tab.config.qc_engine_chain == [("cli", "", 4)]
+
+    def test_saving_persists_the_choices_without_running_anything(
+        self, qapp, tmp_path, monkeypatch
+    ):
+        """Saving a setting and starting a scan over a thousand chapters are different
+        acts — the button must do only the first, and leave the dialog open."""
+        tab, project = _tab(qapp, tmp_path, monkeypatch)
+        dialog = QcDialog(project, tab.config)
+        closed: list[str] = []
+        monkeypatch.setattr(dialog, "accept", lambda: closed.append("accept"))
+        monkeypatch.setattr(dialog, "reject", lambda: closed.append("reject"))
+        started: list[dict] = []
+        dialog.start_requested.connect(started.append)
+
+        dialog.auto_check.setChecked(True)
+        dialog._add_chain_row("codex_cli", "gpt-5.6-luna", 3)
+        dialog._save_settings()
+
+        assert tab.config.qc_enabled is True
+        assert tab.config.qc_engine_chain == [("codex_cli", "gpt-5.6-luna", 3)]
+        assert not started, "saving must not start a scan"
+        assert not closed, "saving must leave the dialog open"
+
+    def test_the_save_button_says_it_saved_then_goes_back(
+        self, qapp, tmp_path, monkeypatch
+    ):
+        tab, project = _tab(qapp, tmp_path, monkeypatch)
+        dialog = QcDialog(project, tab.config)
+        dialog._save_settings()
+        assert dialog.save_button.text() == SAVED_LABEL
+        assert not dialog.save_button.isEnabled()  # nothing further to save this instant
+        dialog._restore_save_button()  # what the timer fires
+        assert dialog.save_button.text() == SAVE_LABEL
+        assert dialog.save_button.isEnabled()
+
+    def test_closing_without_saving_still_discards(self, qapp, tmp_path, monkeypatch):
+        """The reason the button had to exist — and it must stay true, so that Đóng
+        remains a way to back out of a change."""
+        tab, project = _tab(qapp, tmp_path, monkeypatch)
+        tab.config.qc_engine_chain = [("cli", "", 2)]
+        dialog = QcDialog(project, tab.config)
+        dialog._add_chain_row("codex_cli", "gpt-5.6-luna", 3)
+        assert tab.config.qc_engine_chain == [("cli", "", 2)]
+
+    def test_a_blocked_novel_disables_the_save_button_too(
+        self, qapp, tmp_path, monkeypatch
+    ):
+        tab, project = _tab(qapp, tmp_path, monkeypatch, translated=0)
+        dialog = QcDialog(project, tab.config)
+        assert not dialog.save_button.isEnabled()
+        dialog._restore_save_button()  # a stale timer must not re-enable it
+        assert not dialog.save_button.isEnabled()
 
     def test_the_dry_run_asks_for_a_handful_of_chapters(self, qapp, tmp_path, monkeypatch):
         from noveltrans.gui.qc_dialog import DRY_RUN_CHAPTERS

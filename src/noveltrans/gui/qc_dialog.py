@@ -17,7 +17,7 @@ place.
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -48,6 +48,9 @@ from noveltrans.storage import NovelProject
 from noveltrans.translators.qc import QC_LABELS
 
 DRY_RUN_CHAPTERS = 3  # what "Thử N chương" checks before committing to a whole novel
+SAVE_LABEL = "💾 Lưu cài đặt"
+SAVED_LABEL = "✓ Đã lưu"
+SAVED_FLASH_MS = 1500  # how long the button admits it saved before going back
 
 
 class QcDialog(QDialog):
@@ -214,6 +217,13 @@ class QcDialog(QDialog):
         self.start_button.clicked.connect(lambda: self._request_start())
         self.results_button = QPushButton("Xem chương lỗi đã tìm được")
         self.results_button.clicked.connect(self._request_results)
+        self.save_button = QPushButton(SAVE_LABEL)
+        self.save_button.setToolTip(
+            "Ghi nhớ engine, model và chuỗi engine ở trên mà không chạy gì cả.\n\n"
+            "Không bấm thì thay đổi chỉ được ghi khi bắt đầu kiểm tra hoặc thử "
+            f"{DRY_RUN_CHAPTERS} chương — đóng hộp thoại là mất."
+        )
+        self.save_button.clicked.connect(self._save_settings)
         close_button = QPushButton("Đóng")
         close_button.clicked.connect(self.reject)
         action_row = QHBoxLayout()
@@ -221,8 +231,16 @@ class QcDialog(QDialog):
         action_row.addWidget(self.dry_run_button)
         action_row.addWidget(self.results_button)
         action_row.addStretch(1)
+        action_row.addWidget(self.save_button)
         action_row.addWidget(close_button)
         layout.addLayout(action_row)
+
+        # Parented to the dialog so it dies with it — a bare `QTimer.singleShot` would
+        # still fire after the user closed the dialog and call a method on a deleted
+        # widget.
+        self._saved_flash = QTimer(self)
+        self._saved_flash.setSingleShot(True)
+        self._saved_flash.timeout.connect(self._restore_save_button)
 
         self._refresh_estimate()
         if self._blocked:
@@ -231,6 +249,7 @@ class QcDialog(QDialog):
                 self.auto_check, self.engine_combo, self.model_edit, self.judge_check,
                 self.chain_table, self.start_spin, self.end_spin, self.scope_pending,
                 self.scope_all, self.start_button, self.dry_run_button, self.results_button,
+                self.save_button,  # nothing above can be edited, so there is nothing to save
             ):
                 widget.setEnabled(False)
 
@@ -318,6 +337,24 @@ class QcDialog(QDialog):
         self.engine_combo.setEnabled(on)
         self.model_edit.setEnabled(on)
         self._refresh_estimate()
+
+    def _save_settings(self) -> None:
+        """Persist the choices without running anything — the dialog stays open.
+
+        Everything `_remember_choices` writes used to be written ONLY by `_request_start`
+        and `_request_results`, so changing the engine and closing threw the change away
+        with nothing on screen to say so. `accept()` is deliberately not called here:
+        saving a setting and starting a scan over a thousand chapters are different acts,
+        and the user asked for the first without the second.
+        """
+        self._remember_choices()
+        self.save_button.setText(SAVED_LABEL)
+        self.save_button.setEnabled(False)
+        self._saved_flash.start(SAVED_FLASH_MS)
+
+    def _restore_save_button(self) -> None:
+        self.save_button.setText(SAVE_LABEL)
+        self.save_button.setEnabled(not self._blocked)
 
     def _remember_choices(self) -> None:
         self.config.qc_enabled = self.auto_check.isChecked()
