@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QRadioButton,
     QSpinBox,
@@ -51,6 +52,12 @@ DRY_RUN_CHAPTERS = 3  # what "Thử N chương" checks before committing to a wh
 SAVE_LABEL = "💾 Lưu cài đặt"
 SAVED_LABEL = "✓ Đã lưu"
 SAVED_FLASH_MS = 1500  # how long the button admits it saved before going back
+# Đóng with unsaved changes. Spelled out rather than using QMessageBox's standard buttons,
+# whose text arrives in English unless a Qt translation is loaded — the rest of this app is
+# Vietnamese and a lone "Save / Discard / Cancel" row would read as a different program.
+CLOSE_SAVE_LABEL = "Lưu rồi đóng"
+CLOSE_DISCARD_LABEL = "Đóng, bỏ thay đổi"
+CLOSE_CANCEL_LABEL = "Quay lại"
 
 
 class QcDialog(QDialog):
@@ -253,6 +260,13 @@ class QcDialog(QDialog):
             ):
                 widget.setEnabled(False)
 
+        # What Đóng compares against. A snapshot of the WIDGETS as first shown, not of the
+        # config: `qc_ai_engine` may hold an engine this combo does not offer (it defaults
+        # to the translator, which can be Google), and the combo then falls back to its
+        # first item. Comparing widgets to config would call that a change the user made
+        # and prompt on a dialog they only looked at.
+        self._saved_state = self._current_settings()
+
     # -------------------------------------------------------------- the chain
 
     def _remembered_model(self, engine: str) -> str:
@@ -338,6 +352,54 @@ class QcDialog(QDialog):
         self.model_edit.setEnabled(on)
         self._refresh_estimate()
 
+    def _current_settings(self) -> tuple:
+        """Everything `_remember_choices` would write, as one comparable value."""
+        return (
+            self.auto_check.isChecked(),
+            self.judge_check.isChecked(),
+            self.engine_combo.currentData(),
+            self.model_edit.text().strip(),
+            tuple(self._chain()),
+        )
+
+    def _ask_unsaved(self) -> str:
+        """Ask what to do with unsaved changes: "save", "discard" or "cancel"."""
+        box = QMessageBox(self)
+        box.setWindowTitle("Chưa lưu thay đổi")
+        box.setText(
+            "Cài đặt kiểm tra chất lượng đã thay đổi nhưng chưa được lưu.\n\n"
+            "Đóng bây giờ thì các thay đổi này sẽ mất."
+        )
+        save_button = box.addButton(CLOSE_SAVE_LABEL, QMessageBox.ButtonRole.AcceptRole)
+        discard_button = box.addButton(
+            CLOSE_DISCARD_LABEL, QMessageBox.ButtonRole.DestructiveRole
+        )
+        box.addButton(CLOSE_CANCEL_LABEL, QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(save_button)  # Enter keeps the work, never throws it away
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is save_button:
+            return "save"
+        if clicked is discard_button:
+            return "discard"
+        return "cancel"  # includes the message box's own close button
+
+    def reject(self) -> None:
+        """Đóng — still a way to throw a change away, but no longer a silent one.
+
+        Reached by the Đóng button, Esc, and the window's X alike: `QDialog.closeEvent`
+        rejects. `accept()` is untouched, so starting a scan or opening the results (both
+        of which save first) never asks.
+        """
+        if self._current_settings() != self._saved_state:
+            answer = self._ask_unsaved()
+            if answer == "cancel":
+                return  # stay open, nothing written
+            if answer == "save":
+                self._remember_choices()
+        super().reject()
+
     def _save_settings(self) -> None:
         """Persist the choices without running anything — the dialog stays open.
 
@@ -362,6 +424,9 @@ class QcDialog(QDialog):
         self.config.qc_ai_engine = self.engine_combo.currentData()
         self.config.qc_ai_model = self.model_edit.text()
         self.config.qc_engine_chain = self._chain()
+        # The single place anything is written, so the single place the baseline moves —
+        # every caller (the Save button, starting a scan, opening the results) is covered.
+        self._saved_state = self._current_settings()
 
     def _refresh_estimate(self, *_args) -> None:
         if self._blocked:
