@@ -10,6 +10,7 @@ worker.
 from __future__ import annotations
 
 import pytest
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QMenu
 
 import noveltrans.gui.tab_translate as tt
@@ -117,6 +118,20 @@ class TestDialog:
         ]
         assert "google" not in engines
         assert engines  # …and something usable is offered
+
+    def test_the_intro_renders_its_markup_instead_of_showing_the_tags(
+        self, qapp, tmp_path, monkeypatch
+    ):
+        """A QLabel defaults to AutoText and Qt's `mightBeRichText()` stops scanning at the
+        first newline, so a `\\n` ahead of the markup made this label draw a literal
+        "<b>…</b>" on screen."""
+        tab, project = _tab(qapp, tmp_path, monkeypatch)
+        dialog = RewriteDialog(project, tab.config, None)
+        assert dialog.intro.textFormat() == Qt.TextFormat.RichText
+        assert "<b>" in dialog.intro.text()
+        # and the line breaks must be tags: in rich text a newline is only whitespace
+        assert "\n" not in dialog.intro.text()
+        assert "<br>" in dialog.intro.text()
 
     def test_switching_the_engine_drops_the_old_engine_model(
         self, qapp, tmp_path, monkeypatch
