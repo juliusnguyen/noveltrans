@@ -708,6 +708,23 @@ class NovelProject:
                 (title, STATUS_TRANSLATED, _now(), idx),
             )
 
+    def save_name_fix(self, idx: int, title: str, text: str) -> None:
+        """Write a chapter corrected by `qc.fix_name_variants` — a string edit, not a run.
+
+        Feature 095. Like `save_title_translation`: `translator` and `target_lang` are
+        untouched because no engine produced this text, and the QC mark is lifted so the
+        verdict written after it (`save_qc_verdict` / `mark_qc_failed`) is the one that
+        stands. No rewrite backup is taken: the edit swaps a handful of name syllables the
+        check itself identified, nothing a user would need to roll back to.
+        """
+        with self._db:
+            self._db.execute(
+                "UPDATE chapters SET translated = ?, translated_title = ?,"
+                " status = CASE WHEN ? != '' THEN ? ELSE status END,"
+                " error = '', updated_at = ? WHERE idx = ?",
+                (text, title, text, STATUS_TRANSLATED, _now(), idx),
+            )
+
     def save_qc_verdict(
         self, idx: int, status: str, code: str, reason: str, text_hash: str,
         attempts: int = 0,

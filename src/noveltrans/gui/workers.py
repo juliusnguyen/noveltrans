@@ -13,6 +13,7 @@ import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 from PySide6.QtCore import QThread, Signal
 
@@ -290,12 +291,23 @@ class TranslateWorker(PausableWorker):
         indices: list[int] | None = None,
         qc: QcSettings | None = None,
         title_only: frozenset[int] | set[int] = frozenset(),
+        name_fix: frozenset[int] | set[int] = frozenset(),
+        approved_names: frozenset | set = frozenset(),
+        name_profile=None,
         parent=None,
     ):
         super().__init__(parent)
-        # Chapters among `indices` whose body is kept and only the title re-translated
-        # (feature 094). A chapter with no translated body falls back to a full translation.
+        # Chapters among `indices` fixed without re-translating the body: the title alone
+        # (feature 094), or names corrected in place (feature 095). A chapter with no
+        # translated body falls back to a full translation. See `split_retranslation`.
         self.title_only = frozenset(title_only)
+        self.name_fix = frozenset(name_fix)
+        # The `NameFixProposal.key`s a person approved in `NameFixReviewDialog`. Only these
+        # are ever written — see `qc.fix_name_variants`. `name_profile` is the one the
+        # proposals were computed from, so what is applied is exactly what was reviewed;
+        # None rebuilds it here.
+        self.approved_names = frozenset(approved_names)
+        self.name_profile = name_profile
         self.project_path = Path(project_path)
         self.engine_name = engine_name
         self.target_lang = target_lang
@@ -341,6 +353,50 @@ class TranslateWorker(PausableWorker):
                 )
             )
         return plans
+
+    def _fix_names(
+        self, project: NovelProject, chapter, profile, judge, glossary, done: int, total: int
+    ) -> bool:
+        """Correct one chapter's APPROVED odd name spellings in place, then re-judge it.
+
+        No engine translates anything here. The judge may still be asked — sample-sized —
+        because the name check runs before it, so a chapter flagged for a name has never
+        had its prose judged. False when the chapter still fails after the edit.
+        """
+        from noveltrans.translators.qc import check_translation, fix_name_variants
+
+        title, title_changes = fix_name_variants(
+            chapter.translated_title, profile, approved=self.approved_names
+        )
+        body, body_changes = fix_name_variants(
+            chapter.translated, profile, approved=self.approved_names
+        )
+        changes = sorted(set(title_changes) | set(body_changes))
+        self.progress.emit(
+            done, total,
+            f"{chapter.title} — sửa tên: {'; '.join(changes)}" if changes
+            else f"{chapter.title} — không còn tên nào cần sửa",
+        )
+        # Always written, even unchanged: it lifts the QC error mark, and the verdict
+        # below is what decides whether the row goes red again.
+        project.save_name_fix(chapter.index, title, body)
+        fresh = project.chapter(chapter.index)
+        verdict = check_translation(
+            fresh.content, fresh.translated_title, fresh.translated,
+            target=self.target_lang, glossary=glossary, profile=profile,
+        )
+        if verdict.ok and judge is not None:
+            verdict = judge(fresh.translated)
+        if verdict.ok:
+            project.save_qc_verdict(
+                chapter.index, QC_STATUS_OK, "", "", fresh.qc_fingerprint(), 0
+            )
+            return True
+        project.mark_qc_failed(
+            chapter.index, verdict.code, verdict.reason, fresh.qc_fingerprint(), 0
+        )
+        self.chapter_error.emit(chapter.index, verdict.reason)
+        return False
 
     def _retranslate_title(
         self, project: NovelProject, chapter, source_title: str, plans: list, judge, glossary
@@ -547,6 +603,18 @@ class TranslateWorker(PausableWorker):
                     )
                 ]
 
+            # How this novel spells its names, learned once for the whole run and only when a
+            # chapter needs it: it reads every translation in the novel.
+            name_profile = self.name_profile
+            if self.name_fix and name_profile is None:
+                from noveltrans.translators.qc import build_name_profile
+
+                self.progress.emit(0, total, "Đang học cách truyện viết tên nhân vật…")
+                name_profile = build_name_profile(
+                    (c.translated for c in project.chapters() if c.translated),
+                    applied_glossary(read_names(project.path)).values(),
+                )
+
             for chapter in pending:
                 if self._checkpoint():
                     break
@@ -555,7 +623,15 @@ class TranslateWorker(PausableWorker):
                     source_title = apply_glossary(chapter.title, glossary)
                     source_content = apply_glossary(chapter.content, glossary)
                     started = time.monotonic()
-                    if chapter.index in self.title_only and chapter.translated:
+                    if chapter.index in self.name_fix and chapter.translated:
+                        if not self._fix_names(
+                            project, chapter, name_profile, qc_judge, qc_glossary,
+                            done, total,
+                        ):
+                            errors += 1
+                            done += 1
+                            continue
+                    elif chapter.index in self.title_only and chapter.translated:
                         self.progress.emit(done, total, f"{chapter.title} — dịch lại tiêu đề")
                         if not self._retranslate_title(
                             project, chapter, source_title, title_plans, qc_judge, qc_glossary
@@ -822,25 +898,40 @@ def chapters_to_qc(
     return project.pending_qc(target_lang, start_idx, end_idx, force=force)
 
 
-def split_retranslation(chapters: list) -> tuple[list[int], list[int]]:
-    """(title-only, full) chapter indices for re-translating QC failures, in given order.
+class RetranslationPlan(NamedTuple):
+    """How each chosen QC failure gets fixed — chapter indices, in the order given."""
 
-    A chapter whose ONLY failure is its title keeps its body: the body passed, and sending
-    it again costs thousands of tokens to fix a dozen characters (feature 094). It needs a
-    translated body to keep — without one there is nothing to protect and it goes full.
+    title_only: list[int]  # title re-translated, body kept (feature 094)
+    name_fix: list[int]  # names corrected in place, no engine call (feature 095)
+    full: list[int]  # cleared and translated again
 
-    Shared by `QcResultDialog` and the tab for the same reason as `chapters_to_qc`: what the
-    dialog says the click will do has to be what the worker then does.
+
+def split_retranslation(chapters: list) -> RetranslationPlan:
+    """Sort chosen QC failures by the cheapest fix that actually addresses each one.
+
+    * `title_untranslated` → the title alone: the body passed, and sending it again costs
+      thousands of tokens to fix a dozen characters.
+    * `name_variant` → a string edit: the check already knows the wrong spelling and the
+      novel's usual one. NOT `name_drift`: that check only knows a glossary name is
+      MISSING, never what the engine wrote instead, so there is nothing to replace.
+    * everything else → a full re-translation, as before.
+
+    Both cheap paths need a translated body to keep; without one there is nothing to
+    protect and the chapter goes full. Shared by `QcResultDialog` and the tab for the same
+    reason as `chapters_to_qc`: what the dialog says the click will do has to be what the
+    worker then does.
     """
-    from noveltrans.translators.qc import QC_TITLE_UNTRANSLATED
+    from noveltrans.translators.qc import QC_NAME_VARIANT, QC_TITLE_UNTRANSLATED
 
-    title_only, full = [], []
+    plan = RetranslationPlan([], [], [])
     for chapter in chapters:
-        if chapter.qc_code == QC_TITLE_UNTRANSLATED and chapter.translated:
-            title_only.append(chapter.index)
+        if chapter.translated and chapter.qc_code == QC_TITLE_UNTRANSLATED:
+            plan.title_only.append(chapter.index)
+        elif chapter.translated and chapter.qc_code == QC_NAME_VARIANT:
+            plan.name_fix.append(chapter.index)
         else:
-            full.append(chapter.index)
-    return title_only, full
+            plan.full.append(chapter.index)
+    return plan
 
 
 class QcScanWorker(PausableWorker):

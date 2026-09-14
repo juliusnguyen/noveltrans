@@ -18,6 +18,7 @@ from noveltrans.translators.qc import (
     QC_HAN_VIET,
     QC_LABELS,
     QC_NAME_DRIFT,
+    QC_NAME_VARIANT,
     QC_NOT_VIETNAMESE,
     QC_OK,
     QC_REFUSAL,
@@ -34,10 +35,12 @@ from noveltrans.translators.qc import (
     check_title,
     check_translation,
     diacritic_ratio,
+    fix_name_variants,
     english_word_rate,
     judge_sample,
     judge_translation,
     parse_judge_reply,
+    propose_name_fixes,
     retranslate_title_with_qc,
     retry_hint_for,
     severity,
@@ -260,7 +263,7 @@ class TestNameConsistency:
         "Doãn Chí Bình", and every other QC check passes it."""
         odd = "Hôm nay Yin Chí Bình đi tới. Hắn nhìn quanh."
         verdict = check_name_consistency(odd, self._profile([odd]))
-        assert verdict.code == QC_NAME_DRIFT
+        assert verdict.code == QC_NAME_VARIANT
         assert "doãn chí bình" in verdict.reason  # tells the user what it should be
 
     def test_the_usual_spelling_passes(self):
@@ -315,7 +318,118 @@ class TestNameConsistency:
         verdict = check_translation(
             "尹志平" * 40, "Chương 1", odd, profile=self._profile([odd])
         )
-        assert verdict.code == QC_NAME_DRIFT
+        assert verdict.code == QC_NAME_VARIANT
+
+
+class TestNameFix:
+    """Feature 095 — propose odd spellings for review, then apply only the approved ones."""
+
+    READING = "Doãn Chí Bình"
+    YIN = ("chí bình", "iin")  # a proposal key: folded stem and folded prefix
+
+    def _profile(self, *extra: str, reading: str = READING, usual: str = READING):
+        # 200 uses: a slip used twice in one chapter must stay under `VARIANT_SHARE` (2%),
+        # or it is an established alternative and — correctly — not a mistake to fix.
+        novel = [f"Hôm nay {usual} đi tới. Hắn nhìn quanh." for _ in range(200)]
+        return build_name_profile(novel + list(extra), [reading])
+
+    def test_an_approved_slip_becomes_the_usual_spelling(self):
+        odd = "Hôm nay Yin Chí Bình đi tới, rồi Yin Chí Bình ngồi xuống."
+        fixed, changes = fix_name_variants(odd, self._profile(odd), approved={self.YIN})
+        assert fixed == "Hôm nay Doãn Chí Bình đi tới, rồi Doãn Chí Bình ngồi xuống."
+        assert changes == ["Yin Chí Bình → Doãn Chí Bình"]  # shown to the user
+        assert check_name_consistency(fixed, self._profile(odd)).code == QC_OK
+
+    def test_nothing_is_written_that_was_not_approved(self):
+        """THE rule. On a real library most proposed pairs were false positives."""
+        odd = "Hôm nay Yin Chí Bình đi tới."
+        assert fix_name_variants(odd, self._profile(odd), approved=set()) == (odd, [])
+        other = {("chí bình", "lê")}
+        assert fix_name_variants(odd, self._profile(odd), approved=other) == (odd, [])
+
+    def test_approval_is_required_not_defaulted(self):
+        with pytest.raises(TypeError):
+            fix_name_variants("Hôm nay Yin Chí Bình đi.", self._profile())
+
+    def test_proposals_group_a_slip_across_chapters_with_an_example(self):
+        a = "Hôm nay Yin Chí Bình đi tới."
+        b = "Rồi Yin Chí Bình lại tới, và Yin Chí Bình ngồi."
+        proposals = propose_name_fixes([(3, a), (7, b)], self._profile(a, b))
+        assert len(proposals) == 1
+        proposal = proposals[0]
+        assert proposal.key == self.YIN
+        assert (proposal.wrong, proposal.right) == ("Yin Chí Bình", "Doãn Chí Bình")
+        assert proposal.occurrences == 3 and proposal.chapters == (3, 7)
+        assert "Yin Chí Bình" in proposal.example  # enough context to judge it by
+
+    def test_proposals_are_exactly_what_a_full_approval_would_change(self):
+        odd = "Yin Chí Bình đứng dậy. Hôm nay Yin Chí Bình đi tới."
+        profile = self._profile(odd)
+        keys = {p.key for p in propose_name_fixes([(0, odd)], profile)}
+        assert fix_name_variants(odd, profile, approved=keys)[0].count("Doãn") == 2
+
+    def test_it_writes_the_novels_own_spelling_not_the_folded_one(self):
+        """Names are COMPARED with i/y folded, but "Lí" must never be WRITTEN where the
+        novel says "Lý" — that would trade one inconsistency for another."""
+        odd = "Hôm nay Lê Mạc Sầu đi tới."
+        profile = self._profile(odd, reading="Lí Mạc Sầu", usual="Lý Mạc Sầu")
+        keys = {p.key for p in propose_name_fixes([(0, odd)], profile)}
+        assert fix_name_variants(odd, profile, approved=keys)[0] == "Hôm nay Lý Mạc Sầu đi tới."
+
+    def test_a_sentence_start_is_fixed_when_the_chapter_uses_that_spelling(self):
+        """Otherwise the fix leaves it, and the re-check — which ignores sentence starts —
+        calls the chapter clean with the wrong name still in it."""
+        odd = "Yin Chí Bình đứng dậy. Hôm nay Yin Chí Bình đi tới."
+        fixed, _ = fix_name_variants(odd, self._profile(odd), approved={self.YIN})
+        assert "Yin" not in fixed
+
+    def test_an_ordinary_word_at_a_sentence_start_is_not_proposed(self):
+        """Even when a stray mid-sentence capital has made "Còn" a known minority spelling
+        novel-wide, THIS chapter never uses it mid-sentence — so "as for Chí Bình" stays."""
+        profile = self._profile("Hắn gọi Còn Chí Bình tới.")
+        assert ("chí bình", "còn") in profile.minority  # the trap is armed
+        assert propose_name_fixes([(0, "Còn Chí Bình thì sao? Hắn đi ra.")], profile) == []
+
+    def test_an_established_alternative_is_not_proposed(self):
+        common = ["Hôm nay Duẫn Chí Bình đi tới."] * 20
+        assert propose_name_fixes([(0, common[0])], self._profile(*common)) == []
+
+    def test_honorifics_and_lowercase_words_are_not_proposed(self):
+        profile = self._profile("Hôm nay Yin Chí Bình đi tới.")
+        assert propose_name_fixes([(0, "Hắn đi theo Chí Bình, gọi Tiểu Chí Bình.")], profile) == []
+
+    def test_no_profile_proposes_and_changes_nothing(self):
+        text = "Hôm nay Yin Chí Bình đi."
+        assert propose_name_fixes([(0, text)], None) == []
+        assert fix_name_variants(text, None, approved={self.YIN}) == (text, [])
+        assert fix_name_variants("", self._profile(), approved={self.YIN}) == ("", [])
+
+
+class TestFastPrefixMatching:
+    """`_prefix_matches` walks back from `str.find` instead of running a regex at every
+    character — 126 s to profile a 1793-chapter novel before. It must not change a result."""
+
+    def test_it_agrees_with_the_regex_it_replaced(self):
+        import re
+
+        from noveltrans.translators.qc import _HONORIFICS, _SENTENCE_END, _prefix_matches
+
+        def by_regex(text, stem):
+            found = []
+            for m in re.compile(r"([^\W\d_]+)\s+" + re.escape(stem), re.IGNORECASE).finditer(text):
+                word = m.group(1)
+                if not word[:1].isupper() or word.casefold() in _HONORIFICS:
+                    continue
+                before = text[: m.start(1)].rstrip(" ")
+                found.append((m.start(1), m.end(1), word, not before or before[-1] in _SENTENCE_END))
+            return found
+
+        text = (
+            "Yin Chí Bình đứng dậy. Hôm nay  Doãn Chí Bình đi tới, gọi Tiểu Chí Bình.\n"
+            "“Lê Chí Bình!” theo Chí Bình 3Yin Chí Bình, CHÍ BÌNH, Cao\tChí Bình chí bình\n"
+            "Ông Chí Bìnhxyz Chí Bình. Chí Bình Chí Bình Chí Bình Xa  Chí Bình"
+        )
+        assert list(_prefix_matches(text, "chí bình")) == by_regex(text, "chí bình")
 
 
 class TestSeverityAndHints:
@@ -338,6 +452,9 @@ class TestSeverityAndHints:
                 assert retry_hint_for(QcVerdict(code)) == "", code
                 continue
             assert retry_hint_for(QcVerdict(code)).strip(), code
+
+    def test_a_name_variant_ranks_beside_the_glossary_name_failure(self):
+        assert severity(QC_NAME_VARIANT) == severity(QC_NAME_DRIFT) + 1
 
     def test_a_bad_title_ranks_below_every_body_failure(self):
         """`KEEP_BEST` must never give up a good body to get a clean heading."""

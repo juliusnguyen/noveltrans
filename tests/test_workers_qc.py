@@ -445,10 +445,122 @@ class TestTitleOnlyRetranslation:
 
 
 class TestSplitRetranslation:
-    def test_only_a_title_failure_with_a_body_is_title_only(self, library_dir, opened):
-        path = _title_failed_project(library_dir)
+    def test_each_failure_gets_the_cheapest_fix_that_addresses_it(self, library_dir, opened):
+        title_chapter = opened(_title_failed_project(library_dir)).chapter(0)
+        chapters = [
+            title_chapter,
+            replace(title_chapter, index=1, qc_code="name_variant"),
+            replace(title_chapter, index=2, qc_code="not_vietnamese"),
+            # the glossary check knows a name is MISSING, never what replaced it
+            replace(title_chapter, index=3, qc_code="name_drift"),
+            replace(title_chapter, index=4, qc_code="name_variant", translated=""),
+            replace(title_chapter, index=5, translated=""),
+        ]
+        assert split_retranslation(chapters) == ([0], [1], [2, 3, 4, 5])
+
+
+READING = "Doãn Chí Bình"
+ODD_BODY = STORED_GOOD.replace("Hắn", "Hôm nay Yin Chí Bình và hắn", 1)
+
+
+def _name_variant_project(library_dir: Path) -> Path:
+    """A novel that spells a character one way 60 times, and one chapter that slipped."""
+    from noveltrans.name_glossary import NameEntry, write_names
+
+    meta = NovelMeta(url="https://x/n", site="x", title="Truyện", source_lang="zh")
+    refs = [ChapterRef(index=i, title=f"第{i + 1}章", url=f"https://x/{i}") for i in range(61)]
+    project = NovelProject.create(library_dir, meta, refs)
+    for idx in range(61):
+        project.save_content(idx, SOURCE)
+        body = ODD_BODY if idx == 0 else f"Hôm nay {READING} đi tới. {STORED_GOOD}"
+        project.save_translation(idx, f"Chương {idx + 1}", body, "vi", "CLI (agy)")
+    project.mark_qc_failed(
+        0, "name_variant", "tên riêng viết khác cả truyện", project.chapter(0).qc_fingerprint()
+    )
+    write_names(project.path, [NameEntry(source="尹志平", reading=READING)], chapters_scanned=61)
+    path = project.path
+    project.close()
+    return path
+
+
+YIN = ("chí bình", "iin")  # the approval key for "Yin Chí Bình"
+
+
+class TestNameFixRun:
+    """Feature 095 — an APPROVED name slip is fixed in place; no engine translates anything."""
+
+    def test_the_name_is_corrected_without_a_single_engine_call(
+        self, qapp, library_dir, monkeypatch, opened
+    ):
+        path = _name_variant_project(library_dir)
+        engine = _FakeEngine(GOOD_VI)
+        _use(monkeypatch, engine)
+        TranslateWorker(
+            path, "fake", "vi", indices=[0], qc=_settings(), name_fix={0}, approved_names={YIN}
+        ).run()
+
+        chapter = opened(path).chapter(0)
+        assert engine.body_calls == []  # THE point: nothing re-translated
+        assert chapter.translated == ODD_BODY.replace("Yin Chí Bình", READING)
+        assert chapter.translator == "CLI (agy)"  # still that engine's translation
+        assert chapter.qc_ok and not chapter.qc_is_stale
+        assert chapter.error == "" and chapter.status == "translated"
+
+    def test_a_chapter_that_still_fails_is_marked_with_the_new_reason(
+        self, qapp, library_dir, monkeypatch, opened
+    ):
+        """The name is fixed, but the judge has never read this body until now."""
+
+        class _HarshJudge(_FakeEngine):
+            def complete(self, prompt: str) -> str:
+                return "LOI: han_viet — trật tự từ kiểu tiếng Trung"
+
+        path = _name_variant_project(library_dir)
+        _use(monkeypatch, _HarshJudge(GOOD_VI))
+        errors: list = []
+        worker = TranslateWorker(
+            path, "fake", "vi", indices=[0], qc=_settings(judge=QcEngineSpec("fake")),
+            name_fix={0}, approved_names={YIN},
+        )
+        worker.chapter_error.connect(lambda idx, _msg: errors.append(idx))
+        worker.run()
+
+        chapter = opened(path).chapter(0)
+        assert "Yin" not in chapter.translated  # the fix is kept
+        assert chapter.qc_code == "han_viet" and errors == [0]
+
+    def test_an_unapproved_slip_is_left_in_the_text_and_still_marked(
+        self, qapp, library_dir, monkeypatch, opened
+    ):
+        path = _name_variant_project(library_dir)
+        _use(monkeypatch, _FakeEngine(GOOD_VI))
+        TranslateWorker(
+            path, "fake", "vi", indices=[0], qc=_settings(), name_fix={0},
+            approved_names={("chí bình", "lê")},  # approved something else entirely
+        ).run()
+
+        chapter = opened(path).chapter(0)
+        assert chapter.translated == ODD_BODY  # not one character written
+        assert chapter.qc_code == "name_variant" and chapter.qc_failed
+
+    def test_the_reviewed_profile_is_used_rather_than_rebuilt(
+        self, qapp, library_dir, monkeypatch, opened
+    ):
+        """What is applied must be exactly what the user reviewed."""
+        from noveltrans.translators import qc
+
+        path = _name_variant_project(library_dir)
         project = opened(path)
-        title_chapter = project.chapter(0)
-        body_failure = replace(title_chapter, index=1, qc_code="not_vietnamese")
-        no_body = replace(title_chapter, index=2, translated="")
-        assert split_retranslation([title_chapter, body_failure, no_body]) == ([0], [1, 2])
+        profile = qc.build_name_profile(
+            (c.translated for c in project.chapters() if c.translated), [READING]
+        )
+        _use(monkeypatch, _FakeEngine(GOOD_VI))
+        monkeypatch.setattr(
+            qc, "build_name_profile",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("rebuilt")),
+        )
+        TranslateWorker(
+            path, "fake", "vi", indices=[0], qc=_settings(), name_fix={0},
+            approved_names={YIN}, name_profile=profile,
+        ).run()
+        assert "Yin" not in opened(path).chapter(0).translated

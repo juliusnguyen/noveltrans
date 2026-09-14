@@ -63,6 +63,7 @@ QC_REFUSAL = "refusal"
 QC_TRUNCATED = "truncated"
 QC_HAN_VIET = "han_viet"
 QC_NAME_DRIFT = "name_drift"
+QC_NAME_VARIANT = "name_variant"
 QC_TITLE_UNTRANSLATED = "title_untranslated"
 
 # Vietnamese labels for the result view. One per code, checked by a test, so a new code
@@ -76,6 +77,7 @@ QC_LABELS: dict[str, str] = {
     QC_TRUNCATED: "Bản dịch bị cắt ngắn",
     QC_HAN_VIET: "Đặc Hán-Việt (giọng convert)",
     QC_NAME_DRIFT: "Tên riêng viết sai",
+    QC_NAME_VARIANT: "Tên riêng viết khác cả truyện",
     QC_TITLE_UNTRANSLATED: "Tiêu đề còn chữ Hán",
 }
 
@@ -90,6 +92,7 @@ QC_SEVERITY: tuple[str, ...] = (
     QC_REFUSAL,
     QC_TRUNCATED,
     QC_NAME_DRIFT,
+    QC_NAME_VARIANT,
     QC_HAN_VIET,
     # Mildest of all: the body passed every check, only the heading is wrong. Ranked below
     # Hán-Việt so `KEEP_BEST` never trades a good body for a bad one to get a clean title.
@@ -433,22 +436,6 @@ VARIANT_SHARE = 0.02
 # mean anything, and one early chapter would define the canon for the whole book.
 MIN_CANONICAL_USES = 20
 
-_PREFIX_RE_CACHE: dict[str, "re.Pattern[str]"] = {}
-
-
-def _stem_pattern(stem: str):
-    """Matches `<word> <stem>` in orthography-folded, case-PRESERVED text.
-
-    The capitalisation test is applied to the captured word by `_prefixes_in`, not here, so
-    the pattern stays simple and the rule lives in one place.
-    """
-    if stem not in _PREFIX_RE_CACHE:
-        _PREFIX_RE_CACHE[stem] = re.compile(
-            r"([^\W\d_]+)\s+" + re.escape(stem), re.IGNORECASE
-        )
-    return _PREFIX_RE_CACHE[stem]
-
-
 # A capital letter only means "name" in the MIDDLE of a sentence. After any of these, it
 # means "start of a sentence" and says nothing at all — "Còn Kiếm Tiên…" is "As for the
 # sword immortal…", not a person called Còn. Ignoring this was worth 3 points of false
@@ -464,23 +451,74 @@ _HONORIFICS = frozenset(
 )
 
 
-def _prefixes_in(text: str, stem: str) -> list[str]:
+def _is_word_char(ch: str) -> bool:
+    """Exactly the regex class `[^\\W\\d_]` — a letter, not a digit or underscore."""
+    return ch.isalnum() and not ch.isdecimal()
+
+
+def lowered_for_matching(text: str) -> str:
+    """`text` lowercased character for character, so its offsets still index `text`.
+
+    `str.lower()` is length-preserving for Vietnamese, but not for every character (`İ`
+    lowers to two). A character that would change length is kept as it is.
+    """
+    lowered = text.lower()
+    if len(lowered) == len(text):
+        return lowered
+    return "".join(low if len(low := ch.lower()) == 1 else ch for ch in text)
+
+
+def _prefix_matches(text: str, stem: str, lowered: str | None = None):
+    """`(start, end, word, sentence_initial)` for each capitalised word written before `stem`.
+
+    Offsets index `text` AND the unfolded text it was folded from: `fold_orthography` maps
+    one character to one character, so a span found in the folded text cuts the same word
+    out of the original. That is what lets `fix_name_variants` edit the text it was given.
+
+    Found by `str.find` on the stem and a walk BACKWARDS to the word before it, not by a
+    `<word>\\s+<stem>` regex. The regex tried a match at every character of every chapter
+    for every stem: 126 s to profile a 1793-chapter novel, which the QC scan paid before
+    checking its first chapter. Pass `lowered` (see `lowered_for_matching`) when matching
+    many stems against one text, so it is lowercased once.
+    """
+    if lowered is None:
+        lowered = lowered_for_matching(text)
+    # Where the last `<word> <stem>` ended. The regex never let two matches overlap — the
+    # word of one match cannot be inside the stem of the previous — and a test pins that
+    # this reproduces it, so the faster search cannot quietly change a single verdict.
+    consumed = 0
+    pos = lowered.find(stem)
+    while pos != -1:
+        # `\\s+` between the word and the stem, then the word itself.
+        end = pos
+        while end > 0 and text[end - 1].isspace():
+            end -= 1
+        start = end
+        while start > consumed and _is_word_char(text[start - 1]):
+            start -= 1
+        if end < pos and start < end:
+            consumed = pos + len(stem)
+            word = text[start:end]
+            if word[:1].isupper() and word.casefold() not in _HONORIFICS:
+                before = start - 1
+                while before >= 0 and text[before] == " ":
+                    before -= 1
+                initial = before < 0 or text[before] in _SENTENCE_END
+                yield start, end, word, initial
+        pos = lowered.find(stem, pos + 1)
+
+
+def _prefixes_in(text: str, stem: str, lowered: str | None = None) -> list[str]:
     """Folded first syllables written before `stem`, mid-sentence and capitalised.
 
     Both conditions carry weight. A name's first syllable is capitalised, which is what
     keeps "theo Chí Thường" ("follow Chí Thường") from reading as a person called Theo —
     and it must not be the first word of a sentence, where every word is capitalised.
     """
-    found = []
-    for match in _stem_pattern(stem).finditer(text):
-        word = match.group(1)
-        if not word[:1].isupper() or word.casefold() in _HONORIFICS:
-            continue
-        before = text[: match.start(1)].rstrip(" ")
-        if not before or before[-1] in _SENTENCE_END:
-            continue  # sentence-initial: the capital is orthography, not evidence
-        found.append(word.casefold())
-    return found
+    return [
+        word.casefold() for _start, _end, word, initial in _prefix_matches(text, stem, lowered)
+        if not initial  # sentence-initial: the capital is orthography, not evidence
+    ]
 
 
 @dataclass(frozen=True)
@@ -489,12 +527,15 @@ class NameProfile:
 
     `canonical` maps a folded name stem ("chí bình") to the folded first syllable the novel
     overwhelmingly uses for it ("doãn"), and `display` keeps a readable form for the message.
-    `minority` is the set of (stem, prefix) pairs rare enough to be mistakes.
+    `minority` is the set of (stem, prefix) pairs rare enough to be mistakes. `surface` is
+    the canonical first syllable AS THE NOVEL WRITES IT ("Lý", never the folded "lí"), which
+    is what `fix_name_variants` writes back.
     """
 
     canonical: dict[str, str] = field(default_factory=dict)
     display: dict[str, str] = field(default_factory=dict)
     minority: set = field(default_factory=set)
+    surface: dict[str, str] = field(default_factory=dict)
 
     @property
     def empty(self) -> bool:
@@ -504,8 +545,9 @@ class NameProfile:
         """The odd spellings this text uses, as `"Yin Chí Bình"` ready to show the user."""
         found = []
         folded = fold_orthography(text)
+        lowered = lowered_for_matching(folded)
         for stem, canon in self.canonical.items():
-            for prefix in set(_prefixes_in(folded, stem)):
+            for prefix in set(_prefixes_in(folded, stem, lowered)):
                 if prefix != canon and (stem, prefix) in self.minority:
                     found.append(f"{prefix} {stem} (thường viết {canon} {stem})")
         return sorted(found)
@@ -530,13 +572,22 @@ def build_name_profile(translations, readings) -> NameProfile:
         return NameProfile()
 
     counts: dict[str, dict[str, int]] = {stem: {} for stem in stems}
+    # How each folded prefix is actually written: "lí" may be "Lý" in every chapter.
+    written: dict[tuple[str, str], dict[str, int]] = {}
     for text in translations:
-        folded = fold_orthography(text or "")
+        text = text or ""
+        folded = fold_orthography(text)
+        lowered = lowered_for_matching(folded)
         for stem in stems:
-            for prefix in _prefixes_in(folded, stem):
+            for start, end, word, initial in _prefix_matches(folded, stem, lowered):
+                if initial:
+                    continue
+                prefix = word.casefold()
                 counts[stem][prefix] = counts[stem].get(prefix, 0) + 1
+                forms = written.setdefault((stem, prefix), {})
+                forms[text[start:end]] = forms.get(text[start:end], 0) + 1
 
-    canonical, minority = {}, set()
+    canonical, minority, surface = {}, set(), {}
     for stem, prefixes in counts.items():
         if not prefixes:
             continue
@@ -544,10 +595,14 @@ def build_name_profile(translations, readings) -> NameProfile:
         if canon_uses < MIN_CANONICAL_USES:
             continue
         canonical[stem] = canon
+        forms = written[(stem, canon)]
+        surface[stem] = max(forms.items(), key=lambda kv: kv[1])[0]
         for prefix, uses in prefixes.items():
             if prefix != canon and uses <= VARIANT_SHARE * canon_uses:
                 minority.add((stem, prefix))
-    return NameProfile(canonical=canonical, display=stems, minority=minority)
+    return NameProfile(
+        canonical=canonical, display=stems, minority=minority, surface=surface
+    )
 
 
 def check_name_consistency(body: str, profile: NameProfile | None) -> QcVerdict:
@@ -560,10 +615,149 @@ def check_name_consistency(body: str, profile: NameProfile | None) -> QcVerdict:
     shown = "; ".join(variants[:_MAX_REPORTED_NAMES])
     more = f" (và {len(variants) - _MAX_REPORTED_NAMES} chỗ khác)" if len(variants) > _MAX_REPORTED_NAMES else ""
     return QcVerdict(
-        QC_NAME_DRIFT,
+        QC_NAME_VARIANT,
         f"tên riêng viết khác cả truyện: {shown}{more}",
         {"variants": float(len(variants))},
     )
+
+
+# -- fixing a name slip, after the user has approved it -------------------------
+#
+# Feature 095. `check_name_consistency` knows both the odd spelling and the usual one, so a
+# chapter it flags could be corrected with a string edit instead of a re-translation. It is
+# NOT applied automatically, and that is measured, not cautious: run over the reporting
+# library, the pairs it would rewrite included "Nhưng Sơn Hải → Đoạn Sơn Hải" (Sơn Hải is a
+# place), "Chân Trúc Cơ → Ngã Trúc Cơ" (a cultivation stage) and "Tân Tông Chủ → Niếp Tông
+# Chủ" ("the new sect leader"). A glossary name whose tail is an ordinary word or a title
+# makes the capitalised word before it look like a misspelt surname. As a reviewable verdict
+# that costs a glance; as an automatic edit it would write the mistake into the novel. So
+# `propose_name_fixes` lists the pairs, a person approves them, and `fix_name_variants`
+# applies only those.
+
+NAME_FIX_CONTEXT_CHARS = 40  # each side of the example shown for a proposed pair
+
+
+@dataclass(frozen=True)
+class NameFixProposal:
+    """One odd spelling the novel could be corrected away from, with its evidence.
+
+    `key` — `(stem, prefix)`, both folded — is what an approval is recorded as, so every
+    written form of the same slip ("Yin", "YIN") is approved or refused together.
+    """
+
+    key: tuple[str, str]
+    wrong: str  # "Yin Chí Bình", as most often written
+    right: str  # "Doãn Chí Bình", as the novel usually writes it
+    occurrences: int
+    chapters: tuple[int, ...]
+    example: str  # a short excerpt around the first occurrence, for the reviewer
+
+
+def _variant_edits(text: str, profile: NameProfile):
+    """`(start, end, key, right)` for each odd spelling in `text` that a fix may rewrite.
+
+    Only the pairs the profile calls a MISTAKE (`minority`), under the same capital and
+    honorific rules the check uses, so nothing is proposed that the check would not flag.
+    One widening, bounded: a sentence-initial occurrence counts too, but only when this
+    same text also uses that spelling mid-sentence. Without it "Yin Chí Bình đi." at a
+    sentence start would survive the fix — and the re-check, which ignores sentence starts,
+    would call the chapter clean. Requiring the chapter's own mid-sentence evidence is what
+    keeps "Còn Chí Bình thì sao?" ("as for Chí Bình") out.
+    """
+    folded = fold_orthography(text)
+    lowered = lowered_for_matching(folded)
+    for stem, canon in profile.canonical.items():
+        right = profile.surface.get(stem)
+        if not right:
+            continue
+        matches = [
+            (start, end, word.casefold(), initial)
+            for start, end, word, initial in _prefix_matches(folded, stem, lowered)
+        ]
+        evidenced = {prefix for _s, _e, prefix, initial in matches if not initial}
+        for start, end, prefix, initial in matches:
+            if prefix == canon or (stem, prefix) not in profile.minority:
+                continue
+            if initial and prefix not in evidenced:
+                continue
+            yield start, end, (stem, prefix), right
+
+
+def propose_name_fixes(chapters, profile: NameProfile | None) -> list[NameFixProposal]:
+    """Every odd spelling across `chapters` — `(index, text)` pairs — grouped for review.
+
+    Most frequent first, because a slip repeated across chapters is both the most likely to
+    be a real engine mistake and the most worth fixing.
+    """
+    if profile is None or profile.empty:
+        return []
+    uses: dict[tuple[str, str], int] = {}
+    where: dict[tuple[str, str], list[int]] = {}
+    written: dict[tuple[str, str], dict[str, int]] = {}
+    right_of: dict[tuple[str, str], str] = {}
+    example_of: dict[tuple[str, str], str] = {}
+    for index, text in chapters:
+        if not text:
+            continue
+        for start, end, key, right in _variant_edits(text, profile):
+            uses[key] = uses.get(key, 0) + 1
+            if index not in where.setdefault(key, []):
+                where[key].append(index)
+            forms = written.setdefault(key, {})
+            forms[text[start:end]] = forms.get(text[start:end], 0) + 1
+            right_of[key] = right
+            if key not in example_of:
+                lo = max(0, start - NAME_FIX_CONTEXT_CHARS)
+                hi = min(len(text), end + len(key[0]) + NAME_FIX_CONTEXT_CHARS)
+                excerpt = " ".join(text[lo:hi].split())
+                example_of[key] = ("…" if lo else "") + excerpt + ("…" if hi < len(text) else "")
+    proposals = []
+    for key, count in uses.items():
+        name = profile.display.get(key[0], key[0])
+        wrong = max(written[key].items(), key=lambda kv: kv[1])[0]
+        proposals.append(
+            NameFixProposal(
+                key=key,
+                wrong=f"{wrong} {name}",
+                right=f"{right_of[key]} {name}",
+                occurrences=count,
+                chapters=tuple(where[key]),
+                example=example_of[key],
+            )
+        )
+    return sorted(proposals, key=lambda p: (-p.occurrences, p.wrong))
+
+
+def fix_name_variants(
+    text: str, profile: NameProfile | None, *, approved
+) -> tuple[str, list[str]]:
+    """Rewrite the APPROVED odd spellings in `text` to the novel's usual one — no engine.
+
+    `approved` is a collection of `NameFixProposal.key`s and is required, never defaulted
+    to "all": see the comment above `NAME_FIX_CONTEXT_CHARS` for what "all" would write.
+    Returns `(text, changes)`, `changes` as `"Yin Chí Bình → Doãn Chí Bình"`.
+    """
+    if not text or profile is None or profile.empty or not approved:
+        return text, []
+    approved = set(approved)
+    edits: list[tuple[int, int, str]] = []
+    changes: set[str] = set()
+    for start, end, key, right in _variant_edits(text, profile):
+        if key not in approved:
+            continue
+        edits.append((start, end, right))
+        name = profile.display.get(key[0], key[0])
+        changes.add(f"{text[start:end]} {name} → {right} {name}")
+    if not edits:
+        return text, []
+    pieces, cursor = [], 0
+    for start, end, replacement in sorted(edits):
+        if start < cursor:
+            continue  # two stems matched the same word: the first edit stands
+        pieces.extend((text[cursor:start], replacement))
+        cursor = end
+    pieces.append(text[cursor:])
+    return "".join(pieces), sorted(changes)
 
 
 # -- the LLM judge ------------------------------------------------------------
@@ -681,6 +875,10 @@ _RETRY_HINTS: dict[str, str] = {
         "đến cuối, không tóm tắt"
     ),
     QC_NAME_DRIFT: (
+        "lần trước viết SAI tên riêng — phải giữ nguyên chính xác tên đã có trong văn bản "
+        "đưa vào, không được đổi cách viết, không được chuyển sang phiên âm pinyin"
+    ),
+    QC_NAME_VARIANT: (
         "lần trước viết SAI tên riêng — phải giữ nguyên chính xác tên đã có trong văn bản "
         "đưa vào, không được đổi cách viết, không được chuyển sang phiên âm pinyin"
     ),
