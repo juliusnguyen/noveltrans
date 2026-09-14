@@ -188,6 +188,15 @@ class SettingsDialog(QDialog):
         )
         form.addRow("Lệnh Claude CLI:", self.claude_cli_edit)
 
+        self.codex_cli_edit = QLineEdit(config.codex_cli_command)
+        self.codex_cli_edit.setPlaceholderText("codex exec --skip-git-repo-check --ephemeral")
+        self.codex_cli_edit.setToolTip(
+            "Lệnh Codex headless (codex exec) — dùng tài khoản ChatGPT đã `codex login`, "
+            "không cần API key. Nội dung chương được gửi qua stdin. Có thể thêm "
+            "-c model_reasoning_effort=\"low\" để dịch nhanh hơn."
+        )
+        form.addRow("Lệnh Codex CLI:", self.codex_cli_edit)
+
         # medoctruyen.vn session cookie — needed to read full chapter bodies
         self.medoctruyen_cookie_edit = QLineEdit(config.medoctruyen_cookies)
         self.medoctruyen_cookie_edit.setEchoMode(QLineEdit.EchoMode.Password)
@@ -902,6 +911,7 @@ class SettingsDialog(QDialog):
         self.config.claude_model = self.model_edit.text().strip()
         self.config.cli_command = self.cli_edit.text().strip()
         self.config.claude_cli_command = self.claude_cli_edit.text().strip()
+        self.config.codex_cli_command = self.codex_cli_edit.text().strip()
         self.config.medoctruyen_cookies = self.medoctruyen_cookie_edit.text().strip()
         self.config.tieuthuyetmang_cookies = (
             self.tieuthuyetmang_cookie_edit.text().strip()

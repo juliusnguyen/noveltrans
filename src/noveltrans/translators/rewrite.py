@@ -12,8 +12,9 @@ does the model summarise? does it rename a character? — is unit-testable again
 LLM that misbehaves on purpose. See `tts/tags.py` for the same discipline.
 
 Engines are prompted through `Translator.complete(prompt)` **positionally, with no
-`system=`**: `CliAgentTranslator.complete` (`cli_agent.py`) appends the prompt as the
-final argv entry of a subprocess and has no second channel to put a system prompt in.
+`system=`**: `CliAgentTranslator.complete` (`cli_agent.py`) hands the prompt to a
+subprocess — as the final argv entry, or on stdin for Codex — and has no second channel
+to put a system prompt in.
 That is why the whole instruction set lives inside the prompt string, and why the prompt
 is *task-framed* rather than role-framed ("Bạn là biên tập viên…") — agent CLIs refuse
 prompts that try to redefine their role.

@@ -559,3 +559,16 @@ def test_the_config_default_is_vertical(qapp, tmp_path):
     assert config.workspace_tabs_vertical is True
     config.workspace_tabs_vertical = False
     assert config.workspace_tabs_vertical is False
+
+
+# -- Codex CLI command (088) ----------------------------------------------------
+
+
+def test_codex_cli_command_loads_and_saves(qapp, tmp_path):
+    config = _isolated_config(tmp_path)
+    config.codex_cli_command = "codex exec --skip-git-repo-check"
+    dialog = SettingsDialog(config)
+    assert dialog.codex_cli_edit.text() == "codex exec --skip-git-repo-check"
+    dialog.codex_cli_edit.setText("  codex exec --ephemeral  ")
+    dialog.accept()
+    assert config.codex_cli_command == "codex exec --ephemeral"

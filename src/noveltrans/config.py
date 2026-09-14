@@ -12,6 +12,7 @@ from pathlib import Path
 from PySide6.QtCore import QSettings
 
 from noveltrans.storage.library import DEFAULT_LIBRARY_DIR
+from noveltrans.translators import CLI_ENGINES  # noqa: F401 — re-exported for the GUI
 
 # How many previously-used library folders to keep. Enough for a few real libraries,
 # short enough that the dropdown stays scannable.
@@ -31,6 +32,18 @@ DEFAULT_CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 
 DEFAULT_CLI_COMMAND = "agy -p"
 DEFAULT_CLAUDE_CLI_COMMAND = "claude -p"
+# `--ephemeral` keeps a novel's worth of chapters from piling up as saved sessions under
+# ~/.codex/sessions. `CliAgentTranslator` adds the other two flags itself if they are
+# removed; they are spelled out here so the Settings field shows what actually runs.
+DEFAULT_CODEX_CLI_COMMAND = "codex exec --skip-git-repo-check --sandbox read-only --ephemeral"
+# Model-box suggestions for CLIs with no `<binary> models` subcommand to list them — for
+# these the tab must not run one: `codex models` would start an agent session with
+# "models" as the prompt. Keyed by binary, so a `cli` engine running codex gets them too.
+# Codex IDs as offered by codex-cli 0.154.0; the box stays editable for newer ones.
+CLI_MODEL_SUGGESTIONS = {
+    "claude": ["haiku", "sonnet", "opus"],
+    "codex": ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra", "gpt-5.5"],
+}
 DEFAULT_LMSTUDIO_URL = "http://127.0.0.1:1234"
 # Where OneDrive backups go. One folder for the whole library; each novel is a subfolder
 # of it. Kept here rather than in `onedrive_upload` so that module stays free of AppConfig
@@ -73,6 +86,7 @@ TRANSLATORS = {
     "claude": "Claude API",
     "cli": "CLI Agent",
     "claude_cli": "Claude CLI",
+    "codex_cli": "Codex CLI",
     "lmstudio": "LM Studio (local)",
 }
 
@@ -80,7 +94,7 @@ TRANSLATORS = {
 # Engines that can run a free-form prompt (`Translator.supports_completion`), for the
 # features that need more than translation: YouTube tags, the thumbnail image prompt, and
 # the style rewrite. Google is translate-only and is deliberately absent.
-LLM_ENGINES = ("cli", "claude_cli", "claude", "lmstudio")
+LLM_ENGINES = ("cli", "claude_cli", "codex_cli", "claude", "lmstudio")
 
 # Translation QC (feature 084): how many times ONE engine in the chain may retry a chapter
 # before the next engine takes over. The default is deliberately small — a retry costs a
@@ -97,6 +111,7 @@ def translator_labels(config: "AppConfig | None" = None) -> dict[str, str]:
         for key, command in (
             ("cli", config.cli_command),
             ("claude_cli", config.claude_cli_command),
+            ("codex_cli", config.codex_cli_command),
         ):
             parts = (command or "").strip().split()
             if parts:
@@ -309,9 +324,21 @@ class AppConfig:
     def claude_cli_command(self, value: str) -> None:
         self._s.setValue("claude_cli_command", value)
 
+    @property
+    def codex_cli_command(self) -> str:
+        return str(self._s.value("codex_cli_command", DEFAULT_CODEX_CLI_COMMAND))
+
+    @codex_cli_command.setter
+    def codex_cli_command(self, value: str) -> None:
+        self._s.setValue("codex_cli_command", value)
+
     def cli_command_for(self, engine: str) -> str:
         """The shell command backing a CLI-based engine."""
-        return self.claude_cli_command if engine == "claude_cli" else self.cli_command
+        if engine == "claude_cli":
+            return self.claude_cli_command
+        if engine == "codex_cli":
+            return self.codex_cli_command
+        return self.cli_command
 
     @property
     def lmstudio_url(self) -> str:
@@ -668,8 +695,9 @@ class AppConfig:
         which is the obvious behaviour for someone who switched QC on without configuring
         anything.
 
-        Entries carry a MODEL as well as an engine key because `cli` and `claude_cli` are the
-        same class over different commands and each has its own model box — without it,
+        Entries carry a MODEL as well as an engine key because `cli`, `claude_cli` and
+        `codex_cli` are the same class over different commands and each has its own model
+        box — without it,
         "sonnet then haiku" would be inexpressible.
 
         Validated on read, like every other list here: a stale or hand-edited entry degrades
