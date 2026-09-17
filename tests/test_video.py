@@ -1691,6 +1691,52 @@ class TestVideoWorker:
         assert "Phần 1" in title1
         assert "Phần 3" in title3  # not "Phần 2" from grid arithmetic on first_num=21
 
+    def test_the_title_order_reaches_the_title_sidecar(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        """"Phần N - Tên truyện" is what the render writes to `.title.txt`, which is what
+        the upload sends."""
+        from pathlib import Path
+
+        from noveltrans.gui.workers import VideoWorker
+        from noveltrans.models import ChapterRef
+        from noveltrans.storage import NovelProject
+        from noveltrans.storage.project import slugify
+        from noveltrans.tts.merge import MergeWindow
+        from noveltrans.tts.video import video_part_name
+
+        refs = [ChapterRef(index=i, title=f"第{i + 1}章", url=f"https://x/{i + 1}")
+                for i in range(10)]
+        project = NovelProject.create(library_dir, sample_meta, refs)
+        for i in range(10):
+            rel = f"exports/audio/{i}.mp3"
+            project.save_audio(i, rel, "V", 1.0)
+            (project.path / rel).parent.mkdir(parents=True, exist_ok=True)
+            (project.path / rel).write_bytes(b"fake audio")
+        chapters = project.chapters()
+        path, name = project.path, project.meta.display_name()
+        slug = slugify(project.meta.translated_title or project.meta.title)
+        project.close()
+
+        def _fake_render_video(segments, image_path, out_path, *a, **k):
+            Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(out_path).write_bytes(b"fake mp4")
+
+        monkeypatch.setattr("noveltrans.tts.video.render_video", _fake_render_video)
+        image = tmp_path / "bg.png"
+        image.write_bytes(b"fake")
+        VideoWorker(
+            path, voice="V", mode="batch", image_path=str(image), batch=10,
+            explicit_windows=[MergeWindow(1, 10, chapters)],
+            explicit_part_numbers={1: 1},
+            title_order="part_first",
+        ).run()
+
+        part = video_part_name(slug, 1, 10, whole_novel=False)
+        out = project.video_dir / Path(part).stem / part
+        title = (out.parent / (out.stem + ".title.txt")).read_text(encoding="utf-8").strip()
+        assert title == f"Phần 1 - {name}"
+
 
 class TestRealDurations:
     def test_falls_back_to_stored_when_probe_fails(self):

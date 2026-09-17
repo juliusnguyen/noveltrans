@@ -1068,11 +1068,29 @@ class _FakeEditPage:
         self.toast = toast
         self.save_present = save_present
         self.save_enabled = False  # nothing to save yet
+        self.typed: list = []  # text put into a box via the keyboard (the title)
         self.sent: list = []
         self.tried: list = []
         self.clicked: list = []
         self.goto_urls: list = []
         self.waits: list = []
+
+    @property
+    def keyboard(self):
+        """Studio's boxes are contenteditable divs, so text goes in through the keyboard
+        — and lands the same "Save became enabled" signal a new image does."""
+        page = self
+
+        class _Keyboard:
+            def press(self, _keys):
+                pass
+
+            def insert_text(self, text):
+                page.typed.append(text)
+                if page.accepts:
+                    page.save_enabled = True
+
+        return _Keyboard()
 
     def goto(self, url, wait_until=None):
         self.goto_urls.append(url)
@@ -1241,7 +1259,7 @@ class TestSaveConfirmation:
         from noveltrans.youtube_upload import _SAVE_SEL, _save_edits
 
         page = _FakeEditPage()
-        page.save_enabled = True  # as `_thumbnail_accepted` left it
+        page.save_enabled = True  # as `_edit_accepted` left it
         _save_edits(page, video_id="dQw4w9WgXcQ")
         assert page.clicked == [_SAVE_SEL]
 
@@ -1278,12 +1296,12 @@ class TestSaveConfirmation:
 
     def test_disabled_save_alone_is_not_proof_the_image_landed(self):
         """`#save` is disabled on arrival, so "disabled" means nothing on its own. The
-        gate that gives it meaning is `_thumbnail_accepted` seeing it ENABLED first —
+        gate that gives it meaning is `_edit_accepted` seeing it ENABLED first —
         exactly the always-true check that made `_finish` report every publish a success."""
-        from noveltrans.youtube_upload import _thumbnail_accepted
+        from noveltrans.youtube_upload import _edit_accepted
 
         page = _FakeEditPage()  # save_enabled False, never touched
-        assert _thumbnail_accepted(page, timeout_ms=2_000) is False
+        assert _edit_accepted(page, timeout_ms=2_000) is False
 
 
 class TestUpdateThumbnailOneGuards:
@@ -1386,6 +1404,108 @@ class TestUpdateThumbnailRecord:
                 should_cancel=should_cancel,
             )
         assert "thumbnail_updated_at" not in read_upload_state(part)
+
+
+class TestTitleRequestValidation:
+    def test_an_empty_title_is_refused(self, part):
+        from noveltrans.youtube_upload import TitleRequest
+
+        with pytest.raises(YouTubeUploadError, match="thiếu tiêu đề"):
+            TitleRequest(video=part, title="   ", label="Phần 1").validate()
+
+    def test_a_title_over_youtubes_limit_is_refused(self, part):
+        from noveltrans.youtube_upload import TitleRequest
+
+        with pytest.raises(YouTubeUploadError, match="100"):
+            TitleRequest(video=part, title="x" * 101, label="Phần 1").validate()
+
+    def test_angle_brackets_are_refused(self, part):
+        from noveltrans.youtube_upload import TitleRequest
+
+        with pytest.raises(YouTubeUploadError, match="<"):
+            TitleRequest(video=part, title="Phần 1 - <b>", label="Phần 1").validate()
+
+
+class TestUpdateTitleOne:
+    """`page=None` in the guards: any locator access would raise AttributeError instead
+    of the error asserted on, which proves nothing was touched."""
+
+    def _page(self):
+        from noveltrans.youtube_upload import _EDIT_TITLE_SEL
+
+        return _FakeEditPage(inputs={_EDIT_TITLE_SEL})
+
+    def test_a_part_with_no_video_on_youtube_raises_before_the_page(self, part):
+        from noveltrans.youtube_upload import TitleRequest, update_title_one
+
+        with pytest.raises(YouTubeUploadError, match="chưa có video"):
+            update_title_one(None, TitleRequest(video=part, title="Phần 1 - X"))
+
+    def test_a_bad_title_raises_before_the_page(self, part):
+        from noveltrans.youtube_upload import TitleRequest, update_title_one
+
+        write_upload_state(part, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
+        with pytest.raises(YouTubeUploadError):
+            update_title_one(None, TitleRequest(video=part, title=""))
+
+    def test_it_fills_the_title_box_and_saves(self, part):
+        from noveltrans.youtube_upload import _SAVE_SEL, TitleRequest, update_title_one
+
+        write_upload_state(part, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
+        page = self._page()
+        result = update_title_one(page, TitleRequest(video=part, title="Phần 1 - X"))
+        assert page.typed == ["Phần 1 - X"]
+        assert _SAVE_SEL in page.clicked
+        assert result.video_id == "dQw4w9WgXcQ"
+
+    def test_the_new_title_becomes_the_record_of_what_youtube_shows(self, part):
+        from noveltrans.youtube_upload import TitleRequest, update_title_one
+
+        write_upload_state(
+            part, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ", title="X - Phần 1"
+        )
+        update_title_one(self._page(), TitleRequest(video=part, title="Phần 1 - X"))
+        state = read_upload_state(part)
+        assert state["title"] == "Phần 1 - X"
+        assert state["title_updated_at"]
+        # a rename cannot move the publication state machine
+        assert state["status"] == STATE_PUBLISHED
+
+    def test_a_failed_save_writes_nothing(self, part):
+        from noveltrans.youtube_upload import _EDIT_TITLE_SEL, TitleRequest, update_title_one
+
+        write_upload_state(
+            part, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ", title="X - Phần 1"
+        )
+        page = _FakeEditPage(inputs={_EDIT_TITLE_SEL}, commits=False)
+        with pytest.raises(YouTubeUploadError):
+            update_title_one(page, TitleRequest(video=part, title="Phần 1 - X"))
+        assert read_upload_state(part)["title"] == "X - Phần 1"
+
+    def test_studio_ignoring_the_change_is_a_named_failure(self, part):
+        """Save staying disabled means the text never landed — reporting success there
+        would tell the user the channel was renamed when it wasn't."""
+        from noveltrans.youtube_upload import _EDIT_TITLE_SEL, TitleRequest, update_title_one
+
+        write_upload_state(part, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
+        page = _FakeEditPage(inputs={_EDIT_TITLE_SEL}, accepts=False)
+        with pytest.raises(YouTubeUploadError, match="Lưu"):
+            update_title_one(page, TitleRequest(video=part, title="Phần 1 - X"))
+        assert "title_updated_at" not in read_upload_state(part)
+
+    def test_cancelling_before_the_save_writes_nothing(self, part):
+        from noveltrans.youtube_upload import TitleRequest, UploadCancelled, update_title_one
+
+        write_upload_state(part, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
+        calls = {"n": 0}
+
+        with pytest.raises(UploadCancelled):
+            update_title_one(
+                self._page(),
+                TitleRequest(video=part, title="Phần 1 - X"),
+                should_cancel=lambda: calls.__setitem__("n", calls["n"] + 1) or calls["n"] > 1,
+            )
+        assert "title_updated_at" not in read_upload_state(part)
 
 
 class TestUpdateThumbnailBatch:
@@ -3051,7 +3171,13 @@ class TestPauseHook:
 
     @pytest.mark.parametrize(
         "name",
-        ["upload_batch", "upload_subtitle_batch", "update_thumbnail_batch", "sync_playlist_batch"],
+        [
+            "upload_batch",
+            "upload_subtitle_batch",
+            "update_thumbnail_batch",
+            "update_title_batch",
+            "sync_playlist_batch",
+        ],
     )
     def test_the_hook_is_optional_and_keyword_only(self, name):
         import inspect
@@ -3062,9 +3188,11 @@ class TestPauseHook:
         assert param.default is None  # every existing caller keeps working untouched
         assert param.kind is inspect.Parameter.KEYWORD_ONLY
 
+    # The edit-page batches (thumbnail, title) are thin wrappers over the shared
+    # `_edit_batch`, which is where their per-part loop — and the hook — actually lives.
     @pytest.mark.parametrize(
         "name",
-        ["upload_batch", "upload_subtitle_batch", "update_thumbnail_batch", "sync_playlist_batch"],
+        ["upload_batch", "upload_subtitle_batch", "_edit_batch", "sync_playlist_batch"],
     )
     def test_the_hook_sits_at_the_part_boundary_not_mid_transfer(self, name):
         # Guards the one thing that would break a live upload: holding inside

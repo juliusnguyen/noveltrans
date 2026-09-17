@@ -303,3 +303,79 @@ class TestTitleAlign:
                 )
             outs.append(out.read_bytes())
         assert outs[0] != outs[1]
+
+
+class TestTitleLineBreaks:
+    """The user picks where the cover title breaks (Enter in the cover editor)."""
+
+    TITLE = "Đại Càn Đỉnh Lưu: Phò Mã Gia Trốn Hôn"
+
+    def test_a_typed_break_starts_a_new_line(self):
+        from noveltrans.tts.thumbnail import _wrap_title_lines
+
+        font = _load_font(40)
+        text = "Đại Càn Đỉnh Lưu:\nPhò Mã Gia Trốn Hôn"
+        assert _wrap_title_lines(text, font, 5000) == ["Đại Càn Đỉnh Lưu:", "Phò Mã Gia Trốn Hôn"]
+
+    def test_a_line_that_is_still_too_wide_still_wraps(self):
+        from noveltrans.tts.thumbnail import _wrap_title_lines
+
+        font = _load_font(80)
+        lines = _wrap_title_lines("Đại Càn\nPhò Mã Gia Trốn Hôn", font, 300)
+        assert lines[0] == "Đại Càn"
+        assert len(lines) > 2
+
+    def test_blank_lines_are_dropped(self):
+        from noveltrans.tts.thumbnail import _wrap_title_lines
+
+        assert _wrap_title_lines("A\n\n  \nB", _load_font(40), 5000) == ["A", "B"]
+
+    def test_a_typed_break_changes_the_rendered_cover(self):
+        from noveltrans.tts.thumbnail import compose_thumbnail
+
+        with font_dir_context() as d:
+            kw = dict(part_num=1, tagline="", font_path=d / video_font("noto_sans")["file"],
+                      width=320, height=180)
+            broken = compose_thumbnail("", vn_title="Đại Càn\nĐỉnh Lưu: Phò Mã Gia Trốn Hôn", **kw)
+            plain = compose_thumbnail("", vn_title=self.TITLE, **kw)
+        assert broken.tobytes() != plain.tobytes()
+
+    def test_cover_title_uses_the_layout_when_it_spells_the_title(self):
+        from noveltrans.tts.thumbnail import cover_title
+
+        # line breaks and a dropped ":" are layout, not a different title
+        assert cover_title(self.TITLE, "Đại Càn Đỉnh Lưu:\nPhò Mã Gia Trốn Hôn") == (
+            "Đại Càn Đỉnh Lưu:\nPhò Mã Gia Trốn Hôn"
+        )
+        assert cover_title(self.TITLE, "Đại Càn Đỉnh Lưu\nPhò Mã Gia Trốn Hôn") == (
+            "Đại Càn Đỉnh Lưu\nPhò Mã Gia Trốn Hôn"
+        )
+
+    def test_cover_title_falls_back_when_empty_or_stale(self):
+        from noveltrans.tts.thumbnail import cover_title
+
+        assert cover_title(self.TITLE, "") == self.TITLE
+        assert cover_title(self.TITLE, "  \n ") == self.TITLE
+        # the novel was renamed after the layout was saved → the new name, auto-wrapped
+        assert cover_title("Tên Mới Hoàn Toàn", "Đại Càn Đỉnh Lưu:\nPhò Mã") == "Tên Mới Hoàn Toàn"
+
+    def test_a_typed_line_is_not_capped_at_the_auto_wrap_width(self, monkeypatch):
+        """Pacifico at 102%, title at the left edge: "Phò Mã Gia Trốn Hôn" is wider than
+        the 62% auto-wrap budget but fits the frame, so a typed break keeps it whole."""
+        from noveltrans.tts import thumbnail
+
+        budgets = []
+        real = thumbnail._wrap_title
+        monkeypatch.setattr(
+            thumbnail, "_wrap_title", lambda t, f, w: budgets.append(w) or real(t, f, w)
+        )
+        with font_dir_context() as d:
+            font_path = d / "Pacifico-Regular.ttf"
+            thumbnail.compose_thumbnail(
+                "", vn_title="Đại Càn Đỉnh Lưu\nPhò Mã Gia Trốn Hôn", part_num=1,
+                tagline="", font_path=font_path, width=1280, height=720,
+                title_pos=(0.035, 0.62), title_scale=1.02,
+            )
+            font = ImageFont.truetype(str(font_path), 81)
+        assert budgets == [1280 - 45 - 45] * 2  # the frame's room, not 62% of it
+        assert real("Phò Mã Gia Trốn Hôn", font, budgets[1]) == ["Phò Mã Gia Trốn Hôn"]

@@ -42,6 +42,25 @@ class TestThumbnailEditorDialog:
         assert dlg.preview.pixmap() is not None
         assert not dlg.preview.pixmap().isNull()
 
+    def test_preview_is_composed_at_the_real_cover_size(self, qapp, tmp_path, monkeypatch):
+        """Composing at the display size wraps the title differently from the saved
+        1280×720 cover (font sizes round to whole pixels): "Đại Càn Đỉnh Lưu: Phò Mã Gia
+        Trốn Hôn" in Pacifico at 102% fit two lines in the preview but three in the
+        cover, pushing "Hôn" off the bottom. So compose full size, then scale down."""
+        import noveltrans.tts.thumbnail as thumbnail
+
+        sizes = []
+        real = thumbnail.compose_thumbnail
+
+        def spy(*args, **kwargs):
+            sizes.append((kwargs["width"], kwargs["height"]))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(thumbnail, "compose_thumbnail", spy)
+        dlg = self._dialog(tmp_path)
+        assert sizes == [(1280, 720)]
+        assert (dlg.preview.pixmap().width(), dlg.preview.pixmap().height()) == (720, 405)
+
     def test_dragging_moves_the_active_block(self, qapp, tmp_path):
         dlg = self._dialog(tmp_path)
         dlg.pick_title.setChecked(True)  # title is active
@@ -250,3 +269,52 @@ class TestThumbnailEditorAlign:
         assert dialog.title_align == DEFAULT_TITLE_ALIGN
         assert dialog.align_left.isChecked()
         assert tuple(dialog.title_pos) == DEFAULT_TITLE_POS
+
+
+class TestThumbnailEditorTitleBreaks:
+    TITLE = "Đại Càn Đỉnh Lưu: Phò Mã Gia Trốn Hôn"
+
+    def _dialog(self, tmp_path, **kw):
+        return ThumbnailEditorDialog(
+            _config(tmp_path), base_image="", novel_title=self.TITLE, part_num=1, **kw
+        )
+
+    def test_box_starts_with_the_title_and_no_custom_layout(self, qapp, tmp_path):
+        dialog = self._dialog(tmp_path)
+        assert dialog.title_edit.toPlainText() == self.TITLE
+        assert dialog.title_text == ""
+
+    def test_typing_a_break_records_the_layout_and_renders_it(self, qapp, tmp_path, monkeypatch):
+        import noveltrans.tts.thumbnail as thumbnail
+
+        dialog = self._dialog(tmp_path)
+        dialog.title_edit.setPlainText("Đại Càn Đỉnh Lưu:\nPhò Mã Gia Trốn Hôn")
+        assert dialog.title_text == "Đại Càn Đỉnh Lưu:\nPhò Mã Gia Trốn Hôn"
+        assert not dialog.title_warning.isVisibleTo(dialog)
+
+        seen = {}
+        real = thumbnail.compose_thumbnail
+        monkeypatch.setattr(
+            thumbnail, "compose_thumbnail", lambda *a, **k: seen.update(k) or real(*a, **k)
+        )
+        dialog._render_preview()
+        assert seen["vn_title"] == "Đại Càn Đỉnh Lưu:\nPhò Mã Gia Trốn Hôn"
+
+    def test_changing_the_words_warns_and_is_not_used(self, qapp, tmp_path):
+        dialog = self._dialog(tmp_path)
+        dialog.title_edit.setPlainText("Một tên khác\nhẳn")
+        assert dialog.title_warning.isVisibleTo(dialog)
+
+    def test_seeded_layout_is_shown(self, qapp, tmp_path):
+        layout = "Đại Càn Đỉnh Lưu\nPhò Mã Gia Trốn Hôn"
+        dialog = self._dialog(tmp_path, settings={"video_thumbnail_title_text": layout})
+        assert dialog.title_edit.toPlainText() == layout
+        assert dialog.title_text == layout
+
+    def test_reset_clears_the_layout(self, qapp, tmp_path):
+        dialog = self._dialog(
+            tmp_path, settings={"video_thumbnail_title_text": "Đại Càn Đỉnh Lưu\nPhò Mã Gia Trốn Hôn"}
+        )
+        dialog._reset_positions()
+        assert dialog.title_text == ""
+        assert dialog.title_edit.toPlainText() == self.TITLE

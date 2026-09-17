@@ -6,12 +6,16 @@ that makes the real cover — so what they see is what every video gets. They ca
 
   * drag the title block or the "PHẦN N" block to reposition it (or nudge with the sliders),
   * switch fonts and see the result instantly,
+  * choose where the title breaks onto a new line (Enter in the title box),
 
 then **save** the positions + font to config so every subsequent render uses them, and
 optionally **apply to all** existing parts right away (a callback the tab supplies).
 
-The preview renders at a smaller size for speed; because positions are stored as fractions
-of the frame, the small preview and the full 1280×720 cover lay out identically.
+The preview is composed at the cover's real 1280×720 and only scaled down for display.
+Composing at the display size instead is NOT equivalent, even though positions are
+fractions: font sizes round to whole pixels and glyph widths don't scale linearly, so a
+title line that just fits at 720×405 can wrap onto an extra line at 1280×720 — the saved
+cover then showed a line (or a word) the preview did not.
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
     QLabel,
+    QPlainTextEdit,
     QPushButton,
     QRadioButton,
     QSlider,
@@ -33,9 +38,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-# The preview is rendered at this size (16:9, same aspect as the 1280×720 cover).
+# The preview is shown at this size (16:9, same aspect as the cover)…
 _PREVIEW_W = 720
 _PREVIEW_H = 405
+# …but composed at the real cover size, so line wrapping matches the saved cover.
+_COVER_W = 1280
+_COVER_H = 720
 
 
 def _pil_to_pixmap(img) -> QPixmap:
@@ -110,6 +118,9 @@ class ThumbnailEditorDialog(QDialog):
         )
         self.title_align = seeded("video_thumbnail_title_align", config.video_thumbnail_title_align)
         self.font_key = seeded("video_thumbnail_font", config.video_thumbnail_font)
+        # The title as laid out for the cover. Not seeded from config: line breaks for one
+        # novel's title are meaningless for another's.
+        self.title_text = seeded("video_thumbnail_title_text", "") or ""
         self._active = "title"  # which block a drag moves
 
         self.setWindowTitle("Tùy chỉnh ảnh bìa — kéo để đặt vị trí, đổi phông trực tiếp")
@@ -145,6 +156,28 @@ class ThumbnailEditorDialog(QDialog):
         pick_row.addWidget(self.pick_title)
         pick_row.addWidget(self.pick_part)
         pick_row.addStretch()
+
+        # The cover title, one line per box line: Enter picks where it breaks. Only the
+        # layout is editable here — the words themselves come from "Tên hiển thị", so the
+        # cover can't quietly disagree with the video's title (see `cover_title`).
+        self.title_edit = QPlainTextEdit()
+        self.title_edit.setPlainText(self._shown_title_text())
+        self.title_edit.setFixedHeight(self.title_edit.fontMetrics().lineSpacing() * 3 + 14)
+        self.title_edit.setToolTip(
+            "Nhấn Enter để xuống dòng ở chỗ muốn ngắt. Chỉ đổi cách xuống dòng "
+            "(và dấu câu) — muốn đổi tên truyện, sửa ô “Tên hiển thị”."
+        )
+        self.title_edit.textChanged.connect(self._on_title_text_changed)
+        self.title_warning = QLabel(
+            "⚠️ Chữ khác tên truyện nên chưa được dùng — sửa tên ở ô “Tên hiển thị”."
+        )
+        self.title_warning.setWordWrap(True)
+        self.title_warning.setVisible(False)
+        title_row = QHBoxLayout()
+        title_label = QLabel("Tiêu đề\n(Enter để\nxuống dòng):")
+        title_label.setAlignment(Qt.AlignmentFlag.AlignTop)
+        title_row.addWidget(title_label)
+        title_row.addWidget(self.title_edit)
 
         # font picker (live)
         self.font_combo = QComboBox()
@@ -209,7 +242,7 @@ class ThumbnailEditorDialog(QDialog):
         align_row.addStretch()
 
         reset = QPushButton("Đặt lại")
-        reset.setToolTip("Trả vị trí và cỡ chữ về mặc định.")
+        reset.setToolTip("Trả vị trí, cỡ chữ và cách xuống dòng của tiêu đề về mặc định.")
         reset.clicked.connect(self._reset_positions)
 
         save = QPushButton("Lưu")
@@ -230,6 +263,8 @@ class ThumbnailEditorDialog(QDialog):
         btns.addWidget(close)
 
         controls = QVBoxLayout()
+        controls.addLayout(title_row)
+        controls.addWidget(self.title_warning)
         controls.addLayout(pick_row)
         controls.addLayout(font_row)
         controls.addLayout(sx)
@@ -336,6 +371,24 @@ class ThumbnailEditorDialog(QDialog):
         self._sync_controls_from_state()
         self._schedule_render()
 
+    def _shown_title_text(self) -> str:
+        """What the title box starts with: the saved layout if it still applies, else
+        the display name on one line."""
+        from noveltrans.tts.thumbnail import cover_title
+
+        return cover_title(self.novel_title, self.title_text)
+
+    def _on_title_text_changed(self) -> None:
+        from noveltrans.tts.thumbnail import cover_title
+
+        text = self.title_edit.toPlainText().strip()
+        # A box that just reads the display name on one line is "no custom layout" —
+        # store "" so a later rename is picked up rather than pinned to this spelling.
+        self.title_text = "" if text == self.novel_title.strip() else text
+        applied = cover_title(self.novel_title, self.title_text) != self.novel_title
+        self.title_warning.setVisible(bool(self.title_text) and not applied)
+        self._schedule_render()
+
     def _on_font_changed(self) -> None:
         self.font_key = self.font_combo.currentData()
         self._schedule_render()
@@ -359,6 +412,7 @@ class ThumbnailEditorDialog(QDialog):
         self.title_scale = DEFAULT_TEXT_SCALE
         self.part_scale = DEFAULT_TEXT_SCALE
         self.tagline_scale = DEFAULT_TEXT_SCALE
+        self.title_edit.setPlainText(self.novel_title)  # back to auto-wrap
         self._sync_controls_from_state()
         self._render_preview()
 
@@ -368,23 +422,26 @@ class ThumbnailEditorDialog(QDialog):
         self._render_timer.start()
 
     def _render_preview(self) -> None:
-        from noveltrans.tts.thumbnail import compose_thumbnail
+        from PIL import Image
+
+        from noveltrans.tts.thumbnail import compose_thumbnail, cover_title
         from noveltrans.tts.video import font_dir_context, video_font
 
         try:
             with font_dir_context() as font_dir:
                 img = compose_thumbnail(
                     self.base_image,
-                    vn_title=self.novel_title,
+                    vn_title=cover_title(self.novel_title, self.title_text),
                     part_num=self.part_num,
                     tagline=self.tagline,
                     font_path=font_dir / video_font(self.font_key)["file"],
-                    width=_PREVIEW_W, height=_PREVIEW_H,
+                    width=_COVER_W, height=_COVER_H,
                     title_pos=tuple(self.title_pos), part_pos=tuple(self.part_pos),
                     title_scale=self.title_scale, part_scale=self.part_scale,
                     tagline_scale=self.tagline_scale,
                     title_align=self.title_align,
                 )
+            img = img.resize((_PREVIEW_W, _PREVIEW_H), Image.Resampling.LANCZOS)
             self.preview.setPixmap(_pil_to_pixmap(img))
         except Exception:  # noqa: BLE001 — a bad base image must not crash the editor
             self.preview.setText("Không tạo được xem trước")
