@@ -912,6 +912,36 @@ class AppConfig:
         self._s.setValue(key, _clamp(float(value), MIN_TEXT_SCALE, MAX_TEXT_SCALE))
 
     @property
+    def video_thumbnail_title_text(self) -> str:
+        """The novel title as laid out for the cover, with the user's line breaks.
+
+        "" = auto-wrap the display name. Per novel in practice (an identity key — see
+        `noveltrans.video_settings`); this global value exists only so `snapshot` can
+        read every key, and nothing writes it.
+        """
+        return str(self._s.value("video_thumbnail_title_text", ""))
+
+    @video_thumbnail_title_text.setter
+    def video_thumbnail_title_text(self, value: str) -> None:
+        self._s.setValue("video_thumbnail_title_text", str(value or ""))
+
+    @property
+    def video_title_order(self) -> str:
+        """Video title order: "name_first" ("{tên} - Phần N") or "part_first".
+
+        Per novel in practice (an identity key); this global value exists only so
+        `video_settings.snapshot` can read every key. Validated on read.
+        """
+        from noveltrans.tts.video import DEFAULT_TITLE_ORDER, TITLE_ORDERS
+
+        value = str(self._s.value("video_title_order", DEFAULT_TITLE_ORDER))
+        return value if value in TITLE_ORDERS else DEFAULT_TITLE_ORDER
+
+    @video_title_order.setter
+    def video_title_order(self, value: str) -> None:
+        self._s.setValue("video_title_order", str(value or ""))
+
+    @property
     def video_thumbnail_title_scale(self) -> float:
         """Size multiplier for the novel title on the cover. 1.0 = the original layout."""
         return self._text_scale("video_thumbnail_title_scale")

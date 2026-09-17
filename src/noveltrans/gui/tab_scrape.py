@@ -796,6 +796,7 @@ class ScrapeTab(QWidget):
         # `.title.txt` still holds the OLD name on every rendered part, and only this
         # call knows what that name was. Done here rather than in the video tab because
         # the video tab is reached (below) without a previous name to compare against.
+        from noveltrans import video_settings
         from noveltrans.rename import resync_title_sidecars
 
         meta = self.project.meta
@@ -804,6 +805,7 @@ class ScrapeTab(QWidget):
             meta.slug_name(),
             meta.display_name(),
             (previous, meta.display_title, meta.translated_title, meta.title),
+            video_settings.effective(meta.video_settings, self.config)["video_title_order"],
         )
         self._show_meta(self.project.reload_meta())
         # The documented fan-out: Workspace._on_scrape_project re-selects this novel in

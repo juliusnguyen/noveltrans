@@ -26,6 +26,15 @@ class TestBuildUploadTitle:
     def test_strips_surrounding_whitespace(self):
         assert build_upload_title("  X  ", 1) == "X - Phần 1"
 
+    def test_part_first_order(self):
+        assert build_upload_title("Đại Càn", 1, "part_first") == "Phần 1 - Đại Càn"
+
+    def test_part_first_whole_novel_is_just_the_name(self):
+        assert build_upload_title("Đại Càn", None, "part_first") == "Đại Càn"
+
+    def test_unknown_order_reads_as_the_default(self):
+        assert build_upload_title("X", 2, "sideways") == "X - Phần 2"
+
 
 def _segs():
     return [
