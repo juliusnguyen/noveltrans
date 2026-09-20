@@ -44,6 +44,7 @@ IDENTITY_KEYS: tuple[str, ...] = (
     "video_thumbnail_part_scale",
     "video_thumbnail_tagline_scale",
     "video_thumbnail_title_align",
+    "video_title_scale",
 )
 
 # Per-novel override, seeded from the user's last-used value when the novel has none.
@@ -78,7 +79,7 @@ def identity_defaults() -> dict[str, Any]:
         DEFAULT_TITLE_ALIGN,
         DEFAULT_TITLE_POS,
     )
-    from noveltrans.tts.video import DEFAULT_VIDEO_FONT
+    from noveltrans.tts.video import DEFAULT_TITLE_SCALE, DEFAULT_VIDEO_FONT
 
     return {
         "video_image_path": "",
@@ -94,6 +95,7 @@ def identity_defaults() -> dict[str, Any]:
         "video_thumbnail_part_scale": DEFAULT_TEXT_SCALE,
         "video_thumbnail_tagline_scale": DEFAULT_TEXT_SCALE,
         "video_thumbnail_title_align": DEFAULT_TITLE_ALIGN,
+        "video_title_scale": DEFAULT_TITLE_SCALE,
     }
 
 

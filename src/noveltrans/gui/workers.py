@@ -2136,6 +2136,7 @@ class VideoWorker(PausableWorker):
         thumb_title_align: str = "",  # cover title flush edge; "" → the renderer's "left"
         burn_subtitles: bool = False,  # also burn the narration into the video
         show_bars: bool = True,  # False → no audio visualiser (faster, smaller, roomier titles)
+        title_scale: float | None = None,  # in-video novel-title size multiplier; None → 1.0
         encoder: str = "libx264",  # video codec: "libx264" (CPU) | "h264_nvenc" (NVIDIA GPU)
         bg_color: str = "",  # background hex "#rrggbb"; "" → the default pastel gradient
         skip_existing: bool = False,  # skip parts whose .mp4 already exists (batch "continue")
@@ -2178,6 +2179,7 @@ class VideoWorker(PausableWorker):
         self.thumb_title_align = thumb_title_align
         self.burn_subtitles = burn_subtitles
         self.show_bars = show_bars
+        self.title_scale = title_scale
         self.encoder = encoder
         self.bg_color = bg_color
         self.skip_existing = skip_existing
@@ -2209,6 +2211,7 @@ class VideoWorker(PausableWorker):
         from noveltrans.tts.player_skin import hex_to_rgb
         from noveltrans.tts.thumbnail import render_thumbnail
         from noveltrans.tts.video import (
+            DEFAULT_TITLE_SCALE,
             FONT_NAME,
             _with_real_durations,
             build_upload_title,
@@ -2368,7 +2371,9 @@ class VideoWorker(PausableWorker):
                             width=self.width, height=self.height, fps=self.fps,
                             spin_vinyl=self.spin_vinyl, font_name=self.font or FONT_NAME,
                             bg_color=bg_rgb, burn_subtitles=self.burn_subtitles,
-                            show_bars=self.show_bars, encoder=self.encoder,
+                            show_bars=self.show_bars,
+                            title_scale=self.title_scale or DEFAULT_TITLE_SCALE,
+                            encoder=self.encoder,
                             # Cancel only — do NOT gate pause here. This callback is polled inside a
                             # deadline-bounded ffmpeg/TTS wait; holding it would trip the timeout, and
                             # synthesize_chapter buffers the whole chapter in RAM until it writes.
@@ -2691,6 +2696,7 @@ class VideoPreviewWorker(QThread):
         height: int = 1080,
         spin_vinyl: bool = True,
         show_bars: bool = True,
+        title_scale: float | None = None,  # in-video novel-title size multiplier; None → 1.0
         font: str = "",
         bg_color: str = "",  # background hex "#rrggbb"; "" → the default pastel gradient
         parent=None,
@@ -2703,6 +2709,7 @@ class VideoPreviewWorker(QThread):
         self.height = height
         self.spin_vinyl = spin_vinyl
         self.show_bars = show_bars
+        self.title_scale = title_scale
         self.font = font
         self.bg_color = bg_color
 
@@ -2711,7 +2718,12 @@ class VideoPreviewWorker(QThread):
 
         from noveltrans.errors import TtsError
         from noveltrans.tts.player_skin import hex_to_rgb
-        from noveltrans.tts.video import FONT_NAME, font_dir_context, render_preview_frame
+        from noveltrans.tts.video import (
+            DEFAULT_TITLE_SCALE,
+            FONT_NAME,
+            font_dir_context,
+            render_preview_frame,
+        )
 
         try:
             out = Path(tempfile.gettempdir()) / "noveltrans-preview.png"
@@ -2720,6 +2732,7 @@ class VideoPreviewWorker(QThread):
                     self.image_path, out, font_dir, self.novel_title, self.sample_title,
                     width=self.width, height=self.height,
                     spin_vinyl=self.spin_vinyl, show_bars=self.show_bars,
+                    title_scale=self.title_scale or DEFAULT_TITLE_SCALE,
                     font_name=self.font or FONT_NAME,
                     bg_color=hex_to_rgb(self.bg_color),
                 )

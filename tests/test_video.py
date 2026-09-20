@@ -271,13 +271,30 @@ class TestFittedTitlesInTheAssDocument:
         roomy = self._doc(title, show_bars=False)
         assert tight != roomy  # the same title is laid out differently in the wider band
 
-    def test_a_long_novel_title_is_kept_to_one_line(self):
-        # The album line sits directly above the chapter title; wrapping it would push it
-        # into the title it labels, so it shrinks (and ellipsises) instead.
+    def test_a_long_novel_title_wraps_to_a_second_line_before_shrinking_or_ellipsising(self):
         doc = self._doc("Chương 1: Ngắn", novel="Vạn Cổ Thần Đế Chi Tối Cường Đô Thị Hệ Thống Truyền Kỳ")
         novel = [ln for ln in doc.splitlines() if ",Novel,," in ln][0]
-        assert "\\N" not in novel
-        assert "\\fs" in novel  # shrunk to fit the column on one line
+        assert "\\N" in novel  # wrapped onto a second line
+        assert "…" not in novel  # the wrap was enough — no need to shrink or ellipsise
+
+    def test_an_extremely_long_novel_title_still_ellipsises_after_wrapping(self):
+        doc = self._doc("Chương 1: Ngắn", novel="Chương 5: " + "dài " * 200)
+        novel = [ln for ln in doc.splitlines() if ",Novel,," in ln][0]
+        assert "…" in novel  # even two lines at the shrink floor couldn't hold it
+
+    def test_wrapping_the_novel_title_pushes_the_chapter_title_down(self):
+        # The album line and the chapter title it labels must never overlap: when the
+        # album line wraps onto a second line, the chapter style's own MarginV (the
+        # second-to-last field) shifts down by exactly that extra line.
+        def chapter_margin_v(doc):
+            style = [ln for ln in doc.splitlines() if ln.startswith("Style: Chapter,")][0]
+            return int(style.split(",")[-2])
+
+        one_line = self._doc("Chương 1: Ngắn", novel="Truyện")
+        two_line = self._doc(
+            "Chương 1: Ngắn", novel="Vạn Cổ Thần Đế Chi Tối Cường Đô Thị Hệ Thống Truyền Kỳ"
+        )
+        assert chapter_margin_v(two_line) > chapter_margin_v(one_line)
 
 
 class TestYoutubeTimestamp:

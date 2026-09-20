@@ -340,11 +340,22 @@ def _escape_ass(text: str) -> str:
 # name has to be made to fit rather than allowed to grow into the visualizer bars below it.
 _TITLE_MIN_SCALE = 0.62    # never shrink a title below this fraction of its layout size
 _TITLE_SHRINK_STEP = 0.06  # try the layout size, then 94%, 88%, … of it
+# The album line may now wrap onto a second line rather than ellipsising a long novel
+# title — see `build_ass_subtitles`, which pushes the chapter title (and its band) down
+# by exactly the extra line when this happens, so the two can never overlap.
+_NOVEL_MAX_LINES = 2
 # libass synthesises the Chapter style's bold from the same regular TTF we measure with,
 # which renders a little wider than Pillow reports — wrap against a slightly narrower box
 # so a fitted line cannot come out one pixel too long and get re-wrapped by libass.
 _TITLE_WIDTH_SLACK = 0.94
 _ELLIPSIS = "…"
+
+# User-facing multiplier on the novel title's BASE size (before `fit_title` ever shrinks
+# it) — raising it gives a long title more headroom before it hits `_TITLE_MIN_SCALE` and
+# gets ellipsised. Same bounds as the thumbnail's own text-scale controls.
+DEFAULT_TITLE_SCALE = 1.0
+MIN_TITLE_SCALE = 0.5
+MAX_TITLE_SCALE = 2.0
 
 
 def font_file_for(family: str) -> str:
@@ -466,6 +477,7 @@ def build_ass_subtitles(
     narration=None,
     font_file: Path | None = None,
     show_bars: bool = True,
+    title_scale: float = DEFAULT_TITLE_SCALE,
 ) -> str:
     """An ASS document: the novel title for the whole video + one event per chapter.
 
@@ -488,16 +500,39 @@ def build_ass_subtitles(
     the visualizer bars instead of running over them. `show_bars=False` frees the bars'
     strip, so the chapter title gets that much more room. Without `font_file` the titles
     are emitted unmeasured, exactly as before.
+
+    `title_scale` raises or lowers the novel title's BASE size before fitting even starts
+    (1.0 = the original layout) — see `PlayerLayout.of`.
     """
-    lay = PlayerLayout.of(width, height)
+    lay = PlayerLayout.of(width, height, title_scale=title_scale)
     palette = _text_palette(bg_color)
     total = sum(s.seconds for s in segments)
+    # The album line may wrap onto a second line before it resorts to an ellipsis (a title
+    # that fits at the layout size is never wrapped just because it COULD be — `fit_title`
+    # only reaches for the second line when one isn't enough). When it does wrap, the
+    # chapter title — and the band it fits into — are pushed down by exactly that extra
+    # line, computed here BEFORE the styles block is written, since MarginV is fixed per
+    # style for the whole document.
+    novel_lines, novel_px = fit_title(
+        novel_title, font_file, lay.novel_font_px, lay.text_width, max_lines=_NOVEL_MAX_LINES
+    )
+    chapter_margin_v = lay.chapter_margin_v
+    chapter_band = lay.chapter_band_h(show_bars)
+    if font_file is not None and len(novel_lines) > 1:
+        try:
+            ascent, descent = _title_font(str(font_file), novel_px).getmetrics()
+        except (OSError, ImportError):
+            pass
+        else:
+            extra = (len(novel_lines) - 1) * (ascent + descent)
+            chapter_margin_v += extra
+            chapter_band = max(0, chapter_band - extra)
     out = [
         _ASS_HEADER.format(w=width, h=height),
         _ASS_STYLES.format(
             font=font_name, nsize=lay.novel_font_px, csize=lay.chapter_font_px,
             mL=lay.text_margin_l, mR=lay.text_margin_r,
-            nmargin=lay.novel_margin_v, cmargin=lay.chapter_margin_v,
+            nmargin=lay.novel_margin_v, cmargin=chapter_margin_v,
             npri=palette["npri"], cpri=palette["cpri"],
             ocol=palette["ocol"], ow=palette["ow"],
             ssize=sub_font_px(height), sow=max(2, round(height * 0.0035)),
@@ -507,16 +542,10 @@ def build_ass_subtitles(
         "\n",
         _ASS_EVENTS_HEADER,
     ]
-    # The album line is held to ONE line: it sits directly above the chapter title, so
-    # letting it wrap would push it into the title it labels.
-    novel_lines, novel_px = fit_title(
-        novel_title, font_file, lay.novel_font_px, lay.text_width, max_lines=1
-    )
     out.append(
         f"Dialogue: 0,{_ass_time(0)},{_ass_time(total)},Novel,,0,0,0,,"
         f"{_title_event_text(novel_lines, novel_px, lay.novel_font_px)}\n"
     )
-    chapter_band = lay.chapter_band_h(show_bars)
     start = 0.0
     for seg in segments:
         end = start + seg.seconds
@@ -1047,6 +1076,7 @@ def render_video(
     bg_color: tuple[int, int, int] | None = None,
     burn_subtitles: bool = False,
     show_bars: bool = True,
+    title_scale: float = DEFAULT_TITLE_SCALE,
     encoder: str = DEFAULT_VIDEO_ENCODER,
     cancelled: Callable[[], bool] | None = None,
 ) -> Path:
@@ -1096,12 +1126,12 @@ def render_video(
                                 narration=narration,
                                 font_name=font_name, bg_color=bg_color,
                                 font_file=font_dir / font_file_for(font_name),
-                                show_bars=show_bars),
+                                show_bars=show_bars, title_scale=title_scale),
             encoding="utf-8",
         )
         # Bake the three artwork layers once; ffmpeg loops each and animates them: the
         # static skin (backdrop), the vinyl disc (spun), and the playhead knob (slid).
-        lay = PlayerLayout.of(width, height)
+        lay = PlayerLayout.of(width, height, title_scale=title_scale)
         build_player_skin(image_path, skin_file, width=width, height=height, bg_color=bg_color)
         build_vinyl(font_dir / VINYL_LABEL, vinyl_file, size=lay.vinyl_size)
         build_knob(knob_file, radius=lay.knob_r)
@@ -1190,6 +1220,7 @@ def render_preview_frame(
     height: int = 1080,
     spin_vinyl: bool = True,
     show_bars: bool = True,
+    title_scale: float = DEFAULT_TITLE_SCALE,
     font_name: str = FONT_NAME,
     bg_color: tuple[int, int, int] | None = None,
     cancelled: Callable[[], bool] | None = None,
@@ -1213,14 +1244,14 @@ def render_preview_frame(
     deadline = time.monotonic() + 120
 
     try:
-        lay = PlayerLayout.of(width, height)
+        lay = PlayerLayout.of(width, height, title_scale=title_scale)
         # One synthetic chapter spanning the whole preview so both titles show at grab time.
         sample = [MergeSegment(path="", seconds=_PREVIEW_TOTAL, title=sample_chapter_title)]
         subs_file.write_text(
             build_ass_subtitles(sample, novel_title, width=width, height=height,
                                 font_name=font_name, bg_color=bg_color,
                                 font_file=font_dir / font_file_for(font_name),
-                                show_bars=show_bars),
+                                show_bars=show_bars, title_scale=title_scale),
             encoding="utf-8",
         )
         build_player_skin(image_path, skin_file, width=width, height=height, bg_color=bg_color)

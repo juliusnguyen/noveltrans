@@ -941,6 +941,22 @@ class AppConfig:
         self._set_text_scale("video_thumbnail_tagline_scale", value)
 
     @property
+    def video_title_scale(self) -> float:
+        """Size multiplier for the novel title burned into the video itself (the "now
+        playing" album line) — distinct from `video_thumbnail_title_scale`, which only
+        affects the cover image. 1.0 = the original layout."""
+        from noveltrans.tts.video import DEFAULT_TITLE_SCALE, MAX_TITLE_SCALE, MIN_TITLE_SCALE
+
+        raw = self._s.value("video_title_scale", DEFAULT_TITLE_SCALE, type=float)
+        return _clamp(raw, MIN_TITLE_SCALE, MAX_TITLE_SCALE)
+
+    @video_title_scale.setter
+    def video_title_scale(self, value: float) -> None:
+        from noveltrans.tts.video import MAX_TITLE_SCALE, MIN_TITLE_SCALE
+
+        self._s.setValue("video_title_scale", _clamp(float(value), MIN_TITLE_SCALE, MAX_TITLE_SCALE))
+
+    @property
     def video_burn_subtitles(self) -> bool:
         """Burn the narration subtitles into the video as well as writing the .srt.
 

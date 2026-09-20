@@ -143,6 +143,8 @@ class VideoTab(QWidget):
         self._preview_label: QLabel | None = None
         self._preview_status: QLabel | None = None
         self._preview_color_button: QPushButton | None = None
+        self._preview_title_scale_spin: QSpinBox | None = None
+        self._preview_font_combo: QComboBox | None = None
         self._preview_controls: list = []
         # The open novel's effective video settings (see noveltrans.video_settings).
         # Every render/preview reads from here rather than from `config`, so one novel's
@@ -221,7 +223,7 @@ class VideoTab(QWidget):
     def _build_video_box(self) -> QGroupBox:
         """The 'Xuất video' controls: mode + quality + font + background image + buttons."""
         from noveltrans.tts.convert import ffmpeg_available
-        from noveltrans.tts.video import VIDEO_FONTS, nvenc_available
+        from noveltrans.tts.video import nvenc_available
 
         self.video_mode = QComboBox()
         self.video_mode.addItem("Toàn bộ", "all")
@@ -271,14 +273,6 @@ class VideoTab(QWidget):
         eidx = self.video_encoder.findData(wanted)
         self.video_encoder.setCurrentIndex(eidx if eidx >= 0 else 0)
         self.video_encoder.currentIndexChanged.connect(self._on_video_encoder_changed)
-
-        self.video_font = QComboBox()
-        for key, spec in VIDEO_FONTS.items():
-            self.video_font.addItem(spec["label"], key)
-        fidx = self.video_font.findData(self.config.video_font)
-        self.video_font.setCurrentIndex(fidx if fidx >= 0 else 0)
-        self.video_font.setToolTip("Phông chữ cho tên truyện/chương trong video và ảnh bìa.")
-        self.video_font.currentIndexChanged.connect(self._on_video_font_changed)
 
         self.video_range_from = QSpinBox()
         self.video_range_from.setRange(1, 999999)
@@ -379,8 +373,6 @@ class VideoTab(QWidget):
         row.addWidget(self.video_quality)
         row.addWidget(QLabel("Encode:"))
         row.addWidget(self.video_encoder)
-        row.addWidget(QLabel("Phông chữ:"))
-        row.addWidget(self.video_font)
         row.addWidget(QLabel("Màu nền:"))
         row.addWidget(self.bg_color_button)
         row.addWidget(self.bg_reset_button)
@@ -2514,7 +2506,6 @@ class VideoTab(QWidget):
             if encoder == "h264_nvenc" and not nvenc_available():
                 encoder = "libx264"
             self._set_combo(self.video_encoder, encoder, fallback="libx264")
-            self._set_combo(self.video_font, values["video_font"])
             self._set_combo(self.thumb_font, values["video_thumbnail_font"])
             self.video_batch_size.setValue(int(values["video_batch_size"]))
             self.burn_subs_check.setChecked(bool(values["video_burn_subtitles"]))
@@ -2531,6 +2522,14 @@ class VideoTab(QWidget):
         # Outside the guard: these only read state, and the mode handler owns the
         # show/hide of the range and batch rows, which must reflect the novel just loaded.
         self._update_bg_swatch()
+        if self._preview_title_scale_spin is not None:
+            self._preview_title_scale_spin.blockSignals(True)
+            self._preview_title_scale_spin.setValue(round(values["video_title_scale"] * 100))
+            self._preview_title_scale_spin.blockSignals(False)
+        if self._preview_font_combo is not None:
+            self._preview_font_combo.blockSignals(True)
+            self._set_combo(self._preview_font_combo, values["video_font"])
+            self._preview_font_combo.blockSignals(False)
         self._on_video_mode_changed()
 
     @staticmethod
@@ -2580,8 +2579,9 @@ class VideoTab(QWidget):
     def _on_video_encoder_changed(self) -> None:
         self._save_video_setting("video_encoder", self.video_encoder.currentData())
 
-    def _on_video_font_changed(self) -> None:
-        self._save_video_setting("video_font", self.video_font.currentData())
+    def _on_preview_font_changed(self) -> None:
+        self._save_video_setting("video_font", self._preview_font_combo.currentData())
+        self._maybe_refresh_preview()
 
     def _pick_video_image(self) -> None:
         # Opens where this novel's image lives, not where some other novel's did.
@@ -3100,7 +3100,7 @@ class VideoTab(QWidget):
         if self._preview_worker is not None and self._preview_worker.isRunning():
             return
         preset = video_preset(self.video_quality.currentData())
-        family = video_font(self.video_font.currentData())["family"]
+        family = video_font(self._video_settings["video_font"])["family"]
         novel_title = "Tên truyện"
         if self.project is not None:
             novel_title = self.project.meta.display_name()
@@ -3114,6 +3114,7 @@ class VideoTab(QWidget):
             image, novel_title, "Chương 1: Chương mẫu",
             width=preset["width"], height=preset["height"],
             spin_vinyl=preset["spin_vinyl"], show_bars=self.show_bars_check.isChecked(),
+            title_scale=self._video_settings["video_title_scale"],
             font=family, bg_color=self.bg_color,
         )
         self._preview_worker.done.connect(self._on_preview_ready)
@@ -3121,29 +3122,70 @@ class VideoTab(QWidget):
         self._preview_worker.start()
 
     def _build_preview_dialog(self) -> None:
-        """Create the persistent, non-modal preview window with live color controls."""
+        """Create the persistent, non-modal preview window with live font/color/title-size controls."""
+        from noveltrans.tts.video import MAX_TITLE_SCALE, MIN_TITLE_SCALE, VIDEO_FONTS
+
         dialog = QDialog(self)
         dialog.setWindowTitle("Xem trước video — chỉnh màu nền trực tiếp")
         dialog.setModal(False)
 
         self._preview_label = QLabel()
         self._preview_status = QLabel("")
+
+        # Phông chữ: lives here too — the preview is the only place a font choice can
+        # actually be judged, since the thumbnail editor has its own separate font.
+        self._preview_font_combo = QComboBox()
+        for key, spec in VIDEO_FONTS.items():
+            self._preview_font_combo.addItem(spec["label"], key)
+        self._set_combo(self._preview_font_combo, self._video_settings["video_font"])
+        self._preview_font_combo.setToolTip("Phông chữ cho tên truyện/chương trong video và ảnh bìa.")
+        self._preview_font_combo.currentIndexChanged.connect(self._on_preview_font_changed)
+
         self._preview_color_button = QPushButton("Đổi màu nền…")
         self._preview_color_button.setToolTip("Đổi màu nền và cập nhật ngay ảnh xem trước.")
         self._preview_color_button.clicked.connect(self._pick_bg_color)
         reset_button = QPushButton("Mặc định")
         reset_button.clicked.connect(self._reset_bg_color)
+
+        # Cỡ chữ tiêu đề: lives here (not the main tab) so its effect is seen live, right
+        # next to the preview it changes. keyboardTracking off — only commit + re-render
+        # once typing is done (Enter/focus-out), not on every digit; the ↑/↓ arrows still
+        # fire immediately, same as a discrete color pick.
+        self._preview_title_scale_spin = QSpinBox()
+        self._preview_title_scale_spin.setKeyboardTracking(False)
+        self._preview_title_scale_spin.setRange(
+            round(MIN_TITLE_SCALE * 100), round(MAX_TITLE_SCALE * 100)
+        )
+        self._preview_title_scale_spin.setValue(
+            round(self._video_settings["video_title_scale"] * 100)
+        )
+        self._preview_title_scale_spin.setSuffix("%")
+        self._preview_title_scale_spin.setToolTip(
+            "Cỡ chữ tiêu đề truyện trong video (dòng trên khối “đang phát”). Tên truyện dài "
+            "tự xuống dòng (tối đa 2 dòng) rồi mới thu nhỏ, và chỉ cắt bớt “…” nếu 2 dòng "
+            "vẫn không đủ chỗ. Giảm cỡ này nếu muốn hiện được nhiều chữ hơn; tăng lên nếu "
+            "muốn chữ to hơn (nhưng dễ bị cắt bớt hơn với tên truyện rất dài)."
+        )
+        self._preview_title_scale_spin.valueChanged.connect(self._on_preview_title_scale_changed)
+
         refresh_button = QPushButton("Cập nhật")
         refresh_button.setToolTip("Render lại ảnh xem trước.")
         refresh_button.clicked.connect(self._start_preview)
         close_button = QPushButton("Đóng")
         close_button.clicked.connect(dialog.close)
-        self._preview_controls = [self._preview_color_button, reset_button, refresh_button]
+        self._preview_controls = [
+            self._preview_font_combo, self._preview_color_button, reset_button,
+            self._preview_title_scale_spin, refresh_button,
+        ]
 
         controls = QHBoxLayout()
+        controls.addWidget(QLabel("Phông chữ:"))
+        controls.addWidget(self._preview_font_combo)
         controls.addWidget(QLabel("Màu nền:"))
         controls.addWidget(self._preview_color_button)
         controls.addWidget(reset_button)
+        controls.addWidget(QLabel("Cỡ chữ tiêu đề:"))
+        controls.addWidget(self._preview_title_scale_spin)
         controls.addWidget(refresh_button)
         controls.addWidget(self._preview_status)
         controls.addStretch()
@@ -3156,6 +3198,10 @@ class VideoTab(QWidget):
         dialog.finished.connect(self._on_preview_dialog_closed)
         self._preview_dialog = dialog
 
+    def _on_preview_title_scale_changed(self, value: int) -> None:
+        self._save_video_setting("video_title_scale", value / 100.0)
+        self._maybe_refresh_preview()
+
     def _set_preview_controls_enabled(self, enabled: bool) -> None:
         for w in self._preview_controls:
             w.setEnabled(enabled)
@@ -3165,6 +3211,8 @@ class VideoTab(QWidget):
         self._preview_label = None
         self._preview_status = None
         self._preview_color_button = None
+        self._preview_title_scale_spin = None
+        self._preview_font_combo = None
         self._preview_controls = []
 
     def _on_preview_ready(self, png_path: str) -> None:
@@ -3450,7 +3498,7 @@ class VideoTab(QWidget):
             end = self.video_range_to.value() if mode == "range" else None
             batch = self.video_batch_size.value() if mode == "batch" else None
         preset = video_preset(self.video_quality.currentData())
-        font_key = self.video_font.currentData()
+        font_key = self._video_settings["video_font"]
         font_family = video_font(font_key)["family"]
         tags = self.tags_edit.toPlainText().strip()
 
@@ -3480,6 +3528,7 @@ class VideoTab(QWidget):
             thumb_title_align=self._video_settings["video_thumbnail_title_align"],
             burn_subtitles=self.burn_subs_check.isChecked(),
             show_bars=self.show_bars_check.isChecked(),
+            title_scale=self._video_settings["video_title_scale"],
             bg_color=self.bg_color, skip_existing=skip_existing, part_num=part_num,
             explicit_windows=explicit_windows, explicit_part_numbers=explicit_part_numbers,
             credit=self.credit_edit.text().strip() or "Fox Novel",

@@ -18,6 +18,7 @@ dist/
 # App data (never commit downloaded novels) — anchored to the repo root:
 # on case-insensitive filesystems an unanchored rule also matches src/noveltrans/
 /NovelTrans/
+/.noveltrans/
 *.db
 *.db-wal
 *.db-shm

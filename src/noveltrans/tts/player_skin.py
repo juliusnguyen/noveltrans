@@ -90,7 +90,10 @@ class PlayerLayout:
         return max(0, bottom - self.chapter_margin_v - self.title_gap)
 
     @classmethod
-    def of(cls, width: int, height: int) -> PlayerLayout:
+    def of(cls, width: int, height: int, *, title_scale: float = 1.0) -> PlayerLayout:
+        """`title_scale` resizes only the novel-title (album) line — see `video.fit_title`
+        for why: a long title still shrinks to fit, but a user who finds that shrunk size
+        too small can raise the base it shrinks from instead."""
         vinyl_r = round(height * 0.139)
         knob_r = max(6, round(height * 0.012))
         return cls(
@@ -127,7 +130,7 @@ class PlayerLayout:
             # moved down, gives the chapter title a real two-line band.
             novel_margin_v=round(height * 0.382),
             chapter_margin_v=round(height * 0.437),
-            novel_font_px=round(height * 0.035),
+            novel_font_px=round(height * 0.035 * title_scale),
             chapter_font_px=round(height * 0.048),
             title_gap=round(height * 0.009),
         )
