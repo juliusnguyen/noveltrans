@@ -37,8 +37,10 @@ _SUFFIX_RE = re.compile(r"^(?:-nguon)?(?:-\d{4}-\d{4})?$")
 
 _AUDIO_EXTS = {".mp3", ".m4b"}
 
-# The shape `tts.video.build_upload_title` produces: "{name} - Phần {N}".
+# The two shapes `tts.video.build_upload_title` produces: "{name} - Phần {N}" and, with
+# the "part_first" order, "Phần {N} - {name}".
 _PART_TITLE_RE = re.compile(r"^(?P<name>.*?)\s+-\s+(?P<part>Phần\s+\d+)$")
+_PART_FIRST_TITLE_RE = re.compile(r"^(?P<part>Phần\s+\d+)\s+-\s+(?P<name>.*)$")
 
 
 @dataclass(frozen=True)
@@ -159,7 +161,61 @@ def apply_rename(plan: RenamePlan) -> list[Move]:
     return done
 
 
-def resync_title_sidecars(video_dir, slug: str, new_name: str, known_names) -> int:
+def retitle(current: str, new_name: str, known_names, order: str = "name_first") -> str:
+    """What a part's title should read, or "" to leave it exactly as it is.
+
+    Pure, and the single answer to "is this title one we generated, and what is its
+    current spelling?" — shared by the sidecar resync below and by the video tab's
+    "Cập nhật tiêu đề" push, so the file on disk and the title sent to YouTube can never
+    disagree about the rules.
+
+    A title is ours when it is `{name} - Phần {N}` or `Phần {N} - {name}` for a name this
+    novel has gone by (`known_names`), or is just such a name (a whole-novel part).
+    Anything else is hand-written and comes back "".
+    """
+    current = (current or "").strip()
+    new_name = (new_name or "").strip()
+    known = {n.strip() for n in known_names if (n or "").strip()}
+    known.add(new_name)
+    if not current or not new_name:
+        return ""
+    match = next(
+        (
+            m
+            for m in (_PART_TITLE_RE.match(current), _PART_FIRST_TITLE_RE.match(current))
+            if m and m.group("name").strip() in known
+        ),
+        None,
+    )
+    if match:
+        part = match.group("part")
+        fresh = f"{part} - {new_name}" if order == "part_first" else f"{new_name} - {part}"
+    elif current in known:
+        fresh = new_name  # a whole-novel part: the title is just the name
+    else:
+        return ""  # hand-written, or a name this novel never had
+    return "" if fresh == current else fresh
+
+
+def title_name(current: str) -> str:
+    """The novel-name half of a generated part title, or the whole string if it has no
+    "Phần N" half. Answers "does this title already carry the current name?"."""
+    current = (current or "").strip()
+    for regex in (_PART_TITLE_RE, _PART_FIRST_TITLE_RE):
+        match = regex.match(current)
+        if match:
+            return match.group("name").strip()
+    return current
+
+
+def _is_published(part_dir: Path) -> bool:
+    """Does this part have an upload record — i.e. a video on the channel?"""
+    return (part_dir / f"{part_dir.name}.upload.json").is_file()
+
+
+def resync_title_sidecars(
+    video_dir, slug: str, new_name: str, known_names, order: str = "name_first"
+) -> int:
     """Rewrite `.title.txt` for every rendered part still carrying one of the old names.
 
     The third of the three write-once sidecars, and the one that was missed:
@@ -182,6 +238,12 @@ def resync_title_sidecars(video_dir, slug: str, new_name: str, known_names) -> i
     display name, the override, the translated title, the original). Same regenerate-and-diff
     discipline the description resync uses, and it is what leaves a genuinely hand-written
     title ("Bản đặc biệt - Phần 3") alone.
+
+    `order` is the novel's title order (`tts.video.TITLE_ORDERS`); a generated title in
+    either shape is rewritten into it, so switching the order in the video tab reuses this
+    same pass with `new_name` unchanged. That order-only rewrite skips parts already on
+    YouTube (a `.upload.json` beside them): their sidecar should keep matching the title
+    the video was published under. A rename still rewrites them, as it always has.
     """
     video_dir = Path(video_dir)
     new_name = (new_name or "").strip()
@@ -200,14 +262,12 @@ def resync_title_sidecars(video_dir, slug: str, new_name: str, known_names) -> i
             current = sidecar.read_text(encoding="utf-8").strip()
         except OSError:
             continue
-        match = _PART_TITLE_RE.match(current)
-        if match and match.group("name").strip() in known:
-            fresh = f"{new_name} - {match.group('part')}"
-        elif current in known:
-            fresh = new_name  # a whole-novel part: the title is just the name
-        else:
-            continue  # hand-written, or a name this novel never had
-        if fresh == current:
+        fresh = retitle(current, new_name, known, order)
+        if not fresh:
+            continue
+        if title_name(current) == new_name and _is_published(part_dir):
+            # Order-only change on a published part: leave the sidecar matching the title
+            # the video was published under, and let "Cập nhật tiêu đề" push both.
             continue
         sidecar.write_text(fresh + "\n", encoding="utf-8")
         updated += 1

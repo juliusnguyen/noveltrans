@@ -3204,6 +3204,55 @@ class TestDisplayTitleUi:
         tab._video_worker = None
         tab.shutdown()
 
+    def test_both_cover_paths_carry_the_title_line_breaks(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        """The cover-only render draws the laid-out title; the video render hands the
+        layout to the worker (which applies it to the cover only, not the upload title)."""
+        from noveltrans.gui import tab_video as tab_module
+        from noveltrans.tts.video import font_dir_context
+
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        words = tab.project.meta.display_name().split()
+        layout = " ".join(words[:1]) + "\n" + " ".join(words[1:])
+        tab._apply_video_settings({**tab._video_settings, "video_thumbnail_title_text": layout})
+
+        seen = {}
+        monkeypatch.setattr(
+            "noveltrans.tts.thumbnail.render_thumbnail",
+            lambda *a, **k: seen.update(k) or a[1],
+        )
+        window = tab._windows_for_current_selection()[0]
+        with font_dir_context() as font_dir:
+            tab._render_thumbnail_now(window, 1, False, base="/no/such.png", font_dir=font_dir)
+        assert seen["vn_title"] == layout
+
+        tab.video_image_edit.setText(str(tmp_path / "bg.png"))
+        (tmp_path / "bg.png").write_bytes(b"x")
+        built = {}
+
+        class _Sig:
+            def connect(self, *_a):
+                pass
+
+        class _FakeWorker:
+            def __init__(self, *a, **kw):
+                built.update(kw)
+                self.progress = self.file_done = self.finished_ok = self.failed = _Sig()
+
+            def start(self):
+                pass
+
+            def isRunning(self):
+                return False
+
+        monkeypatch.setattr(tab_module, "VideoWorker", _FakeWorker)
+        monkeypatch.setattr(tab_module, "track_worker", lambda *_a: None)
+        tab._launch_video()
+        assert built["thumb_title_text"] == layout
+        tab._video_worker = None
+        tab.shutdown()
+
 
 class TestVideoTabScrolling:
     """Feature 037 — the tab scrolls, and the parts table stops collapsing.
@@ -4074,19 +4123,21 @@ class TestPauseButtonRouting:
             job_registry.reset()
 
     def test_every_registration_targets_the_button_beside_its_own_dung(self):
-        # Source-level, because driving all six launches needs a browser and ffmpeg.
-        # `_cancel` stops the render worker; `_cancel_upload` stops the four browser ones.
+        # Source-level, because driving all seven launches needs a browser and ffmpeg.
+        # `_cancel` stops the render worker; `_cancel_upload` stops the five browser ones.
         import inspect
         import re
 
         from noveltrans.gui import tab_video
 
         source = inspect.getsource(tab_video)
-        upload_kinds = {"Tải video lên", "Tải phụ đề lên", "Danh sách phát", "Đổi ảnh bìa"}
+        upload_kinds = {
+            "Tải video lên", "Tải phụ đề lên", "Danh sách phát", "Đổi ảnh bìa", "Đổi tiêu đề",
+        }
         pairs = re.findall(
             r'kind="([^"]+)", novel=self\._job_novel\(\)\s*\)\s*self\.(\w*pause_button)', source
         )
-        assert len(pairs) == 6
+        assert len(pairs) == 7
         for kind, button in pairs:
             expected = "upload_pause_button" if kind in upload_kinds else "pause_button"
             assert button == expected, f"{kind} binds {button}, expected {expected}"
@@ -4819,6 +4870,158 @@ class TestRenameFromTheVideoTab:
         )
         assert after == out and after.is_file()
         assert uploaded_video_id(after) == "dQw4w9WgXcQ"
+        tab.shutdown()
+
+
+class TestTitleOrder:
+    """"Tiêu đề video": Tên truyện - Phần N  ↔  Phần N - Tên truyện."""
+
+    _tab = TestDisplayTitleUi._tab
+    _project = TestDisplayTitleUi._project
+
+    def _rendered_part(self, tab, title: str):
+        window = tab._windows_for_current_selection()[0]
+        out = tab._part_output_path(window, whole_novel=False)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"fake mp4")
+        sidecar = out.parent / (out.stem + ".title.txt")
+        sidecar.write_text(title + "\n", encoding="utf-8")
+        return out, sidecar
+
+    def test_switching_order_saves_retitles_and_reaches_the_render(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from noveltrans.gui import tab_video as tab_module
+
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        name = tab.project.meta.display_name()
+        _out, sidecar = self._rendered_part(tab, f"{name} - Phần 1")
+
+        tab._set_combo(tab.title_order_combo, "part_first")
+        assert tab._video_settings["video_title_order"] == "part_first"
+        assert tab.project.meta.video_settings["video_title_order"] == "part_first"
+        assert sidecar.read_text(encoding="utf-8").strip() == f"Phần 1 - {name}"
+        assert tab._part_title(3) == f"Phần 3 - {name}"
+        assert "tiêu đề 1 phần" in tab.status_label.text()
+
+        tab.video_image_edit.setText(str(tmp_path / "bg.png"))
+        (tmp_path / "bg.png").write_bytes(b"x")
+        built = {}
+
+        class _Sig:
+            def connect(self, *_a):
+                pass
+
+        class _FakeWorker:
+            def __init__(self, *a, **kw):
+                built.update(kw)
+                self.progress = self.file_done = self.finished_ok = self.failed = _Sig()
+
+            def start(self):
+                pass
+
+            def isRunning(self):
+                return False
+
+        monkeypatch.setattr(tab_module, "VideoWorker", _FakeWorker)
+        monkeypatch.setattr(tab_module, "track_worker", lambda *_a: None)
+        tab._launch_video()
+        assert built["title_order"] == "part_first"
+        tab._video_worker = None
+        tab.shutdown()
+
+    def test_an_uploaded_part_keeps_its_published_title(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        from noveltrans.youtube_upload import STATE_PUBLISHED, write_upload_state
+
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        name = tab.project.meta.display_name()
+        out, sidecar = self._rendered_part(tab, f"{name} - Phần 1")
+        write_upload_state(out, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ")
+
+        tab._set_combo(tab.title_order_combo, "part_first")
+        assert sidecar.read_text(encoding="utf-8").strip() == f"{name} - Phần 1"
+        tab.shutdown()
+
+
+class TestTitleUpdateOnYouTube:
+    """"Cập nhật tiêu đề": the published parts the order switch deliberately left alone."""
+
+    _tab = TestDisplayTitleUi._tab
+    _project = TestDisplayTitleUi._project
+
+    def _published_part(self, tab, title: str):
+        from noveltrans.youtube_upload import STATE_PUBLISHED, write_upload_state
+
+        window = tab._windows_for_current_selection()[0]
+        out = tab._part_output_path(window, whole_novel=False)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"fake mp4")
+        (out.parent / (out.stem + ".title.txt")).write_text(title + "\n", encoding="utf-8")
+        write_upload_state(
+            out, status=STATE_PUBLISHED, video_id="dQw4w9WgXcQ", title=title
+        )
+        return out
+
+    def test_a_published_part_is_listed_with_its_new_title(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        name = tab.project.meta.display_name()
+        self._published_part(tab, f"{name} - Phần 1")
+        tab._set_combo(tab.title_order_combo, "part_first")
+
+        rows = tab._title_update_rows()
+        assert [(label, title) for (_w, label, _wn, title) in rows] == [
+            ("Phần 1", f"Phần 1 - {name}")
+        ]
+        # and the status line after the switch points at the button
+        assert "Cập nhật tiêu đề" in tab.status_label.text()
+        tab.shutdown()
+
+    def test_a_part_already_titled_right_is_not_listed(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        name = tab.project.meta.display_name()
+        self._published_part(tab, f"{name} - Phần 1")
+        assert tab._title_update_rows() == []
+        tab.shutdown()
+
+    def test_a_hand_written_title_is_never_touched(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        self._published_part(tab, "Bản đặc biệt - Phần 1")
+        tab._set_combo(tab.title_order_combo, "part_first")
+        assert tab._title_update_rows() == []
+        tab.shutdown()
+
+    def test_the_sidecar_follows_only_after_youtube_confirms(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """The published part's `.title.txt` stays matching the channel until the push
+        lands, so "Chi tiết phần" never claims a rename that didn't happen."""
+        from noveltrans.gui.workers import YouTubeTitleWorker
+        from noveltrans.youtube_upload import TitleRequest
+
+        tab = self._tab(tmp_path, self._project(library_dir, sample_meta, sample_refs))
+        name = tab.project.meta.display_name()
+        out = self._published_part(tab, f"{name} - Phần 1")
+        sidecar = out.parent / (out.stem + ".title.txt")
+        tab._set_combo(tab.title_order_combo, "part_first")
+        assert sidecar.read_text(encoding="utf-8").strip() == f"{name} - Phần 1"
+
+        fresh = f"Phần 1 - {name}"
+        tab._title_worker = YouTubeTitleWorker(
+            [TitleRequest(video=out, title=fresh, video_id="dQw4w9WgXcQ", label="Phần 1")]
+        )
+        tab._on_title_part_done(0, "", "hỏng")  # a failed part changes nothing
+        assert sidecar.read_text(encoding="utf-8").strip() == f"{name} - Phần 1"
+        tab._on_title_part_done(0, "https://youtu.be/dQw4w9WgXcQ", "")
+        assert sidecar.read_text(encoding="utf-8").strip() == fresh
+        tab._title_worker = None
         tab.shutdown()
 
 

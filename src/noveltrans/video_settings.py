@@ -45,6 +45,8 @@ IDENTITY_KEYS: tuple[str, ...] = (
     "video_thumbnail_tagline_scale",
     "video_thumbnail_title_align",
     "video_title_scale",
+    "video_thumbnail_title_text",
+    "video_title_order",
 )
 
 # Per-novel override, seeded from the user's last-used value when the novel has none.
@@ -96,6 +98,8 @@ def identity_defaults() -> dict[str, Any]:
         "video_thumbnail_tagline_scale": DEFAULT_TEXT_SCALE,
         "video_thumbnail_title_align": DEFAULT_TITLE_ALIGN,
         "video_title_scale": DEFAULT_TITLE_SCALE,
+        "video_thumbnail_title_text": "",  # "" = auto-wrap the display name
+        "video_title_order": "name_first",  # "{tên} - Phần N"; see tts.video.TITLE_ORDERS
     }
 
 

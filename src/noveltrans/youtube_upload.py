@@ -298,6 +298,10 @@ _EDIT_THUMBNAIL_BUTTON_SEL = (
 )
 _EDIT_THUMBNAIL_TEXTS = ("Tải file lên", "Tải tệp lên", "Upload file", "Upload thumbnail")
 _SAVE_SEL = "#save, ytcp-button#save, ytcp-button#save-button"
+# The title box on the edit page. Same `#title-textarea` the upload dialog uses; the
+# `ytcp-video-title` form is the one some Studio builds mount on the edit page instead.
+_EDIT_TITLE_SEL = "#title-textarea #textbox, ytcp-video-title #textbox"
+_MAX_TITLE_CHARS = 100  # YouTube's hard limit
 _SAVE_TEXTS = ("Lưu", "Save")
 # Studio's post-save toast. Secondary confirmation only: the primary one is `#save`
 # going back to disabled, which needs no text matching at all.
@@ -556,6 +560,33 @@ class ThumbnailRequest:
                 f"{name}: YouTube không nhận định dạng “{thumbnail.suffix}”. "
                 "Dùng .jpg, .png, .gif hoặc .bmp."
             )
+
+
+@dataclass
+class TitleRequest:
+    """One already-uploaded part's new title (e.g. after switching the title order).
+
+    `video` is only the identity key for the `<name>.upload.json` record, as in
+    `ThumbnailRequest`.
+    """
+
+    video: Path
+    title: str
+    video_id: str = ""  # "" → resolved from the record in `update_title_one`
+    label: str = ""
+
+    def validate(self) -> None:
+        name = self.label or Path(self.video).stem
+        title = (self.title or "").strip()
+        if not title:
+            raise YouTubeUploadError(f"{name}: thiếu tiêu đề.")
+        if len(title) > _MAX_TITLE_CHARS:
+            raise YouTubeUploadError(
+                f"{name}: tiêu đề dài {len(title)} ký tự, YouTube chỉ nhận tối đa "
+                f"{_MAX_TITLE_CHARS}."
+            )
+        if "<" in title or ">" in title:
+            raise YouTubeUploadError(f"{name}: YouTube không nhận dấu “<” hoặc “>” trong tiêu đề.")
 
 
 @dataclass
@@ -1549,8 +1580,10 @@ def _save_button_disabled(page) -> bool:
         return False
 
 
-def _thumbnail_accepted(page, *, timeout_ms: int = _THUMB_ACCEPT_MS) -> bool:
+def _edit_accepted(page, *, timeout_ms: int = _THUMB_ACCEPT_MS) -> bool:
     """True once Save has become enabled — Studio's own "there is an unsaved change" bit.
+
+    Used for every edit-page change (a new thumbnail, a new title), not just images.
 
     The counterpart to `_file_accepted`, and it exists for the same reason:
     `set_input_files` against a selector that matched the wrong element is a silent
@@ -1589,7 +1622,7 @@ def _send_thumbnail(page, image: Path, *, video_id: str) -> None:
             locator.set_input_files(str(image))
         except Exception:
             continue
-        if _thumbnail_accepted(page):
+        if _edit_accepted(page):
             return
 
     try:
@@ -1618,7 +1651,7 @@ def _send_thumbnail(page, image: Path, *, video_id: str) -> None:
             video_id=video_id,
         ) from exc
 
-    if not _thumbnail_accepted(page):
+    if not _edit_accepted(page):
         said = _toast_text(page)
         raise YouTubeUploadError(
             "Đã chọn ảnh bìa nhưng YouTube Studio không ghi nhận thay đổi (nút “Lưu” "
@@ -1629,7 +1662,7 @@ def _send_thumbnail(page, image: Path, *, video_id: str) -> None:
         )
 
 
-def _save_edits(page, *, video_id: str) -> None:
+def _save_edits(page, *, video_id: str, what: str = "ảnh bìa") -> None:
     """Click Lưu / Save and require Studio to confirm it. Raises otherwise.
 
     Two accepted proofs, in order of trustworthiness: Save going back to *disabled*
@@ -1637,12 +1670,12 @@ def _save_edits(page, *, video_id: str) -> None:
 
     Mirrors `_finish` — and its bug. Never confirm on a state that was already true
     before the click: `#save` is disabled on arrival, so "disabled" means nothing on its
-    own. It only counts because `_thumbnail_accepted` already saw it enabled.
+    own. It only counts because `_edit_accepted` already saw it enabled.
     """
     if not _click_any(page, _SAVE_SEL, _SAVE_TEXTS):
         raise YouTubeUploadError(
             "Không bấm được nút “Lưu” trên trang chỉnh sửa video (giao diện có thể đã "
-            "thay đổi). Ảnh bìa chưa được đổi.",
+            f"thay đổi). {what.capitalize()} chưa được đổi.",
             video_id=video_id,
         )
     waited = 0
@@ -1650,7 +1683,7 @@ def _save_edits(page, *, video_id: str) -> None:
         text = _toast_text(page)
         if text and _SAVE_ERROR_RE.search(text):
             raise YouTubeUploadError(
-                f"YouTube Studio báo lỗi khi lưu ảnh bìa: “{text}”.", video_id=video_id
+                f"YouTube Studio báo lỗi khi lưu {what}: “{text}”.", video_id=video_id
             )
         if text and _SAVED_RE.search(text):
             return
@@ -1659,7 +1692,7 @@ def _save_edits(page, *, video_id: str) -> None:
         page.wait_for_timeout(1_000)
         waited += 1_000
     raise YouTubeUploadError(
-        "Đã bấm “Lưu” nhưng YouTube Studio không xác nhận đã lưu ảnh bìa. "
+        f"Đã bấm “Lưu” nhưng YouTube Studio không xác nhận đã lưu {what}. "
         f"Kiểm tra video trên kênh: https://youtu.be/{video_id}",
         video_id=video_id,
     )
@@ -2995,16 +3028,67 @@ def update_thumbnail_one(
     )
 
 
-def update_thumbnail_batch(
-    requests,
+def update_title_one(
+    page,
+    request: TitleRequest,
     *,
-    headless: bool = False,
     on_progress=None,
-    on_part_done=None,
     should_cancel=None,
-    on_checkpoint=None,
+) -> ThumbnailResult:
+    """Replace one already-uploaded video's title, on an already-open page.
+
+    The sibling of `update_thumbnail_one`: same page, same Save gate, same "write the
+    record only after Studio confirms" rule. On success the record's `title` becomes the
+    new one — it is the app's only note of what the video is called on YouTube.
+    """
+    request.validate()
+    video = Path(request.video)
+    title = request.title.strip()
+    video_id = request.video_id or uploaded_video_id(video)
+    if not video_id:
+        raise YouTubeUploadError(
+            f"{request.label or video.stem}: chưa có video trên YouTube cho phần này "
+            "(hoặc phần này chỉ được đánh dấu thủ công), nên không biết đổi tiêu đề của "
+            "video nào."
+        )
+
+    _check_cancel(should_cancel)
+    _report(on_progress, "Mở trang chỉnh sửa video…")
+    _open_edit_page(page, video_id)
+
+    _report(on_progress, "Điền tiêu đề mới…")
+    _fill_box(page, _EDIT_TITLE_SEL, title)
+    if not _edit_accepted(page):
+        said = _toast_text(page)
+        raise YouTubeUploadError(
+            "Đã điền tiêu đề nhưng YouTube Studio không ghi nhận thay đổi (nút “Lưu” vẫn "
+            "tắt) — có thể video đã mang đúng tiêu đề này, hoặc giao diện Studio đã thay đổi."
+            + (f" Studio báo: “{said}”." if said else ""),
+            video_id=video_id,
+        )
+
+    _check_cancel(should_cancel, video_id=video_id)
+    _report(on_progress, "Lưu thay đổi…")
+    _save_edits(page, video_id=video_id, what="tiêu đề")
+
+    updated_at = _now_iso()
+    write_upload_state(video, title=title, title_updated_at=updated_at)
+    return ThumbnailResult(
+        video_id=video_id, url=f"https://youtu.be/{video_id}", updated_at=updated_at
+    )
+
+
+def _edit_batch(
+    requests,
+    edit_one,
+    *,
+    headless: bool,
+    on_progress,
+    on_part_done,
+    should_cancel,
+    on_checkpoint,
 ) -> list:
-    """Update every request's thumbnail through ONE browser session. Returns the results.
+    """Run `edit_one(page, request, ...)` for every request through ONE browser session.
 
     Same contract as `upload_batch`: headed by default (Google challenges this profile
     hard, and a headless session invites a mid-run re-challenge), `on_part_done(index,
@@ -3035,7 +3119,7 @@ def update_thumbnail_batch(
                 _dismiss_unsaved_changes(page)
                 page.wait_for_timeout(_BETWEEN_THUMBNAILS_MS)
             try:
-                result = update_thumbnail_one(
+                result = edit_one(
                     page,
                     request,
                     on_progress=lambda msg, lbl=label: _report(on_progress, f"{lbl}: {msg}"),
@@ -3056,3 +3140,40 @@ def update_thumbnail_batch(
     finally:
         _close(context, playwright)
     return results
+
+
+def update_thumbnail_batch(
+    requests,
+    *,
+    headless: bool = False,
+    on_progress=None,
+    on_part_done=None,
+    should_cancel=None,
+    on_checkpoint=None,
+) -> list:
+    """Update every request's thumbnail through ONE browser session. See `_edit_batch`."""
+    return _edit_batch(
+        requests,
+        # looked up per call, so a test can swap `update_thumbnail_one`
+        lambda *a, **k: update_thumbnail_one(*a, **k),
+        headless=headless, on_progress=on_progress, on_part_done=on_part_done,
+        should_cancel=should_cancel, on_checkpoint=on_checkpoint,
+    )
+
+
+def update_title_batch(
+    requests,
+    *,
+    headless: bool = False,
+    on_progress=None,
+    on_part_done=None,
+    should_cancel=None,
+    on_checkpoint=None,
+) -> list:
+    """Update every request's title through ONE browser session. See `_edit_batch`."""
+    return _edit_batch(
+        requests,
+        lambda *a, **k: update_title_one(*a, **k),
+        headless=headless, on_progress=on_progress, on_part_done=on_part_done,
+        should_cancel=should_cancel, on_checkpoint=on_checkpoint,
+    )

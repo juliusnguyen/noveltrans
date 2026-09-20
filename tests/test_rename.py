@@ -239,3 +239,46 @@ class TestResyncTitleSidecars:
         assert sidecar.read_text(encoding="utf-8").strip() == build_upload_title(
             "Trọng Sinh", 3
         )
+
+
+class TestResyncTitleOrder:
+    """Switching "Tiêu đề video" to "Phần N - Tên truyện" re-titles rendered parts."""
+
+    _rendered = TestResyncTitleSidecars._rendered
+
+    def test_order_only_switch_rewrites_an_unpublished_part(self, tmp_path):
+        video, sidecar = self._rendered(tmp_path, "dai-can-0001-0010", "Đại Càn - Phần 1")
+        assert resync_title_sidecars(
+            video, "dai-can", "Đại Càn", ["Đại Càn"], "part_first"
+        ) == 1
+        assert sidecar.read_text(encoding="utf-8").strip() == "Phần 1 - Đại Càn"
+        # running it again is a no-op
+        assert resync_title_sidecars(
+            video, "dai-can", "Đại Càn", ["Đại Càn"], "part_first"
+        ) == 0
+
+    def test_switching_back_restores_name_first(self, tmp_path):
+        video, sidecar = self._rendered(tmp_path, "dai-can-0001-0010", "Phần 4 - Đại Càn")
+        assert resync_title_sidecars(video, "dai-can", "Đại Càn", ["Đại Càn"]) == 1
+        assert sidecar.read_text(encoding="utf-8").strip() == "Đại Càn - Phần 4"
+
+    def test_order_only_switch_leaves_an_uploaded_part_alone(self, tmp_path):
+        video, sidecar = self._rendered(tmp_path, "dai-can-0001-0010", "Đại Càn - Phần 1")
+        (sidecar.parent / "dai-can-0001-0010.upload.json").write_text("{}", encoding="utf-8")
+        assert resync_title_sidecars(
+            video, "dai-can", "Đại Càn", ["Đại Càn"], "part_first"
+        ) == 0
+        assert sidecar.read_text(encoding="utf-8").strip() == "Đại Càn - Phần 1"
+
+    def test_a_rename_rewrites_a_part_first_title_in_place(self, tmp_path):
+        video, sidecar = self._rendered(tmp_path, "dai-can-0001-0010", "Phần 2 - Cứu Chuyện")
+        assert resync_title_sidecars(
+            video, "dai-can", "Trọng Sinh", ["Cứu Chuyện"], "part_first"
+        ) == 1
+        assert sidecar.read_text(encoding="utf-8").strip() == "Phần 2 - Trọng Sinh"
+
+    def test_a_hand_written_part_first_title_is_left_alone(self, tmp_path):
+        video, sidecar = self._rendered(tmp_path, "dai-can-0001-0010", "Phần 2 - Bản đặc biệt")
+        assert resync_title_sidecars(
+            video, "dai-can", "Đại Càn", ["Đại Càn"], "name_first"
+        ) == 0

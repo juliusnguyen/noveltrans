@@ -4,7 +4,7 @@ title / description / thumbnail / tags for each part.
 Split out of the audio tab (feature 025): it owns its own project picker, voice selector,
 and status/progress/cancel widgets. When exporting, each produced part-video gets, written
 next to the `.mp4`:
-  * `<name>.title.txt`  — "{tên truyện} - Phần {N}"
+  * `<name>.title.txt`  — "{tên truyện} - Phần {N}" (or "Phần {N} - {tên truyện}")
   * `<name>.txt`        — the YouTube description (original+VN title/author, chapter count,
                            the chapter timestamp table, "Tạo bởi: …"), capped to YouTube's
                            5000 characters
@@ -82,6 +82,7 @@ from noveltrans.gui.workers import (
     SubtitleWorker,
     VideoWorker,
     YouTubeThumbnailWorker,
+    YouTubeTitleWorker,
     YouTubeUploadWorker,
 )
 from noveltrans.storage import NovelProject
@@ -110,6 +111,7 @@ class VideoTab(QWidget):
         self._video_worker: VideoWorker | None = None
         self._upload_worker: YouTubeUploadWorker | None = None
         self._thumbnail_worker: YouTubeThumbnailWorker | None = None
+        self._title_worker: YouTubeTitleWorker | None = None
         self._playlist_worker: PlaylistSyncWorker | None = None
         self._playlist_fetch_worker: PlaylistFetchWorker | None = None
         self._subtitle_worker: SubtitleWorker | None = None
@@ -557,6 +559,14 @@ class VideoTab(QWidget):
             "chọn — dùng sau khi “Tạo lại tất cả ảnh bìa”. Không tải lại video."
         )
         self.thumbnail_update_button.clicked.connect(self._start_thumbnail_update)
+        # Its sibling: the same edit page, the same Chrome profile, the other field.
+        self.title_update_button = QPushButton("✏️ Cập nhật tiêu đề")
+        self.title_update_button.setToolTip(
+            "Đổi tiêu đề trên YouTube cho những phần đã đăng mà tiêu đề đã khác với tiêu "
+            "đề hiện tại (sau khi đổi thứ tự “Tiêu đề video” hoặc đổi tên truyện). "
+            "Không tải lại video."
+        )
+        self.title_update_button.clicked.connect(self._start_title_update)
         self.playlist_fetch_button = QPushButton("Tải danh sách…")
         self.playlist_fetch_button.setToolTip(
             "Đọc các danh sách phát đang có trên kênh đã đăng nhập và đưa vào ô bên trái. "
@@ -594,6 +604,7 @@ class VideoTab(QWidget):
         action_row.addWidget(self.playlist_sync_button)
         action_row.addWidget(self.upload_reset_button)
         action_row.addWidget(self.thumbnail_update_button)
+        action_row.addWidget(self.title_update_button)
         action_row.addWidget(self.subtitle_upload_button)
         action_row.addWidget(self.upload_button)
         action_row.addWidget(self.upload_cancel_button)
@@ -1083,7 +1094,9 @@ class VideoTab(QWidget):
         from noveltrans.tts.video import build_upload_title
 
         novel_title = self.project.meta.display_name()
-        return build_upload_title(novel_title, part_num)
+        return build_upload_title(
+            novel_title, part_num, self._video_settings["video_title_order"]
+        )
 
     @staticmethod
     def _format_hms(seconds: float) -> str:
@@ -2117,10 +2130,13 @@ class VideoTab(QWidget):
     def _render_thumbnail_now(self, window, part_num, whole_novel, *, base, font_dir) -> None:
         """Render one part's `.jpg` cover from the saved cover settings (font + title/part
         positions) — pure Pillow, no ffmpeg, so it's near-instant and needs no video render."""
-        from noveltrans.tts.thumbnail import render_thumbnail
+        from noveltrans.tts.thumbnail import cover_title, render_thumbnail
         from noveltrans.tts.video import video_font
 
-        novel_title = self.project.meta.display_name()
+        novel_title = cover_title(
+            self.project.meta.display_name(),
+            self._video_settings["video_thumbnail_title_text"],
+        )
         font_file = video_font(self._video_settings["video_thumbnail_font"])["file"]
         render_thumbnail(
             base,
@@ -2232,6 +2248,7 @@ class VideoTab(QWidget):
                 ("video_thumbnail_part_scale", dialog.part_scale),
                 ("video_thumbnail_tagline_scale", dialog.tagline_scale),
                 ("video_thumbnail_title_align", dialog.title_align),
+                ("video_thumbnail_title_text", dialog.title_text),
                 ("video_thumbnail_font", dialog.font_key),
             ):
                 self._save_video_setting(key, value)
@@ -2298,6 +2315,16 @@ class VideoTab(QWidget):
         )
         self.display_title_edit.editingFinished.connect(self._save_display_title)
 
+        # Which way round the YouTube title reads. Per novel, like the display name beside it.
+        self.title_order_combo = QComboBox()
+        self.title_order_combo.addItem("Tên truyện - Phần N", "name_first")
+        self.title_order_combo.addItem("Phần N - Tên truyện", "part_first")
+        self.title_order_combo.setToolTip(
+            "Thứ tự tiêu đề video YouTube. Đổi ở đây cũng cập nhật tiêu đề các phần đã tạo "
+            "nhưng chưa đăng; video đã đăng giữ nguyên."
+        )
+        self.title_order_combo.currentIndexChanged.connect(self._on_title_order_changed)
+
         self.tagline_edit = QLineEdit(self.config.video_tagline)
         self.tagline_edit.setPlaceholderText("Câu tagline dưới 'PHẦN N' (tuỳ chọn)…")
         self.tagline_edit.editingFinished.connect(
@@ -2334,6 +2361,8 @@ class VideoTab(QWidget):
         title_row = QHBoxLayout()
         title_row.addWidget(QLabel("Tên hiển thị:"))
         title_row.addWidget(self.display_title_edit, stretch=1)
+        title_row.addWidget(QLabel("Tiêu đề video:"))
+        title_row.addWidget(self.title_order_combo)
 
         row = QHBoxLayout()
         row.addWidget(QLabel("Ảnh bìa:"))
@@ -2507,6 +2536,7 @@ class VideoTab(QWidget):
                 encoder = "libx264"
             self._set_combo(self.video_encoder, encoder, fallback="libx264")
             self._set_combo(self.thumb_font, values["video_thumbnail_font"])
+            self._set_combo(self.title_order_combo, values["video_title_order"])
             self.video_batch_size.setValue(int(values["video_batch_size"]))
             self.burn_subs_check.setChecked(bool(values["video_burn_subtitles"]))
             self.show_bars_check.setChecked(bool(values["video_show_bars"]))
@@ -2903,6 +2933,31 @@ class VideoTab(QWidget):
             self._novel_slug(),
             meta.display_name(),
             (previous_name, meta.display_title, meta.translated_title, meta.title),
+            self._video_settings["video_title_order"],
+        )
+
+    def _on_title_order_changed(self) -> None:
+        """Save the title order and re-title every rendered, not-yet-uploaded part.
+
+        The resync is the point: `_upload_request` prefers `.title.txt`, so without it a
+        part rendered before the switch would still go to YouTube in the old order.
+        """
+        order = self.title_order_combo.currentData()
+        self._save_video_setting("video_title_order", order)
+        if self._loading_video_settings or self.project is None:
+            return
+        retitled = self._resync_title_sidecars()
+        self._refresh_video_list()  # the "Tiêu đề" column is built from _part_title
+        note = f" Đã cập nhật tiêu đề {retitled} phần đã tạo." if retitled else ""
+        # A published part's sidecar is left matching YouTube, so say where to change it.
+        pending = len(self._title_update_rows())
+        if pending:
+            note += (
+                f" {pending} phần đã đăng vẫn giữ tiêu đề cũ trên YouTube — bấm "
+                "“Cập nhật tiêu đề” để đổi."
+            )
+        self.status_label.setText(
+            f"Tiêu đề video: “{self._part_title(1)}”.{note}"
         )
 
     # ------------------------------------------------- keep descriptions fresh
@@ -3526,6 +3581,8 @@ class VideoTab(QWidget):
             thumb_part_scale=self._video_settings["video_thumbnail_part_scale"],
             thumb_tagline_scale=self._video_settings["video_thumbnail_tagline_scale"],
             thumb_title_align=self._video_settings["video_thumbnail_title_align"],
+            thumb_title_text=self._video_settings["video_thumbnail_title_text"],
+            title_order=self._video_settings["video_title_order"],
             burn_subtitles=self.burn_subs_check.isChecked(),
             show_bars=self.show_bars_check.isChecked(),
             title_scale=self._video_settings["video_title_scale"],
@@ -3973,6 +4030,9 @@ class VideoTab(QWidget):
         elif self._thumbnail_worker is not None and self._thumbnail_worker.isRunning():
             self._thumbnail_worker.cancel()
             self.status_label.setText("Đang dừng cập nhật ảnh bìa…")
+        elif self._title_worker is not None and self._title_worker.isRunning():
+            self._title_worker.cancel()
+            self.status_label.setText("Đang dừng cập nhật tiêu đề…")
         elif self._playlist_worker is not None and self._playlist_worker.isRunning():
             self._playlist_worker.cancel()
             self.status_label.setText("Đang dừng sắp xếp danh sách phát…")
@@ -4344,6 +4404,178 @@ class VideoTab(QWidget):
         self._reset_playlist_ui()
         self._on_upload_needs_login(message)
 
+    # ------------------------------------------ cập nhật tiêu đề trên YouTube
+
+    def _title_update_rows(self) -> list:
+        """Parts whose video on the channel is titled differently from what we'd write now.
+
+        The pair is (window, label, whole, title). A published part's `.title.txt` is
+        deliberately left alone by `resync_title_sidecars` (it should keep matching what
+        YouTube shows), so the comparison is against the recorded title — falling back to
+        the sidecar for parts uploaded before that was recorded.
+        """
+        if self.project is None:
+            return []
+        from noveltrans.rename import retitle
+        from noveltrans.youtube_upload import read_upload_state, uploaded_video_id
+
+        meta = self.project.meta
+        known = (meta.display_title, meta.translated_title, meta.title)
+        order = self._video_settings["video_title_order"]
+        windows = self._windows_for_current_selection()
+        mode = self.video_mode.currentData()
+        total = len(windows)
+        rows = []
+        for window in windows:
+            whole_novel = total == 1 and mode == "all"
+            path = self._part_output_path(window, whole_novel=whole_novel)
+            if not uploaded_video_id(path):
+                continue
+            current = (
+                str(read_upload_state(path).get("title") or "").strip()
+                or self._read_sidecar(window, whole_novel, ".title.txt")
+            )
+            fresh = retitle(current, meta.display_name(), known, order)
+            if not fresh:
+                continue  # hand-written, or already right
+            label = "Toàn bộ" if whole_novel else f"Phần {self._part_number(window)}"
+            rows.append((window, label, whole_novel, fresh))
+        return rows
+
+    def _start_title_update(self) -> None:
+        """Push the current title onto every already-uploaded part that needs it."""
+        if self.project is None:
+            QMessageBox.information(self, "Cập nhật tiêu đề", "Chọn truyện trước.")
+            return
+        rows = self._title_update_rows()
+        if not rows:
+            QMessageBox.information(
+                self,
+                "Cập nhật tiêu đề",
+                "Không có phần nào cần đổi tiêu đề (chưa tải lên YouTube, tiêu đề đã "
+                "đúng, hoặc tiêu đề do bạn tự đặt).",
+            )
+            return
+        self._launch_title_update(rows)
+
+    def _launch_title_update(self, rows: list) -> None:
+        from noveltrans.youtube_upload import TitleRequest, YouTubeUploadError, uploaded_video_id
+
+        for worker, running in (
+            (self._title_worker, "cập nhật tiêu đề"),
+            (self._thumbnail_worker, "cập nhật ảnh bìa"),
+            (self._upload_worker, "tải lên"),
+        ):
+            if worker is not None and worker.isRunning():
+                QMessageBox.information(
+                    self, "Cập nhật tiêu đề", f"Đang có phiên {running} chạy — chờ xong đã."
+                )
+                return
+
+        try:
+            requests = [
+                TitleRequest(
+                    video=self._part_output_path(w, whole_novel=wn),
+                    title=title,
+                    video_id=uploaded_video_id(self._part_output_path(w, whole_novel=wn)),
+                    label=label,
+                )
+                for (w, label, wn, title) in rows
+            ]
+            for request in requests:  # surface a bad title before opening a browser
+                request.validate()
+        except YouTubeUploadError as exc:
+            QMessageBox.warning(self, "Cập nhật tiêu đề", str(exc))
+            return
+
+        lines = "\n".join(f"• {r.label}: {r.title}" for r in requests[:5])
+        more = f"\n(+{len(requests) - 5} phần nữa)" if len(requests) > 5 else ""
+        confirm = QMessageBox.question(
+            self,
+            "Cập nhật tiêu đề",
+            f"Sẽ đổi tiêu đề của {len(requests)} video đã đăng trên kênh:\n{lines}{more}\n\n"
+            "Một cửa sổ Chrome sẽ mở ra và tự thao tác — đừng dùng nó khi đang chạy. "
+            "Tiếp tục?",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        self._title_worker = YouTubeTitleWorker(requests, self)
+        self._title_worker.progress.connect(self._on_title_progress)
+        self._title_worker.part_done.connect(self._on_title_part_done)
+        self._title_worker.finished_ok.connect(self._on_title_finished)
+        self._title_worker.failed.connect(self._on_title_failed)
+        self._title_worker.needs_login.connect(self._on_title_needs_login)
+        track_worker(self._title_worker)  # don't let the Mac sleep mid-run
+        self._job = job_registry.register(
+            self._title_worker, kind="Đổi tiêu đề", novel=self._job_novel()
+        )
+        self.upload_pause_button.set_job(self._job.id if self._job else None)
+
+        self.title_update_button.setEnabled(False)
+        self.thumbnail_update_button.setEnabled(False)
+        self.upload_button.setEnabled(False)
+        self.video_button.setEnabled(False)
+        self.upload_cancel_button.setEnabled(True)
+        self.progress.setMaximum(len(requests))
+        self.progress.setValue(0)
+        self.status_label.setText("✏️ Bắt đầu cập nhật tiêu đề…")
+        self._title_worker.start()
+
+    def _on_title_progress(self, done: int, total: int, message: str) -> None:
+        self.progress.setMaximum(max(total, 1))
+        self.progress.setValue(done)
+        if message:
+            self.status_label.setText(f"✏️ ({done}/{total}) {message}")
+
+    def _on_title_part_done(self, index: int, url: str, error: str) -> None:
+        """Bring the sidecar with it, so "Chi tiết phần" and any future re-upload agree
+        with the channel — but only for a part YouTube actually accepted."""
+        from pathlib import Path
+
+        if error or self._title_worker is None:
+            return
+        request = self._title_worker.requests[index]
+        sidecar = Path(request.video).parent / (Path(request.video).stem + ".title.txt")
+        try:
+            sidecar.write_text(request.title + "\n", encoding="utf-8")
+        except OSError:
+            pass
+        self._refresh_video_list()
+
+    def _reset_title_ui(self) -> None:
+        self.title_update_button.setEnabled(True)
+        self.thumbnail_update_button.setEnabled(True)
+        self.upload_button.setEnabled(True)
+        self.video_button.setEnabled(True)
+        self.upload_cancel_button.setEnabled(False)
+        self._refresh_video_list()
+
+    def _on_title_finished(self, updated: int, errors: int) -> None:
+        self._reset_title_ui()
+        if updated and not errors:
+            self.status_label.setText(f"✅ Đã đổi tiêu đề {updated} video trên YouTube.")
+        elif updated:
+            self.status_label.setText(
+                f"⚠️ Đã đổi tiêu đề {updated} video, {errors} phần lỗi."
+            )
+        else:
+            self.status_label.setText("Không đổi được tiêu đề phần nào.")
+
+    def _on_title_failed(self, message: str) -> None:
+        self._reset_title_ui()
+        self.status_label.setText("")
+        QMessageBox.warning(self, "Cập nhật tiêu đề thất bại", message)
+
+    def _on_title_needs_login(self, message: str) -> None:
+        self._reset_title_ui()
+        self.status_label.setText("")
+        QMessageBox.information(
+            self,
+            "Cần đăng nhập YouTube",
+            message + "\n\nVào Settings → “Đăng nhập YouTube”, rồi thử lại.",
+        )
+
     # ------------------------------------------- cập nhật ảnh bìa trên YouTube
 
     def _thumbnail_update_rows(self) -> list:
@@ -4576,6 +4808,9 @@ class VideoTab(QWidget):
         if self._thumbnail_worker is not None and self._thumbnail_worker.isRunning():
             self._thumbnail_worker.cancel()
             self._thumbnail_worker.wait(60_000)
+        if self._title_worker is not None and self._title_worker.isRunning():
+            self._title_worker.cancel()
+            self._title_worker.wait(60_000)
         if self._playlist_worker is not None and self._playlist_worker.isRunning():
             self._playlist_worker.cancel()
             self._playlist_worker.wait(60_000)

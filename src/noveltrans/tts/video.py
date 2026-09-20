@@ -764,15 +764,27 @@ def plan_locked_video_windows(
     return result
 
 
-def build_upload_title(vn_title: str, part_num: int | None) -> str:
-    """The video title: `{vn_title} - Phần {N}`, or just `vn_title` for a whole-novel video.
+# Which way round the video title reads. A fixed choice rather than a free template: the
+# rename resync (`rename.resync_title_sidecars`) has to recognise a generated title to
+# rewrite it, and two known shapes stay recognisable where a template would not.
+TITLE_ORDERS = ("name_first", "part_first")
+DEFAULT_TITLE_ORDER = "name_first"
 
-    `part_num is None` means the single video covers the whole novel (no part split), so the
-    "- Phần N" suffix is omitted.
+
+def build_upload_title(
+    vn_title: str, part_num: int | None, order: str = DEFAULT_TITLE_ORDER
+) -> str:
+    """The video title: `{vn_title} - Phần {N}`, or `Phần {N} - {vn_title}` when `order` is
+    "part_first"; just `vn_title` for a whole-novel video.
+
+    `part_num is None` means the single video covers the whole novel (no part split), so
+    there is no "Phần N" to place. An unrecognised `order` reads as the default.
     """
     vn_title = (vn_title or "").strip()
     if part_num is None:
         return vn_title
+    if order == "part_first":
+        return f"Phần {part_num} - {vn_title}"
     return f"{vn_title} - Phần {part_num}"
 
 

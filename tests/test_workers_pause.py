@@ -25,6 +25,7 @@ from noveltrans.gui.workers import (
     TranslateWorker,
     VideoWorker,
     YouTubeThumbnailWorker,
+    YouTubeTitleWorker,
     YouTubeUploadWorker,
 )
 
@@ -43,6 +44,7 @@ WORKERS = [
     pytest.param(lambda: YouTubeUploadWorker([]), id="youtube-upload"),
     pytest.param(lambda: PlaylistSyncWorker("", []), id="playlist-sync"),
     pytest.param(lambda: YouTubeThumbnailWorker([]), id="thumbnail"),
+    pytest.param(lambda: YouTubeTitleWorker([]), id="title"),
     pytest.param(lambda: OneDrivePushWorker(None), id="onedrive-push"),
 ]
 

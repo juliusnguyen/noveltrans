@@ -2134,6 +2134,8 @@ class VideoWorker(PausableWorker):
         thumb_part_scale: float | None = None,
         thumb_tagline_scale: float | None = None,
         thumb_title_align: str = "",  # cover title flush edge; "" → the renderer's "left"
+        thumb_title_text: str = "",  # cover title with the user's line breaks; "" → auto-wrap
+        title_order: str = "name_first",  # "{tên} - Phần N" | "part_first": "Phần N - {tên}"
         burn_subtitles: bool = False,  # also burn the narration into the video
         show_bars: bool = True,  # False → no audio visualiser (faster, smaller, roomier titles)
         title_scale: float | None = None,  # in-video novel-title size multiplier; None → 1.0
@@ -2177,6 +2179,8 @@ class VideoWorker(PausableWorker):
         self.thumb_part_scale = thumb_part_scale
         self.thumb_tagline_scale = thumb_tagline_scale
         self.thumb_title_align = thumb_title_align
+        self.thumb_title_text = thumb_title_text
+        self.title_order = title_order
         self.burn_subtitles = burn_subtitles
         self.show_bars = show_bars
         self.title_scale = title_scale
@@ -2413,13 +2417,14 @@ class VideoWorker(PausableWorker):
             DEFAULT_TEXT_SCALE,
             DEFAULT_TITLE_ALIGN,
             DEFAULT_TITLE_POS,
+            cover_title,
         )
 
         def sidecar(ext: str) -> Path:
             return out_path.parent / (out_path.stem + ext)
 
         timed = with_real_durations(segments)
-        title = build_upload_title(novel_title, part_num)
+        title = build_upload_title(novel_title, part_num, self.title_order)
         sidecar(".title.txt").write_text(title + "\n", encoding="utf-8")
 
         desc, _dropped = fit_video_description(
@@ -2449,7 +2454,9 @@ class VideoWorker(PausableWorker):
             render_thumbnail(
                 self.thumb_image_path or str(self.image_path),
                 sidecar(".jpg"),
-                vn_title=novel_title,
+                # Only the cover takes the user's line breaks; the upload title and the
+                # description above keep the plain display name.
+                vn_title=cover_title(novel_title, self.thumb_title_text),
                 part_num=part_num or 1,
                 tagline=self.tagline,
                 font_path=font_dir / font_file,
@@ -3260,6 +3267,57 @@ class YouTubeThumbnailWorker(PausableWorker):
             else:
                 self.failed.emit(str(exc))
         except Exception as exc:  # keep unexpected automation errors on-screen
+            self.failed.emit(repr(exc))
+        else:
+            self.finished_ok.emit(done - errors, errors)
+
+
+class YouTubeTitleWorker(YouTubeThumbnailWorker):
+    """Rename already-uploaded parts on YouTube, in one browser session.
+
+    Everything but the batch call and the wording is the thumbnail worker's, because the
+    two runs are the same shape: one edit page per part, a save Studio has to confirm,
+    and nothing half-done to unwind when a part fails.
+    """
+
+    def run(self) -> None:
+        from noveltrans.youtube_upload import (
+            UploadCancelled,
+            YouTubeUploadError,
+            update_title_batch,
+        )
+
+        total = len(self.requests)
+        done = 0
+        errors = 0
+
+        def on_part_done(index: int, result, error: str) -> None:
+            nonlocal done, errors
+            done += 1
+            if error:
+                errors += 1
+            self.part_done.emit(index, getattr(result, "url", "") or "", error)
+            label = self.requests[index].label or f"phần {index + 1}"
+            self.progress.emit(done, total, f"{label}: {'lỗi' if error else 'xong'}")
+
+        try:
+            update_title_batch(
+                self.requests,
+                on_progress=lambda msg: self.progress.emit(done, total, msg),
+                on_part_done=on_part_done,
+                should_cancel=lambda: self._cancelled,
+                on_checkpoint=self._checkpoint,
+            )
+        except UploadCancelled:
+            self.failed.emit(
+                f"Đã dừng cập nhật tiêu đề. {done} phần đã đổi vẫn giữ tiêu đề mới."
+            )
+        except YouTubeUploadError as exc:
+            if exc.needs_login:
+                self.needs_login.emit(str(exc))
+            else:
+                self.failed.emit(str(exc))
+        except Exception as exc:
             self.failed.emit(repr(exc))
         else:
             self.finished_ok.emit(done - errors, errors)

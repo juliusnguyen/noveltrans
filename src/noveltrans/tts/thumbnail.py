@@ -1,7 +1,8 @@
 """Compose a YouTube thumbnail: a base photo + styled Vietnamese overlay text.
 
 Layout (see 025.00-example-thumbnail.png):
-  * top-left — the novel title (Vietnamese), word-wrapped over several lines, in a
+  * top-left — the novel title (Vietnamese), word-wrapped over several lines (plus any
+    line breaks the user typed — see `cover_title`), in a
     decorative "glow" style (a blurred cyan halo under a white, dark-stroked title);
   * bottom-center — `PHẦN {N}` large, plus a smaller tagline subtitle line beneath it.
 
@@ -48,6 +49,39 @@ def _wrap_title(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list
             current = word
     lines.append(current)
     return lines
+
+
+def _wrap_title_lines(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
+    """`_wrap_title`, but honouring the user's own line breaks first.
+
+    Each "\n"-separated line is wrapped on its own, so a break the user typed always
+    starts a new line and a line that is still too wide still wraps. Blank lines are
+    dropped: a stray Enter should not leave a hole in the title.
+    """
+    lines: list[str] = []
+    for paragraph in (text or "").splitlines():
+        lines.extend(_wrap_title(paragraph, font, max_width))
+    return lines
+
+
+def _title_letters(text: str) -> str:
+    """Only the letters and digits, casefolded — what a title *says*, ignoring layout."""
+    return "".join(ch for ch in (text or "").casefold() if ch.isalnum())
+
+
+def cover_title(display_name: str, custom: str) -> str:
+    """The title to draw on the cover: `custom` (with its line breaks) or `display_name`.
+
+    `custom` is the novel title as the user laid it out in the cover editor. It is used
+    only while it still spells the same title — same letters and digits; spaces, line
+    breaks and punctuation such as a trailing ":" may differ. Renaming the novel
+    afterwards (the "Tên hiển thị" box) must not leave every cover showing the old name,
+    so a stale layout quietly falls back to the new name, auto-wrapped.
+    """
+    custom = (custom or "").strip()
+    if custom and _title_letters(custom) == _title_letters(display_name):
+        return custom
+    return display_name
 
 
 def _line_size(font: ImageFont.FreeTypeFont, text: str, stroke_width: int) -> tuple[int, int]:
@@ -211,8 +245,14 @@ def compose_thumbnail(
     # when flush right, rightwards otherwise — capped at the original 62% budget so the
     # title never runs under the photo's subject.
     room = (title_x - margin) if flush_right else (W - title_x - margin)
-    max_text_w = max(round(W * 0.2), min(round(W * 0.62), room))
-    lines = _wrap_title(vn_title, title_font, max_text_w)
+    if "\n" in (vn_title or ""):
+        # The user chose the breaks (see `cover_title`), so each line is as long as they
+        # meant it — only wrap one that would actually leave the frame. Keeping the 62%
+        # cap here turned "Phò Mã Gia Trốn Hôn" back into two lines, "Hôn" off the bottom.
+        max_text_w = max(round(W * 0.2), room)
+    else:
+        max_text_w = max(round(W * 0.2), min(round(W * 0.62), room))
+    lines = _wrap_title_lines(vn_title, title_font, max_text_w)
     y = round(H * title_pos[1])
     line_gap = round(title_px * 0.18)
     for line in lines:
