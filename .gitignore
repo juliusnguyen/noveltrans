@@ -8,6 +8,7 @@ dist/
 
 # Tooling
 .pytest_cache/
+.pytest-host-temp/
 .ruff_cache/
 .coverage
 

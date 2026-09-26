@@ -199,6 +199,11 @@ STATUS_COLORS = {
     STATUS_ERROR: QColor("#c62828"),  # red
 }
 
+# "Đang dịch" is a transient, in-flight state a worker reports while a chapter is on a
+# translate thread — never persisted (there is no matching STATUS_* value), so it lives
+# outside STATUS_COLORS and is overlaid by ChapterTableModel instead.
+STATUS_COLOR_TRANSLATING = QColor("#ef6c00")  # amber
+
 
 def _fold(text: str) -> str:
     """A case- and diacritic-insensitive sort key, so "Ấ" files beside "A" not after "Z".
@@ -707,6 +712,10 @@ class ChapterTableModel(QAbstractTableModel):
         super().__init__(parent)
         self._chapters: list[Chapter] = []
         self._title_editable = False
+        # Chapters a TranslateWorker has told us it just started, not yet persisted as
+        # "translated"/"error" — see `mark_in_progress`. In-memory only, on purpose: see
+        # the comment above `STATUS_COLOR_TRANSLATING`.
+        self._in_progress: set[int] = set()
 
     def set_title_editable(self, editable: bool) -> None:
         """Opt this table in to renaming chapters. Connect `title_edited` as well."""
@@ -717,15 +726,33 @@ class ChapterTableModel(QAbstractTableModel):
     def set_chapters(self, chapters: list[Chapter]) -> None:
         self.beginResetModel()
         self._chapters = list(chapters)
+        self._in_progress = set()
         self.endResetModel()
 
     def update_chapter(self, chapter: Chapter) -> None:
         """Refresh one row in place (chapters are keyed by index order)."""
+        self._in_progress.discard(chapter.index)  # a fresh read is no longer in flight
         for row, existing in enumerate(self._chapters):
             if existing.index == chapter.index:
                 self._chapters[row] = chapter
                 self.dataChanged.emit(self.index(row, 0), self.index(row, self.columnCount() - 1))
                 return
+
+    def mark_in_progress(self, chapter_index: int) -> None:
+        """Show `chapter_index` as `Đang dịch` until its next `update_chapter`."""
+        self._in_progress.add(chapter_index)
+        row = self.row_for_index(chapter_index)
+        if row is not None:
+            self.dataChanged.emit(self.index(row, 0), self.index(row, self.columnCount() - 1))
+
+    def clear_in_progress(self) -> None:
+        """Drop every in-flight mark — a run that ended (done/cancelled/failed) leaves none."""
+        if not self._in_progress:
+            return
+        self._in_progress.clear()
+        last_row = self.rowCount() - 1
+        if last_row >= 0:
+            self.dataChanged.emit(self.index(0, 0), self.index(last_row, self.columnCount() - 1))
 
     def chapter_at(self, row: int) -> Chapter | None:
         return self._chapters[row] if 0 <= row < len(self._chapters) else None
@@ -767,6 +794,8 @@ class ChapterTableModel(QAbstractTableModel):
             if column == self.TRANSLATED_TITLE_COLUMN:
                 return chapter.translated_title
             if column == self.STATUS_COLUMN:
+                if chapter.index in self._in_progress:
+                    return "Đang dịch"
                 return STATUS_LABELS.get(chapter.status, chapter.status)
             if column == self.TRANSLATOR_COLUMN:
                 # Suffixes rather than new columns: a ninth column would shift
@@ -835,6 +864,8 @@ class ChapterTableModel(QAbstractTableModel):
                 return (bool(chapter.error), (chapter.error or "").casefold())
             return None
         if role == Qt.ItemDataRole.ForegroundRole and column == self.STATUS_COLUMN:
+            if chapter.index in self._in_progress:
+                return STATUS_COLOR_TRANSLATING
             return STATUS_COLORS.get(chapter.status)
         if role == Qt.ItemDataRole.TextAlignmentRole and column == self.DURATION_COLUMN:
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)

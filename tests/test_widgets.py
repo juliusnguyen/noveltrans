@@ -129,6 +129,57 @@ class TestChapterTableModelEditing:
         assert edits == []
 
 
+class TestChapterTableModelInProgress:
+    """Feature 097 — a chapter a TranslateWorker just started shows `Đang dịch`."""
+
+    def _model(self, qapp):
+        from noveltrans.gui.widgets import ChapterTableModel
+
+        model = ChapterTableModel()
+        model.set_chapters(
+            [
+                Chapter(index=0, title="第1章", url="u", content="x"),
+                Chapter(index=1, title="第2章", url="u", content="x"),
+            ]
+        )
+        return model
+
+    def test_marked_row_reads_as_translating(self, qapp):
+        from PySide6.QtCore import Qt
+
+        from noveltrans.gui.widgets import STATUS_COLOR_TRANSLATING
+
+        m = self._model(qapp)
+        col = m.STATUS_COLUMN
+        m.mark_in_progress(0)
+        assert m.data(m.index(0, col)) == "Đang dịch"
+        assert m.data(m.index(0, col), Qt.ItemDataRole.ForegroundRole) == STATUS_COLOR_TRANSLATING
+        # the other row is untouched
+        assert m.data(m.index(1, col)) == "Chưa tải"
+
+    def test_a_fresh_read_clears_the_mark(self, qapp):
+        m = self._model(qapp)
+        col = m.STATUS_COLUMN
+        m.mark_in_progress(0)
+        m.update_chapter(Chapter(index=0, title="第1章", url="u", content="x", status="error"))
+        assert m.data(m.index(0, col)) == "Lỗi"
+
+    def test_clear_in_progress_resets_every_row(self, qapp):
+        m = self._model(qapp)
+        col = m.STATUS_COLUMN
+        m.mark_in_progress(0)
+        m.mark_in_progress(1)
+        m.clear_in_progress()
+        assert m.data(m.index(0, col)) == "Chưa tải"
+        assert m.data(m.index(1, col)) == "Chưa tải"
+
+    def test_set_chapters_resets_the_mark(self, qapp):
+        m = self._model(qapp)
+        m.mark_in_progress(0)
+        m.set_chapters([Chapter(index=0, title="第1章", url="u", content="x")])
+        assert m.data(m.index(0, m.STATUS_COLUMN)) == "Chưa tải"
+
+
 class TestChapterTableModelRewriteMarker:
     """Feature 060 — "đã viết lại" is shown as a suffix, not a new column."""
 

@@ -214,6 +214,20 @@ def test_selecting_gpu_device_clamps_workers_to_one(qapp, tmp_path, monkeypatch)
     assert dialog.tts_workers_spin.isEnabled() is True
 
 
+def test_translate_workers_defaults_to_one_and_round_trips(qapp, tmp_path):
+    """Feature 097 — how many chapters `TranslateWorker` translates at once."""
+    dialog = SettingsDialog(_isolated_config(tmp_path))
+    assert dialog.translate_workers_spin.value() == 1  # DEFAULT_TRANSLATE_WORKERS
+
+    config = _isolated_config(tmp_path)
+    dialog = SettingsDialog(config)
+    dialog.translate_workers_spin.setValue(3)
+    dialog.accept()
+    assert config.translate_workers == 3
+    # a freshly opened dialog reflects the saved value
+    assert SettingsDialog(config).translate_workers_spin.value() == 3
+
+
 class TestLibraryDirHistory:
     """Feature 045 — remember previously-used library folders so they can be switched to."""
 
