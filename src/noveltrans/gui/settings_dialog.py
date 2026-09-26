@@ -148,6 +148,19 @@ class SettingsDialog(QDialog):
         self.delay_spin.setValue(config.request_delay)
         form.addRow("Giãn cách giữa các request:", self.delay_spin)
 
+        # Parallel chapter translation — each thread calls its own engine instance, so
+        # more workers means more concurrent requests to the engine/API. Default 1 =
+        # current (sequential) behavior.
+        self.translate_workers_spin = QSpinBox()
+        self.translate_workers_spin.setRange(1, 6)
+        self.translate_workers_spin.setValue(config.translate_workers)
+        self.translate_workers_spin.setToolTip(
+            "Số chương dịch song song cùng lúc. Mỗi luồng gọi engine dịch riêng — "
+            "tăng tốc độ dịch nhưng cũng tăng số request đồng thời tới engine/API. "
+            "1 = tuần tự (mặc định, như trước đây)."
+        )
+        form.addRow("Số chương dịch song song:", self.translate_workers_spin)
+
         # Translator engine
         self.translator_combo = QComboBox()
         for key, label in translator_labels(config).items():
@@ -905,6 +918,7 @@ class SettingsDialog(QDialog):
     def accept(self) -> None:
         self.config.library_dir = self.library_edit.currentText()
         self.config.request_delay = self.delay_spin.value()
+        self.config.translate_workers = self.translate_workers_spin.value()
         self.config.translator = self.translator_combo.currentData()
         self.config.target_lang = self.lang_combo.currentData()
         self.config.claude_api_key = self.api_key_edit.text().strip()

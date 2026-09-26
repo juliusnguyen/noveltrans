@@ -551,7 +551,9 @@ class TranslateTab(QWidget):
             name_fix=name_fix or frozenset(),
             approved_names=approved_names or frozenset(),
             name_profile=name_profile,
+            translate_workers=self.config.translate_workers,
         )
+        self._worker.chapter_started.connect(self._on_chapter_started)
         self._worker.progress.connect(self._on_progress)
         self._worker.chapter_done.connect(self._on_chapter_updated)
         self._worker.chapter_error.connect(lambda idx, _msg: self._on_chapter_updated(idx))
@@ -1306,6 +1308,9 @@ class TranslateTab(QWidget):
         if title:
             self.status_label.setText(f"{self._progress_verb}: {title}")
 
+    def _on_chapter_started(self, idx: int) -> None:
+        self.model.mark_in_progress(idx)
+
     def _on_chapter_updated(self, idx: int) -> None:
         if self.project is None:
             return
@@ -1334,6 +1339,8 @@ class TranslateTab(QWidget):
         self.qc_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
         self.picker.setEnabled(True)
+        # Safety net: a cancelled/failed run must never leave a row stuck on "Đang dịch".
+        self.model.clear_in_progress()
 
     def _job_novel(self) -> str:
         """The novel label for the menu-bar job row — this tab's own project.

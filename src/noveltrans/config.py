@@ -26,6 +26,7 @@ SITE_COOKIES = {
     "tieuthuyetmang.com": "tieuthuyetmang_cookies",
 }
 DEFAULT_REQUEST_DELAY = 1.5
+DEFAULT_TRANSLATE_WORKERS = 1  # sequential; >1 translates that many chapters at once
 DEFAULT_TARGET_LANG = "vi"
 DEFAULT_TRANSLATOR = "google"
 DEFAULT_CLAUDE_MODEL = "claude-haiku-4-5-20251001"
@@ -188,6 +189,15 @@ class AppConfig:
     @request_delay.setter
     def request_delay(self, value: float) -> None:
         self._s.setValue("request_delay", float(value))
+
+    @property
+    def translate_workers(self) -> int:
+        """Chapters translated concurrently. 1 = sequential (default, original behavior)."""
+        return max(1, self._s.value("translate_workers", DEFAULT_TRANSLATE_WORKERS, type=int))
+
+    @translate_workers.setter
+    def translate_workers(self, value: int) -> None:
+        self._s.setValue("translate_workers", max(1, int(value)))
 
     @property
     def target_lang(self) -> str:

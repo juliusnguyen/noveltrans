@@ -11,7 +11,7 @@ import queue
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import NamedTuple
 
@@ -268,10 +268,54 @@ def build_qc_judge(spec: QcEngineSpec | None):
     return lambda body: judge_translation(translator.complete, body)
 
 
+@dataclass
+class _TranslateCtx:
+    """One thread's engine + QC chain — built once per thread, reused across chapters.
+
+    With `translate_workers == 1` there is exactly one of these (the orchestrator's own),
+    built the same way `run()` has always built it. With more workers, each pool thread
+    gets its own (see `_ctx_for_thread`) so `GoogleFreeTranslator`'s unsynchronized
+    request-delay throttle, and any per-engine state like it, is never shared.
+    """
+
+    translator: object
+    qc_plans: list | None
+    title_plans: list | None
+    qc_judge: object | None
+
+
+class _TranslateResult(NamedTuple):
+    """One chapter's outcome, computed off the sqlite-owning thread when running in
+    parallel (or in-line when sequential) and handed back for `_commit_result` to write.
+
+    No `project.*` call and no signal emission happens while building one of these — see
+    the discipline `AudioWorker._run_parallel` already follows for the same reason.
+    """
+
+    index: int
+    status: str  # "ok" | "qc_fail" | "error" | "cancelled"
+    title: str = ""  # chapter.title — for progress display
+    kind: str = "translate"  # "translate" | "name_fix" | "title_only" — which commit to run
+    translated_title: str = ""
+    translated_body: str = ""
+    engine_label: str = ""
+    seconds: float = 0.0
+    attempts_used: int = 0
+    qc: bool = False  # "translate" kind only: went through the QC chain, not one plain call
+    qc_code: str = ""
+    qc_reason: str = ""
+    changes: tuple[str, ...] = ()  # "name_fix" only: "old → new" pieces, for the progress line
+    # "title_only" only: the ORIGINAL chapter's fingerprint, for the rare case nothing was
+    # written at all (every engine in the chain failed) — there is no "fresh" text to hash.
+    original_fingerprint: str = ""
+    error: str = ""
+
+
 class TranslateWorker(PausableWorker):
     """Translate pending chapters of a project (or specific ones), resumably."""
 
     progress = Signal(int, int, str)  # done, total, chapter title
+    chapter_started = Signal(int)  # a chapter was just handed to a translate slot
     chapter_done = Signal(int)
     chapter_error = Signal(int, str)
     failed = Signal(str)  # engine could not even be constructed
@@ -294,9 +338,11 @@ class TranslateWorker(PausableWorker):
         name_fix: frozenset[int] | set[int] = frozenset(),
         approved_names: frozenset | set = frozenset(),
         name_profile=None,
+        translate_workers: int = 1,  # >1 translates that many chapters concurrently
         parent=None,
     ):
         super().__init__(parent)
+        self.translate_workers = max(1, int(translate_workers))
         # Chapters among `indices` fixed without re-translating the body: the title alone
         # (feature 094), or names corrected in place (feature 095). A chapter with no
         # translated body falls back to a full translation. See `split_retranslation`.
@@ -354,97 +400,262 @@ class TranslateWorker(PausableWorker):
             )
         return plans
 
-    def _fix_names(
-        self, project: NovelProject, chapter, profile, judge, glossary, done: int, total: int
-    ) -> bool:
+    def _fallback_title_plans(self, translator, source_lang: str) -> list:
+        """Title-only chain when QC is off: the tab's own engine, once.
+
+        The same engine a full re-translation of the chapter would have used — `translate`
+        is never called on this path, only `translate_title`.
+        """
+        from noveltrans.translators.qc import QcAttemptPlan
+
+        return [
+            QcAttemptPlan(
+                label=self.engine_label(),
+                translate=lambda *_args: ("", ""),  # never called on this path
+                attempts=1,
+                translate_title=lambda title: translator.translate_title(
+                    title, source=source_lang, target=self.target_lang,
+                ),
+            )
+        ]
+
+    # ------------------------------------------------------- compute (pool-safe)
+    #
+    # Everything below `_compute_*` touches an engine or a pure QC helper, never
+    # `project.*` and never a signal — safe to run on a pool thread. Everything in the
+    # matching `_commit_*` is the opposite: DB writes and signal emission, always run on
+    # the sqlite-owning orchestrator thread. `_run_sequential` calls compute-then-commit
+    # in the same order `run()` always has; `_run_parallel` computes on a pool thread and
+    # commits back here as each chapter finishes.
+
+    def _compute_name_fix(self, chapter, ctx: _TranslateCtx, profile, qc_glossary) -> _TranslateResult:
         """Correct one chapter's APPROVED odd name spellings in place, then re-judge it.
 
-        No engine translates anything here. The judge may still be asked — sample-sized —
+        No engine translates anything here — the judge may still be asked, sample-sized,
         because the name check runs before it, so a chapter flagged for a name has never
-        had its prose judged. False when the chapter still fails after the edit.
+        had its prose judged.
         """
         from noveltrans.translators.qc import check_translation, fix_name_variants
 
-        title, title_changes = fix_name_variants(
-            chapter.translated_title, profile, approved=self.approved_names
-        )
-        body, body_changes = fix_name_variants(
-            chapter.translated, profile, approved=self.approved_names
-        )
-        changes = sorted(set(title_changes) | set(body_changes))
+        try:
+            title, title_changes = fix_name_variants(
+                chapter.translated_title, profile, approved=self.approved_names
+            )
+            body, body_changes = fix_name_variants(
+                chapter.translated, profile, approved=self.approved_names
+            )
+            changes = tuple(sorted(set(title_changes) | set(body_changes)))
+            fresh = replace(chapter, translated_title=title, translated=body)
+            verdict = check_translation(
+                fresh.content, fresh.translated_title, fresh.translated,
+                target=self.target_lang, glossary=qc_glossary, profile=profile,
+            )
+            if verdict.ok and ctx.qc_judge is not None:
+                verdict = ctx.qc_judge(fresh.translated)
+            return _TranslateResult(
+                chapter.index, "ok" if verdict.ok else "qc_fail", chapter.title, "name_fix",
+                translated_title=title, translated_body=body, changes=changes,
+                qc_code=verdict.code, qc_reason=verdict.reason,
+            )
+        except NovelTransError as exc:
+            return _TranslateResult(chapter.index, "error", chapter.title, "name_fix", error=str(exc))
+        except Exception as exc:  # keep the batch going
+            return _TranslateResult(chapter.index, "error", chapter.title, "name_fix", error=repr(exc))
+
+    def _commit_name_fix(self, project: NovelProject, result: _TranslateResult, done: int, total: int) -> bool:
+        """Write one `_compute_name_fix` result. Returns True if it counts as an error."""
+        if result.status == "error":
+            project.mark_error(result.index, result.error)
+            self.chapter_error.emit(result.index, result.error)
+            return True
         self.progress.emit(
             done, total,
-            f"{chapter.title} — sửa tên: {'; '.join(changes)}" if changes
-            else f"{chapter.title} — không còn tên nào cần sửa",
+            f"{result.title} — sửa tên: {'; '.join(result.changes)}" if result.changes
+            else f"{result.title} — không còn tên nào cần sửa",
         )
         # Always written, even unchanged: it lifts the QC error mark, and the verdict
         # below is what decides whether the row goes red again.
-        project.save_name_fix(chapter.index, title, body)
-        fresh = project.chapter(chapter.index)
-        verdict = check_translation(
-            fresh.content, fresh.translated_title, fresh.translated,
-            target=self.target_lang, glossary=glossary, profile=profile,
-        )
-        if verdict.ok and judge is not None:
-            verdict = judge(fresh.translated)
-        if verdict.ok:
-            project.save_qc_verdict(
-                chapter.index, QC_STATUS_OK, "", "", fresh.qc_fingerprint(), 0
-            )
-            return True
-        project.mark_qc_failed(
-            chapter.index, verdict.code, verdict.reason, fresh.qc_fingerprint(), 0
-        )
-        self.chapter_error.emit(chapter.index, verdict.reason)
-        return False
+        project.save_name_fix(result.index, result.translated_title, result.translated_body)
+        fresh = project.chapter(result.index)
+        text_hash = fresh.qc_fingerprint() if fresh else ""
+        if result.status == "ok":
+            project.save_qc_verdict(result.index, QC_STATUS_OK, "", "", text_hash, 0)
+            self.chapter_done.emit(result.index)
+            return False
+        project.mark_qc_failed(result.index, result.qc_code, result.qc_reason, text_hash, 0)
+        self.chapter_error.emit(result.index, result.qc_reason)
+        return True
 
-    def _retranslate_title(
-        self, project: NovelProject, chapter, source_title: str, plans: list, judge, glossary
-    ) -> bool:
-        """Fix one chapter's title and re-judge the chapter. False when it still fails.
+    def _compute_title_only(self, chapter, ctx: _TranslateCtx, glossary, qc_glossary) -> _TranslateResult:
+        """Fix one chapter's title and re-judge the chapter.
 
         The body is never sent to an engine and never written. The re-judge matters: a
         title failure stopped the scan before the LLM judge ever read the body, so the body
         has only passed the cheap checks — this is where it gets its first full verdict.
         """
+        from noveltrans.translators.names import apply_glossary
         from noveltrans.translators.qc import check_translation, retranslate_title_with_qc
 
-        outcome = retranslate_title_with_qc(
-            plans, source_title, target=self.target_lang,
-            should_stop=lambda: self._cancelled,
-        )
-        if not outcome.ok:
-            if self._cancelled:
-                return True  # stopped between attempts: nothing written, nothing failed
-            # The old title stays — see `retranslate_title_with_qc`. Re-marked so the row
-            # is still red and still offered in the result view.
-            project.mark_qc_failed(
-                chapter.index, outcome.verdict.code, outcome.verdict.reason,
-                chapter.qc_fingerprint(), outcome.attempts_used,
+        try:
+            source_title = apply_glossary(chapter.title, glossary)
+            outcome = retranslate_title_with_qc(
+                ctx.title_plans, source_title, target=self.target_lang,
+                should_stop=lambda: self._cancelled,
             )
-            self.chapter_error.emit(chapter.index, outcome.verdict.reason)
-            return False
+            if not outcome.ok:
+                if self._cancelled:
+                    # stopped between attempts: nothing written, nothing failed
+                    return _TranslateResult(chapter.index, "ok", chapter.title, "title_only")
+                # The old title stays — see `retranslate_title_with_qc`. Re-marked so the
+                # row is still red and still offered in the result view.
+                return _TranslateResult(
+                    chapter.index, "qc_fail", chapter.title, "title_only",
+                    attempts_used=outcome.attempts_used,
+                    qc_code=outcome.verdict.code, qc_reason=outcome.verdict.reason,
+                    original_fingerprint=chapter.qc_fingerprint(),
+                )
+            fresh = replace(chapter, translated_title=outcome.title)
+            verdict = check_translation(
+                fresh.content, fresh.translated_title, fresh.translated,
+                target=self.target_lang, glossary=qc_glossary,
+            )
+            if verdict.ok and ctx.qc_judge is not None:
+                verdict = ctx.qc_judge(fresh.translated)
+            return _TranslateResult(
+                chapter.index, "ok" if verdict.ok else "qc_fail", chapter.title, "title_only",
+                translated_title=outcome.title, attempts_used=outcome.attempts_used,
+                qc_code=verdict.code, qc_reason=verdict.reason,
+            )
+        except NovelTransError as exc:
+            return _TranslateResult(chapter.index, "error", chapter.title, "title_only", error=str(exc))
+        except Exception as exc:  # keep the batch going
+            return _TranslateResult(chapter.index, "error", chapter.title, "title_only", error=repr(exc))
 
-        project.save_title_translation(chapter.index, outcome.title)
-        fresh = project.chapter(chapter.index)
-        verdict = check_translation(
-            fresh.content, fresh.translated_title, fresh.translated,
-            target=self.target_lang, glossary=glossary,
-        )
-        if verdict.ok and judge is not None:
-            verdict = judge(fresh.translated)
-        if verdict.ok:
-            project.save_qc_verdict(
-                chapter.index, QC_STATUS_OK, "", "", fresh.qc_fingerprint(),
-                outcome.attempts_used,
-            )
+    def _commit_title_only(self, project: NovelProject, result: _TranslateResult) -> bool:
+        """Write one `_compute_title_only` result. Returns True if it counts as an error."""
+        if result.status == "error":
+            project.mark_error(result.index, result.error)
+            self.chapter_error.emit(result.index, result.error)
             return True
-        project.mark_qc_failed(
-            chapter.index, verdict.code, verdict.reason, fresh.qc_fingerprint(),
-            outcome.attempts_used,
+        if result.status == "ok" and not result.translated_title:
+            # cancelled between attempts (see `_compute_title_only`): nothing to write
+            self.chapter_done.emit(result.index)
+            return False
+        if result.status == "qc_fail" and not result.translated_title:
+            # every engine in the chain failed — nothing was ever saved
+            project.mark_qc_failed(
+                result.index, result.qc_code, result.qc_reason,
+                result.original_fingerprint, result.attempts_used,
+            )
+            self.chapter_error.emit(result.index, result.qc_reason)
+            return True
+        project.save_title_translation(result.index, result.translated_title)
+        fresh = project.chapter(result.index)
+        text_hash = fresh.qc_fingerprint() if fresh else ""
+        if result.status == "ok":
+            project.save_qc_verdict(result.index, QC_STATUS_OK, "", "", text_hash, result.attempts_used)
+            self.chapter_done.emit(result.index)
+            return False
+        project.mark_qc_failed(result.index, result.qc_code, result.qc_reason, text_hash, result.attempts_used)
+        self.chapter_error.emit(result.index, result.qc_reason)
+        return True
+
+    def _compute_chapter(
+        self, chapter, ctx: _TranslateCtx, glossary, qc_glossary, source_lang, on_attempt=None,
+    ) -> _TranslateResult:
+        """Translate one chapter: one engine call, or the whole QC chain."""
+        from noveltrans.translators.names import apply_glossary
+        from noveltrans.translators.qc import Policy, translate_with_qc
+
+        try:
+            source_title = apply_glossary(chapter.title, glossary)
+            source_content = apply_glossary(chapter.content, glossary)
+            started = time.monotonic()
+            if ctx.qc_plans is None:
+                title, text = ctx.translator.translate_chapter(
+                    source_title, source_content, source=source_lang, target=self.target_lang,
+                )
+                return _TranslateResult(
+                    chapter.index, "ok", chapter.title,
+                    translated_title=title, translated_body=text,
+                    engine_label=self.engine_label(), seconds=time.monotonic() - started,
+                )
+            outcome = translate_with_qc(
+                ctx.qc_plans, source_title, source_content,
+                judge=ctx.qc_judge, policy=Policy.KEEP_BEST, target=self.target_lang,
+                # Only reviewed names (see `confirmed_glossary`): the substitution above
+                # may use every auto-detected entry, but a verdict that triggers a
+                # re-translation needs better evidence.
+                glossary=qc_glossary, on_attempt=on_attempt,
+                should_stop=lambda: self._cancelled,
+            )
+            return _TranslateResult(
+                chapter.index, "ok" if outcome.ok else "qc_fail", chapter.title,
+                translated_title=outcome.title, translated_body=outcome.body,
+                engine_label=outcome.engine_label, seconds=time.monotonic() - started,
+                attempts_used=outcome.attempts_used, qc=True,
+                qc_code=outcome.verdict.code, qc_reason=outcome.verdict.reason,
+            )
+        except NovelTransError as exc:
+            return _TranslateResult(chapter.index, "error", chapter.title, error=str(exc))
+        except Exception as exc:  # keep the batch going
+            return _TranslateResult(chapter.index, "error", chapter.title, error=repr(exc))
+
+    def _commit_chapter(self, project: NovelProject, result: _TranslateResult) -> bool:
+        """Write one `_compute_chapter` result. Returns True if it counts as an error."""
+        if result.status == "error":
+            project.mark_error(result.index, result.error)
+            self.chapter_error.emit(result.index, result.error)
+            return True
+        # `save_translation` first: it forces status=translated and clears `error`, so
+        # marking a failure before it would wipe the mark.
+        project.save_translation(
+            result.index, result.translated_title, result.translated_body, self.target_lang,
+            result.engine_label, seconds=result.seconds,
         )
-        self.chapter_error.emit(chapter.index, verdict.reason)
-        return False
+        if not result.qc:
+            self.chapter_done.emit(result.index)
+            return False
+        fresh = project.chapter(result.index)
+        text_hash = fresh.qc_fingerprint() if fresh else ""
+        if result.status == "ok":
+            project.save_qc_verdict(result.index, QC_STATUS_OK, "", "", text_hash, result.attempts_used)
+            self.chapter_done.emit(result.index)
+            return False
+        # Kept, not discarded — see `qc.Policy`. The row goes red so the user can find
+        # it, and the text is there to salvage.
+        project.mark_qc_failed(result.index, result.qc_code, result.qc_reason, text_hash, result.attempts_used)
+        self.chapter_error.emit(result.index, result.qc_reason)
+        return True
+
+    def _compute_one(
+        self, chapter, kind: str, ctx: _TranslateCtx, glossary, qc_glossary, name_profile,
+        source_lang, on_attempt=None,
+    ) -> _TranslateResult:
+        if self._cancelled:
+            return _TranslateResult(chapter.index, "cancelled", chapter.title, kind)
+        if kind == "name_fix":
+            return self._compute_name_fix(chapter, ctx, name_profile, qc_glossary)
+        if kind == "title_only":
+            return self._compute_title_only(chapter, ctx, glossary, qc_glossary)
+        return self._compute_chapter(chapter, ctx, glossary, qc_glossary, source_lang, on_attempt)
+
+    def _commit_result(self, project: NovelProject, result: _TranslateResult, done: int, total: int) -> bool:
+        if result.kind == "name_fix":
+            return self._commit_name_fix(project, result, done, total)
+        if result.kind == "title_only":
+            return self._commit_title_only(project, result)
+        return self._commit_chapter(project, result)
+
+    @staticmethod
+    def _kind_for(chapter, title_only: frozenset, name_fix: frozenset) -> str:
+        """Which fix a chapter needs — the cheapest one that still has a body to work
+        from; without one there is nothing to fix and it falls back to a full translation."""
+        if chapter.index in name_fix and chapter.translated:
+            return "name_fix"
+        if chapter.index in title_only and chapter.translated:
+            return "title_only"
+        return "translate"
 
     def _run_identity(self, project: NovelProject, pending: list) -> None:
         """Passthrough 'translation' when source_lang == target_lang: copy the
@@ -461,6 +672,7 @@ class TranslateWorker(PausableWorker):
             if self._checkpoint():
                 break
             self.progress.emit(done, total, chapter.title)
+            self.chapter_started.emit(chapter.index)
             project.save_translation(
                 chapter.index,
                 chapter.title,
@@ -474,6 +686,155 @@ class TranslateWorker(PausableWorker):
         self.progress.emit(done, total, "")
         self.finished_ok.emit(done, 0)
 
+    # ------------------------------------------------------------- sequential / parallel
+
+    def _run_sequential(
+        self, project: NovelProject, pending: list, ctx: _TranslateCtx, glossary, qc_glossary,
+        name_profile, source_lang: str, total: int,
+    ) -> None:
+        """The original single-engine loop — used whenever translate_workers == 1.
+
+        A literal compute-then-commit of what `run()` always did per chapter, in the
+        same order, on this one thread — the backward-compatibility guarantee.
+        """
+        done = 0
+        errors = 0
+        for chapter in pending:
+            if self._checkpoint():
+                break
+            self.progress.emit(done, total, chapter.title)
+            self.chapter_started.emit(chapter.index)
+            kind = self._kind_for(chapter, self.title_only, self.name_fix)
+            on_attempt = None
+            if kind == "title_only":
+                self.progress.emit(done, total, f"{chapter.title} — dịch lại tiêu đề")
+            elif kind == "translate":
+                on_attempt = lambda n, label, verdict, ch=chapter, d=done: self.progress.emit(
+                    d, total,
+                    f"{ch.title} — thử lần {n} ({label})"
+                    + (f": {verdict.reason}" if not verdict.ok else ""),
+                )
+            result = self._compute_one(
+                chapter, kind, ctx, glossary, qc_glossary, name_profile, source_lang, on_attempt,
+            )
+            if result.status != "cancelled":
+                errors += int(self._commit_result(project, result, done, total))
+            done += 1
+        self.progress.emit(done, total, "")
+        self.finished_ok.emit(done - errors, errors)
+
+    def _ctx_for_thread(self, tl: threading.local, seed: queue.Queue, source_lang: str) -> _TranslateCtx:
+        """One engine + QC chain per pool thread, built once and reused across chapters.
+
+        The first thread reuses the already-built translator from `seed`; later threads
+        build their own — see `_TranslateCtx`.
+        """
+        ctx = getattr(tl, "ctx", None)
+        if ctx is not None:
+            return ctx
+        from noveltrans.translators import get_translator
+
+        try:
+            translator = seed.get_nowait()  # reuse the already-built translator on thread #1
+        except queue.Empty:
+            translator = get_translator(
+                self.engine_name, api_key=self.api_key, model=self.model,
+                request_delay=self.request_delay, cli_command=self.cli_command,
+                base_url=self.base_url,
+            )
+        qc_plans = self._build_qc_plans(source_lang) if self.qc is not None else None
+        title_plans = qc_plans
+        if title_plans is None and self.title_only:
+            title_plans = self._fallback_title_plans(translator, source_lang)
+        qc_judge = build_qc_judge(self.qc.judge) if self.qc is not None else None
+        ctx = _TranslateCtx(translator, qc_plans, title_plans, qc_judge)
+        tl.ctx = ctx
+        return ctx
+
+    def _compute_for_pool(
+        self, chapter, kind: str, tl: threading.local, seed: queue.Queue, source_lang: str,
+        glossary, qc_glossary, name_profile,
+    ) -> _TranslateResult:
+        """Pool-thread entry point: resolve this thread's engine, then compute as usual."""
+        ctx = self._ctx_for_thread(tl, seed, source_lang)
+        # No `on_attempt`: granular per-attempt progress text would come from whichever
+        # of several chapters' threads happens to finish an attempt first, which reads as
+        # noise once more than one chapter is in flight — the per-chapter progress emitted
+        # on completion (in `_run_parallel`) is what stays meaningful under concurrency.
+        return self._compute_one(chapter, kind, ctx, glossary, qc_glossary, name_profile, source_lang)
+
+    def _run_parallel(
+        self, project: NovelProject, pending: list, ctx: _TranslateCtx, glossary, qc_glossary,
+        name_profile, source_lang: str, total: int,
+    ) -> None:
+        """Translate chapters across a thread pool; commit results here, in order of
+        completion, on the sqlite-owning orchestrator thread. Mirrors
+        `AudioWorker._run_parallel`."""
+        done = 0
+        errors = 0
+        if total == 0:
+            self.progress.emit(0, 0, "")
+            self.finished_ok.emit(0, 0)
+            return
+
+        tl = threading.local()
+        seed: queue.Queue = queue.Queue()
+        seed.put(ctx.translator)  # first pool thread reuses the already-built translator
+        pending_iter = iter(pending)
+        inflight: dict = {}
+        n_workers = min(self.translate_workers, total)
+        pool = ThreadPoolExecutor(max_workers=n_workers)
+
+        def submit_next() -> bool:
+            # Paused means "start nothing new". Returning False here cannot end the run
+            # early: the drain loop holds at its checkpoint while paused instead of
+            # treating an empty pool as "finished".
+            if self._cancelled or self.is_paused():
+                return False
+            try:
+                chapter = next(pending_iter)
+            except StopIteration:
+                return False
+            kind = self._kind_for(chapter, self.title_only, self.name_fix)
+            self.chapter_started.emit(chapter.index)
+            future = pool.submit(
+                self._compute_for_pool, chapter, kind, tl, seed, source_lang,
+                glossary, qc_glossary, name_profile,
+            )
+            inflight[future] = chapter
+            return True
+
+        try:
+            for _ in range(n_workers):
+                if not submit_next():
+                    break
+            while True:
+                # Hold here while paused — never break out of the loop for a pause, or the
+                # run would report itself finished. Nothing new is submitted while held
+                # (submit_next gates on it too); chapters already on pool threads keep
+                # going and are committed below once we resume.
+                self._checkpoint()
+                if not inflight:
+                    # Pool is empty: either the batch is done, or a pause drained it and a
+                    # resume should refill it. submit_next says which.
+                    if not submit_next():
+                        break
+                    continue
+                finished, still = wait(inflight, return_when=FIRST_COMPLETED)
+                inflight = {f: inflight[f] for f in still}
+                for future in finished:
+                    result = future.result()  # never raises — every _compute_* catches its own
+                    if result.status == "cancelled":
+                        continue  # not counted, no write (matches sequential break)
+                    errors += int(self._commit_result(project, result, done, total))
+                    done += 1
+                    self.progress.emit(done, total, result.title)
+                    submit_next()  # backfill; a no-op once cancelled or exhausted
+        finally:
+            pool.shutdown(wait=True)  # let in-flight chapters finish/cancel cleanly
+        self.progress.emit(done, total, "")
+        self.finished_ok.emit(done - errors, errors)
+
     def run(self) -> None:
         from noveltrans.name_glossary import (
             applied_glossary,
@@ -483,7 +844,6 @@ class TranslateWorker(PausableWorker):
             write_names,
         )
         from noveltrans.translators.names import apply_glossary
-        from noveltrans.translators.qc import Policy, translate_with_qc
 
         project = NovelProject.open(self.project_path)
         try:
@@ -516,8 +876,6 @@ class TranslateWorker(PausableWorker):
                 return
 
             total = len(pending)
-            done = 0
-            errors = 0
 
             # Pre-replace recurring character names with their Hán-Việt reading, so the
             # same person is spelled the same way in every chapter.
@@ -590,18 +948,7 @@ class TranslateWorker(PausableWorker):
             # once — the same engines a full re-translation of them would have used.
             title_plans = qc_plans
             if title_plans is None and self.title_only:
-                from noveltrans.translators.qc import QcAttemptPlan
-
-                title_plans = [
-                    QcAttemptPlan(
-                        label=self.engine_label(),
-                        translate=lambda *_args: ("", ""),  # never called on this path
-                        attempts=1,
-                        translate_title=lambda title: translator.translate_title(
-                            title, source=project.meta.source_lang, target=self.target_lang,
-                        ),
-                    )
-                ]
+                title_plans = self._fallback_title_plans(translator, project.meta.source_lang)
 
             # How this novel spells its names, learned once for the whole run and only when a
             # chapter needs it: it reads every translation in the novel.
@@ -615,96 +962,16 @@ class TranslateWorker(PausableWorker):
                     applied_glossary(read_names(project.path)).values(),
                 )
 
-            for chapter in pending:
-                if self._checkpoint():
-                    break
-                self.progress.emit(done, total, chapter.title)
-                try:
-                    source_title = apply_glossary(chapter.title, glossary)
-                    source_content = apply_glossary(chapter.content, glossary)
-                    started = time.monotonic()
-                    if chapter.index in self.name_fix and chapter.translated:
-                        if not self._fix_names(
-                            project, chapter, name_profile, qc_judge, qc_glossary,
-                            done, total,
-                        ):
-                            errors += 1
-                            done += 1
-                            continue
-                    elif chapter.index in self.title_only and chapter.translated:
-                        self.progress.emit(done, total, f"{chapter.title} — dịch lại tiêu đề")
-                        if not self._retranslate_title(
-                            project, chapter, source_title, title_plans, qc_judge, qc_glossary
-                        ):
-                            errors += 1
-                            done += 1
-                            continue
-                    elif qc_plans is None:
-                        title, text = translator.translate_chapter(
-                            source_title,
-                            source_content,
-                            source=project.meta.source_lang,
-                            target=self.target_lang,
-                        )
-                        project.save_translation(
-                            chapter.index, title, text, self.target_lang,
-                            self.engine_label(), seconds=time.monotonic() - started,
-                        )
-                    else:
-                        outcome = translate_with_qc(
-                            qc_plans,
-                            source_title,
-                            source_content,
-                            judge=qc_judge,
-                            policy=Policy.KEEP_BEST,
-                            target=self.target_lang,
-                            # Only reviewed names (see `confirmed_glossary`): the
-                            # substitution above may use every auto-detected entry, but a
-                            # verdict that triggers a re-translation needs better evidence.
-                            glossary=qc_glossary,
-                            on_attempt=lambda n, label, verdict, ch=chapter: self.progress.emit(
-                                done, total,
-                                f"{ch.title} — thử lần {n} ({label})"
-                                + (f": {verdict.reason}" if not verdict.ok else ""),
-                            ),
-                            should_stop=lambda: self._cancelled,
-                        )
-                        # `save_translation` first: it forces status=translated and clears
-                        # `error`, so marking a failure before it would wipe the mark.
-                        project.save_translation(
-                            chapter.index, outcome.title, outcome.body, self.target_lang,
-                            outcome.engine_label, seconds=time.monotonic() - started,
-                        )
-                        fresh = project.chapter(chapter.index)
-                        text_hash = fresh.qc_fingerprint() if fresh else ""
-                        if outcome.ok:
-                            project.save_qc_verdict(
-                                chapter.index, QC_STATUS_OK, "", "", text_hash,
-                                outcome.attempts_used,
-                            )
-                        else:
-                            # Kept, not discarded — see `qc.Policy`. The row goes red so the
-                            # user can find it, and the text is there to salvage.
-                            errors += 1
-                            project.mark_qc_failed(
-                                chapter.index, outcome.verdict.code, outcome.verdict.reason,
-                                text_hash, outcome.attempts_used,
-                            )
-                            self.chapter_error.emit(chapter.index, outcome.verdict.reason)
-                            done += 1
-                            continue
-                    self.chapter_done.emit(chapter.index)
-                except NovelTransError as exc:
-                    errors += 1
-                    project.mark_error(chapter.index, str(exc))
-                    self.chapter_error.emit(chapter.index, str(exc))
-                except Exception as exc:  # keep the batch going
-                    errors += 1
-                    project.mark_error(chapter.index, repr(exc))
-                    self.chapter_error.emit(chapter.index, repr(exc))
-                done += 1
-            self.progress.emit(done, total, "")
-            self.finished_ok.emit(done - errors, errors)
+            ctx = _TranslateCtx(translator, qc_plans, title_plans, qc_judge)
+            source_lang = project.meta.source_lang
+            if self.translate_workers == 1:
+                self._run_sequential(
+                    project, pending, ctx, glossary, qc_glossary, name_profile, source_lang, total,
+                )
+            else:
+                self._run_parallel(
+                    project, pending, ctx, glossary, qc_glossary, name_profile, source_lang, total,
+                )
         finally:
             project.close()
 
@@ -1603,7 +1870,7 @@ class AudioWorker(PausableWorker):
         self.progress.emit(done, total, "")
         self.finished_ok.emit(done - errors, errors)
 
-    def _engine_for_thread(self, tl: threading.local, seed: "queue.Queue"):
+    def _engine_for_thread(self, tl: threading.local, seed: queue.Queue):
         """One TTS engine per pool thread, loaded once and reused across chapters.
 
         The first thread reuses the already-loaded probe from `seed`; later threads
