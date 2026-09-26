@@ -849,7 +849,7 @@ class TranslateWorker(PausableWorker):
         try:
             if self.indices is not None:
                 chapters = (project.chapter(i) for i in self.indices)
-                pending = [c for c in chapters if c is not None and c.content]
+                pending = [c for c in chapters if c is not None and c.content and c.enabled]
             else:
                 pending = project.pending_translation(self.target_lang)
 
@@ -996,7 +996,7 @@ def chapters_to_rewrite(
     """
     if indices is not None:
         chapters = (project.chapter(i) for i in indices)
-        return [c for c in chapters if c is not None and c.translated]
+        return [c for c in chapters if c is not None and c.translated and c.enabled]
     if force:
         return [
             c
@@ -1161,7 +1161,7 @@ def chapters_to_qc(
     """
     if indices is not None:
         chapters = (project.chapter(i) for i in indices)
-        return [c for c in chapters if c is not None and c.translated]
+        return [c for c in chapters if c is not None and c.translated and c.enabled]
     return project.pending_qc(target_lang, start_idx, end_idx, force=force)
 
 
@@ -1776,7 +1776,9 @@ class AudioWorker(PausableWorker):
                 pending = [
                     c
                     for c in chapters
-                    if c is not None and (c.translated if self.use_translation else c.content)
+                    if c is not None
+                    and (c.translated if self.use_translation else c.content)
+                    and c.enabled
                 ]
             else:
                 pending = project.pending_audio(self.voice, self.use_translation)
@@ -2886,8 +2888,9 @@ class SubtitleWorker(PausableWorker):
 
         project = NovelProject.open(self.project_path)
         try:
+            chapters = project.chapters()
             windows = plan_merge_windows(
-                project.chapters(), self.voice, self.mode,
+                chapters, self.voice, self.mode,
                 start=self.start_num, end=self.end_num, batch=self.batch_size,
             )
             if not windows:
@@ -2898,6 +2901,10 @@ class SubtitleWorker(PausableWorker):
             slug = project.meta.slug_name()
             total = len(windows)
             written = backfilled = skipped = 0
+            # This worker only backfills sidecars for parts that already exist, so its
+            # label can never renumber anything on disk — it just needs to agree with
+            # whatever the render itself called that part (see `plan_merge_windows`).
+            disabled_numbers = {c.index + 1 for c in chapters if not c.enabled}
 
             for i, window in enumerate(windows):
                 if self._checkpoint():
@@ -2905,7 +2912,7 @@ class SubtitleWorker(PausableWorker):
                 label = (
                     "Toàn bộ"
                     if (total == 1 and self.mode == "all")
-                    else f"Phần {part_number(window.first_num, self.batch_size)}"
+                    else f"Phần {part_number(window.first_num, self.batch_size, disabled_numbers)}"
                 )
                 self.progress.emit(i, total, f"{label}: dò mốc thời gian…")
                 for chapter in window.chapters:
@@ -3118,7 +3125,7 @@ class DownloadWorker(PausableWorker):
         """The chapters this run will fetch, honouring `indices`, the range and `force`."""
         if self.indices is not None:
             wanted = set(self.indices)
-            return [c for c in project.chapters() if c.index in wanted]
+            return [c for c in project.chapters() if c.index in wanted and c.enabled]
         if self.force:
             return project.chapters_in_range(self.start_index, self.end_index)
         return project.pending_download(self.start_index, self.end_index)

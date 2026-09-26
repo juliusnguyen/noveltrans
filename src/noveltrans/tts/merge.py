@@ -48,15 +48,21 @@ def plan_merge_windows(
     """Group the chapters that have audio in `voice` into output windows.
 
     Ranges/batches are by 1-based chapter *number* (`index + 1`), so boundaries are
-    predictable and a missing chapter doesn't shift later batches. Each window's
-    first/last number reflect its actually-included chapters (no phantom span). Windows
-    with no audio in range are omitted. Returns [] when nothing matches.
+    predictable and a MISSING chapter (deleted, or never scraped) doesn't shift later
+    batches — see `_group_windows`. Each window's first/last number reflect its
+    actually-included chapters (no phantom span). Windows with no audio in range are
+    omitted. Returns [] when nothing matches.
+
+    A DISABLED chapter (feature 098) is different from a missing one: it still exists,
+    it just must not occupy a grid slot in "batch" mode — the window reaches past its
+    number to still collect `batch` chapters. See `_group_windows`'s `disabled_numbers`.
     """
     avail = sorted(
-        (c for c in chapters if c.audio_path and c.audio_voice == voice),
+        (c for c in chapters if c.enabled and c.audio_path and c.audio_voice == voice),
         key=lambda c: c.index,
     )
-    return _group_windows(avail, mode, start=start, end=end, batch=batch)
+    disabled_numbers = {c.index + 1 for c in chapters if not c.enabled}
+    return _group_windows(avail, disabled_numbers, mode, start=start, end=end, batch=batch)
 
 
 def plan_source_windows(
@@ -81,13 +87,36 @@ def plan_source_windows(
     Everything downstream is shared: a release satisfies the same narrow protocol
     (`audio_path`, `audio_seconds`, `audio_source`, `title`, `translated_title`) that
     `chapter_marker_title` and the renderers read off a Chapter.
+
+    Releases have no `enabled` concept (they're a different edition, not 1:1 with
+    chapters) — an empty `disabled_numbers`, unlike `plan_merge_windows`.
     """
     avail = sorted((r for r in releases if r.audio_path), key=lambda r: r.index)
-    return _group_windows(avail, mode, start=start, end=end, batch=batch)
+    return _group_windows(avail, set(), mode, start=start, end=end, batch=batch)
+
+
+def _batch_window_end(lo: int, size: int, max_num: int, disabled_numbers: set[int]) -> int:
+    """The last chapter NUMBER a fresh batch window starting at `lo` claims.
+
+    Walks numbers one at a time from `lo`, counting each toward the window's `size`-sized
+    quota UNLESS it's in `disabled_numbers` — a disabled chapter's number is skipped over
+    entirely rather than counted (feature 098), while a number with no chapter at all
+    (deleted, or never scraped) still counts, so a hole never shrinks or shifts a window
+    (see `_group_windows`). Shared with `plan_locked_video_windows`, which only needs this
+    for windows NOT already frozen by `committed`/`read_manual_windows`.
+    """
+    hi = lo
+    counted = 0
+    while counted < size and hi <= max_num:
+        if hi not in disabled_numbers:
+            counted += 1
+        hi += 1
+    return hi - 1
 
 
 def _group_windows(
     avail: list,
+    disabled_numbers: set[int],
     mode: str,
     *,
     start: int | None = None,
@@ -96,8 +125,16 @@ def _group_windows(
 ) -> list[MergeWindow]:
     """Slice an already-filtered, index-sorted list into windows. Shared by both planners.
 
-    Works on anything carrying `.index`; the two callers differ only in what they consider
+    Works on anything carrying `.index`; the callers differ only in what they consider
     available, which is why the filter is theirs and the slicing is here.
+
+    In "batch" mode, a window's `[lo, hi]` number span is still walked one integer at a
+    time starting from 1 (as it always was — a MISSING chapter number, deleted or never
+    scraped, still fills a slot and leaves a hole, never shrinking or shifting a window).
+    The one thing that changed (feature 098): a number in `disabled_numbers` does not
+    count towards the window's `batch`-sized quota, so the window's `hi` reaches past it
+    to still collect `batch` real slots — a disabled chapter is skipped over, not just
+    left empty.
     """
     if not avail:
         return []
@@ -118,18 +155,20 @@ def _group_windows(
         windows: list[MergeWindow] = []
         lo = 1
         while lo <= max_num:
-            hi = lo + size - 1
+            hi = _batch_window_end(lo, size, max_num, disabled_numbers)
             sel = [c for c in avail if lo <= c.index + 1 <= hi]
             if sel:
                 windows.append(window(sel))
-            lo += size
+            lo = hi + 1
         return windows
 
     # "all"
     return [window(avail)]
 
 
-def part_number(first_num: int, batch: int | None) -> int:
+def part_number(
+    first_num: int, batch: int | None, disabled_numbers: set[int] | None = None,
+) -> int:
     """Which part a window is, derived from the chapter it starts at.
 
     **Not** the window's position in the list being rendered. That was the old rule and it
@@ -147,11 +186,23 @@ def part_number(first_num: int, batch: int | None) -> int:
 
     `batch` under 1 (or None) means the caller has no batch grid — a custom range, where
     there is no meaningful part number — and falls back to 1 rather than raising.
+
+    A DISABLED chapter (feature 098) doesn't occupy a grid slot at all — see
+    `_group_windows`. `disabled_numbers`, when given, is the set of disabled 1-based
+    chapter numbers; the part number is then `first_num - 1` MINUS however many of those
+    disabled numbers fall before it, divided by the batch size — the same "skip over,
+    don't shift" rule `_group_windows` applies when building the window itself. Omitted
+    (the default), behavior is unchanged: every existing caller with nothing ever
+    disabled keeps the exact old formula.
     """
     size = int(batch or 0)
     if size < 1:
         return 1
-    return (int(first_num) - 1) // size + 1
+    if not disabled_numbers:
+        return (int(first_num) - 1) // size + 1
+    skipped = sum(1 for n in disabled_numbers if n < int(first_num))
+    rank = (int(first_num) - 1) - skipped
+    return rank // size + 1
 
 
 def chapter_marker_title(chapter: Chapter) -> str:

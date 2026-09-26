@@ -315,6 +315,9 @@ class Chapter:
     # the DB through seven different write paths.
     qc_text_hash: str = ""
     qc_attempts: int = 0  # engine calls this chapter's last QC run cost
+    # False once the user disables this chapter: skipped everywhere (download, translate,
+    # audio, video) until re-enabled. A TOC re-scan never resets this — see `replace_toc`.
+    enabled: bool = True
 
     @property
     def is_downloaded(self) -> bool:

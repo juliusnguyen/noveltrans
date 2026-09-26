@@ -128,13 +128,72 @@ class TestPlanMergeWindows:
         assert spans == [(1, 10, 9), (11, 20, 10), (21, 25, 5)]
 
     def test_batch_skips_empty_windows(self):
-        chs = [_ch(i) for i in (0, 1, 25)]  # nothing in 11-20
+        # 26 chapters exist, but only 1, 2 and 26 have audio — chapters 3-25 are pending,
+        # not disabled, so they still occupy their own grid slots (see TestEnabledChapters
+        # for what a genuinely DISABLED chapter does instead).
+        chs = [_ch(i, audio=i in (0, 1, 25)) for i in range(26)]
         windows = plan_merge_windows(chs, "Ngọc Lan", "batch", batch=10)
         assert [(w.first_num, w.last_num) for w in windows] == [(1, 2), (26, 26)]
 
     def test_no_audio_returns_empty(self):
         assert plan_merge_windows([_ch(0, audio=False)], "Ngọc Lan", "all") == []
         assert plan_merge_windows([_ch(0)], "Khác", "all") == []
+
+
+class TestDisabledChapters:
+    """Feature 098 — a disabled chapter is skipped over, not just left empty.
+
+    Unlike a chapter that's simply MISSING (deleted, or never scraped — see
+    `test_local_novel.py::test_merge_windows_still_batch_by_chapter_number_across_a_gap`,
+    which pins that a hole does NOT shift later batches), a chapter that EXISTS but is
+    disabled must not consume a batch slot at all: the window reaches past it.
+    """
+
+    def test_the_reported_example_chapter_9_of_10(self):
+        """The exact example from the feature request: batch of 10, chapter 9 disabled
+        → the first video is chapters 1-8 and 10-11, ten chapters total."""
+        chs = [_ch(i) for i in range(20)]
+        chs[8].enabled = False  # chapter 9
+        windows = plan_merge_windows(chs, "Ngọc Lan", "batch", batch=10)
+        first = windows[0]
+        assert (first.first_num, first.last_num) == (1, 11)
+        assert [c.index + 1 for c in first.chapters] == [1, 2, 3, 4, 5, 6, 7, 8, 10, 11]
+        assert len(first.chapters) == 10
+
+    def test_a_no_disabled_chapters_control_stays_byte_identical(self):
+        """Regression guard: nothing disabled must reproduce the pre-098 windows exactly."""
+        chs = [_ch(i) for i in range(25)]
+        chs[4].audio_path = ""
+        windows = plan_merge_windows(chs, "Ngọc Lan", "batch", batch=10)
+        spans = [(w.first_num, w.last_num, len(w.chapters)) for w in windows]
+        assert spans == [(1, 10, 9), (11, 20, 10), (21, 25, 5)]
+
+    def test_a_disabled_chapter_that_was_never_voiced_is_excluded_without_crashing(self):
+        chs = [_ch(i) for i in range(15)]
+        chs[8].enabled = False
+        chs[8].audio_path = ""  # never voiced at all, on top of being disabled
+        windows = plan_merge_windows(chs, "Ngọc Lan", "batch", batch=10)
+        first = windows[0]
+        assert [c.index + 1 for c in first.chapters] == [1, 2, 3, 4, 5, 6, 7, 8, 10, 11]
+
+    def test_stale_audio_from_before_disabling_never_reappears(self):
+        """Belt-and-suspenders: even if a disabled chapter still has an audio file from
+        before it was disabled, it must never be selected into any output."""
+        chs = [_ch(i) for i in range(11)]
+        chs[8].enabled = False  # still has audio_path set from _ch()'s default
+        [w] = plan_merge_windows(chs, "Ngọc Lan", "all")
+        assert 9 not in [c.index + 1 for c in w.chapters]
+
+    def test_part_number_accounts_for_a_disabled_chapter_before_it(self):
+        chs = [_ch(i) for i in range(25)]
+        chs[8].enabled = False  # chapter 9
+        windows = plan_merge_windows(chs, "Ngọc Lan", "batch", batch=10)
+        disabled = {9}
+        numbers = [part_number(w.first_num, 10, disabled) for w in windows]
+        assert numbers == [1, 2, 3]  # still sequential, not shifted or duplicated
+        # backward compatible: omitting disabled_numbers keeps the old (now slightly
+        # different, since chapter 9 is really gone from this window) raw formula
+        assert part_number(windows[0].first_num, 10) == 1
 
 
 class TestMergeWorker:

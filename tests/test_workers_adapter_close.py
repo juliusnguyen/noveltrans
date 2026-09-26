@@ -161,6 +161,41 @@ class TestDownloadWorker:
 
         assert picked == [0, 1, 2]  # all pending, nothing downloaded yet
 
+    def test_a_disabled_chapter_is_skipped_even_when_named_explicitly(
+        self, qapp, library_dir, fake_adapter
+    ):
+        """Feature 098 — disabling is an unconditional skip, even via `indices`."""
+        fake_adapter()
+        path = _project(library_dir, n=3)
+        project = NovelProject.open(path)
+        project.set_enabled(1, False)
+        project.close()
+
+        worker = DownloadWorker(path, delay=0, indices=[0, 1, 2])
+        project = NovelProject.open(path)
+        try:
+            picked = [c.index for c in worker._select_chapters(project)]
+        finally:
+            project.close()
+        assert picked == [0, 2]
+
+    def test_a_disabled_chapter_is_skipped_from_the_pending_range_too(
+        self, qapp, library_dir, fake_adapter
+    ):
+        fake_adapter()
+        path = _project(library_dir, n=3)
+        project = NovelProject.open(path)
+        project.set_enabled(1, False)
+        project.close()
+
+        worker = DownloadWorker(path, delay=0)
+        project = NovelProject.open(path)
+        try:
+            picked = [c.index for c in worker._select_chapters(project)]
+        finally:
+            project.close()
+        assert picked == [0, 2]
+
     def test_closes_the_adapter_when_cancelled(self, qapp, library_dir, fake_adapter):
         adapter = fake_adapter()
         worker = DownloadWorker(_project(library_dir), delay=0)

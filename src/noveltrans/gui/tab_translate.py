@@ -159,6 +159,7 @@ class TranslateTab(QWidget):
         enable_cell_copy(self.table, extra_actions=self._table_context_actions)
         self.table.setMouseTracking(True)  # hover state for the row buttons
         self.model.translated_title_edited.connect(self._on_translated_title_edited)
+        self.model.enabled_toggled.connect(self._on_enabled_toggled)
         # Same clipping as the chapter title in Tải truyện: the styled QLineEdit
         # editor is taller than the row unless its padding is stripped.
         self.table.setItemDelegate(CellEditorDelegate(self.table))
@@ -470,6 +471,14 @@ class TranslateTab(QWidget):
         self.project.edit_translation(idx, title=title)
         if idx == self._preview_idx:
             self._load_preview(self.project.chapter(idx))
+
+    def _on_enabled_toggled(self, idx: int, enabled: bool) -> None:
+        if self.project is None:
+            return
+        self.project.set_enabled(idx, enabled)
+        chapter = self.project.chapter(idx)
+        if chapter is not None:
+            self.model.update_chapter(chapter)
 
     def eventFilter(self, obj, event) -> bool:
         if event.type() == QEvent.Type.FocusOut:

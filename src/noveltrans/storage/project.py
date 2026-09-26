@@ -86,7 +86,11 @@ CREATE TABLE IF NOT EXISTS chapters (
   qc_reason        TEXT NOT NULL DEFAULT '',
   -- fingerprint of the (title, text) that was judged; a later edit makes the verdict stale
   qc_text_hash     TEXT NOT NULL DEFAULT '',
-  qc_attempts      INTEGER NOT NULL DEFAULT 0
+  qc_attempts      INTEGER NOT NULL DEFAULT 0,
+  -- 0 once the user disables this chapter; a disabled chapter is skipped everywhere
+  -- (download/translate/audio/video) until re-enabled. Default 1 so every row already
+  -- in the table, and every row inserted before this existed, reads as enabled.
+  enabled          INTEGER NOT NULL DEFAULT 1
 );
 
 -- Audio published by the source site. A SEPARATE edition of the work, not a property of
@@ -137,6 +141,7 @@ def _row_to_chapter(row: sqlite3.Row) -> Chapter:
         qc_reason=row["qc_reason"],
         qc_text_hash=row["qc_text_hash"],
         qc_attempts=row["qc_attempts"],
+        enabled=bool(row["enabled"]),
     )
 
 
@@ -194,6 +199,9 @@ class NovelProject:
             "qc_reason": "TEXT NOT NULL DEFAULT ''",
             "qc_text_hash": "TEXT NOT NULL DEFAULT ''",
             "qc_attempts": "INTEGER NOT NULL DEFAULT 0",
+            # every existing chapter predates this feature, so none of them was ever
+            # deliberately disabled — default 1 (enabled) keeps an upgrade silent
+            "enabled": "INTEGER NOT NULL DEFAULT 1",
         }
         with self._db:
             for name, ddl in added.items():
@@ -420,6 +428,21 @@ class NovelProject:
             self._db.execute("DELETE FROM chapters WHERE idx = ?", (idx,))
         return chapter
 
+    def set_enabled(self, idx: int, enabled: bool) -> None:
+        """Enable or disable one chapter. Touches ONLY `enabled` + `updated_at`.
+
+        A disabled chapter is skipped by every pipeline (download/translate/audio/video) —
+        see `pending_download`, `pending_translation`, `pending_rewrite`, `pending_qc`,
+        `pending_audio`, `chapters_in_range`, and the merge/video batch planners.
+        Re-enabling makes it eligible again, subject to the normal resume rules (an
+        already-translated chapter isn't re-translated unless forced, etc).
+        """
+        with self._db:
+            self._db.execute(
+                "UPDATE chapters SET enabled = ?, updated_at = ? WHERE idx = ?",
+                (1 if enabled else 0, _now(), idx),
+            )
+
     # ---------------------------------------------------------------- queries
 
     def chapters(self) -> list[Chapter]:
@@ -439,7 +462,7 @@ class NovelProject:
         range (default = the whole novel), so the caller can download from a chosen
         chapter or a range without re-fetching the ones before it.
         """
-        sql = "SELECT * FROM chapters WHERE content = '' AND idx >= ?"
+        sql = "SELECT * FROM chapters WHERE content = '' AND enabled = 1 AND idx >= ?"
         params: list[object] = [start_idx]
         if end_idx is not None:
             sql += " AND idx <= ?"
@@ -449,12 +472,13 @@ class NovelProject:
         return [_row_to_chapter(r) for r in rows]
 
     def chapters_in_range(self, start_idx: int, end_idx: int | None = None) -> list[Chapter]:
-        """All chapters in a 0-based inclusive index range, regardless of status.
+        """All ENABLED chapters in a 0-based inclusive index range, regardless of status.
 
-        Used for a forced re-download, which re-fetches even chapters that already
-        have content.
+        Used for a forced re-download/re-translate/re-QC, which re-runs even chapters
+        that already have content — but a disabled chapter is skipped unconditionally,
+        the same as every other pipeline, even under `force`.
         """
-        sql = "SELECT * FROM chapters WHERE idx >= ?"
+        sql = "SELECT * FROM chapters WHERE enabled = 1 AND idx >= ?"
         params: list[object] = [start_idx]
         if end_idx is not None:
             sql += " AND idx <= ?"
@@ -472,7 +496,7 @@ class NovelProject:
         rows = self._db.execute(
             """
             SELECT * FROM chapters
-            WHERE content != '' AND (translated = '' OR target_lang != ?)
+            WHERE content != '' AND (translated = '' OR target_lang != ?) AND enabled = 1
             ORDER BY idx
             """,
             (target_lang,),
@@ -495,6 +519,7 @@ class NovelProject:
             "SELECT * FROM chapters"
             " WHERE translated != '' AND translated_raw = ''"
             "   AND (target_lang = ? OR target_lang = '')"
+            "   AND enabled = 1"
             "   AND idx >= ?"
         )
         params: list = [target_lang, start_idx]
@@ -526,6 +551,7 @@ class NovelProject:
             "SELECT * FROM chapters"
             " WHERE translated != ''"
             "   AND (target_lang = ? OR target_lang = '')"
+            "   AND enabled = 1"
             "   AND idx >= ?"
         )
         params: list = [target_lang, start_idx]
@@ -576,7 +602,7 @@ class NovelProject:
         rows = self._db.execute(
             f"""
             SELECT * FROM chapters
-            WHERE {src_col} != ''
+            WHERE {src_col} != '' AND enabled = 1
               AND (audio_path = '' OR (? != '' AND audio_voice != ?) OR audio_source != ?)
               {keep_downloaded}
             ORDER BY idx
@@ -606,6 +632,7 @@ class NovelProject:
         rows = self._db.execute(
             "SELECT * FROM chapters"
             " WHERE audio_path != '' AND audio_text_hash != '' AND audio_source = ?"
+            "   AND enabled = 1"
             " ORDER BY idx",
             (wanted,),
         ).fetchall()

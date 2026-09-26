@@ -1230,6 +1230,71 @@ class TestPlanLockedVideoWindows:
         assert [pn for pn, _ in locked] == [1, 3]  # part 2 omitted, not renumbered to 2
 
 
+class TestPlanLockedVideoWindowsWithDisabledChapters:
+    """Feature 098 — a disabled chapter never occupies a batch slot, but a chapter
+    inside an already-committed span is frozen exactly as it was, no matter what gets
+    disabled afterward."""
+
+    def test_the_reported_example_with_nothing_committed(self):
+        from noveltrans.tts.video import plan_locked_video_windows
+
+        chapters = [_chapter(i) for i in range(20)]
+        chapters[8].enabled = False  # chapter 9
+        locked = plan_locked_video_windows(chapters, "V", 10, {})
+        part1 = locked[0]
+        assert (part1[0], part1[1].first_num, part1[1].last_num) == (1, 1, 11)
+        assert [c.index + 1 for c in part1[1].chapters] == [1, 2, 3, 4, 5, 6, 7, 8, 10, 11]
+
+    def test_a_committed_span_stays_frozen_when_a_later_chapter_is_disabled(self):
+        """Part 1 (chapters 1-8) was already rendered/committed. Chapter 15, disabled
+        AFTER that, must only affect the still-fresh windows after it."""
+        from noveltrans.tts.video import plan_locked_video_windows
+
+        chapters = [_chapter(i) for i in range(30)]
+        chapters[14].enabled = False  # chapter 15, inside the would-be part 2 (11-20)
+        locked = plan_locked_video_windows(chapters, "V", 10, {1: 8})
+        part1 = locked[0]
+        assert (part1[0], part1[1].first_num, part1[1].last_num) == (1, 1, 8)
+        assert len(part1[1].chapters) == 8  # untouched by the later disable
+
+        part2 = locked[1]
+        assert part2[0] == 2
+        # fresh window resumes counting enabled chapters from chapter 9 onward,
+        # skipping disabled chapter 15 to still collect 10 chapters
+        assert [c.index + 1 for c in part2[1].chapters] == [
+            9, 10, 11, 12, 13, 14, 16, 17, 18, 19,
+        ]
+
+    def test_a_chapter_disabled_before_a_committed_span_does_not_derail_it(self):
+        """A disabled chapter in the still-fresh stretch before a committed span must
+        never push the walk PAST that span's recorded start — the fresh window ahead of
+        it is capped short (a smaller partial batch) rather than reaching into the
+        frozen span's own territory to make up the count."""
+        from noveltrans.tts.video import plan_locked_video_windows
+
+        chapters = [_chapter(i) for i in range(30)]
+        chapters[4].enabled = False  # chapter 5, before the committed span
+        # part 2 (chapters 11-20) was already committed; part 1 is still fresh
+        locked = plan_locked_video_windows(chapters, "V", 10, {11: 20})
+        part1 = locked[0]
+        assert (part1[0], part1[1].first_num, part1[1].last_num) == (1, 1, 10)
+        assert len(part1[1].chapters) == 9  # chapter 5 skipped, NOT backfilled from 11+
+
+        part2 = locked[1]
+        assert (part2[0], part2[1].first_num, part2[1].last_num) == (2, 11, 20)
+        assert len(part2[1].chapters) == 10  # frozen span lands exactly, untouched
+
+    def test_a_committed_spans_own_start_chapter_being_disabled_still_finds_it(self):
+        from noveltrans.tts.video import plan_locked_video_windows
+
+        chapters = [_chapter(i) for i in range(20)]
+        chapters[0].enabled = False  # chapter 1 — the committed span's own start
+        locked = plan_locked_video_windows(chapters, "V", 10, {1: 10})
+        part1 = locked[0]
+        assert (part1[0], part1[1].first_num, part1[1].last_num) == (1, 2, 10)
+        assert len(part1[1].chapters) == 9  # chapter 1 excluded, span otherwise frozen
+
+
 class TestDiscoverCommittedVideoWindows:
     def test_empty_when_the_directory_does_not_exist(self, tmp_path):
         from noveltrans.tts.video import discover_committed_video_windows
