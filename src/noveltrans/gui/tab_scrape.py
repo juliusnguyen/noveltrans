@@ -159,6 +159,7 @@ class ScrapeTab(QWidget):
         # arrives, and a wrong name is easiest to fix before anything is built on it.
         self.model.set_title_editable(True)
         self.model.title_edited.connect(self._on_title_edited)
+        self.model.enabled_toggled.connect(self._on_enabled_toggled)
         self.table = QTableView()
         # A proxy, so the header sorts the view without ever reordering the chapter list
         # itself. Every read of a row goes through source_index / source_rows — a view row
@@ -858,6 +859,14 @@ class ScrapeTab(QWidget):
         self.project.edit_title(idx, title)
         # Re-read the row so the "tên bạn đặt" tooltip reflects what is on disk rather
         # than what the model assumed it wrote.
+        chapter = self.project.chapter(idx)
+        if chapter is not None:
+            self.model.update_chapter(chapter)
+
+    def _on_enabled_toggled(self, idx: int, enabled: bool) -> None:
+        if self.project is None:
+            return
+        self.project.set_enabled(idx, enabled)
         chapter = self.project.chapter(idx)
         if chapter is not None:
             self.model.update_chapter(chapter)

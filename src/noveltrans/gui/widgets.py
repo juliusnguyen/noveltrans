@@ -204,6 +204,10 @@ STATUS_COLORS = {
 # outside STATUS_COLORS and is overlaid by ChapterTableModel instead.
 STATUS_COLOR_TRANSLATING = QColor("#ef6c00")  # amber
 
+# A disabled chapter (feature 098) dims its WHOLE row, independent of column/status —
+# a separate token from STATUS_COLORS since it overrides every column's own color.
+DISABLED_ROW_COLOR = QColor("#9e9e9e")
+
 
 def _fold(text: str) -> str:
     """A case- and diacritic-insensitive sort key, so "Ấ" files beside "A" not after "Z".
@@ -698,8 +702,11 @@ class ChapterTableModel(QAbstractTableModel):
 
     translated_title_edited = Signal(int, str)  # chapter.index, new title
     title_edited = Signal(int, str)  # chapter.index, new chapter title
+    enabled_toggled = Signal(int, bool)  # chapter.index, new enabled state
 
-    COLUMNS = ("#", "Tên chương", "Tên dịch", "Trạng thái", "Dịch bằng", "Thời gian", "Lỗi", "")
+    COLUMNS = (
+        "#", "Tên chương", "Tên dịch", "Trạng thái", "Dịch bằng", "Thời gian", "Lỗi", "", "Bật",
+    )
     TITLE_COLUMN = 1
     TRANSLATED_TITLE_COLUMN = 2
     STATUS_COLUMN = 3
@@ -707,6 +714,7 @@ class ChapterTableModel(QAbstractTableModel):
     DURATION_COLUMN = 5
     ERROR_COLUMN = 6
     RETRANSLATE_COLUMN = 7
+    ENABLED_COLUMN = 8
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -863,10 +871,15 @@ class ChapterTableModel(QAbstractTableModel):
             if column == self.ERROR_COLUMN:
                 return (bool(chapter.error), (chapter.error or "").casefold())
             return None
-        if role == Qt.ItemDataRole.ForegroundRole and column == self.STATUS_COLUMN:
-            if chapter.index in self._in_progress:
-                return STATUS_COLOR_TRANSLATING
-            return STATUS_COLORS.get(chapter.status)
+        if role == Qt.ItemDataRole.ForegroundRole:
+            # A disabled row dims every column — it doesn't need its own status color
+            # once it already reads as greyed-out.
+            if not chapter.enabled:
+                return DISABLED_ROW_COLOR
+            if column == self.STATUS_COLUMN:
+                if chapter.index in self._in_progress:
+                    return STATUS_COLOR_TRANSLATING
+                return STATUS_COLORS.get(chapter.status)
         if role == Qt.ItemDataRole.TextAlignmentRole and column == self.DURATION_COLUMN:
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         if column == self.RETRANSLATE_COLUMN:
@@ -874,6 +887,11 @@ class ChapterTableModel(QAbstractTableModel):
                 return bool(chapter.content)
             if role == Qt.ItemDataRole.ToolTipRole and chapter.content:
                 return "Dịch lại riêng chương này"
+        if column == self.ENABLED_COLUMN:
+            if role == Qt.ItemDataRole.CheckStateRole:
+                return Qt.CheckState.Checked if chapter.enabled else Qt.CheckState.Unchecked
+            if role == Qt.ItemDataRole.ToolTipRole:
+                return "Bỏ qua chương này" if chapter.enabled else "Bật lại chương này"
         return None
 
     def flags(self, index):
@@ -887,12 +905,24 @@ class ChapterTableModel(QAbstractTableModel):
             flags |= Qt.ItemFlag.ItemIsEditable
         if index.column() == self.TITLE_COLUMN and self._title_editable:
             flags |= Qt.ItemFlag.ItemIsEditable
+        if index.column() == self.ENABLED_COLUMN:
+            flags |= Qt.ItemFlag.ItemIsUserCheckable
         return flags
 
     def setData(self, index, value, role=Qt.ItemDataRole.EditRole) -> bool:
-        if not index.isValid() or role != Qt.ItemDataRole.EditRole:
+        if not index.isValid():
             return False
         chapter = self._chapters[index.row()]
+        if index.column() == self.ENABLED_COLUMN and role == Qt.ItemDataRole.CheckStateRole:
+            new_enabled = int(value) == int(Qt.CheckState.Checked.value)
+            if new_enabled == chapter.enabled:
+                return False
+            chapter.enabled = new_enabled
+            self.dataChanged.emit(index, index)
+            self.enabled_toggled.emit(chapter.index, new_enabled)
+            return True
+        if role != Qt.ItemDataRole.EditRole:
+            return False
         title = str(value).strip()
         if index.column() == self.TITLE_COLUMN:
             # A blank name is a mis-edit, not an instruction: the title is what the

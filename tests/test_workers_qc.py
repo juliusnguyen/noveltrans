@@ -129,6 +129,20 @@ class TestTranslateWorkerWithoutQc:
         assert project.chapter(0).qc_status == ""  # never checked, not "failed"
         assert all(hint == "" for _text, hint in engine.calls)  # no hint ever passed
 
+    def test_a_disabled_chapter_is_skipped_even_when_named_explicitly(
+        self, qapp, library_dir, monkeypatch, opened
+    ):
+        """Feature 098 — disabling is an unconditional skip, even via `indices`."""
+        path = _project(library_dir)
+        project = opened(path)
+        project.set_enabled(0, False)
+        _use(monkeypatch, _FakeEngine(GOOD_VI))
+        TranslateWorker(path, "fake", "vi", indices=[0, 1]).run()
+
+        project = opened(path)
+        assert not project.chapter(0).is_translated
+        assert project.chapter(1).is_translated
+
 
 class TestTranslateWorkerWithQc:
     def test_a_bad_chapter_is_retried_with_the_reason_named(
@@ -325,6 +339,14 @@ class TestChaptersToQc:
         # an explicit "check this one again".
         assert chapters_to_qc(project, "vi") == []
         assert [c.index for c in chapters_to_qc(project, "vi", indices=[1])] == [1]
+
+    def test_a_disabled_chapter_is_never_offered_even_by_index(self, library_dir, opened):
+        """Feature 098 — disabling is an unconditional skip, even via `indices`."""
+        path = _project(library_dir, translated=GOOD_VI)
+        project = opened(path)
+        project.set_enabled(0, False)
+        assert chapters_to_qc(project, "vi", indices=[0, 1]) == [project.chapter(1)]
+        assert [c.index for c in chapters_to_qc(project, "vi")] == [1]
 
 
 class _TitleEngine(_FakeEngine):

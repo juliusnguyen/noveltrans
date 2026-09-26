@@ -180,6 +180,71 @@ class TestChapterTableModelInProgress:
         assert m.data(m.index(0, m.STATUS_COLUMN)) == "Chưa tải"
 
 
+class TestChapterTableModelEnabled:
+    """Feature 098 — a per-chapter checkbox to disable/enable it everywhere."""
+
+    def _model(self, qapp):
+        from noveltrans.gui.widgets import ChapterTableModel
+
+        model = ChapterTableModel()
+        model.set_chapters(
+            [
+                Chapter(index=0, title="第1章", url="u", content="x"),
+                Chapter(index=1, title="第2章", url="u", content="x", enabled=False),
+            ]
+        )
+        return model
+
+    def test_check_state_reflects_enabled(self, qapp):
+        from PySide6.QtCore import Qt
+
+        m = self._model(qapp)
+        col = m.ENABLED_COLUMN
+        assert m.data(m.index(0, col), Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Checked
+        assert m.data(m.index(1, col), Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Unchecked
+
+    def test_only_the_enabled_column_is_user_checkable(self, qapp):
+        from PySide6.QtCore import Qt
+
+        m = self._model(qapp)
+        assert m.flags(m.index(0, m.ENABLED_COLUMN)) & Qt.ItemFlag.ItemIsUserCheckable
+        assert not (m.flags(m.index(0, m.STATUS_COLUMN)) & Qt.ItemFlag.ItemIsUserCheckable)
+
+    def test_unchecking_mutates_and_emits(self, qapp):
+        from PySide6.QtCore import Qt
+
+        m = self._model(qapp)
+        toggled: list[tuple[int, bool]] = []
+        m.enabled_toggled.connect(lambda idx, enabled: toggled.append((idx, enabled)))
+        index = m.index(0, m.ENABLED_COLUMN)
+        assert m.setData(index, Qt.CheckState.Unchecked.value, Qt.ItemDataRole.CheckStateRole)
+        assert toggled == [(0, False)]
+        assert m.data(index, Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Unchecked
+
+    def test_setting_the_same_state_is_a_noop(self, qapp):
+        from PySide6.QtCore import Qt
+
+        m = self._model(qapp)
+        toggled: list[tuple[int, bool]] = []
+        m.enabled_toggled.connect(lambda idx, enabled: toggled.append((idx, enabled)))
+        index = m.index(0, m.ENABLED_COLUMN)
+        assert not m.setData(index, Qt.CheckState.Checked.value, Qt.ItemDataRole.CheckStateRole)
+        assert toggled == []
+
+    def test_a_disabled_row_is_dimmed_across_every_column(self, qapp):
+        from PySide6.QtCore import Qt
+
+        from noveltrans.gui.widgets import DISABLED_ROW_COLOR
+
+        m = self._model(qapp)
+        for col in range(m.columnCount()):
+            assert m.data(m.index(1, col), Qt.ItemDataRole.ForegroundRole) == DISABLED_ROW_COLOR
+        # the enabled row keeps its normal (non-dimmed) status color
+        assert m.data(
+            m.index(0, m.STATUS_COLUMN), Qt.ItemDataRole.ForegroundRole
+        ) != DISABLED_ROW_COLOR
+
+
 class TestChapterTableModelRewriteMarker:
     """Feature 060 — "đã viết lại" is shown as a suffix, not a new column."""
 
@@ -221,11 +286,11 @@ class TestChapterTableModelRewriteMarker:
         tip = m.data(m.index(1, col), Qt.ItemDataRole.ToolTipRole)
         assert "hoàn tác" in tip
 
-    def test_no_column_was_added(self, qapp):
-        # A ninth column would shift RETRANSLATE_COLUMN and every index that follows it
-        # across tab_translate.py. The suffix exists precisely to avoid that.
+    def test_no_column_was_inserted_before_retranslate(self, qapp):
+        # A column inserted BEFORE RETRANSLATE_COLUMN would shift it and every index that
+        # follows it across tab_translate.py. New columns (e.g. ENABLED_COLUMN, feature
+        # 098) are appended after it instead, precisely to avoid that.
         m = self._model(qapp)
-        assert len(m.COLUMNS) == 8
         assert m.RETRANSLATE_COLUMN == 7
 
 
@@ -422,10 +487,10 @@ class TestChapterTableModelQcMarker:
         tip = model.data(model.index(0, col), Qt.ItemDataRole.ToolTipRole)
         assert "hoàn tác" in tip and "lỗi" in tip  # both facts, one hover
 
-    def test_no_column_was_added(self, qapp):
+    def test_no_column_was_inserted_before_retranslate(self, qapp):
         from noveltrans.gui.widgets import ChapterTableModel
 
-        assert len(ChapterTableModel.COLUMNS) == 8
+        assert ChapterTableModel.RETRANSLATE_COLUMN == 7
 
 
 class TestChapterTableModelHelpers:

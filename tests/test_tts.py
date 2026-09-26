@@ -522,6 +522,18 @@ class TestAudioWorker:
         assert results["finished"] == (1, 0)
         assert project.chapter(0).audio_voice == "Ngọc Lan"
 
+    def test_a_disabled_chapter_is_skipped_even_when_named_explicitly(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        """Feature 098 — disabling is an unconditional skip, even via `indices`."""
+        engine = FakeTtsEngine()
+        project = self._project(library_dir, sample_meta, sample_refs)
+        project.set_enabled(0, False)
+        _, results = self._run_worker(project, engine, indices=[0, 1])
+        assert results["finished"] == (1, 0)
+        assert results["done"] == [1]
+        assert project.chapter(0).audio_path == ""
+
     def test_voice_change_regenerates_all_and_drops_stale_file(
         self, library_dir, sample_meta, sample_refs
     ):

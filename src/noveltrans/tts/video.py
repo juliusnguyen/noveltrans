@@ -58,6 +58,7 @@ from noveltrans.tts.merge import (  # noqa: F401
     MergeCancelled,
     MergeSegment,
     MergeWindow,
+    _batch_window_end,
     _terminate,
     build_concat_list,
     chapter_marker_title,
@@ -728,11 +729,21 @@ def plan_locked_video_windows(
     """Batch-mode `MergeWindow`s for video export, each paired with its true part number.
 
     Identical to `plan_merge_windows(..., mode="batch")` when `committed` is empty — same
-    fixed grid, same windows. The difference: a window whose start chapter is a key in
-    `committed` (from `discover_committed_video_windows`) is frozen to that window's
-    already-committed span instead of pulling in up to `batch` chapters fresh. Chapters
-    that arrive after a part was committed start the *next* part instead of retroactively
-    growing one that may already be uploaded — see feature 058's follow-up discussion.
+    grid, same windows (including feature 098's "a disabled chapter doesn't occupy a
+    slot" rule — see `_batch_window_end`). The difference: a window whose start chapter
+    is a key in `committed` (from `discover_committed_video_windows`) is frozen to that
+    window's already-committed span instead of being computed fresh. Chapters that arrive
+    after a part was committed start the *next* part instead of retroactively growing one
+    that may already be uploaded — see feature 058's follow-up discussion.
+
+    A committed span is a fact about the past — a real render on disk, or an explicit
+    manual split/merge — and is NEVER recomputed, resized, or filtered by `enabled`: a
+    chapter disabled after its part was already rendered cannot retroactively edit that
+    video. Only the NOT-yet-committed stretches of the sequence are computed fresh from
+    the current enabled set, and a fresh window is never allowed to walk PAST an upcoming
+    committed span's start (`_batch_window_end`'s `max_num` argument is capped at it) —
+    otherwise a disabled chapter earlier in the novel could shift the walk past a frozen
+    span without ever landing on it.
 
     Part numbers can no longer be `(first_num - 1) // batch + 1` once a window deviates
     from the fixed grid — they're this window's 1-based position in the *entire* novel's
@@ -741,7 +752,7 @@ def plan_locked_video_windows(
     same reason `merge.part_number` avoids "position in the list being rendered").
     """
     avail = sorted(
-        (c for c in chapters if c.audio_path and c.audio_voice == voice),
+        (c for c in chapters if c.enabled and c.audio_path and c.audio_voice == voice),
         key=lambda c: c.index,
     )
     if not avail:
@@ -750,12 +761,21 @@ def plan_locked_video_windows(
     if size < 1:
         raise ValueError("batch size must be >= 1")
     max_num = avail[-1].index + 1
+    disabled_numbers = {c.index + 1 for c in chapters if not c.enabled}
+    frozen = sorted(committed.items())
 
     result: list[tuple[int, MergeWindow]] = []
     lo = 1
     part_num = 0
+    fi = 0
     while lo <= max_num:
-        hi = committed.get(lo, lo + size - 1)
+        upcoming = frozen[fi] if fi < len(frozen) else None
+        if upcoming is not None and upcoming[0] <= lo:
+            hi = upcoming[1]
+            fi += 1
+        else:
+            limit = min(max_num, upcoming[0] - 1) if upcoming is not None else max_num
+            hi = _batch_window_end(lo, size, limit, disabled_numbers)
         sel = [c for c in avail if lo <= c.index + 1 <= hi]
         part_num += 1
         if sel:

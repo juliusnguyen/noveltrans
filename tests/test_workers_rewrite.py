@@ -215,6 +215,31 @@ class TestHappyPath:
         assert not project.chapter(0).is_rewritten
         assert project.chapter(1).is_rewritten
 
+    def test_a_disabled_chapter_is_skipped_even_when_named_explicitly(
+        self, qapp, library_dir, monkeypatch, opened
+    ):
+        """Feature 098 — disabling is an unconditional skip, even via `indices`."""
+        path = _project(library_dir)
+        project = opened(path)
+        project.set_enabled(1, False)
+        _use(monkeypatch, _FakeEngine(_polish))
+        RewriteWorker(path, engine_name="cli", indices=[0, 1]).run()
+
+        assert opened(path).chapter(0).is_rewritten
+        assert not opened(path).chapter(1).is_rewritten
+
+    def test_a_disabled_chapter_is_skipped_from_a_forced_range_too(
+        self, qapp, library_dir, monkeypatch, opened
+    ):
+        path = _project(library_dir)
+        project = opened(path)
+        project.set_enabled(1, False)
+        _use(monkeypatch, _FakeEngine(_polish))
+        RewriteWorker(path, engine_name="cli", force=True).run()
+
+        assert opened(path).chapter(0).is_rewritten
+        assert not opened(path).chapter(1).is_rewritten
+
 
 class TestFailureIsNeverWritten:
     def test_a_summarising_engine_leaves_the_translation_intact(
