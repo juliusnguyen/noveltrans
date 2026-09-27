@@ -2237,6 +2237,52 @@ class TestPartNumberOffsets:
         title = (out.parent / (out.stem + ".title.txt")).read_text(encoding="utf-8")
         assert "Phần 74" in title  # not 147, which a second shift would give
 
+    def test_the_render_writes_the_same_bytes_the_tab_would(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        """Feature 101 leans on this: the title offered for a YouTube push, the title
+        `_renumber_title_sidecars` writes and the title a re-render writes are all
+        `build_upload_title(display_name, effective_part_num, order)`. If the render worker
+        ever formatted its own, a renumbered-then-re-rendered part would silently disagree
+        with what the tab shows and what was pushed to the channel.
+        """
+        from pathlib import Path
+
+        from noveltrans.gui.workers import VideoWorker
+        from noveltrans.storage.project import slugify
+        from noveltrans.tts.video import build_upload_title, video_part_name
+        from noveltrans.video_part_numbers import write_part_offsets
+
+        project = self._voiced_project(library_dir, sample_meta, 10)
+        path = project.path
+        name = project.meta.display_name()
+        slug = slugify(project.meta.translated_title or project.meta.title)
+        video_dir = project.video_dir
+        project.close()
+
+        write_part_offsets(path, {1: 73})  # part 1 becomes Phần 74
+
+        def _fake_render_video(segments, image_path, out_path, *a, **k):
+            out_path = Path(out_path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(b"fake mp4")
+
+        monkeypatch.setattr("noveltrans.tts.video.render_video", _fake_render_video)
+        image = tmp_path / "bg.png"
+        image.write_bytes(b"fake")
+
+        for order in ("name_first", "part_first"):
+            VideoWorker(
+                path, voice="V", mode="batch", image_path=str(image), batch=10,
+                skip_existing=False, title_order=order,
+            ).run()
+
+            part = video_part_name(slug, 1, 10, whole_novel=False)
+            out = video_dir / Path(part).stem / part
+            written = (out.parent / (out.stem + ".title.txt")).read_text(encoding="utf-8")
+            # The same call `tab_video._part_title` makes, with the same three inputs.
+            assert written.strip() == build_upload_title(name, 74, order)
+
 
 class TestMergedSpanAcrossDisabled:
     """Feature 100: a manual merge across a disabled chapter swallows it. Proves the

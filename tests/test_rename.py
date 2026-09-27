@@ -9,7 +9,13 @@ from __future__ import annotations
 
 import pytest
 
-from noveltrans.rename import apply_rename, plan_rename, resync_title_sidecars
+from noveltrans.rename import (
+    apply_rename,
+    is_generated_title,
+    plan_rename,
+    resync_title_sidecars,
+    retitle,
+)
 
 
 def _part(video_dir, stem: str, *, sidecars=(".mp4", ".srt", ".jpg", ".title.txt")):
@@ -301,3 +307,50 @@ class TestResyncTitleOrder:
         assert resync_title_sidecars(
             video, "dai-can", "Đại Càn", ["Đại Càn"], "name_first"
         ) == 0
+
+
+class TestIsGeneratedTitle:
+    """Feature 101 split the "is this title ours?" half out of `retitle`.
+
+    `retitle` returns "" for two different situations — hand-written (leave it alone) and
+    already exactly right (nothing to do) — and the video tab's renumber diff has to tell
+    those apart, because only one of them means "don't touch the number".
+    """
+
+    KNOWN = ("Cứu Chuyện", "旧名")
+
+    def test_name_first_shape_with_a_known_name(self):
+        assert is_generated_title("Trọng Sinh - Phần 8", "Trọng Sinh", self.KNOWN)
+
+    def test_part_first_shape_with_a_known_name(self):
+        assert is_generated_title("Phần 8 - Trọng Sinh", "Trọng Sinh", self.KNOWN)
+
+    def test_a_previous_name_of_this_novel_counts(self):
+        assert is_generated_title("Cứu Chuyện - Phần 8", "Trọng Sinh", self.KNOWN)
+
+    def test_the_bare_novel_name_counts_as_a_whole_novel_title(self):
+        assert is_generated_title("Trọng Sinh", "Trọng Sinh", self.KNOWN)
+
+    def test_a_name_this_novel_never_had(self):
+        assert not is_generated_title("Bản đặc biệt - Phần 8", "Trọng Sinh", self.KNOWN)
+
+    def test_a_part_with_no_name_half(self):
+        assert not is_generated_title("Phần 8", "Trọng Sinh", self.KNOWN)
+
+    @pytest.mark.parametrize("current", ["", "   ", None])
+    def test_an_empty_title_is_not_ours(self, current):
+        assert not is_generated_title(current, "Trọng Sinh", self.KNOWN)
+
+    def test_no_new_name_means_no_answer(self):
+        assert not is_generated_title("Trọng Sinh - Phần 8", "", self.KNOWN)
+
+    def test_it_tells_already_right_apart_from_hand_written(self):
+        """The distinction the tab needs, and the reason this isn't just `retitle`."""
+        already_right = "Trọng Sinh - Phần 8"
+        hand_written = "Bản đặc biệt - Phần 8"
+        # `retitle` says "" to both — indistinguishable.
+        assert retitle(already_right, "Trọng Sinh", self.KNOWN) == ""
+        assert retitle(hand_written, "Trọng Sinh", self.KNOWN) == ""
+        # `is_generated_title` separates them.
+        assert is_generated_title(already_right, "Trọng Sinh", self.KNOWN)
+        assert not is_generated_title(hand_written, "Trọng Sinh", self.KNOWN)

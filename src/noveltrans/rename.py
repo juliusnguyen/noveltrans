@@ -161,6 +161,44 @@ def apply_rename(plan: RenamePlan) -> list[Move]:
     return done
 
 
+def _known_set(new_name: str, known_names) -> set[str]:
+    """Every name this novel has gone by, plus the one it goes by now."""
+    known = {n.strip() for n in known_names if (n or "").strip()}
+    known.add(new_name)
+    return known
+
+
+def _recognise(current: str, known: set[str]) -> tuple[str | None, bool]:
+    """`(the "Phần N" group or None, whether this title is one we generated)`.
+
+    The one place the "is it ours?" question is answered, so `retitle` and
+    `is_generated_title` cannot drift apart on it.
+    """
+    for regex in (_PART_TITLE_RE, _PART_FIRST_TITLE_RE):
+        match = regex.match(current)
+        if match and match.group("name").strip() in known:
+            return match.group("part"), True
+    if current in known:
+        return None, True  # a whole-novel part: the title is just the name
+    return None, False  # hand-written, or a name this novel never had
+
+
+def is_generated_title(current: str, new_name: str, known_names) -> bool:
+    """Is this title one WE generated, as opposed to hand-written?
+
+    Exists separately from `retitle` because `retitle`'s `""` conflates two answers —
+    "hand-written, don't touch it" and "already exactly right" — and the video tab's
+    renumber diff has to tell those apart: a part whose title is already right must be
+    skipped quietly, while a hand-written one must be skipped *and* left alone even
+    though the number it carries is now wrong.
+    """
+    current = (current or "").strip()
+    new_name = (new_name or "").strip()
+    if not current or not new_name:
+        return False
+    return _recognise(current, _known_set(new_name, known_names))[1]
+
+
 def retitle(current: str, new_name: str, known_names, order: str = "name_first") -> str:
     """What a part's title should read, or "" to leave it exactly as it is.
 
@@ -172,28 +210,22 @@ def retitle(current: str, new_name: str, known_names, order: str = "name_first")
     A title is ours when it is `{name} - Phần {N}` or `Phần {N} - {name}` for a name this
     novel has gone by (`known_names`), or is just such a name (a whole-novel part).
     Anything else is hand-written and comes back "".
+
+    `Phần N` is carried over VERBATIM — this function renames and re-orders, it never
+    renumbers. Feature 099 depends on that: the resync below runs on every project open,
+    and recomputing the number here would silently undo a manual correction.
     """
     current = (current or "").strip()
     new_name = (new_name or "").strip()
-    known = {n.strip() for n in known_names if (n or "").strip()}
-    known.add(new_name)
     if not current or not new_name:
         return ""
-    match = next(
-        (
-            m
-            for m in (_PART_TITLE_RE.match(current), _PART_FIRST_TITLE_RE.match(current))
-            if m and m.group("name").strip() in known
-        ),
-        None,
-    )
-    if match:
-        part = match.group("part")
-        fresh = f"{part} - {new_name}" if order == "part_first" else f"{new_name} - {part}"
-    elif current in known:
-        fresh = new_name  # a whole-novel part: the title is just the name
+    part, ours = _recognise(current, _known_set(new_name, known_names))
+    if not ours:
+        return ""
+    if part is None:
+        fresh = new_name
     else:
-        return ""  # hand-written, or a name this novel never had
+        fresh = f"{part} - {new_name}" if order == "part_first" else f"{new_name} - {part}"
     return "" if fresh == current else fresh
 
 
