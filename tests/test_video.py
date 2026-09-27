@@ -2115,3 +2115,124 @@ class TestBurnedSubtitlesShareTheSidecarTimings:
         # the second chapter's cue is offset by the first chapter's duration in both
         assert cues[1].start == 60.0
         assert "00:01:00,000" in srt
+
+
+class TestPartNumberOffsets:
+    """Feature 099: a manual "Phần N" correction moves numbers only — never the chapter
+    spans a part covers, and never the file it is rendered to."""
+
+    def _voiced_project(self, library_dir, sample_meta, n_chapters):
+        from noveltrans.models import ChapterRef
+        from noveltrans.storage import NovelProject
+
+        refs = [ChapterRef(index=i, title=f"第{i + 1}章", url=f"https://x/{i + 1}")
+                for i in range(n_chapters)]
+        project = NovelProject.create(library_dir, sample_meta, refs)
+        for i in range(n_chapters):
+            rel = f"exports/audio/{i}.mp3"
+            project.save_audio(i, rel, "V", 1.0)
+            (project.path / rel).parent.mkdir(parents=True, exist_ok=True)
+            (project.path / rel).write_bytes(b"fake audio")
+        return project
+
+    def test_the_planner_never_reads_the_offsets(self, library_dir, sample_meta):
+        """`plan_locked_video_windows` must produce byte-identical windows whether or not
+        a correction is on disk — that is what keeps a renumber from reshaping a span."""
+        from noveltrans.tts.video import plan_locked_video_windows
+        from noveltrans.video_part_numbers import write_part_offsets
+
+        project = self._voiced_project(library_dir, sample_meta, 25)
+        chapters = project.chapters()
+        before = plan_locked_video_windows(chapters, "V", 10, {})
+
+        write_part_offsets(project.path, {1: 74})
+        after = plan_locked_video_windows(chapters, "V", 10, {})
+        project.close()
+
+        assert [(pn, w.first_num, w.last_num) for pn, w in before] == [
+            (pn, w.first_num, w.last_num) for pn, w in after
+        ]
+
+    def test_the_render_titles_the_part_with_the_corrected_number(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        from pathlib import Path
+
+        from noveltrans.gui.workers import VideoWorker
+        from noveltrans.storage.project import slugify
+        from noveltrans.tts.video import video_part_name
+        from noveltrans.video_part_numbers import write_part_offsets
+
+        project = self._voiced_project(library_dir, sample_meta, 20)
+        path = project.path
+        slug = slugify(project.meta.translated_title or project.meta.title)
+        video_dir = project.video_dir
+        project.close()
+
+        # Parts 1 and 2 should render as "Phần 74" and "Phần 75".
+        write_part_offsets(path, {1: 73})
+
+        def _fake_render_video(segments, image_path, out_path, *a, **k):
+            out_path = Path(out_path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(b"fake mp4")
+
+        monkeypatch.setattr("noveltrans.tts.video.render_video", _fake_render_video)
+        image = tmp_path / "bg.png"
+        image.write_bytes(b"fake")
+
+        VideoWorker(
+            path, voice="V", mode="batch", image_path=str(image), batch=10,
+            skip_existing=True,
+        ).run()
+
+        # The FILE still carries the chapter range, which is why nothing had to be moved.
+        for first, last, expected in ((1, 10, "Phần 74"), (11, 20, "Phần 75")):
+            name = video_part_name(slug, first, last, whole_novel=False)
+            out = video_dir / Path(name).stem / name
+            assert out.is_file()
+            title = (out.parent / (out.stem + ".title.txt")).read_text(encoding="utf-8")
+            assert expected in title
+
+    def test_explicit_part_numbers_are_not_shifted_twice(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        """The table computes `explicit_part_numbers` from its own already-corrected
+        numbers, so the worker must pass them straight through."""
+        from pathlib import Path
+
+        from noveltrans.gui.workers import VideoWorker
+        from noveltrans.storage.project import slugify
+        from noveltrans.tts.merge import MergeWindow
+        from noveltrans.tts.video import video_part_name
+        from noveltrans.video_part_numbers import write_part_offsets
+
+        project = self._voiced_project(library_dir, sample_meta, 10)
+        chapters = project.chapters()
+        path = project.path
+        slug = slugify(project.meta.translated_title or project.meta.title)
+        video_dir = project.video_dir
+        project.close()
+
+        write_part_offsets(path, {1: 73})
+
+        def _fake_render_video(segments, image_path, out_path, *a, **k):
+            out_path = Path(out_path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(b"fake mp4")
+
+        monkeypatch.setattr("noveltrans.tts.video.render_video", _fake_render_video)
+        image = tmp_path / "bg.png"
+        image.write_bytes(b"fake")
+
+        VideoWorker(
+            path, voice="V", mode="batch", image_path=str(image), batch=10,
+            skip_existing=True,
+            explicit_windows=[MergeWindow(1, 10, chapters)],
+            explicit_part_numbers={1: 74},  # already corrected by the tab
+        ).run()
+
+        name = video_part_name(slug, 1, 10, whole_novel=False)
+        out = video_dir / Path(name).stem / name
+        title = (out.parent / (out.stem + ".title.txt")).read_text(encoding="utf-8")
+        assert "Phần 74" in title  # not 147, which a second shift would give

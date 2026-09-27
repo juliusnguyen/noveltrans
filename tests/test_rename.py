@@ -190,6 +190,16 @@ class TestResyncTitleSidecars:
         resync_title_sidecars(video, "cuu-chuyen", "Trọng Sinh", ["Cứu Chuyện"])
         assert sidecar.read_text(encoding="utf-8").strip() == "Trọng Sinh - Phần 8"
 
+    def test_a_manually_renumbered_part_is_not_renumbered_back(self, tmp_path):
+        # Feature 099 leans on this: chương 741-750 is part 75 by arithmetic, but the
+        # user corrected it to 74. The resync runs on every project open, so if it
+        # recomputed the number it would silently undo the correction.
+        video, sidecar = self._rendered(
+            tmp_path, "cuu-chuyen-0741-0750", "Cứu Chuyện - Phần 74"
+        )
+        resync_title_sidecars(video, "cuu-chuyen", "Trọng Sinh", ["Cứu Chuyện"])
+        assert sidecar.read_text(encoding="utf-8").strip() == "Trọng Sinh - Phần 74"
+
     def test_a_hand_written_title_is_left_alone(self, tmp_path):
         video, sidecar = self._rendered(
             tmp_path, "cuu-chuyen-0001-0010", "Bản đặc biệt - Phần 1"
@@ -256,6 +266,15 @@ class TestResyncTitleOrder:
         assert resync_title_sidecars(
             video, "dai-can", "Đại Càn", ["Đại Càn"], "part_first"
         ) == 0
+
+    def test_an_order_flip_carries_a_manually_renumbered_part_across(self, tmp_path):
+        # Feature 099: the correction (chương 741-750 titled Phần 74, not 75) has to
+        # survive a title-order switch as well as a rename.
+        video, sidecar = self._rendered(tmp_path, "dai-can-0741-0750", "Đại Càn - Phần 74")
+        assert resync_title_sidecars(
+            video, "dai-can", "Đại Càn", ["Đại Càn"], "part_first"
+        ) == 1
+        assert sidecar.read_text(encoding="utf-8").strip() == "Phần 74 - Đại Càn"
 
     def test_switching_back_restores_name_first(self, tmp_path):
         video, sidecar = self._rendered(tmp_path, "dai-can-0001-0010", "Phần 4 - Đại Càn")

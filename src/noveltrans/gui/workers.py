@@ -2496,6 +2496,11 @@ class VideoWorker(PausableWorker):
             video_font,
             video_part_name,
         )
+        from noveltrans.video_part_numbers import (
+            apply_part_offsets,
+            effective_part_number,
+            read_part_offsets,
+        )
         from noveltrans.video_state import effective_created
         from noveltrans.video_windows import read_manual_windows
 
@@ -2530,6 +2535,15 @@ class VideoWorker(PausableWorker):
             # table shows.
             #
             # A `source_audio` run skips it too, in EVERY mode — see its branch below.
+            #
+            # Manual "Phần N" corrections (`noveltrans.video_part_numbers`) are applied on
+            # top of whichever of those branches runs, never inside the planning — they
+            # move numbers only, never chapter spans. `explicit_part_numbers` is the one
+            # exception: the table computed those from its own already-corrected numbers,
+            # so applying the offset again here would double-shift them.
+            part_offsets = read_part_offsets(
+                project.path, source_audio=self.source_audio
+            )
             locked_part_numbers: dict[int, int] = {}
             if self.explicit_windows is not None:
                 windows = self.explicit_windows
@@ -2571,7 +2585,9 @@ class VideoWorker(PausableWorker):
                     {**committed, **manual},
                 )
                 windows = [w for _, w in locked]
-                locked_part_numbers = {w.first_num: pn for pn, w in locked}
+                locked_part_numbers = apply_part_offsets(
+                    {w.first_num: pn for pn, w in locked}, part_offsets
+                )
             else:
                 windows = plan_merge_windows(
                     project.chapters(),
@@ -2637,7 +2653,11 @@ class VideoWorker(PausableWorker):
                     elif window.first_num in locked_part_numbers:
                         part_num = locked_part_numbers[window.first_num]
                     else:
-                        part_num = part_number(window.first_num, self.batch_size)
+                        part_num = effective_part_number(
+                            window.first_num,
+                            part_number(window.first_num, self.batch_size),
+                            part_offsets,
+                        )
                     try:
                         render_video(
                             segments, self.image_path, out_path, font_dir, novel_title,
@@ -2885,6 +2905,10 @@ class SubtitleWorker(PausableWorker):
             _with_real_durations,
             video_part_name,
         )
+        from noveltrans.video_part_numbers import (
+            effective_part_number,
+            read_part_offsets,
+        )
 
         project = NovelProject.open(self.project_path)
         try:
@@ -2903,8 +2927,11 @@ class SubtitleWorker(PausableWorker):
             written = backfilled = skipped = 0
             # This worker only backfills sidecars for parts that already exist, so its
             # label can never renumber anything on disk — it just needs to agree with
-            # whatever the render itself called that part (see `plan_merge_windows`).
+            # whatever the render itself called that part (see `plan_merge_windows`),
+            # manual "Phần N" corrections included. Chapter edition only: this worker has
+            # no source-audio branch.
             disabled_numbers = {c.index + 1 for c in chapters if not c.enabled}
+            part_offsets = read_part_offsets(project.path)
 
             for i, window in enumerate(windows):
                 if self._checkpoint():
@@ -2912,7 +2939,15 @@ class SubtitleWorker(PausableWorker):
                 label = (
                     "Toàn bộ"
                     if (total == 1 and self.mode == "all")
-                    else f"Phần {part_number(window.first_num, self.batch_size, disabled_numbers)}"
+                    else "Phần {}".format(
+                        effective_part_number(
+                            window.first_num,
+                            part_number(
+                                window.first_num, self.batch_size, disabled_numbers
+                            ),
+                            part_offsets,
+                        )
+                    )
                 )
                 self.progress.emit(i, total, f"{label}: dò mốc thời gian…")
                 for chapter in window.chapters:

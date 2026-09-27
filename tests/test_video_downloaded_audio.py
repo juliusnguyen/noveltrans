@@ -423,6 +423,46 @@ class TestSourceAudioBatchVideo:
         assert tab._part_number(windows[0]) == 1
         tab.shutdown()
 
+    def _source_tab(self, tmp_path, library_dir, sample_meta, sample_refs):
+        path = _project_with_releases(library_dir, sample_meta, sample_refs, 1, 11, 21)
+        tab = VideoTab(_config(tmp_path))
+        tab._on_project_selected(str(path))
+        tab.voice_combo.setCurrentIndex(tab.voice_combo.findData(SOURCE_AUDIO_KEY))
+        tab.video_mode.setCurrentIndex(tab.video_mode.findData("batch"))
+        tab.video_batch_size.setValue(2)
+        return tab, path
+
+    def test_a_source_edition_correction_shifts_the_source_numbering(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """Feature 099 supports renumbering the source edition too — its corrections get
+        their own key, so unlike the manual split/merge map there is nothing to collide."""
+        from noveltrans.video_part_numbers import write_part_offsets
+
+        tab, path = self._source_tab(tmp_path, library_dir, sample_meta, sample_refs)
+        windows = tab._windows_for_current_selection()
+        assert [tab._part_number(w) for w in windows] == [1, 2]
+
+        write_part_offsets(path, {windows[0].first_num: 73}, source_audio=True)
+        windows = tab._windows_for_current_selection()
+        assert [tab._part_number(w) for w in windows] == [74, 75]
+        tab.shutdown()
+
+    def test_a_chapter_correction_does_not_bleed_into_the_source_edition(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """The two editions number in different spaces — a chapter anchor must never be
+        read as a release ordinal. This is the bug `video_manual_windows.json` could not
+        rule out, and the reason this sidecar is keyed by edition."""
+        from noveltrans.video_part_numbers import write_part_offsets
+
+        tab, path = self._source_tab(tmp_path, library_dir, sample_meta, sample_refs)
+        write_part_offsets(path, {1: 73})  # chapter edition
+
+        windows = tab._windows_for_current_selection()
+        assert [tab._part_number(w) for w in windows] == [1, 2]
+        tab.shutdown()
+
 
 class TestRedoAllForSourceAudio:
     """"Tạo lại tất cả video" planned over chapters directly, so it never reached the
