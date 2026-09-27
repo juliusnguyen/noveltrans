@@ -74,9 +74,50 @@ class TestMergeWindows:
         with pytest.raises(ValueError):
             merge_windows(tmp_path, 81, 90, 96, 100)  # a gap in between
 
+    def test_merges_across_a_gap_of_only_skipped_chapters(self, tmp_path):
+        # The reported case: Phần 13 is chương 223-233 and Phần 14 is 235-241, because
+        # chương 234 is disabled and so never lands in a window. The two parts are
+        # contiguous in everything that gets rendered, so the merge must be allowed.
+        merged = merge_windows(
+            tmp_path, 223, 233, 235, 241,
+            disabled_numbers={65, 192, 199, 200, 209, 227, 234},
+        )
+        assert merged == (223, 241)
+        assert read_manual_windows(tmp_path) == {223: 241}
+
     def test_rejects_overlapping_windows(self, tmp_path):
         with pytest.raises(ValueError):
             merge_windows(tmp_path, 91, 96, 95, 100)
+
+    def test_still_rejects_overlapping_windows_when_the_gap_is_skipped(self, tmp_path):
+        # The vacuous-`range` trap: "every chapter between them is disabled" is trivially
+        # true for a reversed pair, so the ordering test has to be its own clause.
+        with pytest.raises(ValueError):
+            merge_windows(tmp_path, 91, 96, 95, 100, disabled_numbers={95})
+        assert read_manual_windows(tmp_path) == {}
+
+    def test_rejects_a_gap_holding_a_chapter_that_still_renders(self, tmp_path):
+        with pytest.raises(ValueError) as exc:
+            merge_windows(tmp_path, 223, 233, 237, 241, disabled_numbers={234, 235})
+        # 236 is the only one blocking; the two skipped ones must not be blamed.
+        assert "chương 236" in str(exc.value)
+        assert "234" not in str(exc.value)
+
+    def test_rejects_a_gap_holding_a_chapter_that_does_not_exist(self, tmp_path):
+        # Deliberate: a number with no chapter can be re-scraped later, and would then be
+        # swallowed into a part that may already be uploaded. Same rule as "not yet voiced".
+        with pytest.raises(ValueError):
+            merge_windows(tmp_path, 223, 233, 235, 241, disabled_numbers=set())
+
+    def test_a_refused_merge_writes_nothing(self, tmp_path):
+        with pytest.raises(ValueError):
+            merge_windows(tmp_path, 81, 90, 96, 100)
+        assert read_manual_windows(tmp_path) == {}
+
+    def test_a_wide_skipped_gap_is_summarised_not_listed_in_full(self, tmp_path):
+        with pytest.raises(ValueError) as exc:
+            merge_windows(tmp_path, 10, 20, 31, 40)  # 21..30 all still render
+        assert "chương 21, 22, 23 và 7 chương khác" in str(exc.value)
 
     def test_merge_undoes_a_prior_split(self, tmp_path):
         split_window(tmp_path, 91, 100, 5)

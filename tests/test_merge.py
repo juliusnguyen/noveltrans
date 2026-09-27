@@ -16,6 +16,7 @@ from noveltrans.tts.merge import (
     build_chapter_metadata,
     build_concat_list,
     chapter_marker_title,
+    disabled_chapter_numbers,
     merge_chapters,
     part_number,
     plan_merge_windows,
@@ -280,3 +281,25 @@ class TestRealMerge:
         with pytest.raises(MergeCancelled):
             merge_chapters(segs, tmp_path / "out.m4b", "m4b", cancelled=lambda: True)
         assert not (tmp_path / "out.m4b").exists() or True  # terminated; partial ok
+
+
+class TestDisabledChapterNumbers:
+    """Feature 100 extracted this out of three inline copies — one spelling for a set the
+    two window planners and the video tab's merge gating all have to agree on."""
+
+    def test_returns_the_one_based_numbers_of_disabled_chapters(self):
+        chs = [_ch(i) for i in range(5)]
+        chs[0].enabled = False
+        chs[3].enabled = False
+        assert disabled_chapter_numbers(chs) == {1, 4}
+
+    def test_nothing_disabled_is_an_empty_set(self):
+        assert disabled_chapter_numbers([_ch(i) for i in range(3)]) == set()
+
+    def test_matches_the_comprehension_it_replaced(self):
+        chs = [_ch(i) for i in range(20)]
+        for i in (2, 8, 19):
+            chs[i].enabled = False
+        assert disabled_chapter_numbers(chs) == {
+            c.index + 1 for c in chs if not c.enabled
+        }

@@ -12,6 +12,15 @@ Merging is exactly the inverse of splitting: two adjacent windows collapse into 
 that a single (never-split) window would have covered, and a later merge of two split
 halves is how a split gets undone — there's no separate "clear override" action.
 
+"Adjacent" cannot be `last_a + 1 == first_b`, because a window's ends are trimmed to the
+chapters actually available in it (`tts.video.plan_locked_video_windows`), while the grid
+the planner walks is numbered over every chapter. A DISABLED chapter (feature 098) sits in
+between the two: chương 234 disabled makes the part after 223-233 display as 235-241, and
+the two parts are contiguous in everything that gets rendered. So two parts are adjacent
+when every chapter strictly between them is disabled — see `merge_adjacency_error`, which
+owns both that rule and the message shown when it refuses, so the context menu's gating and
+this module's own guard cannot drift apart.
+
 CHAPTER numbers only. A novel can also have the site's own audio edition, whose parts are
 keyed by release ordinal (see `noveltrans.tts.merge.plan_source_windows`), and this flat map
 has no room for a second number space — an entry meant for one edition would silently
@@ -91,16 +100,76 @@ def split_window(
     return first_half, second_half
 
 
-def merge_windows(
-    project_path: Path, first_a: int, last_a: int, first_b: int, last_b: int
-) -> tuple[int, int]:
-    """Force two ADJACENT parts (`last_a + 1 == first_b`) to merge into one part.
+def _describe_gap(blocking: list[int]) -> str:
+    """"chương 234" / "chương 234, 236" / "chương 234, 236, 238 và 4 chương khác".
 
-    Returns the merged `(first, last)` span. Raises `ValueError` if the two windows
-    aren't actually adjacent — merging across a gap would leave chapters out of order.
+    Capped so a wide gap can't turn the tooltip into a wall of numbers.
     """
-    if last_a + 1 != first_b:
-        raise ValueError("Chỉ có thể gộp 2 phần liền kề nhau (không có khoảng trống).")
+    shown = ", ".join(str(n) for n in blocking[:3])
+    rest = len(blocking) - 3
+    return f"chương {shown} và {rest} chương khác" if rest > 0 else f"chương {shown}"
+
+
+def merge_adjacency_error(
+    last_a: int, first_b: int, disabled_numbers: set[int] | None = None
+) -> str | None:
+    """Why these two parts can't be merged, or `None` if they can.
+
+    The single owner of the adjacency rule AND of the text shown when it refuses, so
+    `merge_windows` (the API guard) and the context menu's enable/tooltip state can't
+    disagree about either — see the module docstring for why the rule isn't
+    `last_a + 1 == first_b`.
+
+    Adjacent means: `first_b` is after `last_a`, and every chapter strictly between them is
+    disabled (which includes the ordinary case of no chapters between them at all). A gap
+    holding any chapter that still renders is a real gap — merging across it would pull
+    that chapter out of order — and so is a number with no chapter at all, or one not yet
+    voiced: those can start rendering later and would then be swallowed into a part that
+    may already be uploaded.
+
+    The ordering test is not redundant: without it an overlapping pair (91-96 and 95-100)
+    gives an empty `range` and would pass vacuously.
+    """
+    if first_b <= last_a:
+        return (
+            "Chỉ có thể gộp 2 phần liền kề nhau — phần sau phải bắt đầu ngay sau phần trước."
+        )
+    disabled = disabled_numbers or set()
+    blocking = [n for n in range(last_a + 1, first_b) if n not in disabled]
+    if blocking:
+        return (
+            f"Chỉ gộp được 2 phần liền kề: giữa 2 phần này còn {_describe_gap(blocking)} "
+            "chưa bị bỏ qua.\n\nMuốn gộp thì hãy bỏ qua (các) chương đó trước, hoặc gộp "
+            "lần lượt từng cặp phần liền kề."
+        )
+    return None
+
+
+def merge_windows(
+    project_path: Path,
+    first_a: int,
+    last_a: int,
+    first_b: int,
+    last_b: int,
+    *,
+    disabled_numbers: set[int] | None = None,
+) -> tuple[int, int]:
+    """Force two ADJACENT parts to merge into one part — see `merge_adjacency_error`.
+
+    Returns the merged `(first, last)` span, which swallows any disabled chapter that sat
+    between the two. That is deliberate: such a chapter is excluded from the render anyway,
+    and if it is ever re-enabled it belongs to this merged part rather than reopening a
+    boundary the user removed by hand.
+
+    `disabled_numbers` is the set of disabled 1-based chapter numbers. Omitted, nothing
+    counts as disabled, so the rule collapses to the pre-098 `last_a + 1 == first_b` — the
+    fail-safe direction: a merge can only be refused, never wrongly allowed.
+
+    Raises `ValueError`, with a message meant for a dialog, if the two aren't adjacent.
+    """
+    reason = merge_adjacency_error(last_a, first_b, disabled_numbers)
+    if reason is not None:
+        raise ValueError(reason)
 
     windows = read_manual_windows(project_path)
     windows.pop(first_a, None)
