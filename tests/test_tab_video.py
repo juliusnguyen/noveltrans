@@ -714,7 +714,8 @@ class TestSplitMergeParts:
     """Feature 058 follow-up: right-click a part to split it (e.g. to stay under
     YouTube's 12h cap) or merge two adjacent parts back together."""
 
-    def _project(self, library_dir, sample_meta, n_chapters):
+    def _project(self, library_dir, sample_meta, n_chapters, disabled=()):
+        """`disabled` is 1-based chapter NUMBERS, matching what the tab reasons in."""
         from noveltrans.models import ChapterRef
 
         refs = [
@@ -724,6 +725,8 @@ class TestSplitMergeParts:
         project = NovelProject.create(library_dir, sample_meta, refs)
         for i in range(n_chapters):
             project.save_audio(i, f"exports/audio/{i}.mp3", "V", 60.0)
+        for num in disabled:
+            project.set_enabled(num - 1, False)
         path = project.path
         project.close()
         return path
@@ -5480,4 +5483,176 @@ class TestRenumberParts:
         tab._split_part(tab._windows_for_current_selection()[0])
 
         assert self._numbers(tab) == {1: 75, 6: 76, 11: 77, 21: 78}
+        tab.shutdown()
+
+
+class TestMergeAcrossDisabled:
+    """Feature 100: two parts separated only by a DISABLED chapter can be merged.
+
+    A window's ends are trimmed to the chapters available in it, so a disabled chapter
+    between two parts makes the second one *display* as starting one later — and the old
+    `last + 1 == first` test read that as a gap.
+    """
+
+    _project = TestSplitMergeParts._project
+    _tab_on_project = TestSplitMergeParts._tab_on_project
+    _yes = TestSplitMergeParts._yes
+    _row_pos = TestSplitMergeParts._row_pos
+    _menu_for = TestSplitMergeParts._menu_for
+    _FakeMenu = TestSplitMergeParts._FakeMenu
+
+    def _select_two(self, tab, monkeypatch, row_a, row_b):
+        from PySide6.QtCore import QItemSelectionModel
+
+        tab.video_list.selectRow(row_a)
+        tab.video_list.selectionModel().select(
+            tab.video_list.model().index(row_b, 0),
+            QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows,
+        )
+        return self._menu_for(tab, monkeypatch, row_a)
+
+    def _merge_action(self, menu):
+        return next(a for a in menu.actions if a.text == "Gộp 2 phần liền kề")
+
+    def test_the_two_parts_really_do_look_non_adjacent(
+        self, qapp, tmp_path, library_dir, sample_meta
+    ):
+        """The precondition the whole feature rests on — stated once, so a later change to
+        window trimming shows up here rather than as a confusing failure below."""
+        path = self._project(library_dir, sample_meta, 21, disabled=[11])
+        tab = self._tab_on_project(tmp_path, path)
+        a, b = tab._windows_for_current_selection()
+        assert (a.first_num, a.last_num) == (1, 10)
+        assert (b.first_num, b.last_num) == (12, 21)  # not 11 — chương 11 is skipped
+        assert a.last_num + 1 != b.first_num
+        tab.shutdown()
+
+    def test_a_gap_of_only_a_skipped_chapter_offers_an_enabled_merge(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        path = self._project(library_dir, sample_meta, 21, disabled=[11])
+        tab = self._tab_on_project(tmp_path, path)
+        action = self._merge_action(self._select_two(tab, monkeypatch, 0, 1))
+        assert action.enabled
+        assert action.tooltip == ""
+        tab.shutdown()
+
+    def test_merging_across_a_skipped_chapter_swallows_it(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        from noveltrans.video_windows import read_manual_windows
+
+        path = self._project(library_dir, sample_meta, 21, disabled=[11])
+        tab = self._tab_on_project(tmp_path, path)
+        a, b = tab._windows_for_current_selection()
+        self._yes(monkeypatch)
+        tab._merge_parts(a, b)
+
+        assert read_manual_windows(path) == {1: 21}
+        windows = tab._windows_for_current_selection()
+        assert len(windows) == 1
+        assert (windows[0].first_num, windows[0].last_num) == (1, 21)
+        # 20 of the 21 chapters: chương 11 stays out of the render.
+        assert len(windows[0].chapters) == 20
+        assert 11 not in [c.index + 1 for c in windows[0].chapters]
+        tab.shutdown()
+
+    def test_the_confirm_dialog_names_the_swallowed_chapter(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        path = self._project(library_dir, sample_meta, 21, disabled=[11])
+        tab = self._tab_on_project(tmp_path, path)
+        a, b = tab._windows_for_current_selection()
+        asked = self._yes(monkeypatch)
+        tab._merge_parts(a, b)
+
+        message = asked[0][2]
+        assert "chương 11 ở giữa đang bị bỏ qua" in message
+        assert "nếu bật lại sẽ thuộc phần này" in message
+        tab.shutdown()
+
+    def test_an_ordinary_merge_message_is_unchanged(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        path = self._project(library_dir, sample_meta, 20)  # nothing disabled
+        tab = self._tab_on_project(tmp_path, path)
+        a, b = tab._windows_for_current_selection()
+        asked = self._yes(monkeypatch)
+        tab._merge_parts(a, b)
+
+        assert "gộp thành 1 phần (chương 1–20)." in asked[0][2]
+        assert "bỏ qua" not in asked[0][2]
+        tab.shutdown()
+
+    def test_a_real_gap_still_disables_the_merge_and_names_the_chapter(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        path = self._project(library_dir, sample_meta, 30)  # batch 10 → 3 parts
+        tab = self._tab_on_project(tmp_path, path)
+        action = self._merge_action(self._select_two(tab, monkeypatch, 0, 2))
+        assert not action.enabled
+        assert "chương 11" in action.tooltip
+        tab.shutdown()
+
+    def test_a_gap_mixing_skipped_and_live_chapters_is_still_refused(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        # chương 11 skipped but 12-20 still render, so parts 1 and 3 are not adjacent.
+        path = self._project(library_dir, sample_meta, 30, disabled=[11])
+        tab = self._tab_on_project(tmp_path, path)
+        action = self._merge_action(self._select_two(tab, monkeypatch, 0, 2))
+        assert not action.enabled
+        assert "chương 12" in action.tooltip
+        tab.shutdown()
+
+    def test_the_guard_still_refuses_if_the_gate_went_stale(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        """The menu is only a gate; `merge_windows` is the guard. Drive a genuinely
+        non-adjacent pair straight at the handler, as a stale right-click would."""
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.video_windows import read_manual_windows
+
+        path = self._project(library_dir, sample_meta, 30)
+        tab = self._tab_on_project(tmp_path, path)
+        first, _, third = tab._windows_for_current_selection()
+        monkeypatch.setattr(
+            QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes
+        )
+        warned = []
+        monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warned.append(a))
+        tab._merge_parts(first, third)
+
+        assert warned and "chương 11" in warned[0][2]
+        assert read_manual_windows(path) == {}
+        tab.shutdown()
+
+    def test_a_merge_does_not_move_a_part_number_correction(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        """Feature 099 interaction: merging away a window that an offset was anchored at
+        orphans the anchor. The merged part keeps the EARLIER part's numbering, and the
+        parts after it keep the correction — no code does anything special for this, so
+        pin it."""
+        from noveltrans.video_part_numbers import write_part_offsets
+
+        path = self._project(library_dir, sample_meta, 31, disabled=[11])
+        tab = self._tab_on_project(tmp_path, path)
+        windows = tab._windows_for_current_selection()
+        assert [(w.first_num, w.last_num) for w in windows] == [(1, 10), (12, 21), (22, 31)]
+
+        # Correct from the SECOND part onward, then merge it into the first.
+        write_part_offsets(path, {12: 73})
+        windows = tab._windows_for_current_selection()
+        assert [tab._part_number(w) for w in windows] == [1, 75, 76]
+
+        self._yes(monkeypatch)
+        tab._merge_parts(windows[0], windows[1])
+
+        windows = tab._windows_for_current_selection()
+        assert [(w.first_num, w.last_num) for w in windows] == [(1, 21), (22, 31)]
+        # The merged part is the earlier one extended, so it keeps number 1; the tail
+        # still carries the correction the user made.
+        assert [tab._part_number(w) for w in windows] == [1, 75]
         tab.shutdown()

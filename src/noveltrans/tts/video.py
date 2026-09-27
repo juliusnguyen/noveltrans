@@ -62,6 +62,7 @@ from noveltrans.tts.merge import (  # noqa: F401
     _terminate,
     build_concat_list,
     chapter_marker_title,
+    disabled_chapter_numbers,
     plan_merge_windows,
 )
 
@@ -761,7 +762,7 @@ def plan_locked_video_windows(
     if size < 1:
         raise ValueError("batch size must be >= 1")
     max_num = avail[-1].index + 1
-    disabled_numbers = {c.index + 1 for c in chapters if not c.enabled}
+    disabled_numbers = disabled_chapter_numbers(chapters)
     frozen = sorted(committed.items())
 
     result: list[tuple[int, MergeWindow]] = []

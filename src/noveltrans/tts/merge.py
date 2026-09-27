@@ -61,7 +61,7 @@ def plan_merge_windows(
         (c for c in chapters if c.enabled and c.audio_path and c.audio_voice == voice),
         key=lambda c: c.index,
     )
-    disabled_numbers = {c.index + 1 for c in chapters if not c.enabled}
+    disabled_numbers = disabled_chapter_numbers(chapters)
     return _group_windows(avail, disabled_numbers, mode, start=start, end=end, batch=batch)
 
 
@@ -93,6 +93,16 @@ def plan_source_windows(
     """
     avail = sorted((r for r in releases if r.audio_path), key=lambda r: r.index)
     return _group_windows(avail, set(), mode, start=start, end=end, batch=batch)
+
+
+def disabled_chapter_numbers(chapters: list) -> set[int]:
+    """The 1-based numbers of every disabled chapter (feature 098).
+
+    One spelling for a set four different places need to agree on — the two window
+    planners, and the video tab's merge gating (`video_windows.merge_adjacency_error`).
+    `Chapter.index` is 0-based, every window/part number in this module is 1-based.
+    """
+    return {c.index + 1 for c in chapters if not c.enabled}
 
 
 def _batch_window_end(lo: int, size: int, max_num: int, disabled_numbers: set[int]) -> int:

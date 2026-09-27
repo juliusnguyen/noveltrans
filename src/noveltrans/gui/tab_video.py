@@ -136,6 +136,10 @@ class VideoTab(QWidget):
         self._locked_part_numbers: dict[int, int] = {}
         self._locked_committed: dict[int, int] = {}
         self._locked_manual: dict[int, int] = {}
+        # The disabled 1-based chapter numbers the plan above was built from, so the
+        # merge gating can ask "is anything real between these two parts?" against the
+        # SAME chapter read the planner used — see `_on_video_list_context_menu`.
+        self._locked_disabled: set[int] = set()
         # Manual "Phần N" corrections for the edition currently on screen, refreshed once
         # per `_windows_for_current_selection` — `_part_number` runs once per row in
         # several loops, and re-reading the sidecar each time would be wasteful. See
@@ -755,6 +759,7 @@ class VideoTab(QWidget):
             self._locked_part_numbers = {}
             self._locked_committed = {}
             self._locked_manual = {}
+            self._locked_disabled = set()
             return plan_source_windows(
                 self.project.source_audio(), mode, start=start, end=end, batch=batch
             )
@@ -784,6 +789,7 @@ class VideoTab(QWidget):
         see `plan_locked_video_windows` for why a locked window's part number can deviate
         from plain grid arithmetic.
         """
+        from noveltrans.tts.merge import disabled_chapter_numbers
         from noveltrans.tts.video import (
             discover_committed_video_windows,
             plan_locked_video_windows,
@@ -798,9 +804,11 @@ class VideoTab(QWidget):
             else {}
         )
         manual = read_manual_windows(self.project.path)
-        plan = plan_locked_video_windows(
-            self.project.chapters(), voice, batch, {**committed, **manual}
-        )
+        # One read, shared with the `_locked_disabled` cache below: the merge gating has to
+        # judge adjacency against the same enabled set this plan was built from, or the two
+        # can disagree when a chapter is toggled between them.
+        chapters = self.project.chapters()
+        plan = plan_locked_video_windows(chapters, voice, batch, {**committed, **manual})
         # Only the table's own view (honor_committed=True) may refresh the caches. A
         # redo-all preview deliberately ignores commits, and writing that narrower plan
         # here would mis-number a per-row "Tạo lại" clicked before the next refresh —
@@ -814,6 +822,7 @@ class VideoTab(QWidget):
             )
             self._locked_committed = committed
             self._locked_manual = manual
+            self._locked_disabled = disabled_chapter_numbers(chapters)
         return [w for _, w in plan]
 
     def _part_number(self, window) -> int:
@@ -983,11 +992,20 @@ class VideoTab(QWidget):
             menu.addSeparator()
         elif splittable and len(selected_windows) == 2:
             window_a, window_b = selected_windows
-            adjacent = window_a.last_num + 1 == window_b.first_num
+            # NOT `last_num + 1 == first_num`: a window's ends are trimmed to the chapters
+            # available in it, so a disabled chương 234 makes the part after 223-233 read
+            # 235-241 while the two are still contiguous in everything that renders. The
+            # rule and this message both live in `merge_adjacency_error`, so the gate here
+            # and `merge_windows`'s own guard cannot drift apart.
+            from noveltrans.video_windows import merge_adjacency_error
+
+            reason = merge_adjacency_error(
+                window_a.last_num, window_b.first_num, self._locked_disabled
+            )
             action = menu.addAction("Gộp 2 phần liền kề")
-            action.setEnabled(adjacent)
-            if not adjacent:
-                action.setToolTip("Chỉ gộp được 2 phần liền kề nhau (không có khoảng trống).")
+            action.setEnabled(reason is None)
+            if reason is not None:
+                action.setToolTip(reason)
             action.triggered.connect(lambda: self._merge_parts(window_a, window_b))
             menu.addSeparator()
 
@@ -1065,20 +1083,43 @@ class VideoTab(QWidget):
         """Merge two adjacent parts into one — the inverse of `_split_part`.
 
         Also how an earlier split gets undone: merging its two halves back together.
+
+        "Adjacent" allows disabled chapters in between (see
+        `video_windows.merge_adjacency_error`), and the merged span swallows them: they are
+        excluded from the render anyway, and re-enabling one later should extend this part
+        rather than reopen a boundary the user removed by hand.
         """
+        skipped = sorted(
+            n for n in range(window_a.last_num + 1, window_b.first_num)
+            if n in self._locked_disabled
+        )
+        note = ""
+        if skipped:
+            listed = ", ".join(str(n) for n in skipped)
+            note = (
+                f"; chương {listed} ở giữa đang bị bỏ qua — nếu bật lại sẽ thuộc phần này"
+            )
         if not self._confirm_restructure(
             [window_a, window_b], title="Gộp phần",
-            action_desc=f"gộp thành 1 phần (chương {window_a.first_num}–{window_b.last_num})",
+            action_desc="gộp thành 1 phần "
+            f"(chương {window_a.first_num}–{window_b.last_num}{note})",
         ):
             return
 
         from noveltrans.video_windows import merge_windows
 
-        merge_windows(
-            self.project.path,
-            window_a.first_num, window_a.last_num,
-            window_b.first_num, window_b.last_num,
-        )
+        # The gate in `_on_video_list_context_menu` already checked this, but it can go
+        # stale between right-click and click — the pure function is the real guard.
+        try:
+            merge_windows(
+                self.project.path,
+                window_a.first_num, window_a.last_num,
+                window_b.first_num, window_b.last_num,
+                disabled_numbers=self._locked_disabled,
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Gộp phần", str(exc))
+            return
         self._delete_rendered_part(window_a)
         self._delete_rendered_part(window_b)
         self._refresh_video_list()

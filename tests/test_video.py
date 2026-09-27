@@ -2236,3 +2236,56 @@ class TestPartNumberOffsets:
         out = video_dir / Path(name).stem / name
         title = (out.parent / (out.stem + ".title.txt")).read_text(encoding="utf-8")
         assert "Phần 74" in title  # not 147, which a second shift would give
+
+
+class TestMergedSpanAcrossDisabled:
+    """Feature 100: a manual merge across a disabled chapter swallows it. Proves the
+    planner side of the claim — the merged span plans as ONE part, the disabled chapter
+    stays out of the render, and re-enabling it later grows that part in place."""
+
+    def _chapters_with_234_disabled(self, enabled_234=False):
+        chapters = [_chapter(i) for i in range(241)]
+        chapters[233].enabled = enabled_234  # chương 234
+        return chapters
+
+    def _window_at(self, plan, first_num):
+        return next((pn, w) for pn, w in plan if w.first_num == first_num)
+
+    def test_a_merged_span_plans_as_one_part(self):
+        from noveltrans.tts.video import plan_locked_video_windows
+
+        plan = plan_locked_video_windows(
+            self._chapters_with_234_disabled(), "V", 20, {223: 241}
+        )
+        _, window = self._window_at(plan, 223)
+        assert (window.first_num, window.last_num) == (223, 241)
+        # 19 numbers in the span, 18 rendered — chương 234 is skipped.
+        assert len(window.chapters) == 18
+        assert 234 not in [c.index + 1 for c in window.chapters]
+
+    def test_the_merged_span_is_one_part_not_two(self):
+        from noveltrans.tts.video import plan_locked_video_windows
+
+        plan = plan_locked_video_windows(
+            self._chapters_with_234_disabled(), "V", 20, {223: 241}
+        )
+        starts = [w.first_num for _, w in plan if w.first_num >= 223]
+        assert starts == [223]  # nothing starts at 235 any more
+
+    def test_re_enabling_the_swallowed_chapter_grows_the_part_in_place(self):
+        from noveltrans.tts.video import plan_locked_video_windows
+
+        skipped = plan_locked_video_windows(
+            self._chapters_with_234_disabled(), "V", 20, {223: 241}
+        )
+        restored = plan_locked_video_windows(
+            self._chapters_with_234_disabled(enabled_234=True), "V", 20, {223: 241}
+        )
+        pn_before, before = self._window_at(skipped, 223)
+        pn_after, after = self._window_at(restored, 223)
+
+        assert len(before.chapters) == 18
+        assert len(after.chapters) == 19
+        # Same span and same part number, so no file is renamed and no sidecar key moves.
+        assert (after.first_num, after.last_num) == (before.first_num, before.last_num)
+        assert pn_after == pn_before
