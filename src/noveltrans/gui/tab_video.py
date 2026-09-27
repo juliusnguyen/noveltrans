@@ -1173,7 +1173,8 @@ class VideoTab(QWidget):
             return
 
         moved = self._apply_renumber(windows, numbers)
-        note = f" Đã cập nhật tiêu đề {moved} phần đã tạo." if moved else ""
+        note = f" Đã cập nhật tiêu đề {moved} phần." if moved else ""
+        note += self._pending_title_push_note()
         later = sum(1 for f in numbers if f > window.first_num)
         self.status_label.setText(
             f"Đã đổi Phần {current} thành Phần {new_num} — {later} phần sau dời theo."
@@ -1206,7 +1207,8 @@ class VideoTab(QWidget):
             clear_part_offsets(self.project.path, source_audio=source)
 
         moved = self._apply_renumber(windows, numbers)
-        note = f" Đã cập nhật tiêu đề {moved} phần đã tạo." if moved else ""
+        note = f" Đã cập nhật tiêu đề {moved} phần." if moved else ""
+        note += self._pending_title_push_note()
         self.status_label.setText(
             f"Đã đặt lại số phần theo đánh số tự động.{note}"
         )
@@ -1227,40 +1229,58 @@ class VideoTab(QWidget):
     def _renumber_title_sidecars(
         self, windows: list, old_numbers: dict, new_numbers: dict
     ) -> int:
-        """Rewrite `.title.txt` for every rendered part whose number just changed.
+        """Rewrite `.title.txt` for every part whose number just changed.
 
-        Skips the two cases `resync_title_sidecars` skips, for the same reasons: a
-        hand-written title is not ours to rewrite, and a PUBLISHED part's sidecar should
-        keep matching what is actually on the channel — the number there can only be
-        fixed on YouTube itself. Returns how many were rewritten.
+        Every part with a title WE generated is rewritten, published or not, so the parts
+        table, the "Chi tiết phần" dialog (`_part_metadata` reads this sidecar whenever it
+        exists, `.mp4` or no `.mp4`) and the file on disk all agree on the number the part
+        should now carry. A hand-written title is still left alone — it is not ours to
+        renumber.
+
+        A PUBLISHED part's channel title is preserved into `upload_state["title"]` first,
+        because for a part uploaded before that key was recorded the sidecar is the only
+        copy of it, and `_title_update_rows` needs it to spot the difference and offer the
+        part under "Cập nhật tiêu đề". Hence the rule this shares with
+        `rename.resync_title_sidecars` (which leaves published sidecars alone on an
+        order-only change): a published part's sidecar may be rewritten only once the
+        channel title has been preserved somewhere else. Renumbering preserves it; an
+        order flip has nowhere to put it, so it doesn't rewrite.
+
+        Nothing is sent to YouTube here — "Cập nhật tiêu đề" is the only route for that.
+        Returns how many sidecars were rewritten.
 
         The `.jpg` bakes "PHẦN N" too, but is deliberately left alone: regenerating it
         would discard a cover tuned in the thumbnail editor. The caller says so instead.
         """
-        from noveltrans.rename import title_name
-        from noveltrans.youtube_upload import is_published
+        from noveltrans.rename import is_generated_title
+        from noveltrans.youtube_upload import (
+            STATE_PUBLISHED,
+            read_upload_state,
+            write_upload_state,
+        )
 
         meta = self.project.meta
-        known = {
-            (name or "").strip()
-            for name in (
-                meta.display_name(), meta.display_title, meta.translated_title, meta.title
-            )
-            if (name or "").strip()
-        }
+        name = meta.display_name()
+        known = (meta.display_title, meta.translated_title, meta.title)
         rewritten = 0
         for window in windows:
             first = window.first_num
             if old_numbers.get(first) == new_numbers.get(first):
                 continue
-            out = self._part_output_path(window, whole_novel=False)
-            if not out.is_file() or is_published(out):
-                continue
             sidecar = self._part_sidecar(window, False, ".title.txt")
             if not sidecar.is_file():
-                continue
-            if title_name(sidecar.read_text(encoding="utf-8").strip()) not in known:
+                continue  # nothing recorded yet; the table's computed title is already right
+            current = sidecar.read_text(encoding="utf-8").strip()
+            if not is_generated_title(current, name, known):
                 continue  # hand-written, or a name this novel never had
+            out = self._part_output_path(window, whole_novel=False)
+            state = read_upload_state(out)
+            if state.get("status") == STATE_PUBLISHED and not str(
+                state.get("title") or ""
+            ).strip():
+                # The only copy of what the channel shows is about to be overwritten —
+                # move it to its canonical home first.
+                write_upload_state(out, title=current)
             sidecar.write_text(
                 self._part_title(new_numbers[first]) + "\n", encoding="utf-8"
             )
@@ -1306,8 +1326,8 @@ class VideoTab(QWidget):
             )
         if uploaded:
             message += (
-                f"\n\n⚠️ {len(uploaded)} phần đã tải lên YouTube. Tiêu đề trên kênh sẽ "
-                "KHÔNG tự đổi — bạn cần tự sửa trên YouTube."
+                f"\n\n⚠️ {len(uploaded)} phần đã tải lên YouTube. Tiêu đề trên kênh KHÔNG "
+                "tự đổi — sau khi đổi số, bấm “Cập nhật tiêu đề” để đẩy số mới lên YouTube."
             )
         message += "\n\nTiếp tục?"
         return QMessageBox.question(self, "Đổi số phần", message) == (
@@ -3231,15 +3251,25 @@ class VideoTab(QWidget):
         retitled = self._resync_title_sidecars()
         self._refresh_video_list()  # the "Tiêu đề" column is built from _part_title
         note = f" Đã cập nhật tiêu đề {retitled} phần đã tạo." if retitled else ""
-        # A published part's sidecar is left matching YouTube, so say where to change it.
-        pending = len(self._title_update_rows())
-        if pending:
-            note += (
-                f" {pending} phần đã đăng vẫn giữ tiêu đề cũ trên YouTube — bấm "
-                "“Cập nhật tiêu đề” để đổi."
-            )
+        # An order flip leaves a published part's sidecar matching YouTube, so the channel
+        # still shows the old order until it's pushed — say where.
+        note += self._pending_title_push_note()
         self.status_label.setText(
             f"Tiêu đề video: “{self._part_title(1)}”.{note}"
+        )
+
+    def _pending_title_push_note(self) -> str:
+        """" N phần đã đăng vẫn giữ tiêu đề cũ trên YouTube — bấm …", or "" if none.
+
+        The only place a COUNT of them is truthful: a confirm dialog shown before the
+        change can say a push will be needed, but not how many parts end up needing one.
+        """
+        pending = len(self._title_update_rows())
+        if not pending:
+            return ""
+        return (
+            f" {pending} phần đã đăng vẫn giữ tiêu đề cũ trên YouTube — bấm "
+            "“Cập nhật tiêu đề” để đổi."
         )
 
     # ------------------------------------------------- keep descriptions fresh
@@ -4691,19 +4721,31 @@ class VideoTab(QWidget):
     def _title_update_rows(self) -> list:
         """Parts whose video on the channel is titled differently from what we'd write now.
 
-        The pair is (window, label, whole, title). A published part's `.title.txt` is
-        deliberately left alone by `resync_title_sidecars` (it should keep matching what
-        YouTube shows), so the comparison is against the recorded title — falling back to
-        the sidecar for parts uploaded before that was recorded.
+        The pair is (window, label, whole, title). The comparison is against the title
+        RECORDED for the upload — falling back to the `.title.txt` for parts uploaded
+        before that key existed, which is why `_renumber_title_sidecars` backfills it
+        before overwriting a published sidecar.
+
+        The target is rebuilt from scratch (`_part_title`, i.e. the same
+        `build_upload_title` every other title in the app goes through) rather than patched
+        out of the current one. So a rename, a "Tiêu đề video" order flip and a manual
+        renumber are all noticed — singly or in any combination — with no per-change rules
+        to get out of step, and the string offered here is byte-identical to what the
+        sidecar holds and what a re-render would write.
+
+        `rename.retitle` can't answer this on its own: it carries `Phần N` over verbatim
+        (deliberately — see its docstring), so a renumber is invisible to it. It still owns
+        the "is this title ours?" question, via `is_generated_title`, so a hand-written
+        title is left alone here exactly as it is everywhere else.
         """
         if self.project is None:
             return []
-        from noveltrans.rename import retitle
+        from noveltrans.rename import is_generated_title
         from noveltrans.youtube_upload import read_upload_state, uploaded_video_id
 
         meta = self.project.meta
+        name = meta.display_name()
         known = (meta.display_title, meta.translated_title, meta.title)
-        order = self._video_settings["video_title_order"]
         windows = self._windows_for_current_selection()
         mode = self.video_mode.currentData()
         total = len(windows)
@@ -4717,11 +4759,14 @@ class VideoTab(QWidget):
                 str(read_upload_state(path).get("title") or "").strip()
                 or self._read_sidecar(window, whole_novel, ".title.txt")
             )
-            fresh = retitle(current, meta.display_name(), known, order)
-            if not fresh:
-                continue  # hand-written, or already right
-            label = "Toàn bộ" if whole_novel else f"Phần {self._part_number(window)}"
-            rows.append((window, label, whole_novel, fresh))
+            if not is_generated_title(current, name, known):
+                continue  # hand-written, or a name this novel never had
+            part_num = None if whole_novel else self._part_number(window)
+            target = self._part_title(part_num)
+            if target == current:
+                continue  # already right
+            label = "Toàn bộ" if whole_novel else f"Phần {part_num}"
+            rows.append((window, label, whole_novel, target))
         return rows
 
     def _start_title_update(self) -> None:

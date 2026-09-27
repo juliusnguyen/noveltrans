@@ -5362,18 +5362,26 @@ class TestRenumberParts:
         assert sidecar.read_text(encoding="utf-8").strip() == tab._part_title(75)
         tab.shutdown()
 
-    def test_a_published_title_is_left_matching_youtube(
+    def test_a_published_title_is_rewritten_and_the_channel_title_remembered(
         self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
     ):
+        """Feature 101 inverted this: leaving a published sidecar alone only made the
+        detail dialog disagree with the table, and nothing offered to fix the channel.
+        The sidecar now follows the new number, and the title YouTube actually shows is
+        moved to `upload_state["title"]` first so "Cập nhật tiêu đề" can still spot the
+        difference."""
+        from noveltrans.youtube_upload import read_upload_state
+
         path = self._project(library_dir, sample_meta, 20)
         tab = self._tab_on_project(tmp_path, path)
         windows = tab._windows_for_current_selection()
         out, sidecar = self._render_part(tab, windows[0], tab._part_title(1))
-        self._publish(out)
-        original = sidecar.read_text(encoding="utf-8")
+        self._publish(out)  # published, with NO title recorded — the legacy shape
+        original = sidecar.read_text(encoding="utf-8").strip()
 
         self._renumber(tab, monkeypatch, windows[0], 75)
-        assert sidecar.read_text(encoding="utf-8") == original
+        assert sidecar.read_text(encoding="utf-8").strip() == tab._part_title(75)
+        assert read_upload_state(out).get("title") == original
         tab.shutdown()
 
     def test_a_hand_written_title_is_left_alone(
@@ -5655,4 +5663,339 @@ class TestMergeAcrossDisabled:
         # The merged part is the earlier one extended, so it keeps number 1; the tail
         # still carries the correction the user made.
         assert [tab._part_number(w) for w in windows] == [1, 75]
+        tab.shutdown()
+
+
+class TestRenumberTitleSync:
+    """Feature 101: a renumber has to reach the title everywhere — the detail dialog and
+    the `.title.txt`, published or not — and a published part must then be offered under
+    "Cập nhật tiêu đề" so the new number can be pushed to YouTube."""
+
+    _project = TestRenumberParts._project
+    _tab_on_project = TestRenumberParts._tab_on_project
+    _yes = TestRenumberParts._yes
+    _renumber = TestRenumberParts._renumber
+    _numbers = TestRenumberParts._numbers
+    _render_part = TestRenumberParts._render_part
+
+    def _publish_record(self, tab, window, title, *, video_id="dQw4w9WgXcQ"):
+        """A part live on the channel, with the title YouTube shows recorded."""
+        from noveltrans.youtube_upload import STATE_PUBLISHED, write_upload_state
+
+        out = tab._part_output_path(window, whole_novel=False)
+        fields = {"status": STATE_PUBLISHED, "title": title}
+        if video_id:
+            fields["video_id"] = video_id
+        write_upload_state(out, **fields)
+        return out
+
+    def _sidecar_only(self, tab, window, title):
+        """A `.title.txt` with no `.mp4` — a video deleted after upload to free space."""
+        sidecar = tab._part_sidecar(window, False, ".title.txt")
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(title + "\n", encoding="utf-8")
+        return sidecar
+
+    # ------------------------------------------------- cause 2: the .mp4 is gone
+
+    def test_a_sidecar_with_no_video_is_still_rewritten(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        window = tab._windows_for_current_selection()[0]
+        sidecar = self._sidecar_only(tab, window, tab._part_title(1))
+        assert not tab._part_output_path(window, whole_novel=False).is_file()
+
+        self._renumber(tab, monkeypatch, window, 75)
+        assert sidecar.read_text(encoding="utf-8").strip() == tab._part_title(75)
+        tab.shutdown()
+
+    # --------------------------------------- cause 1: published, the detail dialog
+
+    def test_a_published_part_detail_dialog_shows_the_new_number(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        window = tab._windows_for_current_selection()[0]
+        self._render_part(tab, window, tab._part_title(1))
+        self._publish_record(tab, window, tab._part_title(1))
+
+        self._renumber(tab, monkeypatch, window, 75)
+        w = tab._windows_for_current_selection()[0]
+        title, _, _ = tab._part_metadata(w, tab._part_number(w), False)
+        assert title == tab._part_title(75)
+        tab.shutdown()
+
+    # ------------------------------------------- cause 1: published, the push to YouTube
+
+    def test_a_renumbered_published_part_is_offered_for_a_title_update(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        for window in tab._windows_for_current_selection():
+            self._render_part(tab, window, tab._part_title(tab._part_number(window)))
+            self._publish_record(tab, window, tab._part_title(tab._part_number(window)))
+
+        self._renumber(tab, monkeypatch, tab._windows_for_current_selection()[0], 75)
+
+        rows = tab._title_update_rows()
+        assert [(label, title) for (_w, label, _wn, title) in rows] == [
+            ("Phần 75", tab._part_title(75)),
+            ("Phần 76", tab._part_title(76)),
+        ]
+        tab.shutdown()
+
+    # ------------------------------------------------- the channel-title backfill
+
+    def test_an_already_recorded_channel_title_is_not_overwritten(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        from noveltrans.youtube_upload import read_upload_state
+
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        window = tab._windows_for_current_selection()[0]
+        self._render_part(tab, window, tab._part_title(1))
+        out = self._publish_record(tab, window, "Tên trên kênh - Phần 1")
+
+        self._renumber(tab, monkeypatch, window, 75)
+        # The recorded title is what YouTube shows; the sidecar was never the source here.
+        assert read_upload_state(out).get("title") == "Tên trên kênh - Phần 1"
+        tab.shutdown()
+
+    def test_a_published_sidecar_with_no_video_is_rewritten_and_backfilled(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        """Row 3 of the reported table, published: the .mp4 was deleted after upload, so
+        the sidecar is the only copy of the channel title."""
+        from noveltrans.youtube_upload import STATE_PUBLISHED, read_upload_state, write_upload_state
+
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        window = tab._windows_for_current_selection()[0]
+        sidecar = self._sidecar_only(tab, window, tab._part_title(1))
+        out = tab._part_output_path(window, whole_novel=False)
+        write_upload_state(out, status=STATE_PUBLISHED, video_id="abc123")
+        original = sidecar.read_text(encoding="utf-8").strip()
+
+        self._renumber(tab, monkeypatch, window, 75)
+        assert sidecar.read_text(encoding="utf-8").strip() == tab._part_title(75)
+        assert read_upload_state(out).get("title") == original
+        tab.shutdown()
+
+    # ------------------------------------------------------------- guards preserved
+
+    def test_a_published_hand_written_title_is_neither_rewritten_nor_offered(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        window = tab._windows_for_current_selection()[0]
+        _, sidecar = self._render_part(tab, window, "Bản đặc biệt - Phần 3")
+        self._publish_record(tab, window, "Bản đặc biệt - Phần 3")
+
+        self._renumber(tab, monkeypatch, window, 75)
+        assert sidecar.read_text(encoding="utf-8").strip() == "Bản đặc biệt - Phần 3"
+        assert tab._title_update_rows() == []
+        tab.shutdown()
+
+    def test_a_hand_marked_part_is_rewritten_but_never_offered(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        """Marked "đã tải lên" by hand: no video id, so we cannot address the video on the
+        channel — but the sidecar is what a future re-upload would send, so it follows."""
+        from noveltrans.youtube_upload import mark_uploaded_by_hand
+
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        window = tab._windows_for_current_selection()[0]
+        out, sidecar = self._render_part(tab, window, tab._part_title(1))
+        mark_uploaded_by_hand(out)
+
+        self._renumber(tab, monkeypatch, window, 75)
+        assert sidecar.read_text(encoding="utf-8").strip() == tab._part_title(75)
+        assert tab._title_update_rows() == []
+        tab.shutdown()
+
+    # ------------------------------------------------- nothing reaches YouTube on its own
+
+    def test_a_renumber_never_starts_a_title_worker(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        window = tab._windows_for_current_selection()[0]
+        self._render_part(tab, window, tab._part_title(1))
+        self._publish_record(tab, window, tab._part_title(1))
+
+        self._renumber(tab, monkeypatch, window, 75)
+        assert tab._title_worker is None
+        tab.shutdown()
+
+    def test_declining_the_push_confirmation_sends_nothing(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        from PySide6.QtWidgets import QMessageBox
+
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        window = tab._windows_for_current_selection()[0]
+        self._render_part(tab, window, tab._part_title(1))
+        self._publish_record(tab, window, tab._part_title(1))
+        self._renumber(tab, monkeypatch, window, 75)
+        assert tab._title_update_rows()  # there IS something pending
+
+        monkeypatch.setattr(
+            QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.No
+        )
+        tab._start_title_update()
+        assert tab._title_worker is None
+        tab.shutdown()
+
+    def test_the_status_line_points_at_the_push_button(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        window = tab._windows_for_current_selection()[0]
+        self._render_part(tab, window, tab._part_title(1))
+        self._publish_record(tab, window, tab._part_title(1))
+
+        self._renumber(tab, monkeypatch, window, 75)
+        assert "Cập nhật tiêu đề" in tab.status_label.text()
+        tab.shutdown()
+
+    def test_the_confirm_dialog_points_at_the_push_button(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        window = tab._windows_for_current_selection()[0]
+        self._render_part(tab, window, tab._part_title(1))
+        self._publish_record(tab, window, tab._part_title(1))
+
+        from PySide6.QtWidgets import QInputDialog
+
+        monkeypatch.setattr(QInputDialog, "getInt", lambda *a, **k: (75, True))
+        asked = self._yes(monkeypatch)
+        tab._renumber_part(window, tab._windows_for_current_selection())
+
+        message = asked[0][2]
+        assert "bấm “Cập nhật tiêu đề”" in message
+        assert "bạn cần tự sửa trên YouTube" not in message
+        tab.shutdown()
+
+    # ---------------------------------------------------------- composition regressions
+    #
+    # The point of rebuilding the target from scratch rather than patching the channel
+    # title per-change: a rename, an order flip and a renumber can all be pending at once,
+    # and there is no precedence rule to get wrong. These pin that.
+
+    _combo_tab = TestDisplayTitleUi._tab
+    _combo_project = TestDisplayTitleUi._project
+    _published_full = TestTitleUpdateOnYouTube._published_part
+
+    def _pending_renumber(self, tab, delta=74):
+        """Correct the first part's number without touching anything else."""
+        from noveltrans.video_part_numbers import write_part_offsets
+
+        first = tab._windows_for_current_selection()[0].first_num
+        write_part_offsets(tab.project.path, {first: delta})
+
+    def _titles(self, tab):
+        return [(label, title) for (_w, label, _wn, title) in tab._title_update_rows()]
+
+    def test_a_renumber_alone_is_noticed(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._combo_tab(tmp_path, self._combo_project(library_dir, sample_meta, sample_refs))
+        name = tab.project.meta.display_name()
+        self._published_full(tab, f"{name} - Phần 1")
+        self._pending_renumber(tab)
+
+        assert self._titles(tab) == [("Phần 75", f"{name} - Phần 75")]
+        tab.shutdown()
+
+    def test_a_renumber_plus_an_order_flip(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._combo_tab(tmp_path, self._combo_project(library_dir, sample_meta, sample_refs))
+        name = tab.project.meta.display_name()
+        self._published_full(tab, f"{name} - Phần 1")
+        self._pending_renumber(tab)
+        tab._set_combo(tab.title_order_combo, "part_first")
+
+        assert self._titles(tab) == [("Phần 75", f"Phần 75 - {name}")]
+        tab.shutdown()
+
+    def test_a_renumber_plus_a_rename(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._combo_tab(tmp_path, self._combo_project(library_dir, sample_meta, sample_refs))
+        old_name = tab.project.meta.display_name()
+        self._published_full(tab, f"{old_name} - Phần 1")
+        self._pending_renumber(tab)
+        tab.display_title_edit.setText("Tên Mới")
+        tab._save_display_title()
+
+        assert self._titles(tab) == [("Phần 75", "Tên Mới - Phần 75")]
+        tab.shutdown()
+
+    def test_a_renumber_plus_a_rename_plus_an_order_flip(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._combo_tab(tmp_path, self._combo_project(library_dir, sample_meta, sample_refs))
+        old_name = tab.project.meta.display_name()
+        self._published_full(tab, f"{old_name} - Phần 1")
+        self._pending_renumber(tab)
+        tab.display_title_edit.setText("Tên Mới")
+        tab._save_display_title()
+        tab._set_combo(tab.title_order_combo, "part_first")
+
+        assert self._titles(tab) == [("Phần 75", "Phần 75 - Tên Mới")]
+        tab.shutdown()
+
+    def test_an_order_flip_on_an_already_pushed_renumber_keeps_the_corrected_number(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        """The channel already carries 75 from an earlier push. An order flip must offer
+        75 — the EFFECTIVE number — not the automatic one the grid would compute."""
+        tab = self._combo_tab(tmp_path, self._combo_project(library_dir, sample_meta, sample_refs))
+        name = tab.project.meta.display_name()
+        self._pending_renumber(tab)
+        self._published_full(tab, f"{name} - Phần 75")  # already pushed at 75
+        tab._set_combo(tab.title_order_combo, "part_first")
+
+        assert self._titles(tab) == [("Phần 75", f"Phần 75 - {name}")]
+        tab.shutdown()
+
+    def test_nothing_is_offered_when_the_channel_already_matches(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._combo_tab(tmp_path, self._combo_project(library_dir, sample_meta, sample_refs))
+        name = tab.project.meta.display_name()
+        self._pending_renumber(tab)
+        self._published_full(tab, f"{name} - Phần 75")
+
+        assert self._titles(tab) == []
+        tab.shutdown()
+
+    def test_after_a_reset_the_automatic_number_is_offered_back(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        """The symmetry that rules out gating the diff on "an offset exists": once the
+        offsets are cleared, the channel still carries 75 and must be offered back at 1."""
+        tab = self._combo_tab(tmp_path, self._combo_project(library_dir, sample_meta, sample_refs))
+        name = tab.project.meta.display_name()
+        self._pending_renumber(tab)
+        self._published_full(tab, f"{name} - Phần 75")
+        assert self._titles(tab) == []  # channel agrees while the correction stands
+
+        self._yes(monkeypatch)
+        tab._reset_part_numbers()
+
+        assert self._titles(tab) == [("Phần 1", f"{name} - Phần 1")]
         tab.shutdown()
