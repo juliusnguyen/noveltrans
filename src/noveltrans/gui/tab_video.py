@@ -136,6 +136,12 @@ class VideoTab(QWidget):
         self._locked_part_numbers: dict[int, int] = {}
         self._locked_committed: dict[int, int] = {}
         self._locked_manual: dict[int, int] = {}
+        # Manual "Phần N" corrections for the edition currently on screen, refreshed once
+        # per `_windows_for_current_selection` — `_part_number` runs once per row in
+        # several loops, and re-reading the sidecar each time would be wasteful. See
+        # `noveltrans.video_part_numbers` for why they are stored apart from the manual
+        # split/merge boundaries.
+        self._part_offsets: dict[int, int] = {}
         # Part folder names whose `.txt` description no longer matches the database but
         # was customised (AI-shortened), so `_resync_description_sidecars` refused to
         # overwrite it. Consumed by `_chapter_range_item` and the detail dialog.
@@ -716,8 +722,15 @@ class VideoTab(QWidget):
         if self.project is None:
             return []
         from noveltrans.tts.merge import plan_merge_windows
+        from noveltrans.video_part_numbers import read_part_offsets
 
         voice = self.voice_combo.currentData() or self.voice_combo.currentText().strip()
+        # Refreshed here, before either branch below, so the locked batch plan and the
+        # plain-arithmetic fallback in `_part_number` see the same corrections — and keyed
+        # by edition, since the chapter plan and the source plan number independently.
+        self._part_offsets = read_part_offsets(
+            self.project.path, source_audio=(voice == SOURCE_AUDIO_KEY)
+        )
         mode = self.video_mode.currentData()
         start = self.video_range_from.value() if mode == "range" else None
         end = self.video_range_to.value() if mode == "range" else None
@@ -775,6 +788,7 @@ class VideoTab(QWidget):
             discover_committed_video_windows,
             plan_locked_video_windows,
         )
+        from noveltrans.video_part_numbers import apply_part_offsets
         from noveltrans.video_windows import read_manual_windows
 
         slug = self.project.meta.slug_name()
@@ -792,7 +806,12 @@ class VideoTab(QWidget):
         # here would mis-number a per-row "Tạo lại" clicked before the next refresh —
         # `_render_one` reads `_part_number` without re-planning first.
         if honor_committed:
-            self._locked_part_numbers = {w.first_num: part_num for part_num, w in plan}
+            # The manual "Phần N" corrections ride on top of the planned numbering rather
+            # than inside it: `plan_locked_video_windows` never sees them, so a correction
+            # can shift what a part is CALLED and never what chapters it covers.
+            self._locked_part_numbers = apply_part_offsets(
+                {w.first_num: part_num for part_num, w in plan}, self._part_offsets
+            )
             self._locked_committed = committed
             self._locked_manual = manual
         return [w for _, w in plan]
@@ -809,14 +828,20 @@ class VideoTab(QWidget):
         since every caller of `_part_number` first calls `_windows_for_current_selection`
         in the same method). Range/whole-novel mode has no batch grid to lock, so it keeps
         the plain arithmetic.
+
+        Either way the result carries any manual correction the user has set — already
+        folded into `_locked_part_numbers` for the batch plan, applied here for the
+        fallback, so the two branches can never disagree about what a part is called.
         """
         if self.video_mode.currentData() == "batch":
             cached = self._locked_part_numbers.get(window.first_num)
             if cached is not None:
                 return cached
         from noveltrans.tts.merge import part_number
+        from noveltrans.video_part_numbers import effective_part_number
 
-        return part_number(window.first_num, self.video_batch_size.value())
+        base = part_number(window.first_num, self.video_batch_size.value())
+        return effective_part_number(window.first_num, base, self._part_offsets)
 
     def _is_source_edition(self) -> bool:
         """Whether the parts on screen are the site's own audio edition, not chapter audio.
@@ -966,6 +991,24 @@ class VideoTab(QWidget):
             action.triggered.connect(lambda: self._merge_parts(window_a, window_b))
             menu.addSeparator()
 
+        # Renumbering, unlike split/merge, IS offered for the source edition: its
+        # corrections live under their own key in `video_part_offsets.json`, so there is
+        # no shared number space to corrupt. Batch mode only, though — "range"/"all" has
+        # no grid of parts for "and everything after" to mean anything.
+        if mode == "batch" and len(selected_windows) == 1:
+            window = selected_windows[0]
+            renumber = menu.addAction("Đổi số phần…")
+            renumber.triggered.connect(
+                lambda: self._renumber_part(window, windows)
+            )
+            if window.first_num in self._part_offsets:
+                drop = menu.addAction("Bỏ tuỳ chỉnh số phần ở phần này")
+                drop.triggered.connect(lambda: self._reset_part_numbers(anchor=window.first_num))
+            if self._part_offsets:
+                reset = menu.addAction("Đặt lại số phần tự động")
+                reset.triggered.connect(lambda: self._reset_part_numbers())
+            menu.addSeparator()
+
         created_on = menu.addAction("Đánh dấu \"Đã tạo\"")
         created_on.triggered.connect(lambda: self._bulk_set_created(paths, True))
         created_off = menu.addAction("Đánh dấu \"Chưa tạo\"")
@@ -1042,6 +1085,192 @@ class VideoTab(QWidget):
         self.status_label.setText(
             f"Đã gộp chương {window_a.first_num}–{window_a.last_num} và "
             f"{window_b.first_num}–{window_b.last_num} thành 1 phần."
+        )
+
+    # ------------------------------------------------------------- renumber parts
+
+    def _renumber_part(self, window, windows: list) -> None:
+        """Correct this part's "Phần N", dragging every later part along with it.
+
+        For when the arithmetic is right about the novel and wrong about the CHANNEL —
+        an earlier part went up as two videos, say, so everything this app plans from
+        here on is one ahead of what viewers see. The correction is remembered per novel
+        (`noveltrans.video_part_numbers`) and composes with any earlier one.
+
+        Nothing on disk is renamed: a part's file is named after its chapter range, not
+        its number (`tts.video.video_part_name`), which is exactly why this is safe where
+        a split or a merge has to delete the rendered file.
+        """
+        from noveltrans.video_part_numbers import renumber_part
+
+        numbers = {w.first_num: self._part_number(w) for w in windows}
+        current = numbers.get(window.first_num)
+        if current is None:
+            return  # the table is out of step with the plan; do nothing rather than guess
+        earlier = [f for f in numbers if f < window.first_num]
+        floor = numbers[max(earlier)] + 1 if earlier else 1
+
+        new_num, ok = QInputDialog.getInt(
+            self, "Đổi số phần",
+            f"Phần này đang là Phần {current} "
+            f"(chương {window.first_num}–{window.last_num}).\n"
+            "Số phần mới (các phần SAU sẽ dời theo, các phần trước giữ nguyên):",
+            current, max(1, floor), 9999,
+        )
+        if not ok or new_num == current:
+            return
+        if not self._confirm_renumber(window, windows, numbers, new_num):
+            return
+
+        try:
+            renumber_part(
+                self.project.path, numbers, window.first_num, new_num,
+                source_audio=self._is_source_edition(),
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Đổi số phần", str(exc))
+            return
+
+        moved = self._apply_renumber(windows, numbers)
+        note = f" Đã cập nhật tiêu đề {moved} phần đã tạo." if moved else ""
+        later = sum(1 for f in numbers if f > window.first_num)
+        self.status_label.setText(
+            f"Đã đổi Phần {current} thành Phần {new_num} — {later} phần sau dời theo."
+            f"{note}"
+        )
+
+    def _reset_part_numbers(self, *, anchor: int | None = None) -> None:
+        """Drop the manual numbering — one breakpoint (`anchor`) or all of them."""
+        from noveltrans.video_part_numbers import clear_part_offset_at, clear_part_offsets
+
+        if self.project is None:
+            return
+        message = (
+            f"Bỏ tuỳ chỉnh số phần bắt đầu từ chương {anchor} và quay lại đánh số tự động "
+            "cho các phần sau nó?"
+            if anchor is not None
+            else "Bỏ mọi tuỳ chỉnh số phần của truyện này và quay lại đánh số tự động?"
+        )
+        if QMessageBox.question(self, "Đặt lại số phần", message) != (
+            QMessageBox.StandardButton.Yes
+        ):
+            return
+
+        windows = self._windows_for_current_selection()
+        numbers = {w.first_num: self._part_number(w) for w in windows}
+        source = self._is_source_edition()
+        if anchor is not None:
+            clear_part_offset_at(self.project.path, anchor, source_audio=source)
+        else:
+            clear_part_offsets(self.project.path, source_audio=source)
+
+        moved = self._apply_renumber(windows, numbers)
+        note = f" Đã cập nhật tiêu đề {moved} phần đã tạo." if moved else ""
+        self.status_label.setText(
+            f"Đã đặt lại số phần theo đánh số tự động.{note}"
+        )
+
+    def _apply_renumber(self, windows: list, old_numbers: dict) -> int:
+        """Re-plan after an offset write, rewrite affected titles, refresh the table.
+
+        Re-planning rather than trusting a returned map: `_locked_part_numbers` is stale
+        the moment the sidecar changes, and every consumer of `_part_number` reads it.
+        """
+        # Refreshes `_part_offsets` AND `_locked_part_numbers` from the new sidecar.
+        windows = self._windows_for_current_selection()
+        new_numbers = {w.first_num: self._part_number(w) for w in windows}
+        moved = self._renumber_title_sidecars(windows, old_numbers, new_numbers)
+        self._refresh_video_list()
+        return moved
+
+    def _renumber_title_sidecars(
+        self, windows: list, old_numbers: dict, new_numbers: dict
+    ) -> int:
+        """Rewrite `.title.txt` for every rendered part whose number just changed.
+
+        Skips the two cases `resync_title_sidecars` skips, for the same reasons: a
+        hand-written title is not ours to rewrite, and a PUBLISHED part's sidecar should
+        keep matching what is actually on the channel — the number there can only be
+        fixed on YouTube itself. Returns how many were rewritten.
+
+        The `.jpg` bakes "PHẦN N" too, but is deliberately left alone: regenerating it
+        would discard a cover tuned in the thumbnail editor. The caller says so instead.
+        """
+        from noveltrans.rename import title_name
+        from noveltrans.youtube_upload import is_published
+
+        meta = self.project.meta
+        known = {
+            (name or "").strip()
+            for name in (
+                meta.display_name(), meta.display_title, meta.translated_title, meta.title
+            )
+            if (name or "").strip()
+        }
+        rewritten = 0
+        for window in windows:
+            first = window.first_num
+            if old_numbers.get(first) == new_numbers.get(first):
+                continue
+            out = self._part_output_path(window, whole_novel=False)
+            if not out.is_file() or is_published(out):
+                continue
+            sidecar = self._part_sidecar(window, False, ".title.txt")
+            if not sidecar.is_file():
+                continue
+            if title_name(sidecar.read_text(encoding="utf-8").strip()) not in known:
+                continue  # hand-written, or a name this novel never had
+            sidecar.write_text(
+                self._part_title(new_numbers[first]) + "\n", encoding="utf-8"
+            )
+            rewritten += 1
+        return rewritten
+
+    def _confirm_renumber(
+        self, window, windows: list, numbers: dict, new_num: int
+    ) -> bool:
+        """Confirmation for a renumber — deliberately NOT `_confirm_restructure`, whose
+        text promises the old files will be deleted. Here nothing is renamed or deleted;
+        only the number inside titles and covers moves."""
+        from noveltrans.youtube_upload import is_published
+
+        current = numbers[window.first_num]
+        delta = new_num - current
+        later = sorted(f for f in numbers if f > window.first_num)
+        affected = [w for w in windows if w.first_num >= window.first_num]
+        rendered = [
+            w for w in affected
+            if self._part_output_path(w, whole_novel=False).is_file()
+        ]
+        uploaded = [
+            w for w in affected
+            if is_published(self._part_output_path(w, whole_novel=False))
+        ]
+
+        message = f"Sẽ đổi Phần {current} → Phần {new_num}."
+        if later:
+            nxt = numbers[later[0]]
+            message += (
+                f" {len(later)} phần sau đó cũng dời {delta:+d} "
+                f"(Phần {nxt} → Phần {nxt + delta}…)."
+            )
+        message += (
+            " Các phần trước giữ nguyên.\n\n"
+            "Tên file KHÔNG đổi — chỉ số phần trong tiêu đề và ảnh bìa."
+        )
+        if rendered:
+            message += (
+                f"\n\n{len(rendered)} phần trong đó đã có video — tiêu đề sẽ được ghi "
+                "lại; bấm “Tạo lại tất cả ảnh bìa” để cập nhật ảnh bìa."
+            )
+        if uploaded:
+            message += (
+                f"\n\n⚠️ {len(uploaded)} phần đã tải lên YouTube. Tiêu đề trên kênh sẽ "
+                "KHÔNG tự đổi — bạn cần tự sửa trên YouTube."
+            )
+        message += "\n\nTiếp tục?"
+        return QMessageBox.question(self, "Đổi số phần", message) == (
+            QMessageBox.StandardButton.Yes
         )
 
     def _confirm_restructure(self, windows: list, *, title: str, action_desc: str) -> bool:
@@ -1385,6 +1614,8 @@ class VideoTab(QWidget):
         )
 
     def _rebuild_video_rows(self) -> None:
+        from noveltrans.video_part_numbers import effective_part_number
+
         self.video_list.setRowCount(0)
         if self.project is None:
             return
@@ -1407,6 +1638,16 @@ class VideoTab(QWidget):
             # part NUMBER — "Phần 9" / "Phần 10" / "Phần 100" sort as text in that order.
             part_item = SortableItem(label, part_num if part_num is not None else 0)
             part_item.setData(Qt.ItemDataRole.UserRole, window.first_num)
+            # A persisted renumber is otherwise invisible — the row just reads a number
+            # that doesn't match the grid. Say so on hover rather than with the amber
+            # warning `_chapter_range_item` uses: this one is deliberate, not a problem.
+            if part_num is not None and self._part_offsets:
+                shift = effective_part_number(window.first_num, 0, self._part_offsets)
+                if shift:
+                    part_item.setToolTip(
+                        f"Đã tuỳ chỉnh số phần — đánh số tự động là Phần "
+                        f"{part_num - shift}."
+                    )
             self.video_list.setItem(i, 0, part_item)
             range_item = self._chapter_range_item(
                 window, mode, total_chapters, novel_title, whole_novel

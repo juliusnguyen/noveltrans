@@ -816,7 +816,7 @@ class TestSplitMergeParts:
         tab = self._tab_on_project(tmp_path, path)
         menu = self._menu_for(tab, monkeypatch, 0)
         assert [a.text for a in menu.actions] == [
-            "Tạo video", "Tách phần…",
+            "Tạo video", "Tách phần…", "Đổi số phần…",
             "Đánh dấu \"Đã tạo\"", "Đánh dấu \"Chưa tạo\"",
             "Đánh dấu \"Đã tải lên\"", "Đánh dấu \"Chưa tải lên\"",
         ]
@@ -5097,4 +5097,387 @@ class TestPartsTableSorting:
         next(a for a in menu.actions if a.text == "Tạo video").trigger()
         windows = tab._windows_for_current_selection()
         assert rendered == [[windows[-1]]]  # the last part, which row 0 now shows
+        tab.shutdown()
+
+
+class TestRenumberParts:
+    """Feature 099: right-click a part to correct its "Phần N" when the published series
+    is off by one — every later part follows, earlier parts stay put."""
+
+    # Same table/menu harness as the split-merge tests; only the action differs.
+    _project = TestSplitMergeParts._project
+    _tab_on_project = TestSplitMergeParts._tab_on_project
+    _yes = TestSplitMergeParts._yes
+    _row_pos = TestSplitMergeParts._row_pos
+    _menu_for = TestSplitMergeParts._menu_for
+    _FakeMenu = TestSplitMergeParts._FakeMenu
+
+    def _numbers(self, tab):
+        """`{first_num: part number}` as the tab currently resolves them."""
+        return {
+            w.first_num: tab._part_number(w)
+            for w in tab._windows_for_current_selection()
+        }
+
+    def _renumber(self, tab, monkeypatch, window, new_num):
+        from PySide6.QtWidgets import QInputDialog
+
+        monkeypatch.setattr(QInputDialog, "getInt", lambda *a, **k: (new_num, True))
+        self._yes(monkeypatch)
+        tab._renumber_part(window, tab._windows_for_current_selection())
+
+    # ------------------------------------------------------------------ menu
+
+    def test_the_action_is_offered_for_a_single_row(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        menu = self._menu_for(tab, monkeypatch, 0)
+        assert "Đổi số phần…" in [a.text for a in menu.actions]
+        tab.shutdown()
+
+    def test_the_action_is_hidden_when_two_rows_are_selected(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        from PySide6.QtCore import QItemSelectionModel
+
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        tab.video_list.selectRow(0)
+        tab.video_list.selectionModel().select(
+            tab.video_list.model().index(1, 0),
+            QItemSelectionModel.SelectionFlag.Select
+            | QItemSelectionModel.SelectionFlag.Rows,
+        )
+        menu = self._menu_for(tab, monkeypatch, 0)
+        assert "Đổi số phần…" not in [a.text for a in menu.actions]
+        tab.shutdown()
+
+    @pytest.mark.parametrize("mode", ["range", "all"])
+    def test_the_action_is_hidden_outside_batch_mode(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch, mode
+    ):
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        tab.video_mode.setCurrentIndex(tab.video_mode.findData(mode))
+        tab._refresh_video_list()
+        menu = self._menu_for(tab, monkeypatch, 0)
+        assert "Đổi số phần…" not in [a.text for a in menu.actions]
+        tab.shutdown()
+
+    def test_the_reset_actions_appear_only_once_a_correction_exists(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        assert "Đặt lại số phần tự động" not in [
+            a.text for a in self._menu_for(tab, monkeypatch, 0).actions
+        ]
+
+        windows = tab._windows_for_current_selection()
+        self._renumber(tab, monkeypatch, windows[0], 75)
+
+        texts = [a.text for a in self._menu_for(tab, monkeypatch, 0).actions]
+        assert "Đặt lại số phần tự động" in texts
+        assert "Bỏ tuỳ chỉnh số phần ở phần này" in texts
+        # The second row is not itself an anchor, so only the blunt reset is offered.
+        texts = [a.text for a in self._menu_for(tab, monkeypatch, 1).actions]
+        assert "Bỏ tuỳ chỉnh số phần ở phần này" not in texts
+        tab.shutdown()
+
+    # ------------------------------------------------------- the renumber itself
+
+    def test_the_case_from_the_request(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        # Parts read 75, 76, 77; correcting 75 to 74 must pull 76 and 77 down with it.
+        path = self._project(library_dir, sample_meta, 30)  # batch 10 → 3 parts
+        tab = self._tab_on_project(tmp_path, path)
+        windows = tab._windows_for_current_selection()
+        self._renumber(tab, monkeypatch, windows[0], 75)
+        assert self._numbers(tab) == {1: 75, 11: 76, 21: 77}
+
+        self._renumber(tab, monkeypatch, windows[0], 74)
+        assert self._numbers(tab) == {1: 74, 11: 75, 21: 76}
+        tab.shutdown()
+
+    def test_earlier_parts_are_left_alone(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        path = self._project(library_dir, sample_meta, 30)
+        tab = self._tab_on_project(tmp_path, path)
+        windows = tab._windows_for_current_selection()
+        self._renumber(tab, monkeypatch, windows[1], 5)  # the middle part
+        assert self._numbers(tab) == {1: 1, 11: 5, 21: 6}
+        tab.shutdown()
+
+    def test_the_correction_survives_a_reopen(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        self._renumber(tab, monkeypatch, tab._windows_for_current_selection()[0], 75)
+        tab.shutdown()
+
+        reopened = self._tab_on_project(tmp_path, path)
+        assert self._numbers(reopened) == {1: 75, 11: 76}
+        reopened.shutdown()
+
+    def test_a_rejected_renumber_warns_and_changes_nothing(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        from PySide6.QtWidgets import QInputDialog, QMessageBox
+
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        windows = tab._windows_for_current_selection()
+        before = self._numbers(tab)
+
+        # Part 2 down to 1 collides with part 1 — the spinbox floor would normally stop
+        # this, so drive the pure layer's refusal directly.
+        monkeypatch.setattr(QInputDialog, "getInt", lambda *a, **k: (1, True))
+        monkeypatch.setattr(
+            QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes
+        )
+        warned = []
+        monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warned.append(a))
+        tab._renumber_part(windows[1], windows)
+
+        assert warned and "lớn hơn 1" in warned[0][2]
+        assert self._numbers(tab) == before
+        tab.shutdown()
+
+    def test_cancelling_the_dialog_changes_nothing(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        from PySide6.QtWidgets import QInputDialog
+
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        windows = tab._windows_for_current_selection()
+        monkeypatch.setattr(QInputDialog, "getInt", lambda *a, **k: (75, False))
+        tab._renumber_part(windows[0], windows)
+        assert self._numbers(tab) == {1: 1, 11: 2}
+        tab.shutdown()
+
+    # ----------------------------------------------------------- what the user sees
+
+    def test_the_table_title_and_sort_key_follow_the_new_number(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        from noveltrans.gui.widgets import SORT_ROLE
+
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        self._renumber(tab, monkeypatch, tab._windows_for_current_selection()[0], 75)
+
+        assert tab.video_list.item(0, 0).text() == "Phần 75"
+        assert tab.video_list.item(0, 0).data(SORT_ROLE) == 75
+        assert tab.video_list.item(0, 3).text() == tab._part_title(75)
+        assert tab.video_list.item(1, 0).text() == "Phần 76"
+        tab.shutdown()
+
+    def test_a_corrected_row_says_what_the_automatic_number_was(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        assert tab.video_list.item(0, 0).toolTip() == ""
+
+        self._renumber(tab, monkeypatch, tab._windows_for_current_selection()[0], 75)
+        assert "đánh số tự động là Phần 1" in tab.video_list.item(0, 0).toolTip()
+        assert "đánh số tự động là Phần 2" in tab.video_list.item(1, 0).toolTip()
+        tab.shutdown()
+
+    # ------------------------------------------------------------ what gets rendered
+
+    def test_rendering_one_row_uses_the_corrected_number(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        image = tmp_path / "bg.png"
+        image.write_bytes(b"fake")
+        tab.video_image_edit.setText(str(image))
+        self._renumber(tab, monkeypatch, tab._windows_for_current_selection()[0], 75)
+
+        captured = {}
+        monkeypatch.setattr(tab, "_launch_video", lambda **kw: captured.update(kw))
+        tab._render_one(tab._windows_for_current_selection()[1])
+        assert captured["part_num"] == 76
+        tab.shutdown()
+
+    def test_rendering_a_selection_passes_the_corrected_numbers(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        image = tmp_path / "bg.png"
+        image.write_bytes(b"fake")
+        tab.video_image_edit.setText(str(image))
+        self._renumber(tab, monkeypatch, tab._windows_for_current_selection()[0], 75)
+
+        captured = {}
+        monkeypatch.setattr(tab, "_launch_video", lambda **kw: captured.update(kw))
+        self._yes(monkeypatch)
+        windows = tab._windows_for_current_selection()
+        tab._render_selected_parts(windows)
+        assert captured["explicit_part_numbers"] == {1: 75, 11: 76}
+        tab.shutdown()
+
+    # ------------------------------------------------------------------- sidecars
+
+    def _render_part(self, tab, window, title):
+        """Fake a rendered part: the .mp4 plus its .title.txt sidecar."""
+        out = tab._part_output_path(window, whole_novel=False)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"rendered")
+        sidecar = tab._part_sidecar(window, False, ".title.txt")
+        sidecar.write_text(title + "\n", encoding="utf-8")
+        return out, sidecar
+
+    def _publish(self, out):
+        """Mark a rendered part as live on the channel, via the real state format."""
+        import json
+
+        from noveltrans.youtube_upload import STATE_PUBLISHED, upload_state_path
+
+        upload_state_path(out).write_text(
+            json.dumps({"status": STATE_PUBLISHED}), encoding="utf-8"
+        )
+
+    def test_a_rendered_unpublished_title_is_rewritten(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        windows = tab._windows_for_current_selection()
+        _, sidecar = self._render_part(tab, windows[0], tab._part_title(1))
+
+        self._renumber(tab, monkeypatch, windows[0], 75)
+        assert sidecar.read_text(encoding="utf-8").strip() == tab._part_title(75)
+        tab.shutdown()
+
+    def test_a_published_title_is_left_matching_youtube(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        windows = tab._windows_for_current_selection()
+        out, sidecar = self._render_part(tab, windows[0], tab._part_title(1))
+        self._publish(out)
+        original = sidecar.read_text(encoding="utf-8")
+
+        self._renumber(tab, monkeypatch, windows[0], 75)
+        assert sidecar.read_text(encoding="utf-8") == original
+        tab.shutdown()
+
+    def test_a_hand_written_title_is_left_alone(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        windows = tab._windows_for_current_selection()
+        _, sidecar = self._render_part(tab, windows[0], "Bản đặc biệt - Phần 3")
+
+        self._renumber(tab, monkeypatch, windows[0], 75)
+        assert sidecar.read_text(encoding="utf-8").strip() == "Bản đặc biệt - Phần 3"
+        tab.shutdown()
+
+    def test_the_rendered_file_is_neither_renamed_nor_deleted(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        # The whole reason a renumber is cheap where a split/merge is not: a part's file
+        # is named after its chapter range, so the number can move without touching it.
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        windows = tab._windows_for_current_selection()
+        out, _ = self._render_part(tab, windows[0], tab._part_title(1))
+        before = sorted(p.name for p in out.parent.iterdir())
+
+        self._renumber(tab, monkeypatch, windows[0], 75)
+        assert out.is_file()
+        assert sorted(p.name for p in out.parent.iterdir()) == before
+        tab.shutdown()
+
+    # ---------------------------------------------------------------------- reset
+
+    def test_reset_restores_the_automatic_numbering(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        self._renumber(tab, monkeypatch, tab._windows_for_current_selection()[0], 75)
+
+        self._yes(monkeypatch)
+        tab._reset_part_numbers()
+        assert self._numbers(tab) == {1: 1, 11: 2}
+        tab.shutdown()
+
+    def test_reset_rewrites_the_titles_back(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        path = self._project(library_dir, sample_meta, 20)
+        tab = self._tab_on_project(tmp_path, path)
+        windows = tab._windows_for_current_selection()
+        _, sidecar = self._render_part(tab, windows[0], tab._part_title(1))
+        self._renumber(tab, monkeypatch, windows[0], 75)
+
+        self._yes(monkeypatch)
+        tab._reset_part_numbers()
+        assert sidecar.read_text(encoding="utf-8").strip() == tab._part_title(1)
+        tab.shutdown()
+
+    def test_dropping_one_anchor_keeps_the_others(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        path = self._project(library_dir, sample_meta, 30)
+        tab = self._tab_on_project(tmp_path, path)
+        windows = tab._windows_for_current_selection()
+        self._renumber(tab, monkeypatch, windows[0], 75)   # anchor at chapter 1
+        self._renumber(tab, monkeypatch, windows[2], 80)   # anchor at chapter 21
+        assert self._numbers(tab) == {1: 75, 11: 76, 21: 80}
+
+        self._yes(monkeypatch)
+        tab._reset_part_numbers(anchor=21)
+        assert self._numbers(tab) == {1: 75, 11: 76, 21: 77}
+        tab.shutdown()
+
+    def test_the_chapter_spans_are_untouched(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        """The core guarantee: a renumber moves numbers, never the chapters a part
+        covers. Split/merge is the tool for the latter."""
+        path = self._project(library_dir, sample_meta, 30)
+        tab = self._tab_on_project(tmp_path, path)
+        before = [
+            (w.first_num, w.last_num) for w in tab._windows_for_current_selection()
+        ]
+        self._renumber(tab, monkeypatch, tab._windows_for_current_selection()[0], 75)
+        after = [
+            (w.first_num, w.last_num) for w in tab._windows_for_current_selection()
+        ]
+        assert after == before == [(1, 10), (11, 20), (21, 30)]
+        tab.shutdown()
+
+    def test_a_renumber_composes_with_a_manual_split(
+        self, qapp, tmp_path, library_dir, sample_meta, monkeypatch
+    ):
+        """A split adds a real part, so everything after it legitimately moves up one —
+        and the correction rides along instead of swallowing the new part."""
+        from PySide6.QtWidgets import QInputDialog
+
+        path = self._project(library_dir, sample_meta, 30)
+        tab = self._tab_on_project(tmp_path, path)
+        windows = tab._windows_for_current_selection()
+        self._renumber(tab, monkeypatch, windows[0], 75)
+        assert self._numbers(tab) == {1: 75, 11: 76, 21: 77}
+
+        # Split the FIRST part (chương 1-10) into 1-5 and 6-10.
+        monkeypatch.setattr(QInputDialog, "getInt", lambda *a, **k: (5, True))
+        self._yes(monkeypatch)
+        tab._split_part(tab._windows_for_current_selection()[0])
+
+        assert self._numbers(tab) == {1: 75, 6: 76, 11: 77, 21: 78}
         tab.shutdown()
