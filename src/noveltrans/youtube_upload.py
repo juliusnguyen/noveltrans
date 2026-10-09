@@ -39,13 +39,14 @@ Playwright is an optional dependency (`pip install 'noveltrans[browser]'` then
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from noveltrans.browser import BrowserUnavailableError
-from noveltrans.browser import close as _close
+from noveltrans.browser import close as _close_browser
 from noveltrans.browser import launch_persistent_context, require_playwright
 from noveltrans.storage.library import DEFAULT_LIBRARY_DIR
 
@@ -862,6 +863,9 @@ def _launch_context(sync_playwright, *, headless: bool):
     Chromium — a different build with a headless-ish fingerprint — so we drive the
     *installed* Chrome. Same dedicated profile either way.
     """
+    # Reclaims what an earlier run left behind — a crash, or a version without the prune
+    # in `_close`. A no-op when another run still holds the profile.
+    prune_profile_caches()
     try:
         return launch_persistent_context(sync_playwright, profile_dir(), headless=headless)
     except BrowserUnavailableError as exc:
@@ -1022,6 +1026,67 @@ def clear_profile() -> bool:
         )
     shutil.rmtree(path)
     return True
+
+
+# Profile subtrees that only ever hold disposable data. Studio copies every file handed to
+# its upload input into its IndexedDB (resumable uploads) and never reclaims it once the
+# browser closes right after the upload — measured at 12 GB for 12 videos. The origin goes
+# whole, .blob and .leveldb together, so no metadata is left pointing at deleted blobs;
+# Studio keeps only upload drafts there. The login lives in `Cookies`, untouched.
+_DISPOSABLE_PROFILE_PATHS = (
+    ("Default", "IndexedDB", "https_studio.youtube.com_0.indexeddb.blob"),
+    ("Default", "IndexedDB", "https_studio.youtube.com_0.indexeddb.leveldb"),
+    ("Default", "Cache"),
+    ("Default", "Code Cache"),
+)
+# Chrome's "profile in use" markers: a symlink to `host-pid` on macOS/Linux, a file on Windows.
+_PROFILE_LOCK_NAMES = ("SingletonLock", "lockfile")
+
+
+def _profile_in_use(path: Path) -> bool:
+    # `lexists`, not `exists`: SingletonLock is a symlink to a target that never exists as a
+    # file, so following it would always report "free".
+    return any(os.path.lexists(path / name) for name in _PROFILE_LOCK_NAMES)
+
+
+def prune_profile_caches(path: Path | None = None) -> int:
+    """Delete Studio's upload copies and the browser caches. Returns the bytes freed.
+
+    Runs on every launch and close of the YouTube browser, so it must never raise into an
+    upload: every failure means "freed nothing". Skips a profile a browser still holds,
+    refuses a directory that does not look like a profile (same check as `clear_profile`),
+    and only removes the fixed `_DISPOSABLE_PROFILE_PATHS` — never a symlink, never
+    anything that resolves outside the profile.
+    """
+    import shutil
+
+    try:
+        path = path or profile_dir()
+        if not path.is_dir():
+            return 0
+        if not any((path / name).exists() for name in ("Default", "Local State")):
+            return 0
+        if _profile_in_use(path):
+            return 0
+        root = path.resolve()
+        freed = 0
+        for rel in _DISPOSABLE_PROFILE_PATHS:
+            target = path.joinpath(*rel)
+            if target.is_symlink() or not target.is_dir():
+                continue
+            if not target.resolve().is_relative_to(root):
+                continue
+            freed += sum(f.stat().st_size for f in target.rglob("*") if f.is_file())
+            shutil.rmtree(target, ignore_errors=True)
+        return freed
+    except Exception:
+        return 0
+
+
+def _close(context, playwright) -> None:
+    """Close the browser, then drop what the session cached. Never raises."""
+    _close_browser(context, playwright)
+    prune_profile_caches()
 
 
 def _current_channel(page) -> tuple[str, str]:
