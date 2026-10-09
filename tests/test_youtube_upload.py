@@ -881,6 +881,24 @@ class _FakePlaywright:
 
 
 class TestLaunchContext:
+    @pytest.fixture(autouse=True)
+    def _isolated_profile(self, tmp_path, monkeypatch):
+        # `_launch_context` prunes the profile first: never let that reach the real one.
+        import noveltrans.youtube_upload as yt
+
+        monkeypatch.setattr(yt, "profile_dir", lambda: tmp_path / ".youtube-profile")
+
+    def test_prunes_before_opening(self, monkeypatch):
+        """Reclaims what a crash or an older version left, before Chrome locks the profile."""
+        import noveltrans.youtube_upload as yt
+
+        fake = _FakePlaywright(working_channels=("chrome",))
+        seen = []
+        monkeypatch.setattr(yt, "prune_profile_caches", lambda: seen.append(list(fake.launched)))
+        yt._launch_context(lambda: fake, headless=False)
+        assert seen == [[]]
+        assert fake.launched == ["chrome"]
+
     def test_prefers_real_chrome(self):
         from noveltrans.youtube_upload import _launch_context
 
@@ -902,6 +920,126 @@ class TestLaunchContext:
         with pytest.raises(YouTubeUploadError, match="Không mở được trình duyệt"):
             _launch_context(lambda: fake, headless=False)
         assert fake.stopped is True  # no orphaned Playwright process
+
+
+class TestPruneProfileCaches:
+    """Studio keeps a full copy of every uploaded video in the profile — 12 GB for 12
+    videos. The prune drops those and the browser caches after every session, and has to
+    be just as careful as `clear_profile` because it deletes directory trees."""
+
+    _TARGETS = (
+        "Default/IndexedDB/https_studio.youtube.com_0.indexeddb.blob",
+        "Default/IndexedDB/https_studio.youtube.com_0.indexeddb.leveldb",
+        "Default/Cache",
+        "Default/Code Cache",
+    )
+    _KEEP = (
+        "Default/Cookies",
+        "Default/Local Storage/leveldb/000003.log",
+        "Default/IndexedDB/https_www.youtube.com_0.indexeddb.leveldb/000003.log",
+        "Local State",
+    )
+
+    def _profile(self, tmp_path, monkeypatch, *, chromium_like=True):
+        import noveltrans.youtube_upload as yt
+
+        path = tmp_path / ".youtube-profile"
+        for rel in self._TARGETS:
+            (path / rel).mkdir(parents=True)
+            (path / rel / "data").write_bytes(b"x" * 100)
+        if chromium_like:
+            for rel in self._KEEP:
+                (path / rel).parent.mkdir(parents=True, exist_ok=True)
+                (path / rel).write_text("keep", encoding="utf-8")
+        else:
+            # Not a profile: no `Local State`, and `Default` renamed out of the way.
+            (path / "Default").rename(path / "Other")
+        monkeypatch.setattr(yt, "profile_dir", lambda: path)
+        return path
+
+    def test_removes_studio_blobs_and_caches_but_keeps_the_login(self, tmp_path, monkeypatch):
+        from noveltrans.youtube_upload import prune_profile_caches
+
+        path = self._profile(tmp_path, monkeypatch)
+        assert prune_profile_caches() == 400
+        for rel in self._TARGETS:
+            assert not (path / rel).exists(), rel
+        for rel in self._KEEP:
+            assert (path / rel).read_text(encoding="utf-8") == "keep", rel
+
+    @pytest.mark.parametrize("lock", ["SingletonLock", "lockfile"])
+    def test_skips_while_a_browser_holds_the_profile(self, tmp_path, monkeypatch, lock):
+        import os
+
+        from noveltrans.youtube_upload import prune_profile_caches
+
+        path = self._profile(tmp_path, monkeypatch)
+        if lock == "SingletonLock":
+            # Chrome's lock is a dangling symlink — `exists()` would miss it.
+            os.symlink("host-123", path / lock)
+        else:
+            (path / lock).write_text("", encoding="utf-8")
+        assert prune_profile_caches() == 0
+        for rel in self._TARGETS:
+            assert (path / rel / "data").exists(), rel
+
+    def test_refuses_a_directory_that_is_not_a_profile(self, tmp_path, monkeypatch):
+        from noveltrans.youtube_upload import prune_profile_caches
+
+        path = self._profile(tmp_path, monkeypatch, chromium_like=False)
+        assert prune_profile_caches() == 0
+        assert (path / "Other" / "Cache" / "data").exists()
+
+    def test_missing_profile_is_a_noop(self, tmp_path, monkeypatch):
+        import noveltrans.youtube_upload as yt
+
+        monkeypatch.setattr(yt, "profile_dir", lambda: tmp_path / "nothing-here")
+        assert yt.prune_profile_caches() == 0
+
+    def test_never_raises_into_an_upload(self, tmp_path, monkeypatch):
+        import shutil
+
+        from noveltrans.youtube_upload import prune_profile_caches
+
+        self._profile(tmp_path, monkeypatch)
+
+        def boom(*a, **kw):
+            raise OSError("disk on fire")
+
+        monkeypatch.setattr(shutil, "rmtree", boom)
+        assert prune_profile_caches() == 0
+
+    def test_does_not_follow_a_symlinked_cache(self, tmp_path, monkeypatch):
+        import shutil
+
+        from noveltrans.youtube_upload import prune_profile_caches
+
+        path = self._profile(tmp_path, monkeypatch)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "precious").write_text("mine", encoding="utf-8")
+        shutil.rmtree(path / "Default" / "Cache")
+        (path / "Default" / "Cache").symlink_to(outside, target_is_directory=True)
+        prune_profile_caches()
+        assert (outside / "precious").read_text(encoding="utf-8") == "mine"
+
+    def test_close_prunes_after_the_browser_is_gone(self, monkeypatch):
+        """Pruning under a live Chrome would race its writes — order matters."""
+        import noveltrans.youtube_upload as yt
+
+        calls = []
+
+        class _Ctx:
+            def close(self):
+                calls.append("context.close")
+
+        class _Pw:
+            def stop(self):
+                calls.append("playwright.stop")
+
+        monkeypatch.setattr(yt, "prune_profile_caches", lambda: calls.append("prune"))
+        yt._close(_Ctx(), _Pw())
+        assert calls == ["context.close", "playwright.stop", "prune"]
 
 
 class TestStateFileIsJsonWeCanReadBack:
