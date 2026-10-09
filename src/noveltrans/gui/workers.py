@@ -2493,9 +2493,11 @@ class VideoWorker(PausableWorker):
             font_dir_context,
             plan_locked_video_windows,
             render_video,
+            resolve_part_video,
             video_font,
             video_part_name,
         )
+        from noveltrans.video_inserts import clear_rendered
         from noveltrans.video_part_numbers import (
             apply_part_offsets,
             effective_part_number,
@@ -2628,13 +2630,18 @@ class VideoWorker(PausableWorker):
                     legacy_path = project.video_dir / name
                     # Same resolution `_part_output_path` uses in the tab — the EDITION as
                     # well as the layout: prefer the per-folder path, fall back to a
-                    # pre-existing legacy flat file. If the two ever disagree about which
-                    # edition a window belongs to, the tab shows one file and the worker
-                    # writes another. This
-                    # is the exact path the "Trạng thái" tick's sidecar sits beside, so a
-                    # part manually marked "đã tạo" is skipped here too — not just file
+                    # pre-existing legacy flat file, or a part folder marked as having a
+                    # chapter inserted (feature 104) that covers this window. If the two
+                    # ever disagree, the tab shows one file and the worker writes another.
+                    # This is the exact path the "Trạng thái" tick's sidecar sits beside, so
+                    # a part manually marked "đã tạo" is skipped here too — not just file
                     # existence — even though no .mp4 has actually been rendered for it.
-                    resolved = legacy_path if not out_path.is_file() and legacy_path.is_file() else out_path
+                    resolved = resolve_part_video(
+                        project.video_dir, slug, window.first_num, window.last_num,
+                        whole_novel=whole_novel, source_audio=self.source_audio,
+                    )
+                    if resolved != legacy_path:
+                        out_path = resolved  # a legacy flat part re-renders into a folder
                     if self.skip_existing and effective_created(resolved):
                         self.progress.emit(i + 1, total, "")  # already made (or marked) — skip
                         continue
@@ -2677,6 +2684,12 @@ class VideoWorker(PausableWorker):
                             _with_real_durations, build_upload_title,
                             fit_video_description, video_font, render_thumbnail,
                         )
+                        # The inserted chapters this render actually included are no
+                        # longer missing from the video.
+                        clear_rendered(out_path, {
+                            c.index + 1 for c in window.chapters
+                            if (self.project_path / c.audio_path).is_file()
+                        })
                         written += 1
                         self.file_done.emit(str(out_path))
                     except MergeCancelled:
@@ -2903,6 +2916,7 @@ class SubtitleWorker(PausableWorker):
         from noveltrans.tts.subtitles import part_srt
         from noveltrans.tts.video import (
             _with_real_durations,
+            resolve_part_video,
             video_part_name,
         )
         from noveltrans.video_part_numbers import (
@@ -2981,6 +2995,14 @@ class SubtitleWorker(PausableWorker):
                     slug, window.first_num, window.last_num, whole_novel=whole_novel
                 )
                 out = project.video_dir / Path(name).stem / Path(name).with_suffix(".srt").name
+                # Beside the video it belongs to — which, for a part with a chapter inserted
+                # at its edge, is a folder one chapter wider than this window (feature 104).
+                video = resolve_part_video(
+                    project.video_dir, slug, window.first_num, window.last_num,
+                    whole_novel=whole_novel,
+                )
+                if video.parent != project.video_dir:  # not the legacy flat layout
+                    out = video.with_suffix(".srt")
                 if not srt.strip():
                     skipped += 1
                     continue
@@ -3160,10 +3182,14 @@ class DownloadWorker(PausableWorker):
         """The chapters this run will fetch, honouring `indices`, the range and `force`."""
         if self.indices is not None:
             wanted = set(self.indices)
-            return [c for c in project.chapters() if c.index in wanted and c.enabled]
-        if self.force:
-            return project.chapters_in_range(self.start_index, self.end_index)
-        return project.pending_download(self.start_index, self.end_index)
+            chapters = [c for c in project.chapters() if c.index in wanted and c.enabled]
+        elif self.force:
+            chapters = project.chapters_in_range(self.start_index, self.end_index)
+        else:
+            return project.pending_download(self.start_index, self.end_index)
+        # A chapter made by hand (feature 104) has no URL — nothing to fetch, and trying
+        # would only record an error on a chapter the user is filling in themselves.
+        return [c for c in chapters if c.url]
 
 
     def _fetch_with_backoff(self, adapter, chapter, done: int, total: int) -> str:

@@ -318,6 +318,14 @@ class Chapter:
     # False once the user disables this chapter: skipped everywhere (download, translate,
     # audio, video) until re-enabled. A TOC re-scan never resets this — see `replace_toc`.
     enabled: bool = True
+    # The chapter's position in the source site's TOC, which is what a re-scan matches on.
+    # -1 = made by hand (a local novel's chapters, or one inserted into a scraped novel):
+    # no URL, never downloaded, and a re-scan leaves it where the user put it.
+    toc_index: int = -1
+
+    @property
+    def is_manual(self) -> bool:
+        return self.toc_index < 0
 
     @property
     def is_downloaded(self) -> bool:

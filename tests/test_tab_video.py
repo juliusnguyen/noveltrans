@@ -5999,3 +5999,88 @@ class TestRenumberTitleSync:
 
         assert self._titles(tab) == [("Phần 1", f"{name} - Phần 1")]
         tab.shutdown()
+
+
+class TestInsertedChapterNotice:
+    """Feature 104: a part that took an inserted chapter is flagged and offered a re-render."""
+
+    def _tab(self, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch):
+        from noveltrans.video_inserts import write_marker
+
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.insert_chapter(2, "Chen")  # chapter 3 is new; the part 1-6 took it
+        slug = project.meta.slug_name()
+        video = project.video_dir / f"{slug}-0001-0006" / f"{slug}-0001-0006.mp4"
+        video.parent.mkdir(parents=True)
+        video.write_bytes(b"v")
+        write_marker(video, {"chapters": [3]})
+        path = project.path
+        project.close()
+        tab = VideoTab(_config(tmp_path))
+        monkeypatch.setattr("noveltrans.gui.tab_video.QTimer.singleShot", lambda *a: None)
+        tab._on_project_selected(str(path))
+        monkeypatch.setattr(tab, "isVisible", lambda: True)
+        return tab, video
+
+    def _boxes(self, monkeypatch, answer_yes=False):
+        from PySide6.QtWidgets import QMessageBox
+
+        shown = {"information": [], "question": []}
+        monkeypatch.setattr(
+            QMessageBox, "information", lambda *a, **k: shown["information"].append(a[2])
+        )
+        yes, no = QMessageBox.StandardButton.Yes, QMessageBox.StandardButton.No
+        monkeypatch.setattr(
+            QMessageBox, "question",
+            lambda *a, **k: shown["question"].append(a[2]) or (yes if answer_yes else no),
+        )
+        return shown
+
+    def test_note_says_what_is_missing(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        tab, video = self._tab(tmp_path, library_dir, sample_meta, sample_refs, monkeypatch)
+        note = tab._inserted_note(video)
+        assert "chương 3 “Chen”" in note and "chưa có nội dung" in note
+
+    def test_prompts_once_while_waiting_then_once_when_ready(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from noveltrans.video_inserts import read_marker
+
+        tab, video = self._tab(tmp_path, library_dir, sample_meta, sample_refs, monkeypatch)
+        shown = self._boxes(monkeypatch)
+        tab._maybe_prompt_inserted_parts()
+        tab._maybe_prompt_inserted_parts()
+        assert len(shown["information"]) == 1 and "chưa có audio" in shown["information"][0]
+        assert read_marker(video)["prompted"] == "waiting"
+
+        audio = tab.project.audio_dir / "0003-chen-v.wav"
+        audio.parent.mkdir(parents=True, exist_ok=True)
+        audio.write_bytes(b"a")
+        tab.project.save_content(2, "nội dung")
+        tab.project.save_audio(2, "exports/audio/0003-chen-v.wav", "v", 1.0)
+        rendered = []
+        monkeypatch.setattr(tab, "_render_inserted_parts", lambda videos: rendered.append(videos))
+        tab._maybe_prompt_inserted_parts()
+        tab._maybe_prompt_inserted_parts()
+        assert len(shown["question"]) == 1 and "Render lại phần này?" in shown["question"][0]
+        assert rendered == []  # answered No
+        assert read_marker(video)["prompted"] == "ready"
+
+    def test_yes_renders_the_marked_part(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        tab, video = self._tab(tmp_path, library_dir, sample_meta, sample_refs, monkeypatch)
+        tab.project.save_content(2, "nội dung")
+        audio = tab.project.audio_dir / "0003-chen-v.wav"
+        audio.parent.mkdir(parents=True, exist_ok=True)
+        audio.write_bytes(b"a")
+        tab.project.save_audio(2, "exports/audio/0003-chen-v.wav", "v", 1.0)
+        (video.parent / f"{video.stem}.upload.json").write_text("{}", encoding="utf-8")
+        shown = self._boxes(monkeypatch, answer_yes=True)
+        rendered = []
+        monkeypatch.setattr(tab, "_render_inserted_parts", lambda videos: rendered.append(videos))
+        tab._maybe_prompt_inserted_parts()
+        assert "đã tải lên YouTube" in shown["question"][0]
+        assert rendered == [{video}]
