@@ -45,6 +45,7 @@ from noveltrans.gui.widgets import (
     source_rows,
     CellEditorDelegate,
     RetranslateButtonDelegate,
+    add_enable_actions,
     enable_cell_copy,
 )
 from noveltrans.gui.workers import (
@@ -160,6 +161,7 @@ class TranslateTab(QWidget):
         self.table.setMouseTracking(True)  # hover state for the row buttons
         self.model.translated_title_edited.connect(self._on_translated_title_edited)
         self.model.enabled_toggled.connect(self._on_enabled_toggled)
+        self.model.enabled_batch_toggled.connect(self._on_enabled_batch_toggled)
         # Same clipping as the chapter title in Tải truyện: the styled QLineEdit
         # editor is taller than the row unless its padding is stripped.
         self.table.setItemDelegate(CellEditorDelegate(self.table))
@@ -479,6 +481,11 @@ class TranslateTab(QWidget):
         chapter = self.project.chapter(idx)
         if chapter is not None:
             self.model.update_chapter(chapter)
+
+    def _on_enabled_batch_toggled(self, indices: list[int], enabled: bool) -> None:
+        # See ScrapeTab: one write, no re-read.
+        if self.project is not None:
+            self.project.set_enabled_many(indices, enabled)
 
     def eventFilter(self, obj, event) -> bool:
         if event.type() == QEvent.Type.FocusOut:
@@ -1196,6 +1203,7 @@ class TranslateTab(QWidget):
         self._add_translate_action(menu, rows)
         self._add_rewrite_actions(menu, rows)
         self._add_qc_action(menu, rows)
+        add_enable_actions(menu, self.table, self.model, index)
 
     def _add_translate_action(self, menu, rows: list[int]) -> None:
         """Append "Dịch"/"Dịch lại" for `rows` — the batch behind this feature."""

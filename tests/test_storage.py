@@ -967,3 +967,23 @@ class TestRenameNovel:
         assert project.meta.display_title == "Tên mới"
         assert project.meta.slug == "ten-moi"
         project.close()
+
+
+class TestSetEnabledMany:
+    """Feature 103: the right-click skip/re-enable writes a whole selection at once."""
+
+    def test_touches_only_the_listed_chapters(self, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        assert project.set_enabled_many([1, 3, 3], False) == 2
+        assert [c.enabled for c in project.chapters()] == [True, False, True, False, True]
+        assert [c.index for c in project.pending_download()] == [0, 2, 4]
+
+    def test_is_reversible(self, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.set_enabled_many([0, 1], False)
+        project.set_enabled_many([0, 1], True)
+        assert all(c.enabled for c in project.chapters())
+
+    def test_empty_is_a_noop(self, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        assert project.set_enabled_many([], False) == 0

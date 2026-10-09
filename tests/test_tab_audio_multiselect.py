@@ -300,3 +300,27 @@ def test_row_button_ignores_a_right_click(qapp, tmp_path):
     assert fired == []  # the menu handles right-clicks; the button must stay out of it
     assert delegate.editorEvent(_release(Qt.MouseButton.LeftButton), tab.model, option, index) is True
     assert fired == [1]  # left-click still works exactly as before
+
+
+class _RecordingProject(_FakeProject):
+    def __init__(self, chapters):
+        super().__init__(chapters)
+        self.calls: list[tuple] = []
+
+    def set_enabled_many(self, indices, enabled):
+        self.calls.append((list(indices), enabled))
+        return len(indices)
+
+
+def test_skip_selection_writes_once(qapp, tmp_path):
+    """Feature 103: one write for the whole selection, not one per row."""
+    tab = _tab(qapp, tmp_path)
+    tab.project = _RecordingProject(tab.project._chapters)
+    _select_rows(tab, [1, 3, 4])
+    menu = QMenu(tab)
+    tab._table_context_actions(menu, tab.table.model().index(3, 0))
+    next(a for a in menu.actions() if a.text() == "Bỏ qua 3 chương").trigger()
+    assert tab.project.calls == [([1, 3, 4], False)]
+    assert [tab.model.chapter_at(r).enabled for r in range(6)] == [
+        True, False, True, False, False, True,
+    ]

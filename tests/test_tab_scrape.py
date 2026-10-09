@@ -482,3 +482,31 @@ class TestRenameNovel:
             encoding="utf-8"
         ).strip() == "Trọng Sinh - Phần 1"
         assert (part / f"{stem}.mp4").is_file()  # kept, as chosen
+
+
+class TestSkipFromTheMenu:
+    """Feature 103: skip / re-enable the selection from the right-click menu."""
+
+    def _labels(self, tab, row):
+        menu = QMenu(tab)
+        tab._table_context_actions(menu, tab.table.model().index(row, 0))
+        return {a.text(): a for a in menu.actions() if a.text()}
+
+    def test_skips_the_selection_and_persists(self, qapp, library_dir):
+        tab = _tab_with_project(qapp, library_dir)
+        selection = tab.table.selectionModel()
+        for row in (1, 2):
+            selection.select(
+                tab.table.model().index(row, 0),
+                selection.SelectionFlag.Select | selection.SelectionFlag.Rows,
+            )
+        self._labels(tab, 1)["Bỏ qua 2 chương"].trigger()
+        path = tab.project.path
+        reopened = NovelProject.open(path)
+        assert [c.enabled for c in reopened.chapters()] == [True, False, False, True, True]
+        reopened.close()
+
+    def test_offered_on_a_local_novel_too(self, qapp, library_dir):
+        # `_add_download_actions` returns early for a local novel; the items must survive.
+        tab = _tab_with_local_project(qapp, library_dir)
+        assert "Bỏ qua chương này" in self._labels(tab, 0)

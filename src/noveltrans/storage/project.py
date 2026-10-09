@@ -13,6 +13,7 @@ import hashlib
 import json
 import re
 import sqlite3
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -442,6 +443,21 @@ class NovelProject:
                 "UPDATE chapters SET enabled = ?, updated_at = ? WHERE idx = ?",
                 (1 if enabled else 0, _now(), idx),
             )
+
+    def set_enabled_many(self, indices: Iterable[int], enabled: bool) -> int:
+        """`set_enabled` for many chapters in one transaction. Returns rows affected.
+
+        The right-click "Bỏ qua N chương" can cover thousands of chapters; one commit per
+        chapter would stall the GUI thread that calls it.
+        """
+        now = _now()
+        rows = [(1 if enabled else 0, now, idx) for idx in sorted(set(indices))]
+        if not rows:
+            return 0
+        with self._db:
+            return self._db.executemany(
+                "UPDATE chapters SET enabled = ?, updated_at = ? WHERE idx = ?", rows
+            ).rowcount
 
     # ---------------------------------------------------------------- queries
 
