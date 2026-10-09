@@ -68,6 +68,8 @@ class Workspace(QWidget):
 
         # the scrape tab consults the host before opening a project (same-project guard)
         self.scrape_tab.can_open_project = self._can_open_project
+        # ...and before inserting a chapter, which renumbers rows other tabs' jobs hold
+        self.scrape_tab.workspace_busy = self.has_running_workers
 
         # Every workspace lists the whole library in its pickers so novels opened in
         # other tabs are choosable here too — but with no selection, so a fresh tab

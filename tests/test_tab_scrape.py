@@ -510,3 +510,135 @@ class TestSkipFromTheMenu:
         # `_add_download_actions` returns early for a local novel; the items must survive.
         tab = _tab_with_local_project(qapp, library_dir)
         assert "Bỏ qua chương này" in self._labels(tab, 0)
+
+
+class TestInsertChapter:
+    """Feature 104: right-click → add a chapter above / below, local and scraped novels."""
+
+    def _menu(self, tab, row):
+        menu = QMenu(tab)
+        tab._table_context_actions(menu, tab.table.model().index(row, 0))
+        return menu
+
+    def _labels(self, menu):
+        return [a.text() for a in menu.actions() if a.text()]
+
+    def _answer(self, monkeypatch, title="Mới", ok=True, confirm=True):
+        from PySide6.QtWidgets import QInputDialog
+
+        monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: (title, ok))
+        answers = {"question": [], "warning": [], "information": []}
+        yes, no = QMessageBox.StandardButton.Yes, QMessageBox.StandardButton.No
+        monkeypatch.setattr(
+            QMessageBox, "question",
+            lambda *a, **k: answers["question"].append(a) or (yes if confirm else no),
+        )
+        monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: answers["warning"].append(a))
+        monkeypatch.setattr(
+            QMessageBox, "information", lambda *a, **k: answers["information"].append(a)
+        )
+        return answers
+
+    def _titles(self, tab):
+        return [c.title for c in tab.project.chapters()]
+
+    def test_offered_on_local_and_scraped_novels(self, qapp, library_dir, tmp_path):
+        local = _tab_with_local_project(qapp, library_dir)
+        scraped = _tab_with_project(qapp, tmp_path / "other")
+        for tab in (local, scraped):
+            labels = self._labels(self._menu(tab, 0))
+            assert "Thêm chương phía trên" in labels and "Thêm chương phía dưới" in labels
+
+    def test_insert_below_on_a_local_novel(self, qapp, library_dir, monkeypatch):
+        tab = _tab_with_local_project(qapp, library_dir, titles=("A", "B", "C"))
+        answers = self._answer(monkeypatch, title="Chen")
+        _trigger(self._menu(tab, 0), "Thêm chương phía dưới")
+        assert self._titles(tab) == ["A", "Chen", "B", "C"]
+        assert answers["question"]  # it renumbers, so it asked first
+        assert tab.count_label.text() == "4"
+        assert tab.model.rowCount() == 4
+
+    def test_insert_above_the_first_chapter(self, qapp, library_dir, monkeypatch):
+        tab = _tab_with_local_project(qapp, library_dir, titles=("A", "B"))
+        self._answer(monkeypatch, title="Mở đầu")
+        _trigger(self._menu(tab, 0), "Thêm chương phía trên")
+        assert self._titles(tab) == ["Mở đầu", "A", "B"]
+
+    def test_insert_below_the_last_asks_nothing(self, qapp, library_dir, monkeypatch):
+        tab = _tab_with_local_project(qapp, library_dir, titles=("A", "B"))
+        answers = self._answer(monkeypatch, title="C")
+        _trigger(self._menu(tab, 1), "Thêm chương phía dưới")
+        assert self._titles(tab) == ["A", "B", "C"]
+        assert answers["question"] == []
+
+    def test_declining_the_renumber_changes_nothing(self, qapp, library_dir, monkeypatch):
+        tab = _tab_with_local_project(qapp, library_dir, titles=("A", "B"))
+        self._answer(monkeypatch, confirm=False)
+        _trigger(self._menu(tab, 0), "Thêm chương phía trên")
+        assert self._titles(tab) == ["A", "B"]
+
+    def test_cancelling_the_title_prompt_changes_nothing(self, qapp, library_dir, monkeypatch):
+        tab = _tab_with_local_project(qapp, library_dir, titles=("A", "B"))
+        self._answer(monkeypatch, ok=False)
+        _trigger(self._menu(tab, 0), "Thêm chương phía dưới")
+        assert self._titles(tab) == ["A", "B"]
+
+    def test_scraped_novel_manual_row_is_deletable_and_not_downloaded(
+        self, qapp, library_dir, monkeypatch
+    ):
+        tab = _tab_with_project(qapp, library_dir)
+        self._answer(monkeypatch, title="Ngoại truyện")
+        _trigger(self._menu(tab, 1), "Thêm chương phía dưới")
+        assert self._titles(tab)[2] == "Ngoại truyện"
+        labels = self._labels(self._menu(tab, 2))
+        assert "Xoá chương 3" in labels
+        assert "Chỉ tải lại chương 3" not in labels
+        assert "Xoá chương 1" not in self._labels(self._menu(tab, 0))  # scraped: still none
+        tab._dl_indices, tab._dl_force = None, True
+        tab._dl_start, tab._dl_end = 0, None
+        assert 2 not in [c.index for c in tab._selected_pending()]
+
+    def test_insert_over_voiced_chapters_renames_their_audio(
+        self, qapp, library_dir, monkeypatch
+    ):
+        tab = _tab_with_local_project(qapp, library_dir, titles=("A", "B", "C"))
+        audio_dir = tab.project.audio_dir
+        audio_dir.mkdir(parents=True)
+        (audio_dir / "0003-c-voice.wav").write_bytes(b"x")
+        tab.project.save_audio(2, "exports/audio/0003-c-voice.wav", "voice", 5.0)
+        answers = self._answer(monkeypatch, title="Chen")
+        _trigger(self._menu(tab, 0), "Thêm chương phía dưới")
+        assert self._titles(tab) == ["A", "Chen", "B", "C"]
+        assert "đổi tên 1 file audio" in answers["question"][0][2]
+        assert tab.project.chapter(3).audio_path == "exports/audio/0004-c-voice.wav"
+        assert (audio_dir / "0004-c-voice.wav").is_file()
+
+    def test_insert_into_a_rendered_part_marks_it(self, qapp, library_dir, monkeypatch):
+        from noveltrans.video_inserts import read_marker
+
+        tab = _tab_with_local_project(qapp, library_dir, titles=("A", "B", "C", "D"))
+        slug = tab.project.meta.slug_name()
+        part = tab.project.video_dir / f"{slug}-0001-0002"
+        part.mkdir(parents=True)
+        (part / f"{slug}-0001-0002.mp4").write_bytes(b"v")
+        (part / f"{slug}-0001-0002.upload.json").write_text("{}", encoding="utf-8")
+        later = tab.project.video_dir / f"{slug}-0003-0004"
+        later.mkdir()
+        (later / f"{slug}-0003-0004.mp4").write_bytes(b"v")
+        answers = self._answer(monkeypatch, title="Chen")
+        _trigger(self._menu(tab, 0), "Thêm chương phía dưới")
+        question = answers["question"][0][2]
+        assert "Phần video chương 1–2 sẽ thành chương 1–3" in question
+        assert "đã tải lên YouTube" in question
+        new_part = tab.project.video_dir / f"{slug}-0001-0003" / f"{slug}-0001-0003.mp4"
+        assert read_marker(new_part)["chapters"] == [2]
+        assert (new_part.parent / f"{slug}-0001-0003.upload.json").is_file()
+        assert (tab.project.video_dir / f"{slug}-0004-0005" / f"{slug}-0004-0005.mp4").is_file()
+        assert "đã được đánh dấu" in tab.status_label.text()
+
+    def test_disabled_while_the_workspace_is_busy(self, qapp, library_dir):
+        tab = _tab_with_local_project(qapp, library_dir)
+        tab.workspace_busy = lambda: True
+        menu = self._menu(tab, 0)
+        actions = [a for a in menu.actions() if a.text().startswith("Thêm chương")]
+        assert actions and not any(a.isEnabled() for a in actions)

@@ -91,7 +91,10 @@ CREATE TABLE IF NOT EXISTS chapters (
   -- 0 once the user disables this chapter; a disabled chapter is skipped everywhere
   -- (download/translate/audio/video) until re-enabled. Default 1 so every row already
   -- in the table, and every row inserted before this existed, reads as enabled.
-  enabled          INTEGER NOT NULL DEFAULT 1
+  enabled          INTEGER NOT NULL DEFAULT 1,
+  -- the site's TOC position a re-scan matches on; -1 = a chapter made by hand. Separate
+  -- from idx because inserting a chapter shifts idx but not the site's numbering.
+  toc_index        INTEGER NOT NULL DEFAULT -1
 );
 
 -- Audio published by the source site. A SEPARATE edition of the work, not a property of
@@ -143,6 +146,7 @@ def _row_to_chapter(row: sqlite3.Row) -> Chapter:
         qc_text_hash=row["qc_text_hash"],
         qc_attempts=row["qc_attempts"],
         enabled=bool(row["enabled"]),
+        toc_index=row["toc_index"],
     )
 
 
@@ -203,11 +207,16 @@ class NovelProject:
             # every existing chapter predates this feature, so none of them was ever
             # deliberately disabled — default 1 (enabled) keeps an upgrade silent
             "enabled": "INTEGER NOT NULL DEFAULT 1",
+            "toc_index": "INTEGER NOT NULL DEFAULT -1",
         }
         with self._db:
             for name, ddl in added.items():
                 if name not in columns:
                     self._db.execute(f"ALTER TABLE chapters ADD COLUMN {name} {ddl}")
+            if "toc_index" not in columns and not self.meta.is_local:
+                # Until chapters could be inserted, every row of a scraped novel came from
+                # a scan with idx == the site's position. A local novel's rows keep -1.
+                self._db.execute("UPDATE chapters SET toc_index = idx")
         self._migrate_downloaded_audio()
         self._repair_translated_titles()
 
@@ -359,23 +368,47 @@ class NovelProject:
         A title the user renamed by hand (`title_custom`) is left alone. Without that
         exception every re-scan would silently undo the renaming — and a re-scan is the
         normal way to pick up new chapters, so the work would rarely survive a day.
+
+        Rows are matched on `toc_index` (the site's position), not on `idx`: a chapter
+        inserted by hand (`insert_chapter`) shifts the idx of the rows after it, and a
+        positional match would then write every one of them over its neighbour. Manual
+        rows (`toc_index` -1) are never touched. A ref the novel hasn't seen goes right
+        after its predecessor's row — with no manual rows that is exactly `ref.index`,
+        the numbering this has always produced.
         """
+        known = dict(
+            self._db.execute("SELECT toc_index, idx FROM chapters WHERE toc_index >= 0")
+        )
+        used = {row[0] for row in self._db.execute("SELECT idx FROM chapters")}
+        last_toc = last_idx = None
+        now = _now()
         with self._db:
-            for ref in refs:
-                self._db.execute(
-                    """
-                    INSERT INTO chapters (idx, title, url, updated_at)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(idx) DO UPDATE SET
-                        title = CASE WHEN chapters.title_custom = 1
-                                     THEN chapters.title ELSE excluded.title END,
-                        -- kept current even under a rename, so "undo" restores the
-                        -- site's LATEST title rather than one from months ago
-                        title_source = excluded.title,
-                        url = excluded.url
-                    """,
-                    (ref.index, ref.title, ref.url, _now()),
-                )
+            for ref in sorted(refs, key=lambda r: r.index):
+                idx = known.get(ref.index)
+                if idx is not None:
+                    self._db.execute(
+                        """
+                        UPDATE chapters SET
+                            title = CASE WHEN title_custom = 1 THEN title ELSE ? END,
+                            -- kept current even under a rename, so "undo" restores the
+                            -- site's LATEST title rather than one from months ago
+                            title_source = ?,
+                            url = ?
+                        WHERE idx = ?
+                        """,
+                        (ref.title, ref.title, ref.url, idx),
+                    )
+                else:
+                    idx = ref.index if last_toc is None else last_idx + (ref.index - last_toc)
+                    if idx in used:  # a hand-made chapter holds that slot
+                        idx = max(used) + 1
+                    self._db.execute(
+                        "INSERT INTO chapters (idx, title, url, toc_index, updated_at)"
+                        " VALUES (?, ?, ?, ?, ?)",
+                        (idx, ref.title, ref.url, ref.index, now),
+                    )
+                    used.add(idx)
+                last_toc, last_idx = ref.index, idx
 
     def add_chapters(self, titles: list[str]) -> list[int]:
         """Append hand-written chapters by name; returns the new 0-based indices.
@@ -409,6 +442,60 @@ class NovelProject:
                     (idx, title, _now()),
                 )
         return indices
+
+    def insertion_span(self, at: int) -> tuple[int, int]:
+        """`(at, q)`: `insert_chapter(at)` shifts idx `[at, q)` up by one.
+
+        `q` is the first free idx at or after `at`, so a hole left by a delete absorbs the
+        insert and every chapter past it keeps its number. `q == at` means nothing moves.
+        """
+        q = at
+        for (idx,) in self._db.execute(
+            "SELECT idx FROM chapters WHERE idx >= ? ORDER BY idx", (at,)
+        ):
+            if idx != q:
+                break
+            q += 1
+        return at, q
+
+    def insert_chapter(
+        self, at: int, title: str, *, audio_relinks: dict[int, str] | None = None
+    ) -> int:
+        """Insert a hand-made chapter at 0-based idx `at`; returns `at`.
+
+        Shifts only `insertion_span(at)` up by one, and every column moves with its row.
+        What does NOT move is anything on disk named by chapter number — audio files,
+        video part folders and their upload records, manual windows, part offsets. Go
+        through `chapter_insert.plan_insert` / `apply_insert`, which renames those and
+        passes `audio_relinks` (NEW idx -> new project-relative audio path) so the rows
+        point at the renamed files in this same transaction.
+
+        The new row has no URL and `toc_index` -1: never downloaded, and invisible to a
+        re-scan, which leaves it where it is (see `replace_toc`).
+        """
+        title = title.strip()
+        if not title:
+            raise ValueError("Tên chương trống")
+        if at < 0:
+            raise ValueError(f"Vị trí không hợp lệ: {at}")
+        _, q = self.insertion_span(at)
+        with self._db:
+            # Two passes through negative numbers: a single `idx = idx + 1` collides with
+            # the next row's primary key mid-statement.
+            self._db.execute(
+                "UPDATE chapters SET idx = -idx - 2 WHERE idx >= ? AND idx < ?", (at, q)
+            )
+            self._db.execute("UPDATE chapters SET idx = -idx - 1 WHERE idx < 0")
+            self._db.execute(
+                "INSERT INTO chapters (idx, title, url, toc_index, updated_at)"
+                " VALUES (?, ?, '', -1, ?)",
+                (at, title, _now()),
+            )
+            for idx, path in (audio_relinks or {}).items():
+                self._db.execute(
+                    "UPDATE chapters SET audio_path = ? WHERE idx = ?", (path, idx)
+                )
+        return at
 
     def delete_chapter(self, idx: int) -> Chapter | None:
         """Remove one chapter; returns the deleted row, or None if it wasn't there.
@@ -478,7 +565,11 @@ class NovelProject:
         range (default = the whole novel), so the caller can download from a chosen
         chapter or a range without re-fetching the ones before it.
         """
-        sql = "SELECT * FROM chapters WHERE content = '' AND enabled = 1 AND idx >= ?"
+        # `url != ''`: a chapter made by hand has nowhere to be fetched from.
+        sql = (
+            "SELECT * FROM chapters WHERE content = '' AND enabled = 1 AND url != ''"
+            " AND idx >= ?"
+        )
         params: list[object] = [start_idx]
         if end_idx is not None:
             sql += " AND idx <= ?"

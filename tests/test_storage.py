@@ -987,3 +987,125 @@ class TestSetEnabledMany:
     def test_empty_is_a_noop(self, library_dir, sample_meta, sample_refs):
         project = NovelProject.create(library_dir, sample_meta, sample_refs)
         assert project.set_enabled_many([], False) == 0
+
+
+class TestInsertChapter:
+    """Feature 104: a chapter inserted by hand, and a re-scan that must not undo it."""
+
+    def _project(self, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        for c in project.chapters():
+            project.save_content(c.index, f"nội dung {c.index + 1}")
+        return project
+
+    def test_middle_insert_shifts_later_rows_with_their_data(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        project = self._project(library_dir, sample_meta, sample_refs)
+        project.set_enabled(3, False)
+        assert project.insert_chapter(2, "  Ngoại truyện  ") == 2
+        rows = project.chapters()
+        assert [c.index for c in rows] == [0, 1, 2, 3, 4, 5]
+        assert [c.content for c in rows] == [
+            "nội dung 1", "nội dung 2", "", "nội dung 3", "nội dung 4", "nội dung 5",
+        ]
+        assert [c.enabled for c in rows] == [True, True, True, True, False, True]
+        new = rows[2]
+        assert (new.title, new.url, new.is_manual) == ("Ngoại truyện", "", True)
+        assert [c.toc_index for c in rows] == [0, 1, -1, 2, 3, 4]
+
+    def test_a_hole_absorbs_the_insert(self, library_dir, sample_meta, sample_refs):
+        project = self._project(library_dir, sample_meta, sample_refs)
+        project.delete_chapter(3)
+        assert project.insertion_span(2) == (2, 3)
+        project.insert_chapter(2, "Mới")
+        assert [c.content for c in project.chapters()][3:] == ["nội dung 3", "nội dung 5"]
+        assert project.chapter(4).content == "nội dung 5"  # past the hole: unchanged
+
+    def test_append_position_shifts_nothing(self, library_dir, sample_meta, sample_refs):
+        project = self._project(library_dir, sample_meta, sample_refs)
+        assert project.insertion_span(5) == (5, 5)
+
+    def test_blank_title_is_refused(self, library_dir, sample_meta, sample_refs):
+        project = self._project(library_dir, sample_meta, sample_refs)
+        with pytest.raises(ValueError):
+            project.insert_chapter(1, "   ")
+        assert len(project.chapters()) == 5
+
+    def test_manual_rows_are_not_downloaded(self, library_dir, sample_meta, sample_refs):
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        project.insert_chapter(1, "Mới")
+        assert [c.index for c in project.pending_download()] == [0, 2, 3, 4, 5]
+
+    def test_rescan_keeps_the_manual_row_and_the_shifted_data(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        project = self._project(library_dir, sample_meta, sample_refs)
+        project.insert_chapter(2, "Ngoại truyện")
+        project.replace_toc(sample_refs)
+        rows = project.chapters()
+        assert len(rows) == 6
+        assert (rows[2].title, rows[2].url) == ("Ngoại truyện", "")
+        assert [c.title for c in rows] == ["第1章", "第2章", "Ngoại truyện", "第3章", "第4章", "第5章"]
+        assert rows[3].content == "nội dung 3"
+        assert rows[3].url == sample_refs[2].url
+
+    def test_rescan_appends_new_chapters_after_the_last_scraped_row(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        from noveltrans.models import ChapterRef
+
+        project = self._project(library_dir, sample_meta, sample_refs)
+        project.insert_chapter(1, "Giữa")
+        project.insert_chapter(6, "Cuối")  # below the last scraped chapter
+        more = sample_refs + [
+            ChapterRef(index=i, title=f"第{i + 1}章", url=f"https://example.com/novel/123/{i + 1}")
+            for i in (5, 6)
+        ]
+        project.replace_toc(more)
+        titles = [c.title for c in project.chapters()]
+        assert titles == [
+            "第1章", "Giữa", "第2章", "第3章", "第4章", "第5章", "Cuối", "第6章", "第7章",
+        ]
+        assert [c.index for c in project.chapters()] == list(range(9))
+
+    def test_rescan_retitles_the_shifted_row_and_keeps_a_custom_title(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        from noveltrans.models import ChapterRef
+
+        project = self._project(library_dir, sample_meta, sample_refs)
+        project.insert_chapter(0, "Mở đầu")
+        project.edit_title(2, "Tên tôi đặt")  # was 第2章, now at idx 2
+        refs = list(sample_refs)
+        refs[2] = ChapterRef(index=2, title="第3章 mới", url=refs[2].url)
+        project.replace_toc(refs)
+        assert project.chapter(2).title == "Tên tôi đặt"
+        assert project.chapter(3).title == "第3章 mới"
+        assert project.chapter(0).title == "Mở đầu"
+
+    def test_migration_backfills_toc_index_for_scraped_novels(
+        self, library_dir, sample_meta, sample_refs
+    ):
+        import sqlite3
+
+        from noveltrans.storage.project import DB_FILE
+
+        project = NovelProject.create(library_dir, sample_meta, sample_refs)
+        path = project.path
+        project.close()
+        db = sqlite3.connect(path / DB_FILE)
+        db.execute("ALTER TABLE chapters DROP COLUMN toc_index")
+        db.commit()
+        db.close()
+        reopened = NovelProject.open(path)
+        assert [c.toc_index for c in reopened.chapters()] == [0, 1, 2, 3, 4]
+
+    def test_local_novel_rows_are_manual(self, library_dir):
+        from noveltrans.models import NovelMeta
+
+        project = Library(library_dir).create_local_project(
+            NovelMeta(url="", site="", title="Của tôi", source_lang="vi")
+        )
+        project.add_chapters(["Một", "Hai"])
+        assert all(c.is_manual for c in project.chapters())

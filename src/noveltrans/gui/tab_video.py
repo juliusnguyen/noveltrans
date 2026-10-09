@@ -23,7 +23,7 @@ from __future__ import annotations
 import re
 from types import SimpleNamespace
 
-from PySide6.QtCore import QDateTime, Qt, QUrl
+from PySide6.QtCore import QDateTime, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -878,23 +878,18 @@ class VideoTab(QWidget):
         is inert for the source edition — a `{slug}-nguon-….mp4` cannot predate the feature
         that introduced the name.
         """
-        from pathlib import Path
-
-        from noveltrans.tts.video import video_part_name
+        from noveltrans.tts.video import resolve_part_video
 
         # slug_name(), not display_name(): the stem decides <stem>.mp4 and every sidecar
         # beside it (including <stem>.upload.json), so renaming the novel leaves them
-        # where they are unless the user asked for the files to move too.
-        slug = self.project.meta.slug_name()
-        name = video_part_name(
-            slug, window.first_num, window.last_num,
+        # where they are unless the user asked for the files to move too. The shared
+        # resolver also finds a part a chapter was inserted into (feature 104) while its
+        # window is still narrower than its folder; VideoWorker resolves the same way.
+        return resolve_part_video(
+            self.project.video_dir, self.project.meta.slug_name(),
+            window.first_num, window.last_num,
             whole_novel=whole_novel, source_audio=self._is_source_edition(),
         )
-        per_folder = self.project.video_dir / Path(name).stem / name
-        legacy = self.project.video_dir / name
-        if not per_folder.is_file() and legacy.is_file():
-            return legacy
-        return per_folder
 
     def _part_sidecar(self, window, whole_novel: bool, ext: str):
         """Path of a companion file (`.title.txt` / `.txt` / `.tags.txt` / `.jpg`) for a part."""
@@ -1744,6 +1739,11 @@ class VideoTab(QWidget):
             item.setToolTip("Đánh dấu thủ công — không khớp với file trên đĩa.")
         else:
             item.setToolTip("Tick để đánh dấu thủ công phần này là đã/chưa tạo.")
+        inserted = self._inserted_note(path)
+        if inserted:
+            item.setText("⚠️ Có chương mới chèn")
+            item.setForeground(QColor("#e5c07b"))
+            item.setToolTip(inserted)
 
         item.setFlags(
             (item.flags() | Qt.ItemFlag.ItemIsUserCheckable) & ~Qt.ItemFlag.ItemIsEditable
@@ -1966,6 +1966,9 @@ class VideoTab(QWidget):
 
         make = QPushButton("Tạo lại" if exists else "Tạo")
         make.clicked.connect(lambda _=False, w=window: self._render_one(w))
+        inserted = self._inserted_note(self._part_output_path(window, whole_novel=whole_novel))
+        if inserted:
+            make.setToolTip(inserted)
         detail = QPushButton("Chi tiết")
         detail.setToolTip("Xem và copy tiêu đề, mô tả, tags để dán lên YouTube.")
         detail.clicked.connect(
@@ -3095,6 +3098,135 @@ class VideoTab(QWidget):
         # project_selected → this method.
         self._resync_descriptions_and_report()
         self._refresh_video_list()
+        if self.project is not None:
+            # After the list is built and the tab is on screen — never from inside the
+            # project switch itself.
+            QTimer.singleShot(0, self._maybe_prompt_inserted_parts)
+
+    # ------------------------------------------------- chapters inserted (feature 104)
+
+    def _inserted_readiness(self, numbers: list[int]) -> tuple[str, str]:
+        """`(state, text)` for a marked part: "waiting" until every inserted chapter has
+        audio in this voice, then "ready"."""
+        missing_text, missing_audio = [], []
+        for n in numbers:
+            chapter = self.project.chapter(n - 1) if self.project is not None else None
+            if chapter is None:
+                continue
+            if not (chapter.content or chapter.translated):
+                missing_text.append(n)
+            elif not chapter.audio_path or not (self.project.path / chapter.audio_path).is_file():
+                missing_audio.append(n)
+        if missing_text:
+            return "waiting", "chưa có nội dung (dán ở tab Dịch, rồi tạo audio)"
+        if missing_audio:
+            return "waiting", "chưa có audio (tạo ở tab Audio)"
+        return "ready", "sẵn sàng render lại"
+
+    def _inserted_chapters_label(self, numbers: list[int]) -> str:
+        parts = []
+        for n in numbers:
+            chapter = self.project.chapter(n - 1) if self.project is not None else None
+            parts.append(f"chương {n} “{chapter.title}”" if chapter else f"chương {n}")
+        return ", ".join(parts)
+
+    def _inserted_note(self, path) -> str:
+        """Tooltip for a part with an inserted chapter, or "" when it has none."""
+        from noveltrans.video_inserts import read_marker
+
+        if self.project is None or self._is_source_edition():
+            return ""
+        marker = read_marker(path)
+        if not marker:
+            return ""
+        _state, readiness = self._inserted_readiness(marker["chapters"])
+        return (
+            f"Có chương được chèn sau khi tạo video: "
+            f"{self._inserted_chapters_label(marker['chapters'])} — {readiness}. "
+            "Bấm “Tạo lại” để render lại phần này."
+        )
+
+    def _maybe_prompt_inserted_parts(self) -> None:
+        """Tell the user, once per step, that a part has a chapter inserted into it.
+
+        At most twice per marker: when it is first seen (and the new chapter still needs
+        audio), and when it becomes renderable — `prompted` in the marker remembers which.
+        """
+        from noveltrans.video_inserts import inserted_parts, set_prompted
+
+        if self.project is None or not self.isVisible() or self._is_source_edition():
+            return
+        if self._video_worker is not None and self._video_worker.isRunning():
+            return
+        order = {"": 0, "waiting": 1, "ready": 2}
+        ready, waiting = [], []
+        for video, first, last, marker in inserted_parts(
+            self.project.video_dir, self.project.meta.slug_name()
+        ):
+            state, _text = self._inserted_readiness(marker["chapters"])
+            if order[state] <= order[marker["prompted"]]:
+                continue
+            (ready if state == "ready" else waiting).append((video, first, last, marker))
+            set_prompted(video, state)
+        if not ready and not waiting:
+            return
+
+        def describe(first, last, marker) -> str:
+            span = "Video toàn truyện" if first is None else f"Phần chương {first}–{last}"
+            return f"{span} có chương mới chèn: {self._inserted_chapters_label(marker['chapters'])}"
+
+        if waiting:
+            QMessageBox.information(
+                self, "Có chương mới chèn",
+                "\n".join(
+                    f"• {describe(first, last, m)} — chưa có audio."
+                    for _v, first, last, m in waiting
+                )
+                + "\n\nHãy dán nội dung (tab Dịch) và tạo audio (tab Audio); sau đó quay lại "
+                "đây để render lại phần này.",
+            )
+        if not ready:
+            return
+        lines = []
+        for video, first, last, marker in ready:
+            line = f"• {describe(first, last, marker)}."
+            if (video.parent / f"{video.stem}.upload.json").is_file():
+                line += (
+                    "\n   ⚠️ Phần này đã tải lên YouTube. Render lại KHÔNG đổi video đã đăng."
+                )
+            lines.append(line)
+        answer = QMessageBox.question(
+            self, "Có chương mới chèn",
+            "\n".join(lines) + "\n\nRender lại "
+            + ("phần này" if len(ready) == 1 else f"{len(ready)} phần này") + "?",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._render_inserted_parts({v for v, _f, _l, _m in ready})
+
+    def _render_inserted_parts(self, videos: set) -> None:
+        """Re-render the parts whose .mp4 is in `videos`, from the current window plan."""
+        windows = self._windows_for_current_selection()
+        mode = self.video_mode.currentData()
+        whole_novel = len(windows) == 1 and mode == "all"
+        targets = [
+            w for w in windows
+            if self._part_output_path(w, whole_novel=whole_novel) in videos
+        ]
+        if not targets:
+            QMessageBox.information(
+                self, "Có chương mới chèn",
+                "Phần này không nằm trong lựa chọn hiện tại. Hãy chọn chế độ/khoảng chứa "
+                "phần đó rồi bấm “Tạo lại” ở dòng của nó.",
+            )
+            return
+        if len(targets) == 1 or whole_novel:
+            self._render_one(targets[0])
+            return
+        self._launch_video(
+            mode="batch", skip_existing=False, explicit_windows=targets,
+            explicit_part_numbers={w.first_num: self._part_number(w) for w in targets},
+        )
 
     def _resync_descriptions_and_report(self) -> None:
         """Run the description resync and fold what it did into the status line."""
@@ -3335,9 +3467,15 @@ class VideoTab(QWidget):
 
         rewritten = 0
         customised = 0
+        from noveltrans.video_inserts import folder_has_marker
+
         for part_dir, first_num, last_num in spans:
             sidecar = part_dir / f"{part_dir.name}.txt"
             if not sidecar.is_file() or not (part_dir / f"{part_dir.name}.mp4").is_file():
+                continue
+            if folder_has_marker(part_dir):
+                # The span now covers a chapter the video doesn't have (feature 104):
+                # describing it from the DB would describe a video that doesn't exist yet.
                 continue
             try:
                 current = sidecar.read_text(encoding="utf-8")
@@ -3995,6 +4133,7 @@ class VideoTab(QWidget):
         """
         if self.project is None:
             return []
+        from noveltrans.video_inserts import has_marker
         from noveltrans.youtube_upload import needs_attention
 
         windows = self._windows_for_current_selection()
@@ -4009,6 +4148,8 @@ class VideoTab(QWidget):
                 continue
             if self._part_uploaded(window, whole_novel) or needs_attention(path):
                 continue
+            if has_marker(path):
+                continue  # a chapter was inserted after the render: re-render it first
             label = "Toàn bộ" if whole_novel else f"Phần {part_num}"
             rows.append((window, label, part_num, whole_novel))
         return rows

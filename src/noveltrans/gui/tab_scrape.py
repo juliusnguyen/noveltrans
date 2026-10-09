@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from noveltrans.chapter_insert import apply_insert, plan_insert
 from noveltrans.config import AppConfig
 from noveltrans.discord_unlock import valid_channel_url
 from noveltrans.gui.jobs import job_registry
@@ -69,6 +70,9 @@ class ScrapeTab(QWidget):
         # Host veto: returns False if this project is already open in another workspace,
         # so we never open the same SQLite project in two tabs. None = always allowed.
         self.can_open_project: Callable[[str], bool] | None = None
+        # Set by the workspace: True while any of its tabs runs a job. Inserting a chapter
+        # renumbers rows that a running translate/audio/video job may be holding by idx.
+        self.workspace_busy: Callable[[], bool] | None = None
         self._scan_worker: ScanWorker | None = None
         self._download_worker: DownloadWorker | None = None
         self._unlock_worker: UnlockWorker | None = None
@@ -441,12 +445,133 @@ class ScrapeTab(QWidget):
         )
         self.project_changed.emit(str(self.project.path))
 
+    def _insert_busy(self) -> bool:
+        """True while anything may be holding this novel's chapters by idx.
+
+        The job registry covers every workspace (another window can have the same novel
+        open in its Dịch tab); the workspace hook and this tab's own workers cover jobs
+        that never registered.
+        """
+        if self.has_running_workers():
+            return True
+        if self.workspace_busy is not None and self.workspace_busy():
+            return True
+        novel = self._job_novel()
+        return bool(novel) and any(job.novel == novel for job in job_registry.jobs())
+
+    def _insert_chapter(self, ref_idx: int, below: bool) -> None:
+        """Insert a hand-made chapter above or below chapter `ref_idx` (feature 104)."""
+        if self.project is None:
+            return
+        if self._insert_busy():
+            QMessageBox.information(
+                self,
+                "Đang bận",
+                "Đang có tác vụ chạy trên truyện này (tải/dịch/audio/video). "
+                "Hãy dừng hoặc chờ xong rồi chèn chương.",
+            )
+            return
+        if below:
+            at = ref_idx + 1
+        elif ref_idx > 0 and self.project.chapter(ref_idx - 1) is None:
+            at = ref_idx - 1  # a hole right above: fill it, nothing gets renumbered
+        else:
+            at = ref_idx
+        where = "dưới" if below else "trên"
+        title, ok = QInputDialog.getText(
+            self, "Thêm chương", f"Tên chương mới (chèn {where} chương {ref_idx + 1}):"
+        )
+        title = title.strip()
+        if not ok or not title:
+            return
+        plan = plan_insert(self.project, at, title, ref_idx, below=below)
+        if plan.collisions:
+            QMessageBox.warning(
+                self,
+                "Không thể chèn chương",
+                f"Không thể đổi tên vì trùng file đã có: {plan.collisions[0].name}. "
+                "Hãy xoá/đổi tên file đó rồi thử lại.",
+            )
+            return
+        question = self._insert_question(plan)
+        if question:
+            answer = QMessageBox.question(self, "Thêm chương", question)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            warnings = apply_insert(self.project, plan)
+        except Exception as exc:  # noqa: BLE001 — apply_insert rolled everything back
+            QMessageBox.warning(
+                self, "Chèn chương thất bại", f"Không chèn được: {exc}. Không có gì thay đổi."
+            )
+            return
+        if warnings:
+            QMessageBox.warning(self, "Thêm chương", "\n".join(warnings))
+        self._reload_table()
+        row = self.model.row_for_index(at)
+        if row is not None:
+            # VIEW rows, as in _add_chapters: under a sort the new row is wherever the
+            # current ordering puts it.
+            view_index = self.proxy.mapFromSource(self.model.index(row, self.model.TITLE_COLUMN))
+            self.table.selectRow(view_index.row())
+            self.table.scrollTo(view_index)
+        self.count_label.setText(str(self.project.counts()["total"]))
+        status = f"Đã chèn chương {at + 1}. Dán nội dung vào ô “Bản gốc” ở tab Dịch."
+        if not self._is_local():
+            status += (
+                " Chương này không có trên trang nguồn nên sẽ không được tải; "
+                "lần quét sau vẫn giữ nguyên vị trí."
+            )
+        if plan.affected:
+            status += " Phần video có chương mới đã được đánh dấu — xem tab Video."
+        self.status_label.setText(status)
+        self.project_changed.emit(str(self.project.path))
+
+    @staticmethod
+    def _insert_question(plan) -> str:
+        """What the confirm dialog says, or "" when the insert changes nothing else."""
+        shift = plan.shift
+        lines = []
+        if plan.renumbers:
+            n, q = shift.new_num, shift.last_shifted
+            moved = (
+                f"chương {n}–{q} sẽ thành {n + 1}–{q + 1}" if q > n
+                else f"chương {n} sẽ thành chương {n + 1}"
+            )
+            files = f" (đổi tên {plan.audio_renames} file audio)" if plan.audio_renames else ""
+            lines.append(f"Chương mới sẽ là chương {n}; {moved}{files}.")
+        for part in plan.affected:
+            if part.old is None:
+                lines.append("• Video toàn truyện sẽ cần render lại.")
+                continue
+            (a, b), (na, nb) = part.old, part.new
+            lines.append(
+                f"• Phần video chương {a}–{b} sẽ thành chương {na}–{nb} và được đánh dấu "
+                "“có chương mới chèn” — cần render lại ở tab Video."
+            )
+            if part.uploaded:
+                lines.append("   ⚠️ Phần này đã tải lên YouTube: video đã đăng không tự đổi.")
+        if plan.renamed_parts:
+            lines.append(
+                f"• {plan.renamed_parts} phần video sau đó được đổi tên theo số chương mới "
+                "(nội dung không đổi); bản sao trên OneDrive sẽ được tải lại theo tên mới."
+            )
+        for path in plan.delete_merged:
+            lines.append(f"• File audio gộp {path.name} sẽ bị xoá (ghép lại sau ở tab Audio).")
+        if not lines:
+            return ""
+        return "\n".join(lines) + "\n\nTiếp tục?"
+
     def _delete_chapter(self, idx: int) -> None:
-        """Remove one hand-written chapter, and the audio nothing points at any more."""
-        if self.project is None or not self._is_local():
+        """Remove one hand-made chapter, and the audio nothing points at any more.
+
+        Hand-made means every chapter of a local novel, or one inserted into a scraped
+        novel — a scraped chapter would only come back with the next scan.
+        """
+        if self.project is None:
             return
         chapter = self.project.chapter(idx)
-        if chapter is None:
+        if chapter is None or not (self._is_local() or chapter.is_manual):
             return
         question = f"Xoá chương {idx + 1} — “{chapter.title}”?"
         if chapter.has_audio:
@@ -537,17 +662,28 @@ class ScrapeTab(QWidget):
             # "reset" on a title nobody changed reads like it might erase something.
             restore = menu.addAction("Lấy lại tên gốc từ trang web")
             restore.triggered.connect(lambda: self._reset_title(chapter.index))
+        # On the clicked row even inside a multi-row selection: an insert has one position.
+        busy = self._insert_busy()
+        for label, below in (("Thêm chương phía trên", False), ("Thêm chương phía dưới", True)):
+            action = menu.addAction(label)
+            action.setEnabled(not busy)
+            action.triggered.connect(
+                lambda _=False, below=below: self._insert_chapter(chapter.index, below)
+            )
         menu.addSeparator()
-        if self._is_local():
-            # Nothing to re-download; the destructive counterpart belongs here instead.
-            # Deliberately NOT offered on a scraped novel: the next scan's replace_toc
-            # would put the row back, so the delete would silently undo itself.
+        if self._is_local() or chapter.is_manual:
+            # Deliberately NOT offered for a scraped chapter: the next scan's replace_toc
+            # would put the row back, so the delete would silently undo itself. A chapter
+            # made by hand is invisible to a scan, so deleting it sticks.
             remove = menu.addAction(f"Xoá chương {chapter.index + 1}")
             remove.triggered.connect(lambda: self._delete_chapter(chapter.index))
-            return
+        if self._is_local():
+            return  # nothing to re-download
         from_here = menu.addAction(f"Tải từ chương {chapter.index + 1}")
         from_here.setEnabled(not running)
         from_here.triggered.connect(lambda: self._begin_download(chapter.index, None, False))
+        if chapter.is_manual:
+            return  # no URL: nothing to re-download
         only_this = menu.addAction(f"Chỉ tải lại chương {chapter.index + 1}")
         only_this.setEnabled(not running)
         only_this.triggered.connect(
@@ -586,10 +722,12 @@ class ScrapeTab(QWidget):
             return []
         if self._dl_indices is not None:
             wanted = set(self._dl_indices)
-            return [c for c in self.project.chapters() if c.index in wanted]
-        if self._dl_force:
-            return self.project.chapters_in_range(self._dl_start, self._dl_end)
-        return self.project.pending_download(self._dl_start, self._dl_end)
+            chapters = [c for c in self.project.chapters() if c.index in wanted]
+        elif self._dl_force:
+            chapters = self.project.chapters_in_range(self._dl_start, self._dl_end)
+        else:
+            return self.project.pending_download(self._dl_start, self._dl_end)
+        return [c for c in chapters if c.url]  # same rule as DownloadWorker._select_chapters
 
     def _launch_download(self) -> None:
         # The unlock's resume lands here; we're downloading again, so the "unlock in

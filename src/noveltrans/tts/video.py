@@ -659,6 +659,39 @@ def video_part_dir_name(
     ).stem
 
 
+def resolve_part_video(
+    video_dir: Path, slug: str, first_num: int, last_num: int, *,
+    whole_novel: bool = False, source_audio: bool = False,
+) -> Path:
+    """The .mp4 path a window's part lives at — the one lookup every caller shares.
+
+    In order: the per-part folder (`video_dir/<stem>/<stem>.mp4`) if its video exists; the
+    pre-per-folder flat file; then, for the chapter edition only, a part folder marked as
+    having a chapter inserted (feature 104) whose span contains the window. That last one
+    exists because the planner trims a window to its voiced chapters: until a chapter
+    inserted at a part's edge has audio, the window is one chapter narrower than the
+    folder, and without this the part would read as never rendered and invite a
+    duplicate render and upload. Otherwise the per-folder path, where a render would go.
+    """
+    name = video_part_name(
+        slug, first_num, last_num, whole_novel=whole_novel, source_audio=source_audio,
+    )
+    video_dir = Path(video_dir)
+    per_folder = video_dir / Path(name).stem / name
+    if per_folder.is_file():
+        return per_folder
+    legacy = video_dir / name
+    if legacy.is_file():
+        return legacy
+    if not whole_novel and not source_audio:
+        from noveltrans.video_inserts import marked_part_covering
+
+        marked = marked_part_covering(video_dir, slug, first_num, last_num)
+        if marked is not None:
+            return marked
+    return per_folder
+
+
 _COMMITTED_SUFFIX_RE = re.compile(r"^(\d+)-(\d+)$")
 
 

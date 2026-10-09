@@ -129,15 +129,19 @@ def rendered_parts(project_path: Path) -> list[Path]:
     """Part folders that actually contain a rendered `.mp4`.
 
     A folder without one is a part that was set up and never rendered, and the chapters it
-    names are emphatically not safe to delete audio for.
+    names are emphatically not safe to delete audio for. Neither is a part marked as having
+    a chapter inserted after its render (feature 104): its name already covers the new
+    chapter, but its video doesn't — the re-render it is waiting for needs every audio.
     """
+    from noveltrans.video_inserts import folder_has_marker
+
     video_dir = Path(project_path) / EXPORTS_DIR / VIDEO_DIR
     if not video_dir.is_dir():
         return []
     return sorted(
         folder
         for folder in video_dir.iterdir()
-        if folder.is_dir() and any(folder.glob("*.mp4"))
+        if folder.is_dir() and any(folder.glob("*.mp4")) and not folder_has_marker(folder)
     )
 
 
