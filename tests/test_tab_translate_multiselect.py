@@ -154,7 +154,8 @@ class TestMenu:
     ):
         tab, _ = _tab(tmp_path, monkeypatch, downloaded=0, translated=0)
         _select_rows(tab, [0, 1])
-        assert _labels(_menu(tab, 0)) == []
+        # Only skip/re-enable (feature 103), which needs no text at all.
+        assert _labels(_menu(tab, 0)) == ["Bỏ qua 2 chương"]
 
     def test_it_comes_before_the_rewrite_actions(self, qapp, tmp_path, monkeypatch):
         tab, _ = _tab(tmp_path, monkeypatch)
@@ -289,3 +290,33 @@ class TestPerRowButton:
         tab._retranslate_row(tab.table.model().index(4, 0))
         assert started == []
         assert "chưa có nội dung gốc" in tab.status_label.text()
+
+
+class TestSkipSelection:
+    """Feature 103: skip / re-enable every selected chapter from one right-click."""
+
+    def _action(self, menu: QMenu, label: str):
+        return next(a for a in menu.actions() if a.text() == label)
+
+    def test_skipping_the_selection_persists_and_leaves_the_translate_queue(
+        self, qapp, tmp_path, monkeypatch
+    ):
+        tab, project = _tab(tmp_path, monkeypatch, downloaded=6, translated=0)
+        _select_rows(tab, [1, 3, 4])
+        self._action(_menu(tab, 3), "Bỏ qua 3 chương").trigger()
+        assert [c.enabled for c in project.chapters()] == [True, False, True, False, False, True]
+        assert [c.index for c in project.pending_translation("vi")] == [0, 2, 5]
+
+    def test_re_enabling_restores_them(self, qapp, tmp_path, monkeypatch):
+        tab, project = _tab(tmp_path, monkeypatch)
+        _select_rows(tab, [1, 3])
+        self._action(_menu(tab, 1), "Bỏ qua 2 chương").trigger()
+        self._action(_menu(tab, 1), "Bật lại 2 chương").trigger()
+        assert all(c.enabled for c in project.chapters())
+
+    def test_still_offered_while_translating(self, qapp, tmp_path, monkeypatch):
+        # Same as the checkbox: a running job already took its chapter list.
+        tab, _ = _tab(tmp_path, monkeypatch)
+        tab._worker = _RunningWorker()
+        _select_rows(tab, [0, 1])
+        assert self._action(_menu(tab, 0), "Bỏ qua 2 chương").isEnabled()

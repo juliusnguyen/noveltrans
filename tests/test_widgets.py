@@ -1,3 +1,5 @@
+import pytest
+
 from noveltrans.gui.widgets import format_duration
 from noveltrans.models import Chapter
 
@@ -746,3 +748,159 @@ class TestProjectPickerOrdering:
 
         assert _fold("Ánh Sáng") < _fold("Bản")
         assert _fold("Đấu La") < _fold("Muôn")
+
+
+class TestSetRowsEnabled:
+    """Feature 103: the batch behind "Bỏ qua N chương" / "Bật lại N chương"."""
+
+    def _chapters(self):
+        # Gapped indices, so a row number leaking out as a chapter index would show.
+        return [
+            Chapter(index=0, title="a", url="u"),
+            Chapter(index=2, title="b", url="u"),
+            Chapter(index=5, title="c", url="u", enabled=False),
+        ]
+
+    @pytest.mark.parametrize("model_name", ["ChapterTableModel", "AudioChapterTableModel"])
+    def test_changes_only_rows_that_need_it_and_emits_once(self, qapp, model_name):
+        import noveltrans.gui.widgets as w
+
+        model = getattr(w, model_name)()
+        model.set_chapters(self._chapters())
+        batches, changed = [], []
+        model.enabled_batch_toggled.connect(lambda idx, en: batches.append((idx, en)))
+        model.dataChanged.connect(lambda a, b: changed.append((a.row(), b.row(), b.column())))
+        assert model.set_rows_enabled([0, 1, 2], False) == [0, 2]
+        assert batches == [([0, 2], False)]
+        assert changed == [(0, 1, model.columnCount() - 1)]  # the whole row dims
+        assert [model.chapter_at(r).enabled for r in range(3)] == [False, False, False]
+
+    def test_nothing_to_change_emits_nothing(self, qapp):
+        from noveltrans.gui.widgets import ChapterTableModel
+
+        model = ChapterTableModel()
+        model.set_chapters(self._chapters())
+        batches = []
+        model.enabled_batch_toggled.connect(lambda *a: batches.append(a))
+        assert model.set_rows_enabled([2, 9], False) == []
+        assert batches == []
+
+
+class TestAudioChapterTableModelEnabled:
+    """The 098 checkbox the audio list never got."""
+
+    def _model(self, qapp):
+        from noveltrans.gui.widgets import AudioChapterTableModel
+
+        model = AudioChapterTableModel()
+        model.set_chapters(
+            [
+                Chapter(index=0, title="a", url="u", translated="x"),
+                Chapter(index=1, title="b", url="u", translated="x", enabled=False),
+            ]
+        )
+        return model
+
+    def test_checkbox_reflects_enabled_and_is_checkable(self, qapp):
+        from PySide6.QtCore import Qt
+
+        m = self._model(qapp)
+        col = m.ENABLED_COLUMN
+        assert m.headerData(col, Qt.Orientation.Horizontal) == "Bật"
+        assert m.data(m.index(0, col), Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Checked
+        assert m.data(m.index(1, col), Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Unchecked
+        assert m.flags(m.index(0, col)) & Qt.ItemFlag.ItemIsUserCheckable
+        assert not (m.flags(m.index(0, m.STATUS_COLUMN)) & Qt.ItemFlag.ItemIsUserCheckable)
+
+    def test_unchecking_emits(self, qapp):
+        from PySide6.QtCore import Qt
+
+        m = self._model(qapp)
+        toggled = []
+        m.enabled_toggled.connect(lambda idx, en: toggled.append((idx, en)))
+        assert m.setData(
+            m.index(0, m.ENABLED_COLUMN), Qt.CheckState.Unchecked.value,
+            Qt.ItemDataRole.CheckStateRole,
+        )
+        assert toggled == [(0, False)]
+
+    def test_a_disabled_row_is_dimmed(self, qapp):
+        from PySide6.QtCore import Qt
+
+        from noveltrans.gui.widgets import DISABLED_ROW_COLOR
+
+        m = self._model(qapp)
+        assert m.data(m.index(1, m.STATUS_COLUMN), Qt.ItemDataRole.ForegroundRole) == (
+            DISABLED_ROW_COLOR
+        )
+        assert m.data(m.index(1, 0), Qt.ItemDataRole.ForegroundRole) == DISABLED_ROW_COLOR
+
+
+class TestAddEnableActions:
+    def _table(self, qapp, chapters):
+        from PySide6.QtWidgets import QTableView
+
+        from noveltrans.gui.widgets import ChapterTableModel, sorting_proxy
+
+        model = ChapterTableModel()
+        model.set_chapters(chapters)
+        table = QTableView()
+        table.setModel(sorting_proxy(model, table))
+        table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QTableView.SelectionMode.ExtendedSelection)
+        return table, model
+
+    def _select(self, table, view_rows):
+        selection = table.selectionModel()
+        for row in view_rows:
+            selection.select(
+                table.model().index(row, 0),
+                selection.SelectionFlag.Select | selection.SelectionFlag.Rows,
+            )
+
+    def _menu(self, table, model, view_row):
+        from PySide6.QtWidgets import QMenu
+
+        from noveltrans.gui.widgets import add_enable_actions
+
+        menu = QMenu(table)
+        add_enable_actions(menu, table, model, table.model().index(view_row, 0))
+        return {a.text(): a for a in menu.actions() if a.text()}
+
+    def test_singular_for_one_row(self, qapp):
+        table, model = self._table(qapp, [Chapter(index=i, title="t", url="u") for i in range(3)])
+        assert list(self._menu(table, model, 1)) == ["Bỏ qua chương này"]
+
+    def test_mixed_selection_offers_both_counts(self, qapp):
+        chapters = [Chapter(index=i, title="t", url="u", enabled=i != 2) for i in range(4)]
+        table, model = self._table(qapp, chapters)
+        self._select(table, [0, 1, 2])
+        assert list(self._menu(table, model, 1)) == ["Bỏ qua 2 chương", "Bật lại chương này"]
+
+    def test_click_outside_the_selection_acts_on_that_row(self, qapp):
+        table, model = self._table(qapp, [Chapter(index=i, title="t", url="u") for i in range(4)])
+        self._select(table, [0, 1])
+        self._menu(table, model, 3)["Bỏ qua chương này"].trigger()
+        assert [c.enabled for c in (model.chapter_at(r) for r in range(4))] == [
+            True, True, True, False,
+        ]
+
+    def test_acts_on_source_rows_when_the_view_is_sorted(self, qapp):
+        from PySide6.QtCore import Qt
+
+        table, model = self._table(qapp, [Chapter(index=i, title="t", url="u") for i in range(4)])
+        table.model().sort(0, Qt.SortOrder.DescendingOrder)
+        self._select(table, [0, 1])  # on screen: chapters 4 and 3
+        self._menu(table, model, 0)["Bỏ qua 2 chương"].trigger()
+        assert [model.chapter_at(r).enabled for r in range(4)] == [True, True, False, False]
+
+    def test_nothing_for_an_index_from_another_model(self, qapp):
+        from PySide6.QtWidgets import QMenu
+
+        from noveltrans.gui.widgets import ChapterTableModel, add_enable_actions
+
+        table, model = self._table(qapp, [Chapter(index=0, title="t", url="u")])
+        other = ChapterTableModel()
+        menu = QMenu(table)
+        add_enable_actions(menu, table, other, table.model().index(0, 0))
+        assert [a for a in menu.actions() if a.text()] == []

@@ -238,7 +238,8 @@ class TestContextMenu:
 
     def test_an_untranslated_row_offers_nothing(self, qapp, tmp_path, monkeypatch):
         tab, _ = _tab(qapp, tmp_path, monkeypatch)
-        assert self._labels(self._menu(tab, 2)) == []
+        # Only skip/re-enable (feature 103), which applies to any row.
+        assert self._labels(self._menu(tab, 2)) == ["Bỏ qua chương này"]
 
     def test_undo_appears_only_once_a_chapter_has_been_rewritten(
         self, qapp, tmp_path, monkeypatch

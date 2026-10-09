@@ -149,6 +149,17 @@ def source_rows(view) -> list[int]:
     return sorted({source_index(view, i).row() for i in selection.selectedIndexes()})
 
 
+def menu_source_rows(view, index) -> list[int]:
+    """Rows a right-click at `index` acts on, as SOURCE rows, ascending.
+
+    The selection when the click landed inside it, otherwise just the clicked row — the
+    same rule `focus_index_keeping_selection` applies to what stays highlighted.
+    """
+    rows = source_rows(view)
+    clicked = source_index(view, index).row()
+    return rows if clicked in rows else [clicked]
+
+
 class SortableItem(QTableWidgetItem):
     """A QTableWidget cell that sorts by an explicit key instead of by its own text.
 
@@ -433,9 +444,14 @@ class RetranslateButtonDelegate(RowButtonDelegate):
 
 
 class AudioChapterTableModel(QAbstractTableModel):
-    """Read-only table over Chapter rows, audio-pipeline view."""
+    """Table over Chapter rows, audio-pipeline view. Only the "Bật" checkbox is editable."""
 
-    COLUMNS = ("#", "Tên chương (dịch)", "Ký tự", "Âm thanh", "Thời lượng", "Giọng", "Lỗi", "")
+    enabled_toggled = Signal(int, bool)  # chapter.index, new enabled state
+    enabled_batch_toggled = Signal(list, bool)  # chapter indices, new enabled state
+
+    COLUMNS = (
+        "#", "Tên chương (dịch)", "Ký tự", "Âm thanh", "Thời lượng", "Giọng", "Lỗi", "", "Bật",
+    )
     TITLE_COLUMN = 1
     CHARS_COLUMN = 2
     STATUS_COLUMN = 3
@@ -443,6 +459,7 @@ class AudioChapterTableModel(QAbstractTableModel):
     VOICE_COLUMN = 5
     ERROR_COLUMN = 6
     REGENERATE_COLUMN = 7
+    ENABLED_COLUMN = 8
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -471,6 +488,10 @@ class AudioChapterTableModel(QAbstractTableModel):
 
     def chapter_at(self, row: int) -> Chapter | None:
         return self._chapters[row] if 0 <= row < len(self._chapters) else None
+
+    def set_rows_enabled(self, rows, enabled: bool) -> list[int]:
+        """Batch form of the checkbox; see `_apply_rows_enabled`."""
+        return _apply_rows_enabled(self, self._chapters, rows, enabled)
 
     def _audio_status(self, chapter: Chapter) -> tuple[str, QColor]:
         if self._use_translation and not chapter.translated:
@@ -553,8 +574,12 @@ class AudioChapterTableModel(QAbstractTableModel):
                 # "Which rows failed" is the question, and it is one click.
                 return (bool(chapter.audio_error), (chapter.audio_error or "").casefold())
             return None  # the button column has no key; its header is not clickable
-        if role == Qt.ItemDataRole.ForegroundRole and column == self.STATUS_COLUMN:
-            return self._audio_status(chapter)[1]
+        if role == Qt.ItemDataRole.ForegroundRole:
+            # Same as the chapter tables: a disabled row dims every column.
+            if not chapter.enabled:
+                return DISABLED_ROW_COLOR
+            if column == self.STATUS_COLUMN:
+                return self._audio_status(chapter)[1]
         if role == Qt.ItemDataRole.TextAlignmentRole and column in (
             self.CHARS_COLUMN,
             self.DURATION_COLUMN,
@@ -570,7 +595,36 @@ class AudioChapterTableModel(QAbstractTableModel):
                 return has_source and not downloadable
             if role == Qt.ItemDataRole.ToolTipRole and has_source and not downloadable:
                 return "Tạo (lại) audio riêng chương này"
+        if column == self.ENABLED_COLUMN:
+            if role == Qt.ItemDataRole.CheckStateRole:
+                return Qt.CheckState.Checked if chapter.enabled else Qt.CheckState.Unchecked
+            if role == Qt.ItemDataRole.ToolTipRole:
+                return "Bỏ qua chương này" if chapter.enabled else "Bật lại chương này"
         return None
+
+    def flags(self, index):
+        flags = super().flags(index)
+        if index.isValid() and index.column() == self.ENABLED_COLUMN:
+            flags |= Qt.ItemFlag.ItemIsUserCheckable
+        return flags
+
+    def setData(self, index, value, role=Qt.ItemDataRole.EditRole) -> bool:
+        if (
+            not index.isValid()
+            or index.column() != self.ENABLED_COLUMN
+            or role != Qt.ItemDataRole.CheckStateRole
+        ):
+            return False
+        chapter = self._chapters[index.row()]
+        new_enabled = int(value) == int(Qt.CheckState.Checked.value)
+        if new_enabled == chapter.enabled:
+            return False
+        chapter.enabled = new_enabled
+        # The whole row, not just the checkbox: every column dims.
+        row = index.row()
+        self.dataChanged.emit(self.index(row, 0), self.index(row, self.columnCount() - 1))
+        self.enabled_toggled.emit(chapter.index, new_enabled)
+        return True
 
 
 def audio_source_label(voice: str, pretty: dict[str, str] | None = None) -> str:
@@ -703,6 +757,7 @@ class ChapterTableModel(QAbstractTableModel):
     translated_title_edited = Signal(int, str)  # chapter.index, new title
     title_edited = Signal(int, str)  # chapter.index, new chapter title
     enabled_toggled = Signal(int, bool)  # chapter.index, new enabled state
+    enabled_batch_toggled = Signal(list, bool)  # chapter indices, new enabled state
 
     COLUMNS = (
         "#", "Tên chương", "Tên dịch", "Trạng thái", "Dịch bằng", "Thời gian", "Lỗi", "", "Bật",
@@ -745,6 +800,10 @@ class ChapterTableModel(QAbstractTableModel):
                 self._chapters[row] = chapter
                 self.dataChanged.emit(self.index(row, 0), self.index(row, self.columnCount() - 1))
                 return
+
+    def set_rows_enabled(self, rows, enabled: bool) -> list[int]:
+        """Batch form of the checkbox; see `_apply_rows_enabled`."""
+        return _apply_rows_enabled(self, self._chapters, rows, enabled)
 
     def mark_in_progress(self, chapter_index: int) -> None:
         """Show `chapter_index` as `Đang dịch` until its next `update_chapter`."""
@@ -995,6 +1054,56 @@ def enable_cell_copy(table: QTableView, extra_actions=None) -> None:
         menu.exec(table.viewport().mapToGlobal(pos))
 
     table.customContextMenuRequested.connect(show_menu)
+
+
+def _apply_rows_enabled(model, chapters: list[Chapter], rows, enabled: bool) -> list[int]:
+    """Set `enabled` on the chapters at source `rows`; return the chapter indices changed.
+
+    Rows already in that state are left alone. One `dataChanged` over the affected span and
+    one `enabled_batch_toggled`, however many rows — the tab persists them in a single
+    write. Nothing is emitted when nothing changed.
+    """
+    changed_rows = [
+        row for row in sorted(set(rows))
+        if 0 <= row < len(chapters) and chapters[row].enabled != enabled
+    ]
+    if not changed_rows:
+        return []
+    for row in changed_rows:
+        chapters[row].enabled = enabled
+    model.dataChanged.emit(
+        model.index(changed_rows[0], 0),
+        model.index(changed_rows[-1], model.columnCount() - 1),
+    )
+    indices = [chapters[row].index for row in changed_rows]
+    model.enabled_batch_toggled.emit(indices, enabled)
+    return indices
+
+
+def add_enable_actions(menu: QMenu, table: QTableView, model, index) -> None:
+    """Append "Bỏ qua N chương" / "Bật lại N chương" for the rows a right-click covers.
+
+    Covers the selection when the click is inside it, else the clicked row. Offers each
+    direction only when some row would actually change, so a mixed selection gets both.
+    Never greyed out while a job runs — neither is the checkbox; a running job already
+    took its chapter list. Adds nothing when `index` is not from `model` (e.g. the audio
+    tab's source view swaps the table to a different model).
+    """
+    if not index.isValid() or source_index(table, index).model() is not model:
+        return
+    chapters = [(row, model.chapter_at(row)) for row in menu_source_rows(table, index)]
+    to_disable = [row for row, chapter in chapters if chapter is not None and chapter.enabled]
+    to_enable = [row for row, chapter in chapters if chapter is not None and not chapter.enabled]
+    if not to_disable and not to_enable:
+        return
+    menu.addSeparator()
+    for verb, rows, enabled in (("Bỏ qua", to_disable, False), ("Bật lại", to_enable, True)):
+        if not rows:
+            continue
+        label = f"{verb} chương này" if len(rows) == 1 else f"{verb} {len(rows)} chương"
+        menu.addAction(
+            label, lambda rows=tuple(rows), enabled=enabled: model.set_rows_enabled(rows, enabled)
+        )
 
 
 class PauseButton(QPushButton):

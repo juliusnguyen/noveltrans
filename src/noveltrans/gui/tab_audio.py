@@ -41,6 +41,7 @@ from noveltrans.gui.widgets import (
     source_index,
     source_rows,
     RowButtonDelegate,
+    add_enable_actions,
     enable_cell_copy,
 )
 from noveltrans.gui.workers import (
@@ -156,6 +157,8 @@ class AudioTab(QWidget):
         self._manifest: list[dict] = []
         self._manifest_worker: AudioManifestWorker | None = None
         self.model.set_source(config.tts_use_translation)
+        self.model.enabled_toggled.connect(self._on_enabled_toggled)
+        self.model.enabled_batch_toggled.connect(self._on_enabled_batch_toggled)
         # connect now that the model exists (setChecked/addItem above ran before this)
         self.translated_radio.toggled.connect(self._on_source_changed)
         self.view_combo.currentIndexChanged.connect(self._on_view_changed)
@@ -199,6 +202,7 @@ class AudioTab(QWidget):
         self._plain_delegate = QStyledItemDelegate(self.table)
         self.table.setColumnWidth(AudioChapterTableModel.REGENERATE_COLUMN, 100)
         self.table.setColumnWidth(AudioChapterTableModel.CHARS_COLUMN, 70)
+        self.table.setColumnWidth(AudioChapterTableModel.ENABLED_COLUMN, 40)
         self.table.doubleClicked.connect(self._on_row_double_clicked)
 
         # --- bottom row
@@ -716,9 +720,24 @@ class AudioTab(QWidget):
         self._worker.start()
 
     def _table_context_actions(self, menu: QMenu, index) -> None:
-        """Both row actions, in the order the two audio sources are offered above."""
+        """Both row actions, in the order the two audio sources are offered above, then
+        skip/re-enable (chapter view only — `add_enable_actions` checks the model)."""
         self._add_regenerate_actions(menu, index)
         self._add_download_actions(menu, index)
+        add_enable_actions(menu, self.table, self.model, index)
+
+    def _on_enabled_toggled(self, idx: int, enabled: bool) -> None:
+        if self.project is None:
+            return
+        self.project.set_enabled(idx, enabled)
+        chapter = self.project.chapter(idx)
+        if chapter is not None:
+            self.model.update_chapter(chapter)
+
+    def _on_enabled_batch_toggled(self, indices: list[int], enabled: bool) -> None:
+        # See ScrapeTab: one write, no re-read.
+        if self.project is not None:
+            self.project.set_enabled_many(indices, enabled)
 
     def _add_regenerate_actions(self, menu: QMenu, index) -> None:
         """Append "Tạo lại" for the whole selection to the table's right-click menu.

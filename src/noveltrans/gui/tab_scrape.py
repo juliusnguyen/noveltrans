@@ -36,6 +36,7 @@ from noveltrans.gui.widgets import (
     CellEditorDelegate,
     ChapterTableModel,
     ProjectPicker,
+    add_enable_actions,
     enable_cell_copy,
     sorting_proxy,
     enable_table_sorting,
@@ -160,6 +161,7 @@ class ScrapeTab(QWidget):
         self.model.set_title_editable(True)
         self.model.title_edited.connect(self._on_title_edited)
         self.model.enabled_toggled.connect(self._on_enabled_toggled)
+        self.model.enabled_batch_toggled.connect(self._on_enabled_batch_toggled)
         self.table = QTableView()
         # A proxy, so the header sorts the view without ever reordering the chapter list
         # itself. Every read of a row goes through source_index / source_rows — a view row
@@ -176,8 +178,9 @@ class ScrapeTab(QWidget):
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
         # Ctrl+C copies a cell; the right-click menu also offers "download from here"
-        # / "only this chapter" via the extra_actions hook (see _add_download_actions).
-        enable_cell_copy(self.table, extra_actions=self._add_download_actions)
+        # / "only this chapter" and skip/re-enable via the extra_actions hook (see
+        # _table_context_actions).
+        enable_cell_copy(self.table, extra_actions=self._table_context_actions)
 
         # --- download row
         # A hand-written novel has no TOC to scan, so chapters are created here. It has
@@ -509,6 +512,12 @@ class ScrapeTab(QWidget):
         QMessageBox.warning(self, "Quét thất bại", message)
 
     # -------------------------------------------------------------- download
+
+    def _table_context_actions(self, menu: QMenu, index) -> None:
+        # A wrapper rather than an append inside `_add_download_actions`: that one returns
+        # early for a local novel, which would silently drop the skip/re-enable items.
+        self._add_download_actions(menu, index)
+        add_enable_actions(menu, self.table, self.model, index)
 
     def _add_download_actions(self, menu: QMenu, index) -> None:
         """Append per-chapter download actions to the table's right-click menu."""
@@ -870,6 +879,12 @@ class ScrapeTab(QWidget):
         chapter = self.project.chapter(idx)
         if chapter is not None:
             self.model.update_chapter(chapter)
+
+    def _on_enabled_batch_toggled(self, indices: list[int], enabled: bool) -> None:
+        # One write for the whole selection. No re-read: the model already holds the
+        # new state, and only `enabled` changed.
+        if self.project is not None:
+            self.project.set_enabled_many(indices, enabled)
 
     def _reset_title(self, idx: int) -> None:
         """Undo a rename: put the site's own title back, now."""
