@@ -642,3 +642,73 @@ class TestInsertChapter:
         menu = self._menu(tab, 0)
         actions = [a for a in menu.actions() if a.text().startswith("Thêm chương")]
         assert actions and not any(a.isEnabled() for a in actions)
+
+
+class TestRevealNewChaptersAfterScan:
+    """A re-scan selects the chapters it added and scrolls to the first of them."""
+
+    class _Worker:
+        """Stands in for ScanWorker: `_start_scan` only wires signals and starts it."""
+
+        class _Signal:
+            def connect(self, *_a):
+                pass
+
+        def __init__(self, *_a, **_k):
+            self.progress = self.scanned = self.failed = self.finished = self._Signal()
+
+        def start(self):
+            pass
+
+    def _rescan(self, tab, monkeypatch, total: int) -> None:
+        """Run a scan of the open novel that finds `total` chapters."""
+        monkeypatch.setattr("noveltrans.gui.tab_scrape.ScanWorker", self._Worker)
+        tab._start_scan()
+        path = tab.project.path
+        refs = [
+            ChapterRef(index=i, title=f"C{i + 1}", url=f"https://fake.test/{i}")
+            for i in range(total)
+        ]
+        other = NovelProject.open(path)
+        other.replace_toc(refs)
+        other.close()
+        tab._on_scanned(str(path), None, total)
+
+    def _selected_indices(self, tab) -> list[int]:
+        from noveltrans.gui.widgets import source_rows
+
+        return [tab.model.chapter_at(r).index for r in source_rows(tab.table)]
+
+    def test_the_new_chapters_are_selected_and_announced(self, qapp, library_dir, monkeypatch):
+        tab = _tab_with_project(qapp, library_dir, n=5)
+        self._rescan(tab, monkeypatch, total=8)
+        assert self._selected_indices(tab) == [5, 6, 7]
+        assert "+3 chương mới" in tab.status_label.text()
+
+    def test_a_scan_that_finds_nothing_selects_nothing(self, qapp, library_dir, monkeypatch):
+        tab = _tab_with_project(qapp, library_dir, n=5)
+        self._rescan(tab, monkeypatch, total=5)
+        assert self._selected_indices(tab) == []
+        assert "chương mới" not in tab.status_label.text()
+
+    def test_under_a_sort_it_scrolls_to_the_first_new_row_on_screen(
+        self, qapp, library_dir, monkeypatch
+    ):
+        tab = _tab_with_project(qapp, library_dir, n=5)
+        tab.table.sortByColumn(0, Qt.SortOrder.DescendingOrder)
+        self._rescan(tab, monkeypatch, total=8)
+        assert self._selected_indices(tab) == [5, 6, 7]
+        current_top = tab.table.selectionModel().selectedRows()
+        assert min(i.row() for i in current_top) == 0  # newest first under descending
+
+    def test_a_scan_of_another_novel_announces_nothing(self, qapp, library_dir, monkeypatch):
+        tab = _tab_with_project(qapp, library_dir, n=5)
+        monkeypatch.setattr("noveltrans.gui.tab_scrape.ScanWorker", self._Worker)
+        tab._start_scan()
+        meta = NovelMeta(url="https://fake.test/book/2", site="fake", title="Khác")
+        refs = [ChapterRef(index=i, title=f"C{i + 1}", url=f"https://fake.test/2/{i}") for i in range(4)]
+        other = NovelProject.create(library_dir, meta, refs)
+        other.close()
+        tab._on_scanned(str(other.path), None, 4)
+        assert self._selected_indices(tab) == []
+        assert "chương mới" not in tab.status_label.text()
