@@ -72,6 +72,7 @@ Nguồn đã là tiếng Việt (tải xong đọc/nghe được ngay, không c�
 | Site | URL mẫu |
 |---|---|
 | Mê Đọc Truyện (medoctruyen.vn) | `https://medoctruyen.vn/tu-bao-tien-bon` — cần dán cookie đăng nhập trong Cài đặt để tải chương |
+| MeTruyenChu (metruyenchu.com.vn) | `https://metruyenchu.com.vn/ca-trieu-van-vo-deu-nghe-ta-tieng-long` — chương cuối (đã đến cuối truyện) có bước xác minh thủ công: mở chương trên trình duyệt, hoàn tất bước xác minh, rồi tải lại. Các chương khác tải bình thường |
 | Tiểu Thuyết Mạng (tieuthuyetmang.com) | `https://tieuthuyetmang.com/truyen/<slug>` — **phần lớn chương là trả phí**: cần dán cookie đăng nhập trong Cài đặt, và chỉ tải được những chương tài khoản của bạn đã mở khoá. Đây cũng là site duy nhất **có sẵn audio do trang đọc**: ở tab 4 bấm **⬇️ Tải audio từ nguồn** để tải thẳng bản đọc của site thay vì tạo bằng TTS, rồi chọn giọng **Audio từ nguồn** ở tab 4 / tab video để ghép và render. Mục nào tài khoản chưa mở khoá thì app báo và bỏ qua mục đó |
 | Gia Tộc Vương Tài (giatocvuongtai.com) | `https://giatocvuongtai.com/stories/<slug>` — đọc qua JSON API công khai của site, **không cần đăng nhập hay cookie** |
 | Web Truyện Dịch (webtruyendich.com) | `https://webtruyendich.com/truyen/dong-kinh-y-do` — bản dịch AI do chính trang tạo ra: app mở trình duyệt (Cloudflare), tự chọn model Gemini "Memory / No Apikey" mà trang đang có rồi bấm **Dịch lại**, và lưu thẳng kết quả làm bản dịch. Cần Google Chrome hoặc `playwright install chromium`. **Không tải song song nhiều luồng** — site bị giới hạn Cloudflare + quota AI |
