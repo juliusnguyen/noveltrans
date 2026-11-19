@@ -166,6 +166,51 @@ class TestSortedViewsStillActOnChapters:
         assert source_rows(view) == [3]
 
 
+class TestDisabledChaptersSortLast:
+    """A skipped chapter sorts below every enabled one, whatever the column or direction.
+
+    The regression: 2173 skipped "Chưa tải" chapters buried 17 newly scanned "Chưa tải"
+    ones under a status sort, so the table looked like the scan had found nothing.
+    """
+
+    def _proxy(self, model_cls=ChapterTableModel):
+        chapters = _chapters()
+        for chapter in chapters[:6]:
+            chapter.enabled = False
+        model = model_cls()
+        model.set_chapters(chapters)
+        return sorting_proxy(model)
+
+    def _order(self, proxy) -> list[tuple[int, bool]]:
+        source = proxy.sourceModel()
+        rows = (proxy.mapToSource(proxy.index(r, 0)).row() for r in range(proxy.rowCount()))
+        return [(source.chapter_at(r).index, source.chapter_at(r).enabled) for r in rows]
+
+    @pytest.mark.parametrize(
+        "order", [Qt.SortOrder.AscendingOrder, Qt.SortOrder.DescendingOrder]
+    )
+    @pytest.mark.parametrize(
+        "column", [0, ChapterTableModel.STATUS_COLUMN, ChapterTableModel.DURATION_COLUMN]
+    )
+    def test_every_disabled_row_comes_after_every_enabled_row(self, qapp, column, order):
+        proxy = self._proxy()
+        proxy.sort(column, order)
+        flags = [enabled for _idx, enabled in self._order(proxy)]
+        assert flags == [True] * 6 + [False] * 6
+
+    def test_within_each_group_the_column_still_decides(self, qapp):
+        proxy = self._proxy()
+        proxy.sort(0, Qt.SortOrder.DescendingOrder)
+        assert [idx for idx, _ in self._order(proxy)] == [11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
+        proxy.sort(0, Qt.SortOrder.AscendingOrder)
+        assert [idx for idx, _ in self._order(proxy)] == [6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 4, 5]
+
+    def test_the_audio_table_follows_the_same_rule(self, qapp):
+        proxy = self._proxy(AudioChapterTableModel)
+        proxy.sort(0, Qt.SortOrder.AscendingOrder)
+        assert [enabled for _idx, enabled in self._order(proxy)] == [True] * 6 + [False] * 6
+
+
 class TestSortableItem:
     def test_it_sorts_by_the_key_not_by_the_text(self, qapp):
         from PySide6.QtWidgets import QTableWidget

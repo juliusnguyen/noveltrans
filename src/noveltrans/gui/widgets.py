@@ -70,15 +70,46 @@ _AUDIO_RANK = {
 }
 
 
+class _DisabledLastProxy(QSortFilterProxyModel):
+    """Sorts on SORT_ROLE, but a disabled chapter always sorts below every enabled one.
+
+    Whatever the column and whichever the direction. The case that forced it: a novel whose
+    first 2173 chapters were skipped (still "Chưa tải") and 17 freshly scanned ones (also
+    "Chưa tải"). Sorted by status, the new chapters sat buried after 2173 skipped rows, the
+    bottom of the table ended at the last translated chapter, and it read as "the scan found
+    nothing". A skipped chapter is one the user has said to ignore, so it goes last.
+
+    Qt sorts descending by reversing `lessThan`, so the enabled/disabled tie-break has to
+    read `sortOrder()` and flip itself back, or a descending click would float every
+    disabled chapter to the top.
+
+    Only models exposing `chapter_at(row)` take part; any other source sorts plainly.
+    """
+
+    def _enabled(self, index) -> bool:
+        chapter_at = getattr(self.sourceModel(), "chapter_at", None)
+        chapter = chapter_at(index.row()) if chapter_at is not None else None
+        return True if chapter is None else bool(chapter.enabled)
+
+    def lessThan(self, left, right) -> bool:
+        left_on, right_on = self._enabled(left), self._enabled(right)
+        if left_on != right_on:
+            ascending = self.sortOrder() == Qt.SortOrder.AscendingOrder
+            return left_on if ascending else right_on
+        return super().lessThan(left, right)
+
+
 def sorting_proxy(model, parent=None) -> QSortFilterProxyModel:
     """A proxy that sorts on SORT_ROLE, for the four QTableViews.
+
+    Disabled chapters always sort last — see `_DisabledLastProxy`.
 
     `setDynamicSortFilter(False)` is deliberate. These models emit `dataChanged` per
     chapter while a run is in progress, and with dynamic sorting on, a chapter that
     finishes translating **jumps out from under the cursor** mid-run. Off, the order holds
     until the next header click or `set_chapters` reset.
     """
-    proxy = QSortFilterProxyModel(parent)
+    proxy = _DisabledLastProxy(parent)
     proxy.setSourceModel(model)
     proxy.setSortRole(SORT_ROLE)
     proxy.setDynamicSortFilter(False)

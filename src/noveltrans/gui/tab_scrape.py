@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from PySide6.QtCore import Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QItemSelectionModel, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -74,6 +75,9 @@ class ScrapeTab(QWidget):
         # renumbers rows that a running translate/audio/video job may be holding by idx.
         self.workspace_busy: Callable[[], bool] | None = None
         self._scan_worker: ScanWorker | None = None
+        # (project path, chapter indices) of the open novel when a scan starts, so the
+        # scan's result can say which chapters it added — see `_reveal_new_chapters`.
+        self._pre_scan: tuple[str, set[int]] | None = None
         self._download_worker: DownloadWorker | None = None
         self._unlock_worker: UnlockWorker | None = None
         self._auto_unlocking = False  # suppress the "download finished" chrome mid-unlock
@@ -605,6 +609,11 @@ class ScrapeTab(QWidget):
         self.download_button.setEnabled(False)
         self.range_button.setEnabled(False)
         self.status_label.setText("Đang quét metadata và mục lục…")
+        self._pre_scan = (
+            (str(self.project.path), {c.index for c in self.project.chapters()})
+            if self.project is not None
+            else None
+        )
 
         self._scan_worker = ScanWorker(
             url,
@@ -626,11 +635,51 @@ class ScrapeTab(QWidget):
         self._apply_project_ui()
         self.count_label.setText(str(count))
         counts = self.project.counts()
-        self.status_label.setText(
-            f"Đã quét xong: {counts['total']} chương, {counts['downloaded']} đã tải."
-        )
+        status = f"Đã quét xong: {counts['total']} chương, {counts['downloaded']} đã tải."
+        added = self._reveal_new_chapters(path)
+        if added:
+            status += f" +{added} chương mới — đã chọn sẵn trong bảng."
+        self.status_label.setText(status)
         self.refresh_recent(select_path=path)  # same-path guard avoids a reload
         self.project_changed.emit(path)
+
+    def _reveal_new_chapters(self, path: str) -> int:
+        """Select the chapters this scan added and scroll to the first; return how many.
+
+        Only for a re-scan of the novel that was open when the scan started. A first scan
+        (or a scan of a different novel) has no "before", and calling all 2000 chapters of
+        a fresh novel "new" would be noise rather than news.
+
+        Selected in VIEW order through the proxy, and scrolled to whichever new chapter
+        the current sort shows first — under a status sort the new rows are not at the
+        bottom. Selecting all of them (not just the first) leaves the right-click download
+        acting on exactly what the scan found.
+        """
+        before, self._pre_scan = self._pre_scan, None
+        if before is None or before[0] != path:
+            return 0
+        known = before[1]
+        new_rows = [
+            row
+            for row in range(self.model.rowCount())
+            if (chapter := self.model.chapter_at(row)) is not None and chapter.index not in known
+        ]
+        if not new_rows:
+            return 0
+        view_rows = sorted(
+            self.proxy.mapFromSource(self.model.index(row, self.model.TITLE_COLUMN)).row()
+            for row in new_rows
+        )
+        selection = self.table.selectionModel()
+        selection.clearSelection()
+        flags = (
+            QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
+        )
+        for view_row in view_rows:
+            selection.select(self.proxy.index(view_row, 0), flags)
+        first = self.proxy.index(view_rows[0], self.model.TITLE_COLUMN)
+        self.table.scrollTo(first, QAbstractItemView.ScrollHint.PositionAtTop)
+        return len(new_rows)
 
     def _on_scan_failed(self, message: str) -> None:
         self.status_label.setText("")
