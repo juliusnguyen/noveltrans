@@ -334,6 +334,22 @@ class TestCheapFixesFromTheResultView:
         assert project.chapter(0).translated == GOOD_VI  # kept: only its title is redone
         assert project.chapter(1).translated == ""  # dropped, as before
 
+    def test_name_fix_scan_never_sets_a_wait_cursor(self, qapp, tmp_path, monkeypatch):
+        """WaitCursor under a modal dialog crashes Qt on macOS 27 (changes/107)."""
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QApplication
+
+        tab, project = _tab(qapp, tmp_path, monkeypatch)
+        self._mark(project, 0, "name_variant")
+        shapes: list = []
+        monkeypatch.setattr(
+            QApplication, "setOverrideCursor", staticmethod(lambda cursor: shapes.append(cursor))
+        )
+        monkeypatch.setattr(QApplication, "restoreOverrideCursor", staticmethod(lambda: None))
+        tab._name_fix_proposals([0])
+        assert shapes, "the scan should set a busy cursor"
+        assert all(shape != Qt.CursorShape.WaitCursor for shape in shapes)
+
     def _proposal(self, *chapters):
         from noveltrans.translators.qc import NameFixProposal
 

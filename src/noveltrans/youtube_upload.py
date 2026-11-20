@@ -108,6 +108,7 @@ _PLAYLIST_ITEM_SEL = "ytcp-checkbox-group ytcp-ve, #items ytcp-checkbox-group yt
 _PLAYLIST_NEW_SEL = "ytcp-playlist-dialog #create-playlist-button, #create-playlist-button"
 _PLAYLIST_NEW_TITLE_SEL = "#create-playlist-form #title-input textarea, #playlist-title-input textarea"
 _PLAYLIST_NEW_CREATE_TEXTS = ("Tạo", "Create")
+_PLAYLIST_NEW_TEXTS = ("New playlist", "Danh sách phát mới", "Tạo danh sách phát mới")
 _PLAYLIST_DONE_TEXTS = ("Xong", "Done")
 # `_set_playlist` is best-effort (see its docstring) and each of its lookups used to wait
 # the full `_STEP_WAIT_MS` (30s). Stacked across several sequential lookups (trigger,
@@ -1376,6 +1377,40 @@ def _wait_for_bytes_uploaded(page, *, on_progress, should_cancel, video_id: str)
     )
 
 
+def _norm_title(text: str) -> str:
+    return " ".join(text.split()).casefold()
+
+
+_TITLE_SEPARATORS = (",", ":", "|", "-", "–", "(", "[")
+
+
+def pick_playlist_index(titles: list[str], name: str) -> int | None:
+    """Which picker row is the playlist `name` means, or None.
+
+    Exact title first (case and spacing ignored). Failing that, a single row whose title
+    *extends* the name ("Cho Cậu Học Ở Trường Quý Tộc, Vậy Mà …") is taken, because the
+    novel's saved playlist name is often the short form of Studio's full title. Two or
+    more extensions is ambiguous, so none is picked rather than the wrong one.
+    """
+    target = _norm_title(name)
+    if not target:
+        return None
+    for i, text in enumerate(titles):
+        if any(_norm_title(line) == target for line in text.splitlines()):
+            return i
+    extensions: dict[str, int] = {}  # normalised full title -> first row index
+    for i, text in enumerate(titles):
+        first = next((line for line in text.splitlines() if line.strip()), "")
+        head = _norm_title(first)
+        if head.startswith(target) and (
+            head == target or head[len(target):].lstrip().startswith(_TITLE_SEPARATORS)
+        ):
+            extensions.setdefault(head, i)
+    # Studio can render one playlist twice (e.g. after a search), so identical titles are
+    # one playlist; only *different* titles make the short name ambiguous.
+    return next(iter(extensions.values())) if len(extensions) == 1 else None
+
+
 def _set_playlist(
     page, name: str, *, created_playlists: set | None = None, on_progress=None
 ) -> None:
@@ -1406,16 +1441,16 @@ def _set_playlist(
         page.keyboard.type(name, delay=_TYPE_DELAY_MS)
         page.wait_for_timeout(_SETTLE_MS)
 
-    # An exact-title match wins; a substring match would tick "Phần 1" for "Phần 10".
-    existing = page.locator(f'{_PLAYLIST_ITEM_SEL}:has-text("{name}")').first
+    # Exact title first, then a single extension of it (see `pick_playlist_index`).
+    # A plain substring match would tick "Phần 1" for "Phần 10".
     matched = False
     try:
-        if existing.is_visible(timeout=3_000):
-            for line in existing.inner_text().splitlines():
-                if line.strip() == name:
-                    existing.click()
-                    matched = True
-                    break
+        items = page.locator(_PLAYLIST_ITEM_SEL)
+        titles = items.all_inner_texts()
+        index = pick_playlist_index(titles, name)
+        if index is not None:
+            items.nth(index).click()
+            matched = True
     except Exception:
         matched = False
 
@@ -1426,7 +1461,7 @@ def _set_playlist(
             f"⚠️ Không thấy danh sách phát “{name}” (đã tạo trong phiên này) — bỏ qua.",
         )
     elif not matched:
-        if _click_any(page, _PLAYLIST_NEW_SEL, timeout_ms=_PLAYLIST_STEP_WAIT_MS):
+        if _click_any(page, _PLAYLIST_NEW_SEL, _PLAYLIST_NEW_TEXTS, timeout_ms=_PLAYLIST_STEP_WAIT_MS):
             page.wait_for_timeout(_SETTLE_MS)
             title_box = _first_present(
                 page, _PLAYLIST_NEW_TITLE_SEL, timeout_ms=_PLAYLIST_STEP_WAIT_MS

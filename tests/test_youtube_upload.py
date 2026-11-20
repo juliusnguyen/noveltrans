@@ -3473,3 +3473,49 @@ class TestPauseHook:
         assert len(calls) == 1
         preceding = source[: calls[0]].rstrip().splitlines()[-3:]
         assert any("_check_cancel(should_cancel)" in line for line in preceding)
+
+
+class TestPickPlaylistIndex:
+    """Which picker row a saved playlist name means (feature 107 follow-up)."""
+
+    def test_exact_title_wins_ignoring_case_and_spacing(self):
+        from noveltrans.youtube_upload import pick_playlist_index
+
+        titles = ["Khác", "  phần  1 ", "Phần 10"]
+        assert pick_playlist_index(titles, "Phần 1") == 1
+
+    def test_short_saved_name_matches_the_single_full_title(self):
+        from noveltrans.youtube_upload import pick_playlist_index
+
+        titles = [
+            "Ta Là Phản Diện Sao?",
+            "Cho Cậu Học Ở Trường Quý Tộc, Vậy Mà Cậu Lại Đi Tán Gái Đại Tiểu Thư",
+        ]
+        assert pick_playlist_index(titles, "Cho Cậu Học Ở Trường Quý Tộc") == 1
+
+    def test_substring_without_a_separator_is_not_a_match(self):
+        from noveltrans.youtube_upload import pick_playlist_index
+
+        # "Phần 1" must not claim "Phần 10" or "Phần 1x".
+        assert pick_playlist_index(["Phần 10", "Phần 1x"], "Phần 1") is None
+
+    def test_two_extensions_are_ambiguous_so_nothing_is_picked(self):
+        from noveltrans.youtube_upload import pick_playlist_index
+
+        titles = ["Cho Cậu Học, bản A", "Cho Cậu Học, bản B"]
+        assert pick_playlist_index(titles, "Cho Cậu Học") is None
+
+    def test_the_same_playlist_rendered_twice_is_still_one_match(self):
+        from noveltrans.youtube_upload import pick_playlist_index
+
+        titles = [
+            "Cho Cậu Học Ở Trường Quý Tộc, Vậy Mà Cậu Lại Đi Tán Gái Đại Tiểu Thư",
+            "  Cho Cậu Học Ở Trường Quý Tộc, Vậy Mà Cậu Lại Đi Tán Gái Đại Tiểu Thư",
+        ]
+        assert pick_playlist_index(titles, "Cho Cậu Học Ở Trường Quý Tộc") == 0
+
+    def test_no_match_and_empty_name_return_none(self):
+        from noveltrans.youtube_upload import pick_playlist_index
+
+        assert pick_playlist_index(["Khác"], "Cho Cậu Học") is None
+        assert pick_playlist_index(["Khác"], "   ") is None
