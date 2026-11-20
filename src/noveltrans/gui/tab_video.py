@@ -498,6 +498,7 @@ class VideoTab(QWidget):
             ("Không công khai (unlisted)", "unlisted"),
             ("Công khai ngay", "public"),
             ("Hẹn giờ đăng", "schedule"),
+            ("Hội viên → công khai (sau 3 ngày)", "members_then_public"),
         ):
             self.upload_visibility.addItem(label, key)
         self.upload_visibility.currentIndexChanged.connect(self._on_visibility_changed)
@@ -647,7 +648,10 @@ class VideoTab(QWidget):
         """Show the schedule controls only when they mean something, and remember the
         choice on the open novel (per-novel, not the old always-reset-to-private default —
         see NovelMeta.upload_visibility)."""
-        scheduling = self.upload_visibility.currentData() == "schedule"
+        key = self.upload_visibility.currentData()
+        scheduling = key == "schedule"
+        members = key == "members_then_public"
+        # The members mode has a fixed 3-day rule, so it shows no start date or spacing.
         for widget in (
             self.upload_start_label,
             self.upload_start,
@@ -655,7 +659,7 @@ class VideoTab(QWidget):
             self.upload_spacing,
         ):
             widget.setVisible(scheduling)
-        self.schedule_preview.setVisible(scheduling)
+        self.schedule_preview.setVisible(scheduling or members)
         self._refresh_schedule_preview()
         if self.project is not None:
             self.project.save_upload_visibility(self.upload_visibility.currentData())
@@ -669,7 +673,11 @@ class VideoTab(QWidget):
         """
         if not hasattr(self, "schedule_preview"):
             return
-        if self.upload_visibility.currentData() != "schedule":
+        key = self.upload_visibility.currentData()
+        if key == "members_then_public":
+            self._refresh_members_preview()
+            return
+        if key != "schedule":
             self.schedule_preview.setText("")
             return
         pending = self._pending_upload_rows()
@@ -689,6 +697,27 @@ class VideoTab(QWidget):
         ]
         more = f" … (+{len(pending) - 4} phần)" if len(pending) > 4 else ""
         self.schedule_preview.setText("→ " + "   ".join(shown) + more)
+
+    def _refresh_members_preview(self) -> None:
+        """Show when each pending part goes public, as offsets from the upload click.
+
+        Absolute dates depend on when the upload is launched, so they appear only in the
+        confirmation dialog.
+        """
+        from noveltrans.youtube_upload import PUBLIC_SWITCH_DAYS
+
+        pending = self._pending_upload_rows()
+        if not pending:
+            self.schedule_preview.setText("Không có phần nào cần tải lên.")
+            return
+        shown = [
+            f"{label}: +{PUBLIC_SWITCH_DAYS * (i + 1)} ngày"
+            for i, (_, label, _, _) in enumerate(pending[:4])
+        ]
+        more = f" … (+{len(pending) - 4} phần)" if len(pending) > 4 else ""
+        self.schedule_preview.setText(
+            "Hội viên ngay → công khai: " + "   ".join(shown) + more
+        )
 
     def _voice_label(self, voice: str) -> str:
         """How to name this edition in a dialog — never the raw `SOURCE_AUDIO_KEY`.
@@ -4162,7 +4191,9 @@ class VideoTab(QWidget):
         except OSError:
             return ""
 
-    def _upload_request(self, window, label, part_num, whole_novel, *, publish_at):
+    def _upload_request(
+        self, window, label, part_num, whole_novel, *, publish_at, public_at=None
+    ):
         """Build one `UploadRequest` from the sidecars already sitting beside the .mp4.
 
         Falls back to computing the title/description when a sidecar is missing (parts
@@ -4185,6 +4216,7 @@ class VideoTab(QWidget):
             playlist=self.upload_playlist.currentText().strip(),
             visibility=self.upload_visibility.currentData(),
             publish_at=publish_at,
+            public_at=public_at,
             label=label,
         )
 
@@ -4361,9 +4393,16 @@ class VideoTab(QWidget):
             QMessageBox.information(self, "Tải lên YouTube", "Đang có phiên tải lên chạy.")
             return
 
-        from noveltrans.youtube_upload import YouTubeUploadError, schedule_times
+        from datetime import datetime
+
+        from noveltrans.youtube_upload import (
+            YouTubeUploadError,
+            public_switch_times,
+            schedule_times,
+        )
 
         scheduling = self.upload_visibility.currentData() == "schedule"
+        members = self.upload_visibility.currentData() == "members_then_public"
         times = (
             schedule_times(
                 self.upload_start.dateTime().toPython(), len(rows), self.upload_spacing.value()
@@ -4371,11 +4410,17 @@ class VideoTab(QWidget):
             if scheduling
             else [None] * len(rows)
         )
+        # Anchored to the click, so every part's offset is counted from the same moment.
+        public_times = (
+            public_switch_times(datetime.now(), len(rows))
+            if members
+            else [None] * len(rows)
+        )
 
         try:
             requests = [
-                self._upload_request(w, label, pn, wn, publish_at=when)
-                for (w, label, pn, wn), when in zip(rows, times)
+                self._upload_request(w, label, pn, wn, publish_at=when, public_at=public_when)
+                for (w, label, pn, wn), when, public_when in zip(rows, times, public_times)
             ]
             for request in requests:  # surface a bad input before opening a browser
                 request.validate()
@@ -4386,10 +4431,15 @@ class VideoTab(QWidget):
         names = ", ".join(r.label for r in requests[:5])
         more = f" (+{len(requests) - 5})" if len(requests) > 5 else ""
         when_text = (
-            f"\nHẹn giờ: {times[0]:%d/%m %H:%M}"
-            + (f" → {times[-1]:%d/%m %H:%M}" if len(times) > 1 else "")
-            if scheduling
-            else f"\nChế độ: {self.upload_visibility.currentText()}"
+            f"\nHội viên ngay → công khai: {public_times[0]:%d/%m %H:%M}"
+            + (f" → {public_times[-1]:%d/%m %H:%M}" if len(public_times) > 1 else "")
+            if members
+            else (
+                f"\nHẹn giờ: {times[0]:%d/%m %H:%M}"
+                + (f" → {times[-1]:%d/%m %H:%M}" if len(times) > 1 else "")
+                if scheduling
+                else f"\nChế độ: {self.upload_visibility.currentText()}"
+            )
         )
         # An upload is public and effectively irreversible once it publishes, so it gets
         # a confirmation the render step doesn't need.
