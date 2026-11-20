@@ -1,4 +1,5 @@
 import pytest
+from PySide6.QtCore import Qt
 
 from noveltrans.gui.widgets import format_duration
 from noveltrans.models import Chapter
@@ -904,3 +905,112 @@ class TestAddEnableActions:
         menu = QMenu(table)
         add_enable_actions(menu, table, other, table.model().index(0, 0))
         assert [a for a in menu.actions() if a.text()] == []
+
+
+class TestCharCount:
+    """Feature 108: original / translation character counts on the Translate tab."""
+
+    def test_empty_or_missing_text_is_blank_not_zero(self):
+        from noveltrans.gui.widgets import char_count, format_char_count
+
+        assert format_char_count("") == ""
+        assert format_char_count(None) == ""
+        assert char_count("") == 0
+
+    def test_counts_raw_characters_with_grouping(self):
+        from noveltrans.gui.widgets import format_char_count
+
+        assert format_char_count("abc") == "3"
+        assert format_char_count("x" * 1234) == "1,234"
+
+    def test_whitespace_and_cjk_count_one_each(self):
+        from noveltrans.gui.widgets import char_count
+
+        assert char_count("a b\nc") == 5
+        assert char_count("你好") == 2
+
+
+class TestTranslateChapterTableModel:
+    def _model(self, qapp):
+        from noveltrans.gui.widgets import TranslateChapterTableModel
+
+        model = TranslateChapterTableModel()
+        model.set_chapters([
+            Chapter(index=0, title="第1章", url="u"),  # nothing yet
+            Chapter(index=1, title="第2章", url="u", content="你好世界", translated="xin chào",
+                    translated_title="Chương 2"),
+            Chapter(index=2, title="第3章", url="u", content="x" * 50, translated="",
+                    enabled=False),
+        ])
+        return model
+
+    def _cell(self, model, row, column, role):
+        return model.data(model.index(row, column), role)
+
+    def test_appends_two_count_columns_and_keeps_existing_indices(self, qapp):
+        from noveltrans.gui.widgets import ChapterTableModel, TranslateChapterTableModel
+
+        model = self._model(qapp)
+        assert model.columnCount() == 11
+        assert TranslateChapterTableModel.ORIG_CHARS_COLUMN == 9
+        assert TranslateChapterTableModel.TRANS_CHARS_COLUMN == 10
+        assert ChapterTableModel.RETRANSLATE_COLUMN == 7
+        assert ChapterTableModel.ENABLED_COLUMN == 8
+
+    def test_shows_original_and_translation_counts(self, qapp):
+        from noveltrans.gui.widgets import TranslateChapterTableModel as M
+
+        model = self._model(qapp)
+        assert self._cell(model, 1, M.ORIG_CHARS_COLUMN, Qt.ItemDataRole.DisplayRole) == "4"
+        assert self._cell(model, 1, M.TRANS_CHARS_COLUMN, Qt.ItemDataRole.DisplayRole) == "8"
+        # untranslated / undownloaded chapter: blank
+        assert self._cell(model, 0, M.ORIG_CHARS_COLUMN, Qt.ItemDataRole.DisplayRole) == ""
+        assert self._cell(model, 2, M.TRANS_CHARS_COLUMN, Qt.ItemDataRole.DisplayRole) == ""
+
+    def test_numbers_are_right_aligned(self, qapp):
+        from noveltrans.gui.widgets import TranslateChapterTableModel as M
+
+        model = self._model(qapp)
+        align = self._cell(model, 1, M.ORIG_CHARS_COLUMN, Qt.ItemDataRole.TextAlignmentRole)
+        assert align & Qt.AlignmentFlag.AlignRight
+
+    def test_sort_role_is_numeric_so_10_follows_9(self, qapp):
+        from noveltrans.gui.widgets import SORT_ROLE
+        from noveltrans.gui.widgets import TranslateChapterTableModel as M
+
+        model = self._model(qapp)
+        values = [self._cell(model, r, M.ORIG_CHARS_COLUMN, SORT_ROLE) for r in range(3)]
+        assert values == [0, 4, 50]
+        assert all(isinstance(v, int) for v in values)
+
+    def test_disabled_row_is_dimmed_in_the_new_columns(self, qapp):
+        from noveltrans.gui.widgets import DISABLED_ROW_COLOR
+        from noveltrans.gui.widgets import TranslateChapterTableModel as M
+
+        model = self._model(qapp)
+        assert self._cell(model, 2, M.ORIG_CHARS_COLUMN,
+                          Qt.ItemDataRole.ForegroundRole) == DISABLED_ROW_COLOR
+
+    def test_retained_translation_raw_does_not_change_the_count(self, qapp):
+        from noveltrans.gui.widgets import TranslateChapterTableModel as M
+
+        model = self._model(qapp)
+        chapter = model.chapter_at(1)
+        chapter.translated_raw = "a much longer discarded draft " * 10
+        assert self._cell(model, 1, M.TRANS_CHARS_COLUMN, Qt.ItemDataRole.DisplayRole) == "8"
+
+    def test_update_chapter_refreshes_the_new_columns(self, qapp):
+        from noveltrans.gui.widgets import TranslateChapterTableModel as M
+
+        model = self._model(qapp)
+        seen = []
+        model.dataChanged.connect(lambda tl, br, roles=None: seen.append(br.column()))
+        model.update_chapter(Chapter(index=1, title="第2章", url="u", content="你好世界!!",
+                                     translated="xin chào bạn", translated_title="Chương 2"))
+        assert self._cell(model, 1, M.ORIG_CHARS_COLUMN, Qt.ItemDataRole.DisplayRole) == "6"
+        assert max(seen) == M.TRANS_CHARS_COLUMN
+
+    def test_scrape_tab_model_is_unchanged(self, qapp):
+        from noveltrans.gui.widgets import ChapterTableModel
+
+        assert ChapterTableModel().columnCount() == 9
