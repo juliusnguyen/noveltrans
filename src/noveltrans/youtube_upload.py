@@ -148,6 +148,10 @@ _SCHEDULE_RADIO_SEL = "#schedule-radio-button, tp-yt-paper-radio-button[name='SC
 _DATE_TRIGGER_SEL = "#datepicker-trigger, ytcp-datetime-picker #datepicker-trigger"
 _DATE_INPUT_SEL = "ytcp-date-picker tp-yt-paper-input input, #datepicker-trigger input"
 _TIME_INPUT_SEL = "#time-of-day-container input, ytcp-time-of-day-picker input"
+# Members-only → public lives in Studio's "Schedule" accordion, under the visibility step
+# (probed live 2026-11-20). The header is labelled 'Schedule' (en) or 'Lên lịch' (vi).
+_SCHEDULE_HEADER_TEXTS = ("Lên lịch", "Schedule")
+_PUBLISH_FROM_MEMBERS_SEL = "tp-yt-paper-radio-button[name='PUBLISH_FROM_SPONSORS_ONLY']"
 _DONE_SEL = "#done-button"
 _PUBLISH_TEXTS = ("Xuất bản", "Lên lịch", "Lưu", "Publish", "Schedule", "Save")
 # What Studio puts up after a successful publish — either the share sheet or the
@@ -164,7 +168,9 @@ _CONFIRM_DIALOG_SEL = (
 # (like `_click_text_anywhere`) rather than a component selector, since this dialog's
 # generic-looking markup isn't worth pinning to a fragile Studio class name — one combined
 # `:text()` selector so the poll inside _finish's loop costs one query, not several.
+# Seen live 2026-11-20 on a members-only → public publish: the button reads "Got it".
 _STILL_CHECKING_PUBLISH_ANYWAY_SEL = (
+    ':text("Got it"), :text("Đã hiểu"), '
     ':text("Publish anyway"), :text("Vẫn xuất bản"), :text("Cứ xuất bản")'
 )
 
@@ -330,6 +336,10 @@ _SETTLE_MS = 600  # let Polymer re-render between steps
 # How far ahead of "now" the first scheduled publish must sit. A part is often several
 # GB; by the time it has transferred, a 5-minute lead is in the past and YouTube refuses.
 _MIN_SCHEDULE_LEAD = timedelta(minutes=15)
+# Members-only → public: part k (1-based) goes public this many days × k after launch.
+PUBLIC_SWITCH_DAYS = 3
+# The switch lands at this fixed local time every day, not at the launch's clock time.
+PUBLIC_SWITCH_HOUR = 19
 # Between parts in a batch: cheap, and the main thing separating "automation" from
 # "hammering" in the eyes of whatever watches for it.
 _BETWEEN_PARTS_MS = 20_000
@@ -460,7 +470,7 @@ def profile_dir() -> Path:
 
 # -- what to upload -----------------------------------------------------------
 
-VISIBILITIES = ("public", "unlisted", "private", "schedule")
+VISIBILITIES = ("public", "unlisted", "private", "schedule", "members_then_public")
 
 
 @dataclass
@@ -479,6 +489,8 @@ class UploadRequest:
     playlist: str = ""  # "" → don't touch the playlist picker
     visibility: str = "private"
     publish_at: datetime | None = None  # required when visibility == "schedule"
+    # required when visibility == "members_then_public": when the video goes public
+    public_at: datetime | None = None
     label: str = ""  # human name for progress lines, e.g. "Phần 3"
 
     def __post_init__(self) -> None:
@@ -508,6 +520,13 @@ class UploadRequest:
             raise YouTubeUploadError(f"Chế độ hiển thị không hợp lệ: {self.visibility}")
         if self.visibility == "schedule" and self.publish_at is None:
             raise YouTubeUploadError("Chọn hẹn giờ đăng nhưng chưa có thời điểm đăng.")
+        if self.visibility == "members_then_public":
+            if self.public_at is None:
+                raise YouTubeUploadError("Chưa có thời điểm chuyển sang công khai.")
+            if self.publish_at is not None:
+                raise YouTubeUploadError("Chế độ hội viên → công khai không dùng hẹn giờ đăng.")
+        elif self.public_at is not None:
+            raise YouTubeUploadError("Thời điểm chuyển sang công khai chỉ dùng cho chế độ hội viên.")
         if self.thumbnail is not None and not Path(self.thumbnail).is_file():
             # Not fatal on its own, but silently uploading without the cover the user
             # spent time on is worse than saying so.
@@ -520,6 +539,7 @@ class UploadResult:
     url: str
     visibility: str
     publish_at: datetime | None = None
+    public_at: datetime | None = None
     skipped: bool = False  # already published; nothing was sent this run
 
 
@@ -613,6 +633,24 @@ def schedule_times(start: datetime, count: int, spacing_days: int = 1) -> list[d
     if spacing_days < 0:
         raise ValueError("spacing_days must be >= 0")
     return [start + timedelta(days=spacing_days * i) for i in range(count)]
+
+
+def public_switch_times(
+    launch: datetime, count: int, days: int = PUBLIC_SWITCH_DAYS
+) -> list[datetime]:
+    """When each of `count` members-only parts goes public: part k (1-based) on the day
+    launch + days·k, at PUBLIC_SWITCH_HOUR:00 local time.
+    """
+    if count < 0:
+        raise ValueError("count must be >= 0")
+    if days < 1:
+        raise ValueError("days must be >= 1")
+    return [
+        (launch + timedelta(days=days * (i + 1))).replace(
+            hour=PUBLIC_SWITCH_HOUR, minute=0, second=0, microsecond=0
+        )
+        for i in range(count)
+    ]
 
 
 def validate_schedule_start(start: datetime, *, now: datetime | None = None) -> None:
@@ -1501,7 +1539,10 @@ def _advance_to_visibility(page) -> None:
 
 
 def _set_visibility(page, request: UploadRequest, *, on_progress) -> None:
-    """Pick public/unlisted/private, or fill the schedule date+time."""
+    """Pick public/unlisted/private, fill the schedule date+time, or set members → public."""
+    if request.visibility == "members_then_public":
+        _set_members_then_public(page, request, on_progress=on_progress)
+        return
     if request.visibility != "schedule":
         _report(on_progress, "Đặt chế độ hiển thị…")
         radio = _first_present(page, _VISIBILITY_RADIOS[request.visibility])
@@ -1518,7 +1559,36 @@ def _set_visibility(page, request: UploadRequest, *, on_progress) -> None:
     if not _click_any(page, _SCHEDULE_RADIO_SEL, ("Lên lịch", "Schedule")):
         raise YouTubeUploadError("Không tìm thấy mục hẹn giờ đăng trong YouTube Studio.")
     page.wait_for_timeout(_SETTLE_MS)
+    _fill_date_time(page, when)
 
+
+def _open_schedule_accordion(page) -> None:
+    """Expand Studio's 'Schedule' panel. Its header shares a label with the bottom
+    'Schedule' button (#done-button), so anything inside that button is skipped:
+    clicking it would schedule the video instead of opening the panel."""
+    handle = page.evaluate_handle(
+        """(labels) => {
+            for (const el of document.querySelectorAll('*')) {
+                if (el.closest('#done-button')) continue;
+                if (el.children.length) continue;
+                const t = (el.textContent || '').trim();
+                if (labels.includes(t) && el.offsetParent !== null) return el;
+            }
+            return null;
+        }""",
+        list(_SCHEDULE_HEADER_TEXTS),
+    )
+    element = handle.as_element()
+    if element is None:
+        raise YouTubeUploadError(
+            "Không tìm thấy mục Lên lịch trong YouTube Studio (giao diện có thể đã thay đổi)."
+        )
+    element.click()
+    page.wait_for_timeout(_SETTLE_MS * 2)
+
+
+def _fill_date_time(page, when: datetime) -> None:
+    """Type the date and time into Studio's date/time picker, which must already be open."""
     vietnamese = _page_is_vietnamese(page)
     _click_any(page, _DATE_TRIGGER_SEL, timeout_ms=10_000)
     page.wait_for_timeout(_SETTLE_MS)
@@ -1541,6 +1611,142 @@ def _set_visibility(page, request: UploadRequest, *, on_progress) -> None:
         page.keyboard.type(_format_time(when, vietnamese=vietnamese), delay=_TYPE_DELAY_MS)
         page.keyboard.press("Enter")
         page.wait_for_timeout(_SETTLE_MS)
+
+
+# The members → public date is NOT a typed box: it is a dropdown ("Nov 21, 2026 ⌄") that
+# opens a calendar. Its trigger is zero-sized and its label is a nested text node, so
+# we click the visible label by coordinates, then the day cell inside the month block.
+_VISIBLE_DATE_LABEL_JS = """() => {
+    const walk = (root, out) => { for (const e of root.querySelectorAll('*')) {
+        out.push(e); if (e.shadowRoot) walk(e.shadowRoot, out); } return out; };
+    const trig = document.getElementById('datepicker-trigger');
+    if (!trig) return null;
+    // The trigger itself is zero-sized; its visible label is a leaf with the same text.
+    const label = (trig.textContent || '').trim();
+    if (!label) return null;
+    for (const e of walk(document, [])) {
+        if (e.children.length || (e.textContent || '').trim() !== label) continue;
+        const r = e.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+    }
+    return null;
+}"""
+
+# The time box is a plain input inside #time-of-day-container (shadow DOM), visible once
+# the calendar has closed. Click it by coordinates, like the date label.
+_VISIBLE_TIME_INPUT_JS = """() => {
+    const walk = (root, out) => { for (const e of root.querySelectorAll('*')) {
+        out.push(e); if (e.shadowRoot) walk(e.shadowRoot, out); } return out; };
+    for (const e of walk(document, [])) {
+        if (e.tagName !== 'INPUT') continue;
+        const box = e.closest('#time-of-day-container');
+        if (!box) continue;
+        const r = e.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+    }
+    return null;
+}"""
+
+# The calendar popup has a typeable date box at its top ("21 thg 11, 2026" / "Nov 21, 2026").
+# Preferred over clicking a day cell: it takes the same text `_format_date` already writes.
+_POPUP_DATE_INPUT_JS = """() => {
+    const walk = (root, out) => { for (const e of root.querySelectorAll('*')) {
+        out.push(e); if (e.shadowRoot) walk(e.shadowRoot, out); } return out; };
+    for (const e of walk(document, [])) {
+        if (e.tagName !== 'YTCP-DATE-PICKER') continue;
+        for (const i of walk(e, [])) {
+            if (i.tagName !== 'INPUT') continue;
+            const r = i.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+        }
+    }
+    return null;
+}"""
+
+_CALENDAR_DAY_JS = """(args) => {
+    const walk = (root, out) => { for (const e of root.querySelectorAll('*')) {
+        out.push(e); if (e.shadowRoot) walk(e.shadowRoot, out); } return out; };
+    const months = walk(document, []).filter(e => e.classList && e.classList.contains('calendar-month'));
+    const month = months[args.index];
+    if (!month) return {error: 'month', count: months.length};
+    for (const e of walk(month, [])) {
+        if (e.children.length || (e.textContent || '').trim() !== String(args.day)) continue;
+        const r = e.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+    }
+    return {error: 'day', count: months.length};
+}"""
+
+
+def _fill_members_date_time(page, when: datetime) -> None:
+    """Pick the switch date in Studio's calendar, then type the time.
+
+    Months in the calendar start at the current month, so the target month is an offset
+    from today. Works for any date within the months Studio lists.
+    """
+    now = datetime.now()
+    index = (when.year - now.year) * 12 + (when.month - now.month)
+    if index < 0:
+        raise YouTubeUploadError("Thời điểm chuyển sang công khai đã qua.")
+
+    label = page.evaluate(_VISIBLE_DATE_LABEL_JS)
+    if label is None:
+        raise YouTubeUploadError(
+            "Không tìm thấy ô chọn ngày chuyển sang công khai trong YouTube Studio."
+        )
+    page.mouse.click(label["x"], label["y"])
+    page.wait_for_timeout(_SETTLE_MS * 2)
+
+    box = page.evaluate(_POPUP_DATE_INPUT_JS)
+    if box is not None:
+        vietnamese = _page_is_vietnamese(page)
+        page.mouse.click(box["x"], box["y"])
+        page.keyboard.press("ControlOrMeta+A")
+        page.keyboard.type(_format_date(when, vietnamese=vietnamese), delay=_TYPE_DELAY_MS)
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(_SETTLE_MS * 2)
+    else:
+        # Fallback: click the day cell in the calendar.
+        cell = page.evaluate(_CALENDAR_DAY_JS, {"index": index, "day": when.day})
+        if "x" not in cell:
+            raise YouTubeUploadError(
+                f"Không tìm thấy ngày {when.day} trong lịch của YouTube Studio "
+                f"({cell.get('error')})."
+            )
+        page.mouse.click(cell["x"], cell["y"])
+        page.wait_for_timeout(_SETTLE_MS)
+
+    point = page.evaluate(_VISIBLE_TIME_INPUT_JS)
+    if point is None:
+        raise YouTubeUploadError("Không tìm thấy ô giờ chuyển sang công khai.")
+    vietnamese = _page_is_vietnamese(page)
+    page.mouse.click(point["x"], point["y"])
+    page.keyboard.press("ControlOrMeta+A")
+    page.keyboard.type(_format_time(when, vietnamese=vietnamese), delay=_TYPE_DELAY_MS)
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(_SETTLE_MS)
+
+
+def _set_members_then_public(page, request: UploadRequest, *, on_progress) -> None:
+    """Members-only now, switching to public at `public_at`, using Studio's own schedule.
+
+    The probe showed the 'Schedule' panel's 'From members-only to public' option, which
+    sets both the audience (members) and the switch time. Studio's default audience is
+    'All channel members', left as is. The time zone is Studio's (account) default.
+    """
+    when = request.public_at
+    _report(on_progress, f"Hội viên → công khai lúc {when:%d/%m/%Y %H:%M}…")
+    _open_schedule_accordion(page)
+
+    option = _first_present(page, _PUBLISH_FROM_MEMBERS_SEL)
+    if option is None:
+        raise YouTubeUploadError(
+            "Không tìm thấy tùy chọn “Từ chỉ dành cho hội viên thành công khai” trong "
+            "YouTube Studio."
+        )
+    option.click()
+    page.wait_for_timeout(_SETTLE_MS * 2)
+    _fill_members_date_time(page, when)
 
 
 def _finish(page, *, video_id: str) -> None:
@@ -2855,6 +3061,16 @@ def upload_subtitle_batch(
     return done
 
 
+def _parse_iso(value: str) -> datetime | None:
+    """A stored ISO timestamp, or None for an absent/empty/garbled one."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
 # -- public entry points ------------------------------------------------------
 
 
@@ -2881,6 +3097,7 @@ def upload_one(
             video_id=state.get("video_id", ""),
             url=state.get("url", ""),
             visibility=state.get("visibility", request.visibility),
+            public_at=_parse_iso(state.get("public_at", "")),
             skipped=True,
         )
     if needs_attention(video):
@@ -2939,6 +3156,7 @@ def upload_one(
         video_id=video_id,
         visibility=request.visibility,
         publish_at=request.publish_at.isoformat() if request.publish_at else "",
+        public_at=request.public_at.isoformat() if request.public_at else "",
     )
 
     _report(on_progress, "Xuất bản…")
@@ -2953,12 +3171,14 @@ def upload_one(
         visibility=request.visibility,
         published_at=_now_iso(),
         publish_at=request.publish_at.isoformat() if request.publish_at else "",
+        public_at=request.public_at.isoformat() if request.public_at else "",
     )
     return UploadResult(
         video_id=video_id,
         url=url,
         visibility=request.visibility,
         publish_at=request.publish_at,
+        public_at=request.public_at,
     )
 
 

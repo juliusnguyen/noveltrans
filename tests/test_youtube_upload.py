@@ -36,11 +36,14 @@ from noveltrans.youtube_upload import (
     _format_date,
     _format_time,
     is_published,
+    PUBLIC_SWITCH_DAYS,
     is_uploadable,
     needs_attention,
     profile_dir,
+    public_switch_times,
     read_upload_state,
     schedule_times,
+    upload_one,
     upload_state_path,
     validate_schedule_start,
     write_upload_state,
@@ -224,6 +227,44 @@ class TestScheduleTimes:
             schedule_times(datetime(2026, 8, 1, 20, 0), 3, bad)
 
 
+class TestPublicSwitchTimes:
+    def test_empty(self):
+        assert public_switch_times(datetime(2026, 8, 1, 20, 0), 0) == []
+
+    def test_default_is_three_days(self):
+        assert PUBLIC_SWITCH_DAYS == 3
+
+    def test_batch_is_spaced_three_days_apart_starting_at_three(self):
+        launch = datetime(2026, 8, 1, 20, 0)
+        assert public_switch_times(launch, 3) == [
+            datetime(2026, 8, 4, 19, 0),
+            datetime(2026, 8, 7, 19, 0),
+            datetime(2026, 8, 10, 19, 0),
+        ]
+
+    def test_single_video_goes_public_at_7pm_three_days_later(self):
+        launch = datetime(2026, 8, 1, 9, 30)
+        assert public_switch_times(launch, 1) == [datetime(2026, 8, 4, 19, 0)]
+
+    def test_time_is_fixed_at_7pm_whatever_the_launch_time(self):
+        for launch in (datetime(2026, 8, 1, 0, 5), datetime(2026, 8, 1, 23, 59)):
+            assert public_switch_times(launch, 1) == [datetime(2026, 8, 4, 19, 0)]
+
+    def test_date_crosses_a_month_boundary_at_7pm(self):
+        assert public_switch_times(datetime(2026, 8, 30, 20, 0), 2) == [
+            datetime(2026, 9, 2, 19, 0),
+            datetime(2026, 9, 5, 19, 0),
+        ]
+
+    def test_rejects_negative_count(self):
+        with pytest.raises(ValueError):
+            public_switch_times(datetime(2026, 8, 1), -1)
+
+    def test_rejects_days_below_one(self):
+        with pytest.raises(ValueError):
+            public_switch_times(datetime(2026, 8, 1), 2, days=0)
+
+
 class TestValidateScheduleStart:
     def test_rejects_the_past(self):
         now = datetime(2026, 7, 27, 12, 0)
@@ -337,6 +378,92 @@ class TestRequestValidation:
         """Silently uploading without the cover the user made is worse than saying so."""
         with pytest.raises(YouTubeUploadError, match="Không tìm thấy ảnh bìa"):
             self._request(part, thumbnail=part.parent / "gone.jpg").validate()
+
+
+class TestMembersThenPublicRequest:
+    """The members-only → public mode: its own time field, no start time, no 15-min rule."""
+
+    def _request(self, part, **kw):
+        base = dict(video=part, title="Tên truyện - Phần 1", visibility="members_then_public")
+        base.update(kw)
+        return UploadRequest(**base)
+
+    def test_accepts_a_good_request(self, part):
+        self._request(part, public_at=datetime(2999, 1, 1, 20, 0)).validate()
+
+    def test_rejects_a_missing_public_time(self, part):
+        with pytest.raises(YouTubeUploadError, match="chuyển sang công khai"):
+            self._request(part).validate()
+
+    def test_rejects_a_publish_time_in_this_mode(self, part):
+        with pytest.raises(YouTubeUploadError, match="không dùng hẹn giờ"):
+            self._request(
+                part,
+                publish_at=datetime(2999, 1, 1, 20, 0),
+                public_at=datetime(2999, 1, 4, 20, 0),
+            ).validate()
+
+    def test_public_time_outside_this_mode_is_rejected(self, part):
+        with pytest.raises(YouTubeUploadError, match="chỉ dùng cho chế độ hội viên"):
+            UploadRequest(
+                video=part,
+                title="x",
+                visibility="public",
+                public_at=datetime(2999, 1, 4, 20, 0),
+            ).validate()
+
+
+
+class TestMembersThenPublicStudio:
+    """The members → public branch of `_set_visibility`, with Studio's helpers stubbed.
+
+    The control names come from the live probe (2026-11-20): the 'Schedule' accordion
+    holds a radio `PUBLISH_FROM_SPONSORS_ONLY` and the same date/time picker as scheduling.
+    """
+
+    def _request(self, part, public_at):
+        return UploadRequest(
+            video=part, title="x", visibility="members_then_public", public_at=public_at
+        )
+
+    def test_opens_schedule_clicks_members_option_and_types_public_time(self, part, monkeypatch):
+        from noveltrans import youtube_upload as yu
+
+        calls = []
+        monkeypatch.setattr(yu, "_report", lambda *a, **k: None)
+        monkeypatch.setattr(yu, "_open_schedule_accordion", lambda page: calls.append("accordion"))
+
+        class _Option:
+            def click(self):
+                calls.append("option")
+
+        monkeypatch.setattr(yu, "_first_present", lambda page, sel, **k: _Option())
+        public_at = datetime(2999, 1, 4, 20, 0)
+        monkeypatch.setattr(yu, "_fill_members_date_time", lambda page, when: calls.append(("when", when)))
+
+        page = type("P", (), {"wait_for_timeout": staticmethod(lambda ms: None)})()
+        yu._set_visibility(page, self._request(part, public_at), on_progress=None)
+
+        assert calls == ["accordion", "option", ("when", public_at)]
+
+    def test_missing_members_option_fails_before_typing_a_date(self, part, monkeypatch):
+        from noveltrans import youtube_upload as yu
+
+        monkeypatch.setattr(yu, "_report", lambda *a, **k: None)
+        monkeypatch.setattr(yu, "_open_schedule_accordion", lambda page: None)
+        monkeypatch.setattr(yu, "_first_present", lambda page, sel, **k: None)
+        typed = []
+        monkeypatch.setattr(yu, "_fill_members_date_time", lambda page, when: typed.append(when))
+
+        with pytest.raises(YouTubeUploadError, match="hội viên thành công khai"):
+            yu._set_visibility(object(), self._request(part, datetime(2999, 1, 4, 20, 0)),
+                               on_progress=None)
+        assert typed == []
+
+    def test_members_option_is_the_probed_selector(self):
+        from noveltrans import youtube_upload as yu
+
+        assert yu._PUBLISH_FROM_MEMBERS_SEL == "tp-yt-paper-radio-button[name='PUBLISH_FROM_SPONSORS_ONLY']"
 
 
 class TestUploadOneGuards:

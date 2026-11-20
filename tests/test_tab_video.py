@@ -2019,6 +2019,66 @@ class TestYouTubeUploadUi:
         tab._upload_worker = None
         tab.shutdown()
 
+    def test_members_mode_attaches_public_switch_times(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        from datetime import datetime, timedelta
+
+        from PySide6.QtWidgets import QMessageBox
+
+        from noveltrans.gui import keep_awake
+        from noveltrans.gui.workers import YouTubeUploadWorker
+
+        class _DummyManager:
+            def acquire(self):
+                pass
+
+            def release(self):
+                pass
+
+        monkeypatch.setattr(keep_awake, "_manager", _DummyManager())
+        monkeypatch.setattr(
+            QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes
+        )
+        monkeypatch.setattr(YouTubeUploadWorker, "start", lambda self: None)
+
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        for i in range(3):
+            self._render_part(tab, i)
+        tab.upload_visibility.setCurrentIndex(
+            tab.upload_visibility.findData("members_then_public")
+        )
+
+        before = datetime.now()
+        tab._start_upload()
+        after = datetime.now()
+        requests = tab._upload_worker.requests
+        assert all(r.visibility == "members_then_public" for r in requests)
+        assert all(r.publish_at is None for r in requests)
+        # Part k goes public on the day 3k days after the click, at 19:00 local time.
+        for k, r in enumerate(requests, start=1):
+            assert r.public_at.hour == 19 and r.public_at.minute == 0
+            assert r.public_at.date() == (before + timedelta(days=3 * k)).date() or \
+                r.public_at.date() == (after + timedelta(days=3 * k)).date()
+        tab._upload_worker = None
+        tab.shutdown()
+
+    def test_members_mode_hides_start_and_spacing(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        tab.upload_visibility.setCurrentIndex(
+            tab.upload_visibility.findData("members_then_public")
+        )
+        assert tab.upload_start.isHidden()
+        assert tab.upload_spacing.isHidden()
+        assert not tab.schedule_preview.isHidden()
+        tab.upload_visibility.setCurrentIndex(tab.upload_visibility.findData("schedule"))
+        assert not tab.upload_start.isHidden()
+        tab.shutdown()
+
     def test_stuck_row_offers_reset_instead_of_a_dead_button(
         self, qapp, tmp_path, library_dir, sample_meta, sample_refs
     ):
