@@ -234,6 +234,16 @@ def format_duration(seconds: float) -> str:
     return f"{hours}h{minutes:02d}m"
 
 
+def char_count(text: str | None) -> int:
+    """Characters in a chapter's text, counted the same way as the audio tab: raw `len`."""
+    return len(text) if text else 0
+
+
+def format_char_count(text: str | None) -> str:
+    """"" when there is no text yet (not downloaded / not translated), else e.g. "1,234"."""
+    return f"{char_count(text):,}" if text else ""
+
+
 STATUS_COLORS = {
     STATUS_PENDING: QColor("gray"),
     STATUS_DOWNLOADED: QColor("#2e7d32"),  # green
@@ -1032,6 +1042,38 @@ class ChapterTableModel(QAbstractTableModel):
         self.dataChanged.emit(index, index)
         self.translated_title_edited.emit(chapter.index, title)
         return True
+
+
+class TranslateChapterTableModel(ChapterTableModel):
+    """The Translate tab's chapter table: the base table plus original/translation counts.
+
+    The two count columns are appended (9 and 10), so no existing column index moves.
+    A subclass rather than a flag, so the scrape tab, which shares the base model, keeps
+    its nine columns unchanged.
+    """
+
+    COLUMNS = ChapterTableModel.COLUMNS + ("Ký tự gốc", "Ký tự dịch")
+    ORIG_CHARS_COLUMN = 9
+    TRANS_CHARS_COLUMN = 10
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or index.column() not in (
+            self.ORIG_CHARS_COLUMN, self.TRANS_CHARS_COLUMN
+        ):
+            return super().data(index, role)
+        chapter = self._chapters[index.row()]
+        text = (
+            chapter.content if index.column() == self.ORIG_CHARS_COLUMN else chapter.translated
+        )
+        if role == Qt.ItemDataRole.DisplayRole:
+            return format_char_count(text)
+        if role == SORT_ROLE:
+            return char_count(text)
+        if role == Qt.ItemDataRole.TextAlignmentRole:
+            return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        if role == Qt.ItemDataRole.ForegroundRole and not chapter.enabled:
+            return DISABLED_ROW_COLOR
+        return None
 
 
 def focus_index_keeping_selection(table: QTableView, index) -> None:

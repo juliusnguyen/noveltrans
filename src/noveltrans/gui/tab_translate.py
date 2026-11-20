@@ -38,6 +38,7 @@ from noveltrans.gui.rewrite_dialog import RewriteDialog
 from noveltrans.gui.widgets import (
     PauseButton,
     ChapterTableModel,
+    TranslateChapterTableModel,
     ProjectPicker,
     sorting_proxy,
     enable_table_sorting,
@@ -135,7 +136,7 @@ class TranslateTab(QWidget):
         top_row.addWidget(self.lang_combo)
 
         # --- chapter table + side-by-side preview
-        self.model = ChapterTableModel(self)
+        self.model = TranslateChapterTableModel(self)
         self.table = QTableView()
         # See ScrapeTab: the proxy sorts the view, never the chapter list. Row reads go
         # through source_index / source_rows.
@@ -171,6 +172,9 @@ class TranslateTab(QWidget):
             ChapterTableModel.RETRANSLATE_COLUMN, self._row_button_delegate
         )
         self.table.setColumnWidth(ChapterTableModel.RETRANSLATE_COLUMN, 100)
+        for column in (TranslateChapterTableModel.ORIG_CHARS_COLUMN,
+                       TranslateChapterTableModel.TRANS_CHARS_COLUMN):
+            self.table.setColumnWidth(column, 90)
 
         self.original_view = QPlainTextEdit()
         self.original_view.setReadOnly(True)  # editable once a chapter loads
