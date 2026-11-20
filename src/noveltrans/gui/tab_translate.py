@@ -1001,7 +1001,9 @@ class TranslateTab(QWidget):
         from noveltrans.translators.qc import build_name_profile, propose_name_fixes
 
         chapters = self.project.chapters()
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        # BusyCursor, not WaitCursor: WaitCursor under a modal dialog's exec() crashes
+        # Qt on macOS 27 (SIGTRAP in QImage::toCGImage). See changes/107-THUMBNAIL-ALL-CRASH.
+        QApplication.setOverrideCursor(Qt.CursorShape.BusyCursor)
         try:
             profile = build_name_profile(
                 (c.translated for c in chapters if c.translated),

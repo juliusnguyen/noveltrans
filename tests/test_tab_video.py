@@ -1966,6 +1966,8 @@ class TestYouTubeUploadUi:
 
         tab = self._tab_on_project(tmp_path, self._project_with_audio(
             library_dir, sample_meta, sample_refs))
+        # the novel already has tags, so the upload goes straight through (no auto-generation)
+        tab.tags_edit.setPlainText("tag một, tag hai")
         for i in range(2):
             self._render_part(tab, i)
 
@@ -2003,6 +2005,8 @@ class TestYouTubeUploadUi:
 
         tab = self._tab_on_project(tmp_path, self._project_with_audio(
             library_dir, sample_meta, sample_refs))
+        # the novel already has tags, so the upload goes straight through (no auto-generation)
+        tab.tags_edit.setPlainText("tag một, tag hai")
         for i in range(3):
             self._render_part(tab, i)
         tab.upload_visibility.setCurrentIndex(tab.upload_visibility.findData("schedule"))
@@ -2044,6 +2048,8 @@ class TestYouTubeUploadUi:
 
         tab = self._tab_on_project(tmp_path, self._project_with_audio(
             library_dir, sample_meta, sample_refs))
+        # the novel already has tags, so the upload goes straight through (no auto-generation)
+        tab.tags_edit.setPlainText("tag một, tag hai")
         for i in range(3):
             self._render_part(tab, i)
         tab.upload_visibility.setCurrentIndex(
@@ -2062,6 +2068,66 @@ class TestYouTubeUploadUi:
             assert r.public_at.date() == (before + timedelta(days=3 * k)).date() or \
                 r.public_at.date() == (after + timedelta(days=3 * k)).date()
         tab._upload_worker = None
+        tab.shutdown()
+
+    def _auto_tags_setup(self, qapp, tmp_path, library_dir, sample_meta, sample_refs,
+                         monkeypatch):
+        from noveltrans.gui import keep_awake
+
+        class _DummyManager:
+            def acquire(self):
+                pass
+
+            def release(self):
+                pass
+
+        monkeypatch.setattr(keep_awake, "_manager", _DummyManager())
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        self._render_part(tab, 0)
+        tab.tags_edit.setPlainText("")
+        tab.project.meta.tags = ""
+        calls: dict = {"generate": [], "upload": []}
+        monkeypatch.setattr(tab, "_generate_tags",
+                            lambda **kw: calls["generate"].append(kw))
+        monkeypatch.setattr(tab, "_launch_upload",
+                            lambda rows: calls["upload"].append(rows))
+        return tab, calls
+
+    def test_empty_tags_generate_first_then_upload(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        tab, calls = self._auto_tags_setup(
+            qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch)
+        tab._start_upload()
+        assert calls["generate"] == [{"then_render": False}]
+        assert calls["upload"] == []  # waits for the tags
+        tab._on_tags_ready("tag một, tag hai")
+        assert len(calls["upload"]) == 1
+        assert tab._upload_rows_after_tags is None
+        tab.shutdown()
+
+    def test_failed_tag_generation_uploads_without_tags(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        tab, calls = self._auto_tags_setup(
+            qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch)
+        tab._start_upload()
+        tab._on_tags_failed("engine down")
+        assert len(calls["upload"]) == 1
+        assert "không kèm tags" in tab.status_label.text()
+        assert tab._upload_rows_after_tags is None
+        tab.shutdown()
+
+    def test_existing_tags_skip_generation(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        tab, calls = self._auto_tags_setup(
+            qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch)
+        tab.tags_edit.setPlainText("đã có sẵn")
+        tab._start_upload()
+        assert calls["generate"] == []
+        assert len(calls["upload"]) == 1
         tab.shutdown()
 
     def test_members_mode_hides_start_and_spacing(
@@ -2881,6 +2947,8 @@ class TestThumbnailUpdateUi:
 
         tab = self._tab_on_project(tmp_path, self._project_with_audio(
             library_dir, sample_meta, sample_refs))
+        # the novel already has tags, so the upload goes straight through (no auto-generation)
+        tab.tags_edit.setPlainText("tag một, tag hai")
         self._render_part(tab, 0)
         tab._start_upload()
         assert not tab.thumbnail_update_button.isEnabled()
@@ -2940,6 +3008,32 @@ class TestThumbnailUpdateUi:
         monkeypatch.setattr(tab, "_render_thumbnail_now", lambda *a, **k: None)
         tab._regen_all_thumbnails()
         assert "Cập nhật ảnh bìa" in tab.status_label.text()
+        tab.shutdown()
+
+    def test_regen_all_never_sets_a_wait_cursor(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs, monkeypatch
+    ):
+        """WaitCursor under a modal dialog crashes Qt on macOS 27 (SIGTRAP in
+        QImage::toCGImage). The shape is the regression, so assert it, not the crash."""
+        from PySide6.QtWidgets import QApplication
+
+        shapes: list = []
+        restores: list = []
+        monkeypatch.setattr(
+            QApplication, "setOverrideCursor", staticmethod(lambda cursor: shapes.append(cursor))
+        )
+        monkeypatch.setattr(
+            QApplication, "restoreOverrideCursor", staticmethod(lambda: restores.append(True))
+        )
+        tab = self._tab_on_project(tmp_path, self._project_with_audio(
+            library_dir, sample_meta, sample_refs))
+        self._render_part(tab, 0)
+        monkeypatch.setattr(tab, "_thumbnail_base_image", lambda: "base.png")
+        monkeypatch.setattr(tab, "_render_thumbnail_now", lambda *a, **k: None)
+        tab._regen_all_thumbnails()
+        assert shapes, "the regen path should set a busy cursor"
+        assert all(shape != Qt.CursorShape.WaitCursor for shape in shapes)
+        assert len(restores) == len(shapes)
         tab.shutdown()
 
     def test_regen_all_stays_quiet_when_nothing_is_on_youtube(

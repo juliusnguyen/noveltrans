@@ -126,6 +126,8 @@ class VideoTab(QWidget):
         self._image_prompt_worker: CompletionWorker | None = None
         self._shorten_worker: ShortenTitlesWorker | None = None
         self._render_after_tags = False  # auto-generate tags, then start the render
+        # rows waiting on auto-generated tags before an upload (None when not waiting)
+        self._upload_rows_after_tags: list | None = None
         # guards the "Trạng thái" / "Đã tải lên" checkbox handlers while the table is
         # being repopulated
         self._suppress_status_toggle = False
@@ -2530,7 +2532,9 @@ class VideoTab(QWidget):
         # Counted before the loop: `processEvents()` below can repopulate the voice combo
         # mid-run, and the answer we want is about the selection we are re-rendering.
         live = len(self._thumbnail_update_rows())
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        # BusyCursor, not WaitCursor: WaitCursor under a modal dialog's exec() crashes
+        # Qt on macOS 27 (SIGTRAP in QImage::toCGImage). See changes/107-THUMBNAIL-ALL-CRASH.
+        QApplication.setOverrideCursor(Qt.CursorShape.BusyCursor)
         try:
             with font_dir_context() as font_dir:
                 for i, window in enumerate(windows):
@@ -3552,6 +3556,9 @@ class VideoTab(QWidget):
         if self._render_after_tags:
             self._render_after_tags = False
             self._launch_video(skip_existing=True)
+        elif self._upload_rows_after_tags is not None:
+            rows, self._upload_rows_after_tags = self._upload_rows_after_tags, None
+            self._launch_upload(rows)
 
     def _on_tags_failed(self, message: str) -> None:
         self.tags_button.setEnabled(True)
@@ -3560,6 +3567,10 @@ class VideoTab(QWidget):
             self._render_after_tags = False
             self.status_label.setText("⚠️ Không tạo được tags — tạo video không kèm tags.")
             self._launch_video()
+        elif self._upload_rows_after_tags is not None:
+            rows, self._upload_rows_after_tags = self._upload_rows_after_tags, None
+            self.status_label.setText("⚠️ Không tạo được tags — tải lên không kèm tags.")
+            self._launch_upload(rows)
         else:
             self.status_label.setText("")
             QMessageBox.warning(self, "Tạo tags thất bại", message)
@@ -4233,12 +4244,12 @@ class VideoTab(QWidget):
                 "Không có phần nào để tải lên (chưa tạo video, hoặc đã tải lên hết).",
             )
             return
-        self._launch_upload(rows)
+        self._launch_upload_after_tags(rows)
 
     def _upload_one(self, window, part_num, whole_novel) -> None:
         """Upload a single part — the retry path for one row."""
         label = "Toàn bộ" if whole_novel else f"Phần {part_num}"
-        self._launch_upload([(window, label, part_num, whole_novel)])
+        self._launch_upload_after_tags([(window, label, part_num, whole_novel)])
 
     def _reset_upload_state(self, window, whole_novel) -> None:
         """Clear one part's “dở dang” record so it can be queued again.
@@ -4387,6 +4398,21 @@ class VideoTab(QWidget):
             clear_upload_state(path)
         self._refresh_video_list()
         self.status_label.setText(f"Đã đặt lại {len(chosen)} phần — có thể tải lên lại.")
+
+    def _launch_upload_after_tags(self, rows: list) -> None:
+        """Upload, but generate the novel's tags first when there are none yet.
+
+        Mirrors the render path: an empty tags box means no tags reach YouTube, so the
+        LLM run comes first and the upload resumes from `_on_tags_ready` (or goes ahead
+        without tags if generation fails).
+        """
+        if self.tags_edit.toPlainText().strip() or (self.project and self.project.meta.tags):
+            self._launch_upload(rows)
+            return
+        # If a tag run is already in flight, `_generate_tags` returns early and that run's
+        # `_on_tags_ready` / `_on_tags_failed` resumes this upload.
+        self._upload_rows_after_tags = rows
+        self._generate_tags(then_render=False)
 
     def _launch_upload(self, rows: list) -> None:
         if self._upload_worker is not None and self._upload_worker.isRunning():
