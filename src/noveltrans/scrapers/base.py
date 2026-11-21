@@ -7,6 +7,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 
+import httpx
 import requests
 
 from noveltrans.errors import ScrapeError
@@ -85,6 +86,78 @@ class HttpClient:
         if response.encoding in (None, "ISO-8859-1"):
             response.encoding = response.apparent_encoding
         return response.text
+
+
+def _as_requests_response(hr: httpx.Response) -> requests.Response:
+    """Repackage an httpx response so callers of HttpClient see the same type as before."""
+    response = requests.Response()
+    response.status_code = hr.status_code
+    response.reason = hr.reason_phrase
+    response.url = str(hr.url)
+    response.headers = requests.structures.CaseInsensitiveDict(hr.headers)
+    response._content = hr.content
+    response.encoding = hr.encoding
+    return response
+
+
+class Http2Client(HttpClient):
+    """HttpClient that speaks HTTP/2 (via httpx) for sites that refuse HTTP/1.1 clients.
+
+    ixdzs8.com answers 403 to every HTTP/1.1 client, requests included, and 200 to HTTP/2
+    with the same headers. Everything else (throttling, retries, the session headers and
+    cookies) behaves as in HttpClient. `wrap` keeps reading the source client's headers at
+    request time, so cookies set on it later still apply.
+    """
+
+    def __init__(
+        self,
+        delay_seconds: float = 1.5,
+        max_retries: int = 3,
+        timeout: float = 20.0,
+        cookies: str = "",
+        *,
+        transport: httpx.BaseTransport | None = None,
+        source: HttpClient | None = None,
+    ):
+        super().__init__(delay_seconds, max_retries, timeout, cookies)
+        self._source = source
+        self._http = httpx.Client(
+            http2=True, timeout=timeout, transport=transport, follow_redirects=True
+        )
+
+    @classmethod
+    def wrap(cls, source: HttpClient) -> Http2Client:
+        return cls(
+            delay_seconds=source.delay_seconds,
+            max_retries=source.max_retries,
+            timeout=source.timeout,
+            source=source,
+        )
+
+    def _headers(self) -> dict[str, str]:
+        session = (self._source or self)._session
+        return dict(session.headers)
+
+    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+        headers = self._headers()
+        headers.update(kwargs.pop("headers", None) or {})
+        params = kwargs.pop("params", None)
+        data = kwargs.pop("data", None)
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries):
+            self._throttle()
+            self._last_request_at = time.monotonic()
+            try:
+                response = self._http.request(
+                    method, url, headers=headers, params=params, data=data
+                )
+                response.raise_for_status()
+                return _as_requests_response(response)
+            except httpx.HTTPError as exc:
+                last_error = exc
+                if attempt < self.max_retries - 1:
+                    time.sleep(2.0**attempt)  # 1s, 2s backoff between tries
+        raise ScrapeError(f"Request failed after {self.max_retries} tries: {last_error}", url)
 
 
 class SiteAdapter(ABC):

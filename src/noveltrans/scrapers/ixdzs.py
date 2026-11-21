@@ -18,7 +18,7 @@ from bs4 import BeautifulSoup
 from noveltrans.errors import ScrapeError
 from noveltrans.models import ChapterRef, NovelMeta
 from noveltrans.scrapers import register
-from noveltrans.scrapers.base import SiteAdapter
+from noveltrans.scrapers.base import Http2Client, HttpClient, SiteAdapter
 
 _CHALLENGE_RE = re.compile(r'token = "([^"]+)"')
 
@@ -30,6 +30,12 @@ class IxdzsAdapter(SiteAdapter):
     url_patterns = [r"ixdzs\d*\.(?:com|tw)/read/\d+"]
 
     SEL_CONTENT = "article"
+
+    def __init__(self, client: HttpClient):
+        # The site blocks HTTP/1.1 clients (see Http2Client); keep the caller's settings.
+        if not isinstance(client, Http2Client):
+            client = Http2Client.wrap(client)
+        super().__init__(client)
 
     def _get_html(self, url: str) -> str:
         """GET a page, transparently solving the ?challenge= redirect."""
