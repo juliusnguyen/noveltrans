@@ -38,6 +38,7 @@ def _import_adapters() -> None:
         twkan,
         webtruyendich,
         xbanxia,
+        xszj,
     )
 
 
