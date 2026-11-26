@@ -3744,7 +3744,7 @@ class _FakeCommentPage:
             _PIN_MENU_ITEM_SEL,
         )
 
-        from noveltrans.youtube_upload import _PIN_CONFIRM_SEL
+        from noveltrans.youtube_upload import _PIN_CONFIRM_SEL, _PIN_TOAST_SEL
 
         from noveltrans.youtube_upload import _FILTER_CHIP_X_SEL
 
