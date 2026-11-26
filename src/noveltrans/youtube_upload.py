@@ -3231,6 +3231,8 @@ _PIN_LABELS = ("Pin", "Pin comment", "Ghim", "Ghim bình luận")
 # dialog's Pin button is the one that pins; "Cancel" never matches.
 _PIN_CONFIRM_SEL = "ytcp-button, tp-yt-paper-button, button"
 _PIN_CONFIRM_LABELS = ("Pin", "Ghim")
+# Studio's toast after a pin lands ("Comment pinned"). Pinned is recorded only once it shows.
+_PIN_TOAST_SEL = "ytcp-toast, tp-yt-paper-toast, [role='alert']"
 
 
 def _should_comment(request: UploadRequest) -> bool:
@@ -3276,6 +3278,21 @@ def _clear_comment_filter(page) -> None:
         pass
 
 
+def _wait_pin_toast(page, timeout_ms: int = 10_000) -> bool:
+    """True once Studio shows its "Comment pinned" toast. Polls, never raises."""
+    waited = 0
+    while waited < timeout_ms:
+        try:
+            text = (page.locator(_PIN_TOAST_SEL).first.inner_text(timeout=500) or "").lower()
+            if "pinned" in text or "ghim" in text:
+                return True
+        except Exception:
+            pass
+        page.wait_for_timeout(500)
+        waited += 500
+    return False
+
+
 def _pin_newest_comment(page) -> None:
     """Open the menu on the first comment thread and pick Pin. Raises if any step is missing."""
     _clear_comment_filter(page)
@@ -3291,9 +3308,14 @@ def _pin_newest_comment(page) -> None:
     # The menu item only opens a confirmation. Nothing is pinned until its Pin button is clicked.
     for _ in range(10):
         if _click_menu_item(page, _PIN_CONFIRM_SEL, _PIN_CONFIRM_LABELS):
-            return
+            break
         page.wait_for_timeout(500)
-    raise YouTubeUploadError("đã chọn Ghim nhưng không thấy nút xác nhận “Pin”")
+    else:
+        raise YouTubeUploadError("đã chọn Ghim nhưng không thấy nút xác nhận “Pin”")
+    # Pinned only once Studio confirms it. Closing the browser before the request lands
+    # leaves the comment unpinned, so wait for the toast first.
+    if not _wait_pin_toast(page):
+        raise YouTubeUploadError("đã bấm Ghim nhưng không thấy xác nhận “Comment pinned”")
 
 
 def _post_and_pin_comment(page, video: Path, *, video_id: str, text: str) -> str:
