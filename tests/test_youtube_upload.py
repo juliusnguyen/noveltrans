@@ -895,16 +895,39 @@ class TestFinishConfirmation:
         _finish(page, video_id="dQw4w9WgXcQ")  # does not raise
         assert self._clicks_after_done(page) == [_PUBLISH_ANYWAY_SEL]
 
-    def test_gate_reappearing_after_publish_anyway_stops_without_retrying(self):
-        """One "Publish anyway" click only. If the gate stays up, report it as unconfirmed."""
+    def test_gate_reappearing_after_publish_anyway_waits_then_reports_without_retrying(self):
+        """One "Publish anyway" click only. If the gate stays up, keep waiting for the real
+        confirmation until the normal budget runs out, then report it with the gate noted."""
         from noveltrans.youtube_upload import _finish
 
         page = _FakeStudioPage(
-            attached=True, confirm=True, still_checking=True, gate_reappears=True,
+            attached=True, confirm=False, still_checking=True, gate_reappears=True,
         )
         page.visible = {_DONE_SEL}
-        with pytest.raises(YouTubeUploadError, match="Chưa xác nhận đã xuất bản"):
+        with pytest.raises(YouTubeUploadError, match="không xác nhận.*Publish anyway"):
             _finish(page, video_id="dQw4w9WgXcQ")
+        assert self._clicks_after_done(page) == [_PUBLISH_ANYWAY_SEL]
+
+    def test_gate_reappearing_but_publish_confirms_later_is_not_a_failure(self):
+        """The gate can stay up while the publish is still going through. A confirmation that
+        arrives after it must count as success, not be reported as failed."""
+        from noveltrans.youtube_upload import _finish
+
+        class _ConfirmsLate(_FakeStudioPage):
+            def __init__(self, **kw):
+                super().__init__(**kw)
+                self.polls = 0
+
+            def wait_for_timeout(self, ms):
+                self.polls += 1
+                if self.polls >= 5:
+                    self.confirm = True  # the share dialog appears after the gate lingers
+
+        page = _ConfirmsLate(
+            attached=True, confirm=False, still_checking=True, gate_reappears=True,
+        )
+        page.visible = {_DONE_SEL}
+        _finish(page, video_id="dQw4w9WgXcQ")  # does not raise
         assert self._clicks_after_done(page) == [_PUBLISH_ANYWAY_SEL]
 
     def test_gate_lingering_after_publish_anyway_is_not_reported_as_failure(self):

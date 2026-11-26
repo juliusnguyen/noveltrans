@@ -1838,40 +1838,41 @@ def _finish(page, *, video_id: str) -> None:
     # passed instantly and would have reported every publish a success without looking.
     waited = 0
     gate_clicks = 0
+    gate_lingered = False
     while waited < _STEP_WAIT_MS:
         # "We're still checking your content" gates the publish itself (see the constant's
         # docstring above). Click "Publish anyway" once, by label, then give the gate time to
-        # clear and keep waiting for the real confirmation. If it is still up after that,
-        # stop: retrying would keep pressing publish blindly.
+        # clear. If it is still up afterwards, the publish may still be going through, so
+        # keep waiting for the real confirmation rather than failing early. Never click again:
+        # retrying would keep pressing publish blindly.
         if _gate_showing(page):
-            if gate_clicks >= 1:
-                raise YouTubeUploadError(
-                    "YouTube Studio vẫn hiện cảnh báo “We're still checking your content” "
-                    f"sau khi bấm “Publish anyway” ({_GATE_CLEAR_WAIT_MS // 1000} giây). "
-                    "Chưa xác nhận đã xuất bản — kiểm tra bản nháp trên Studio trước khi "
-                    "xuất bản lại.",
-                    video_id=video_id,
-                )
-            if not _click_publish_anyway(page):
-                raise YouTubeUploadError(
-                    "YouTube Studio hiện cảnh báo “We're still checking your content” nhưng "
-                    "không tìm thấy nút “Publish anyway”. Chưa xác nhận đã xuất bản — kiểm "
-                    "tra trên Studio.",
-                    video_id=video_id,
-                )
-            gate_clicks += 1
-            _wait_gate_clear(page)
-            continue
+            if gate_clicks == 0:
+                if not _click_publish_anyway(page):
+                    raise YouTubeUploadError(
+                        "YouTube Studio hiện cảnh báo “We're still checking your content” "
+                        "nhưng không tìm thấy nút “Publish anyway”. Chưa xác nhận đã xuất "
+                        "bản — kiểm tra trên Studio.",
+                        video_id=video_id,
+                    )
+                gate_clicks += 1
+                _wait_gate_clear(page)
+                continue
+            gate_lingered = True
         if _first_present(page, _DIALOG_SEL, timeout_ms=1_000, state="detached") is not None:
             return
         if _first_present(page, _CONFIRM_DIALOG_SEL, timeout_ms=1_000, state="attached") is not None:
             return
         page.wait_for_timeout(1_000)
         waited += 3_000
+    gate_note = (
+        " Cảnh báo “We're still checking your content” vẫn hiện sau khi bấm “Publish anyway”."
+        if gate_lingered
+        else ""
+    )
     raise YouTubeUploadError(
         "Đã bấm xuất bản nhưng YouTube Studio không xác nhận (hộp thoại vẫn mở ở bước "
-        f"“{_dialog_step(page) or 'không rõ'}”) — có thể còn mục bắt buộc chưa điền. "
-        "Kiểm tra bản nháp trên kênh.",
+        f"“{_dialog_step(page) or 'không rõ'}”) — có thể còn mục bắt buộc chưa điền."
+        f"{gate_note} Kiểm tra bản nháp trên kênh.",
         video_id=video_id,
     )
 
