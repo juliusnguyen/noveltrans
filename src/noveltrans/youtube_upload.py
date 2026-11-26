@@ -3278,16 +3278,33 @@ def _clear_comment_filter(page) -> None:
         pass
 
 
+def _toast_says_pinned(page) -> bool:
+    """True if any toast on the page reads as a pin confirmation. Never raises.
+
+    Checks every match: the first one can be an empty toast container, and reading only
+    that one missed a real "Comment pinned" (seen live 2026-11-27).
+    """
+    toasts = page.locator(_PIN_TOAST_SEL)
+    try:
+        count = toasts.count()
+    except Exception:
+        return False
+    for index in range(count):
+        try:
+            text = (toasts.nth(index).inner_text(timeout=500) or "").lower()
+        except Exception:
+            continue
+        if "pinned" in text or "ghim" in text:
+            return True
+    return False
+
+
 def _wait_pin_toast(page, timeout_ms: int = 10_000) -> bool:
     """True once Studio shows its "Comment pinned" toast. Polls, never raises."""
     waited = 0
     while waited < timeout_ms:
-        try:
-            text = (page.locator(_PIN_TOAST_SEL).first.inner_text(timeout=500) or "").lower()
-            if "pinned" in text or "ghim" in text:
-                return True
-        except Exception:
-            pass
+        if _toast_says_pinned(page):
+            return True
         page.wait_for_timeout(500)
         waited += 500
     return False
