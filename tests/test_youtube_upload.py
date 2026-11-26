@@ -3695,7 +3695,8 @@ class _FakeCommentPage:
 
     def __init__(
         self, *, submit_ok=True, menu_has_pin=True, thread_present=True,
-        logged_out=False, goto_error=None, confirm_present=True,
+        logged_out=False, goto_error=None, confirm_present=True, filter_chip=True,
+        toast_shows=True,
     ):
         self.submit_ok = submit_ok
         self.menu_has_pin = menu_has_pin
@@ -3709,6 +3710,11 @@ class _FakeCommentPage:
         self.typed: list = []
         self.closed = False
         self.confirm_present = confirm_present
+        # Studio's "Unresponded" filter chip: on by default, hides the new comment
+        self.chip_open = filter_chip
+        # Studio's "Comment pinned" toast after the confirmation (off to simulate a lost pin)
+        self.toast_shows = toast_shows
+        self.toast_open = False
         self.confirm_open = False
         self.keyboard = self
 
@@ -3724,6 +3730,9 @@ class _FakeCommentPage:
     def close(self):
         self.closed = True
 
+    def bring_to_front(self):
+        self.brought_front = True
+
     def press(self, key):
         pass
 
@@ -3738,15 +3747,22 @@ class _FakeCommentPage:
             _PIN_MENU_ITEM_SEL,
         )
 
-        from noveltrans.youtube_upload import _PIN_CONFIRM_SEL
+        from noveltrans.youtube_upload import _PIN_CONFIRM_SEL, _PIN_TOAST_SEL
+
+        from noveltrans.youtube_upload import _FILTER_CHIP_X_SEL
 
         present = {_COMMENT_BOX_SEL, _COMMENT_SUBMIT_SEL}
-        if self.posted and self.thread_present:
+        if self.chip_open:
+            present.add(_FILTER_CHIP_X_SEL)
+        # the filter hides the thread until the chip is removed
+        if self.posted and self.thread_present and not self.chip_open:
             present.add(_COMMENT_THREAD_SEL)
         if self.menu_has_pin:
             present.add(_PIN_MENU_ITEM_SEL)
         if self.confirm_open and self.confirm_present:
             present.add(_PIN_CONFIRM_SEL)
+        if self.toast_open:
+            present.add(_PIN_TOAST_SEL)
         return present
 
     def locator(self, selector):
@@ -3783,27 +3799,37 @@ class _CommentLoc:
         return self if index == 0 else _CommentLoc(self._page, "")
 
     def inner_text(self, timeout=None):
-        from noveltrans.youtube_upload import _PIN_CONFIRM_SEL, _PIN_MENU_ITEM_SEL
+        from noveltrans.youtube_upload import _PIN_CONFIRM_SEL, _PIN_MENU_ITEM_SEL, _PIN_TOAST_SEL
 
         # the menu item reads "Pin\n" as on the live page; the dialog's button reads "Pin"
         if self._selector == _PIN_MENU_ITEM_SEL:
             return "Pin\n"
         if self._selector == _PIN_CONFIRM_SEL:
             return "Pin"
+        if self._selector == _PIN_TOAST_SEL and self._page.toast_open:
+            return "Comment pinned"
         return ""
 
-    def click(self):
+    def click(self, timeout=None):
         from noveltrans.youtube_upload import _COMMENT_SUBMIT_SEL
 
         self._page.clicks.append(self._selector)
+        from noveltrans.youtube_upload import _FILTER_CHIP_X_SEL
+
+        if self._selector == _FILTER_CHIP_X_SEL:
+            self._page.chip_open = False
         if self._selector == _COMMENT_SUBMIT_SEL:
             if not self._page.submit_ok:
                 raise RuntimeError("submit button not clickable")
             self._page.posted = True
         from noveltrans.youtube_upload import _PIN_MENU_ITEM_SEL
 
+        from noveltrans.youtube_upload import _PIN_CONFIRM_SEL
+
         if self._selector == _PIN_MENU_ITEM_SEL:
             self._page.confirm_open = True  # Studio asks "Pin this comment?" next
+        if self._selector == _PIN_CONFIRM_SEL and self._page.toast_shows:
+            self._page.toast_open = True
 
 
 class TestPostAndPinComment:
@@ -3835,10 +3861,13 @@ class TestPostAndPinComment:
         # the box is clicked to focus it, then Post, then the thread's menu, then Pin
         from noveltrans.youtube_upload import _PIN_CONFIRM_SEL
 
+        from noveltrans.youtube_upload import _FILTER_CHIP_X_SEL
+
         assert page.clicks == [
-            _COMMENT_BOX_SEL, _COMMENT_SUBMIT_SEL, _COMMENT_MENU_SEL, _PIN_MENU_ITEM_SEL,
-            _PIN_CONFIRM_SEL,
+            _COMMENT_BOX_SEL, _COMMENT_SUBMIT_SEL, _FILTER_CHIP_X_SEL,
+            _COMMENT_MENU_SEL, _PIN_MENU_ITEM_SEL, _PIN_CONFIRM_SEL,
         ]
+        assert page.chip_open is False
         state = read_upload_state(video)
         assert state["comment_status"] == "posted"
         assert state["pinned"] is True
@@ -3871,6 +3900,17 @@ class TestPostAndPinComment:
         note = _post_and_pin_comment(page, video, video_id="dQw4w9WgXcQ", text="Hello")
 
         assert "không ghim được" in note
+        assert "pinned" not in read_upload_state(video)
+
+    def test_pin_is_recorded_only_after_studio_confirms_it(self, tmp_path):
+        """No "Comment pinned" toast means the pin is not recorded, so a later run can retry."""
+        from noveltrans.youtube_upload import _post_and_pin_comment
+
+        video = self._video(tmp_path)
+        page = _FakeCommentPage(toast_shows=False)
+        note = _post_and_pin_comment(page, video, video_id="dQw4w9WgXcQ", text="Hello")
+
+        assert "Comment pinned" in note
         assert "pinned" not in read_upload_state(video)
 
     def test_failed_post_is_marked_failed_and_never_pins(self, tmp_path):
@@ -4011,3 +4051,168 @@ class TestCommentGate:
 
         assert DEFAULT_UPLOAD_COMMENT.splitlines()[1] == "19038324284018"
         assert DEFAULT_UPLOAD_COMMENT.splitlines()[2] == "Techcombank"
+
+
+# -- members schedule chain (feature 112) -------------------------------------
+
+
+class TestMembersScheduleChain:
+    """Members→public switch times: 3 days after the last recorded one, or — when that is
+    long past — the latest 19:00 still within the next 3 days."""
+
+    NOW = datetime(2026, 12, 1, 10, 0)
+
+    def test_no_prior_members_schedule_starts_within_next_three_days(self):
+        from noveltrans.youtube_upload import members_schedule_anchor
+
+        # now + 3d = Dec 4 10:00; the latest 19:00 at or before that is Dec 3 19:00
+        assert members_schedule_anchor(self.NOW, None) == datetime(2026, 12, 3, 19, 0)
+
+    def test_ceiling_after_nineteen_hundred_keeps_same_day(self):
+        from noveltrans.youtube_upload import members_schedule_anchor
+
+        late = datetime(2026, 12, 1, 22, 0)  # now + 3d = Dec 4 22:00 -> Dec 4 19:00
+        assert members_schedule_anchor(late, None) == datetime(2026, 12, 4, 19, 0)
+
+    def test_last_long_past_resets_to_the_window(self):
+        from noveltrans.youtube_upload import members_schedule_anchor
+
+        last = datetime(2026, 11, 10, 19, 0)  # well over 3 days before NOW
+        assert members_schedule_anchor(self.NOW, last) == datetime(2026, 12, 3, 19, 0)
+
+    def test_last_recent_chains_three_days_after(self):
+        from noveltrans.youtube_upload import members_schedule_anchor
+
+        last = datetime(2026, 11, 29, 19, 0)  # within the last 3 days
+        assert members_schedule_anchor(self.NOW, last) == datetime(2026, 12, 2, 19, 0)
+
+    def test_last_in_the_future_is_never_reset(self):
+        from noveltrans.youtube_upload import members_schedule_anchor
+
+        last = datetime(2026, 12, 20, 19, 0)
+        assert members_schedule_anchor(self.NOW, last) == datetime(2026, 12, 23, 19, 0)
+
+    def test_exactly_three_days_ago_chains_rather_than_resets(self):
+        from noveltrans.youtube_upload import members_schedule_anchor
+
+        last = self.NOW - timedelta(days=3)  # boundary: not "more than 3 days" ago
+        assert members_schedule_anchor(self.NOW, last) == last + timedelta(days=3)
+
+    def test_batch_is_three_days_apart_all_at_nineteen_hundred(self):
+        from noveltrans.youtube_upload import members_chain_times
+
+        times = members_chain_times(self.NOW, None, 3)
+        assert times == [
+            datetime(2026, 12, 3, 19, 0),
+            datetime(2026, 12, 6, 19, 0),
+            datetime(2026, 12, 9, 19, 0),
+        ]
+
+    def test_batch_with_zero_parts_is_empty(self):
+        from noveltrans.youtube_upload import members_chain_times
+
+        assert members_chain_times(self.NOW, None, 0) == []
+
+    def test_last_takes_only_committed_or_published_members_parts(self):
+        from noveltrans.youtube_upload import last_members_public_at
+
+        states = [
+            {"visibility": "members_then_public", "status": "published",
+             "public_at": "2026-11-20T19:00:00"},
+            {"visibility": "members_then_public", "status": "committed",
+             "public_at": "2026-11-23T19:00:00"},
+            # not booked yet: a draft or a part that never reached the publish click
+            {"visibility": "members_then_public", "status": "draft",
+             "public_at": "2026-11-30T19:00:00"},
+            # wrong visibility
+            {"visibility": "public", "status": "published", "public_at": "2026-11-29T19:00:00"},
+        ]
+        assert last_members_public_at(states) == datetime(2026, 11, 23, 19, 0)
+
+    def test_last_is_none_when_nothing_is_booked(self):
+        from noveltrans.youtube_upload import last_members_public_at
+
+        assert last_members_public_at([]) is None
+        assert last_members_public_at([{"visibility": "private", "status": "published"}]) is None
+
+    def test_mixed_naive_and_aware_timestamps_compare_without_error(self):
+        from noveltrans.youtube_upload import last_members_public_at, members_schedule_anchor
+
+        states = [
+            {"visibility": "members_then_public", "status": "published",
+             "public_at": "2026-11-28T19:00:00+07:00"},
+            {"visibility": "members_then_public", "status": "published",
+             "public_at": "2026-11-27T19:00:00"},
+        ]
+        last = last_members_public_at(states)
+        assert last is not None and last.tzinfo is None
+        assert members_schedule_anchor(self.NOW, last) is not None
+
+    def test_unreadable_public_at_is_skipped(self):
+        from noveltrans.youtube_upload import last_members_public_at
+
+        states = [
+            {"visibility": "members_then_public", "status": "published", "public_at": "not a date"},
+            {"visibility": "members_then_public", "status": "published", "public_at": ""},
+            "not even a dict",
+        ]
+        assert last_members_public_at(states) is None
+
+    def test_upload_batch_rejects_a_members_switch_inside_the_lead(self, part):
+        from noveltrans.youtube_upload import upload_batch
+
+        request = UploadRequest(
+            video=part,
+            title="t",
+            visibility="members_then_public",
+            public_at=datetime.now() + timedelta(minutes=1),
+        )
+        with pytest.raises(YouTubeUploadError, match="phút|lead|giờ|hẹn"):
+            upload_batch([request])
+
+
+class TestLibraryMembersLast:
+    """The chain is channel-wide: the latest members switch in ANY project counts."""
+
+    def _project_with_part(self, library: Path, name: str, state: dict) -> None:
+        from noveltrans.storage.project import EXPORTS_DIR, VIDEO_DIR
+
+        folder = library / name
+        (folder / EXPORTS_DIR / VIDEO_DIR / "part").mkdir(parents=True)
+        (folder / "meta.json").write_text("{}", encoding="utf-8")
+        record = folder / EXPORTS_DIR / VIDEO_DIR / "part" / "part.upload.json"
+        record.write_text(json.dumps(state), encoding="utf-8")
+
+    def test_latest_members_switch_across_two_novels(self, tmp_path, monkeypatch):
+        from noveltrans.storage import library as lib
+        from noveltrans.youtube_upload import library_members_last
+
+        monkeypatch.setattr(
+            lib.NovelProject, "is_project_dir", staticmethod(lambda p: (p / "meta.json").is_file())
+        )
+        self._project_with_part(tmp_path, "a-0001", {
+            "visibility": "members_then_public", "status": "published",
+            "public_at": "2026-11-20T19:00:00"})
+        self._project_with_part(tmp_path, "b-0002", {
+            "visibility": "members_then_public", "status": "committed",
+            "public_at": "2026-11-23T19:00:00"})
+        assert library_members_last(tmp_path) == datetime(2026, 11, 23, 19, 0)
+
+    def test_missing_library_is_none(self, tmp_path):
+        from noveltrans.youtube_upload import library_members_last
+
+        assert library_members_last(tmp_path / "nope") is None
+
+    def test_corrupt_record_is_skipped(self, tmp_path, monkeypatch):
+        from noveltrans.storage import library as lib
+        from noveltrans.storage.project import EXPORTS_DIR, VIDEO_DIR
+        from noveltrans.youtube_upload import library_members_last
+
+        monkeypatch.setattr(
+            lib.NovelProject, "is_project_dir", staticmethod(lambda p: (p / "meta.json").is_file())
+        )
+        folder = tmp_path / "c-0003"
+        (folder / EXPORTS_DIR / VIDEO_DIR).mkdir(parents=True)
+        (folder / "meta.json").write_text("{}", encoding="utf-8")
+        (folder / EXPORTS_DIR / VIDEO_DIR / "x.upload.json").write_text("{not json", encoding="utf-8")
+        assert library_members_last(tmp_path) is None

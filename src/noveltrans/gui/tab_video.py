@@ -420,9 +420,10 @@ class VideoTab(QWidget):
         Mirrors the audio tab's chapter table: each row is one part, with a per-row
         "Tạo"/"Tạo lại" button, so the user can render only the missing parts.
         """
-        self.video_list = QTableWidget(0, 7)
+        self.video_list = QTableWidget(0, 8)
         self.video_list.setHorizontalHeaderLabels(
-            ["Phần", "Chương", "Thời lượng", "Tiêu đề", "Trạng thái", "Đã tải lên", "Thao tác"]
+            ["Phần", "Chương", "Thời lượng", "Tiêu đề", "Trạng thái", "Đã tải lên",
+             "Lịch đăng", "Thao tác"]
         )
         self.video_list.verticalHeader().setVisible(False)
         self.video_list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -442,7 +443,7 @@ class VideoTab(QWidget):
         # modes. Part order by default — `_part_number` is derived from the chapter range,
         # and a sort must never look like it renumbered anything. Safe now that rows carry
         # their window's `first_num`; the "Thao tác" cell widgets follow their items
-        # through a sort in Qt 6.11 (measured), so column 6 needs nothing.
+        # through a sort in Qt 6.11 (measured), so column 7 needs nothing.
         enable_table_sorting(self.video_list, config=self.config, list_id="video.parts")
         header = self.video_list.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
@@ -453,8 +454,9 @@ class VideoTab(QWidget):
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)  # đã tải lên
         # ResizeToContents ignores cell *widgets*, so the action column must be sized
         # explicitly or the five buttons get crushed unreadably narrow.
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
-        self.video_list.setColumnWidth(6, 420)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)  # lịch đăng
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)
+        self.video_list.setColumnWidth(7, 420)
         self.video_list.verticalHeader().setDefaultSectionSize(34)
         # ~6 rows + header. Without a floor the table is the first thing Qt squeezes —
         # it owns the only stretch in the tab — and on a short window it collapsed to a
@@ -727,15 +729,20 @@ class VideoTab(QWidget):
         Absolute dates depend on when the upload is launched, so they appear only in the
         confirmation dialog.
         """
-        from noveltrans.youtube_upload import PUBLIC_SWITCH_DAYS
+        from datetime import datetime
+
+        from noveltrans.youtube_upload import library_members_last, members_chain_times
 
         pending = self._pending_upload_rows()
         if not pending:
             self.schedule_preview.setText("Không có phần nào cần tải lên.")
             return
+        times = members_chain_times(
+            datetime.now(), library_members_last(self.config.library_dir), len(pending)
+        )
         shown = [
-            f"{label}: +{PUBLIC_SWITCH_DAYS * (i + 1)} ngày"
-            for i, (_, label, _, _) in enumerate(pending[:4])
+            f"{label}: {when:%d/%m %H:%M}"
+            for (_, label, _, _), when in zip(pending[:4], times)
         ]
         more = f" … (+{len(pending) - 4} phần)" if len(pending) > 4 else ""
         self.schedule_preview.setText(
@@ -1766,8 +1773,9 @@ class VideoTab(QWidget):
             self.video_list.setItem(i, 3, QTableWidgetItem(self._part_title(part_num)))
             self.video_list.setItem(i, 4, self._created_item(window, whole_novel))
             self.video_list.setItem(i, 5, self._upload_item(window, whole_novel))
+            self.video_list.setItem(i, 6, self._schedule_item(window, whole_novel))
             self.video_list.setCellWidget(
-                i, 6, self._build_row_actions(window, part_num, whole_novel, exists)
+                i, 7, self._build_row_actions(window, part_num, whole_novel, exists)
             )
 
     def _created_item(self, window, whole_novel: bool) -> QTableWidgetItem:
@@ -1876,6 +1884,35 @@ class VideoTab(QWidget):
         self.status_label.setText(
             "Đã đánh dấu thủ công là đã tạo." if wanted else "Đã bỏ đánh dấu là đã tạo."
         )
+
+    def _schedule_item(self, window, whole_novel: bool) -> QTableWidgetItem:
+        """The "Lịch đăng" cell: when a booked part goes live.
+
+        Members parts show their switch to public, scheduled parts their publish time. Only
+        parts past the publish click (committed or published) have one, so every other cell
+        is blank. The tooltip names which kind of time it is.
+        """
+        from datetime import datetime
+
+        from noveltrans.youtube_upload import _as_naive_local, read_upload_state
+
+        state = read_upload_state(self._part_output_path(window, whole_novel=whole_novel))
+        if state.get("status") not in ("committed", "published"):
+            return QTableWidgetItem("")
+        if state.get("visibility") == "members_then_public":
+            raw, kind = state.get("public_at") or "", "Hội viên → công khai"
+        elif state.get("visibility") == "schedule":
+            raw, kind = state.get("publish_at") or "", "Hẹn giờ đăng"
+        else:
+            return QTableWidgetItem("")
+        try:
+            when = _as_naive_local(datetime.fromisoformat(raw))
+        except (TypeError, ValueError):
+            return QTableWidgetItem("")
+        item = QTableWidgetItem(when.strftime("%d/%m %H:%M"))
+        item.setData(SORT_ROLE, when.timestamp())  # blanks sort last, dates in order
+        item.setToolTip(f"{kind}: {when.strftime('%d/%m/%Y %H:%M')}")
+        return item
 
     def _upload_item(self, window, whole_novel: bool) -> QTableWidgetItem:
         """The "Đã tải lên" cell: a tick the user can toggle, plus a short status.
@@ -4482,7 +4519,8 @@ class VideoTab(QWidget):
 
         from noveltrans.youtube_upload import (
             YouTubeUploadError,
-            public_switch_times,
+            library_members_last,
+            members_chain_times,
             schedule_times,
         )
 
@@ -4495,9 +4533,12 @@ class VideoTab(QWidget):
             if scheduling
             else [None] * len(rows)
         )
-        # Anchored to the click, so every part's offset is counted from the same moment.
+        # Chained across the whole channel, not anchored to the click: 3 days after the
+        # latest members switch already booked, or the next 3 days if that has lapsed.
         public_times = (
-            public_switch_times(datetime.now(), len(rows))
+            members_chain_times(
+                datetime.now(), library_members_last(self.config.library_dir), len(rows)
+            )
             if members
             else [None] * len(rows)
         )
