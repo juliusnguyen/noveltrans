@@ -163,17 +163,23 @@ _CONFIRM_DIALOG_SEL = (
 )
 # A different gate, BEFORE publish even takes: if YouTube's automatic copyright/policy
 # scan hasn't cleared yet, clicking Xuất bản/Publish puts up "We're still checking your
-# content" with "Publish anyway" / "Go back" instead of committing. Left unhandled, the
-# upload dialog just sits there until _finish's wait loop times out — which is what a
-# human watching sees as the run "freezing" on the publish step. Matched loosely by label
-# (like `_click_text_anywhere`) rather than a component selector, since this dialog's
-# generic-looking markup isn't worth pinning to a fragile Studio class name — one combined
-# `:text()` selector so the poll inside _finish's loop costs one query, not several.
-# Seen live 2026-11-20 on a members-only → public publish: the button reads "Got it".
-_STILL_CHECKING_PUBLISH_ANYWAY_SEL = (
-    ':text("Got it"), :text("Đã hiểu"), '
-    ':text("Publish anyway"), :text("Vẫn xuất bản"), :text("Cứ xuất bản")'
+# content" instead of committing. Left unhandled, the upload dialog just sits there until
+# _finish's wait loop times out. Matched by heading text, not a component selector, since
+# this dialog's markup isn't worth pinning to a fragile Studio class name. English heading
+# only: the Vietnamese heading was never observed, so the gate is detected through the
+# bilingual "Publish anyway" button as well (see `_gate_showing`).
+# `:visible` keeps hidden copies of the text elsewhere in the DOM out of the match.
+_STILL_CHECKING_GATE_SEL = ':text("still checking your content"):visible'
+# The button that pushes the publish through the gate. Matched by exact label, never by
+# DOM position: the dialog also carries "Got it", which only dismisses it without
+# publishing. Clicking that instead is what made the run stall (feature 110).
+_PUBLISH_ANYWAY_SEL = (
+    ':text-is("Publish anyway"):visible, :text-is("Vẫn xuất bản"):visible, '
+    ':text-is("Cứ xuất bản"):visible'
 )
+# After "Publish anyway", how long the gate may linger before it counts as re-shown.
+# Studio can keep the heading mounted while the publish request is still processing.
+_GATE_CLEAR_WAIT_MS = 10_000
 
 # the draft's public link, available minutes before processing finishes
 _VIDEO_URL_SEL = "#share-url, ytcp-video-info a[href*='youtu.be'], a.video-url-fadeable"
@@ -1784,6 +1790,40 @@ def _set_members_then_public(page, request: UploadRequest, *, on_progress) -> No
     _fill_members_date_time(page, when)
 
 
+def _is_visible(page, selector: str, *, timeout_ms: int = 500) -> bool:
+    """True if `selector` is visible right now. Never raises."""
+    try:
+        return bool(page.locator(selector).first.is_visible(timeout=timeout_ms))
+    except Exception:
+        return False
+
+
+def _click_publish_anyway(page) -> bool:
+    """Click the gate's "Publish anyway" button by its exact label. False if not clickable."""
+    try:
+        page.locator(_PUBLISH_ANYWAY_SEL).first.click()
+    except Exception:
+        return False
+    return True
+
+
+def _gate_showing(page) -> bool:
+    """True while YouTube's "still checking your content" gate is up, in any language.
+
+    The button is checked too: the English heading is the only text matched directly, and
+    the button is what carries the bilingual label.
+    """
+    return _is_visible(page, _PUBLISH_ANYWAY_SEL) or _is_visible(page, _STILL_CHECKING_GATE_SEL)
+
+
+def _wait_gate_clear(page, *, budget_ms: int = _GATE_CLEAR_WAIT_MS) -> None:
+    """Give the gate up to `budget_ms` to dismiss after "Publish anyway". Returns early."""
+    waited = 0
+    while waited < budget_ms and _gate_showing(page):
+        page.wait_for_timeout(1_000)
+        waited += 1_000
+
+
 def _finish(page, *, video_id: str) -> None:
     """Commit: click Xuất bản / Lên lịch / Lưu, and make sure it actually took."""
     if not _click_any(page, _DONE_SEL, _PUBLISH_TEXTS):
@@ -1797,29 +1837,42 @@ def _finish(page, *, video_id: str) -> None:
     # zero-size wrapper that reads as hidden from the moment it mounts, so that check
     # passed instantly and would have reported every publish a success without looking.
     waited = 0
+    gate_clicks = 0
+    gate_lingered = False
     while waited < _STEP_WAIT_MS:
         # "We're still checking your content" gates the publish itself (see the constant's
-        # docstring above) — click through it and keep waiting for the real confirmation,
-        # rather than let it sit there until the loop below times out. Mirrors
-        # `_click_text_anywhere`'s `.last` choice (smallest-matching-element semantics).
-        try:
-            still_checking = page.locator(_STILL_CHECKING_PUBLISH_ANYWAY_SEL).last
-            if still_checking.is_visible(timeout=500):
-                still_checking.click()
-                page.wait_for_timeout(_SETTLE_MS)
+        # docstring above). Click "Publish anyway" once, by label, then give the gate time to
+        # clear. If it is still up afterwards, the publish may still be going through, so
+        # keep waiting for the real confirmation rather than failing early. Never click again:
+        # retrying would keep pressing publish blindly.
+        if _gate_showing(page):
+            if gate_clicks == 0:
+                if not _click_publish_anyway(page):
+                    raise YouTubeUploadError(
+                        "YouTube Studio hiện cảnh báo “We're still checking your content” "
+                        "nhưng không tìm thấy nút “Publish anyway”. Chưa xác nhận đã xuất "
+                        "bản — kiểm tra trên Studio.",
+                        video_id=video_id,
+                    )
+                gate_clicks += 1
+                _wait_gate_clear(page)
                 continue
-        except Exception:
-            pass
+            gate_lingered = True
         if _first_present(page, _DIALOG_SEL, timeout_ms=1_000, state="detached") is not None:
             return
         if _first_present(page, _CONFIRM_DIALOG_SEL, timeout_ms=1_000, state="attached") is not None:
             return
         page.wait_for_timeout(1_000)
         waited += 3_000
+    gate_note = (
+        " Cảnh báo “We're still checking your content” vẫn hiện sau khi bấm “Publish anyway”."
+        if gate_lingered
+        else ""
+    )
     raise YouTubeUploadError(
         "Đã bấm xuất bản nhưng YouTube Studio không xác nhận (hộp thoại vẫn mở ở bước "
-        f"“{_dialog_step(page) or 'không rõ'}”) — có thể còn mục bắt buộc chưa điền. "
-        "Kiểm tra bản nháp trên kênh.",
+        f"“{_dialog_step(page) or 'không rõ'}”) — có thể còn mục bắt buộc chưa điền."
+        f"{gate_note} Kiểm tra bản nháp trên kênh.",
         video_id=video_id,
     )
 

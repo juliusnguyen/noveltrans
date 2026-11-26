@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "git rev-parse --git-dir >/dev/null 2>&1 && code-review-graph update --skip-flows --repo \"/mnt/d/Tools/Narra\" || true",
+            "command": "git rev-parse --git-dir >/dev/null 2>&1 && code-review-graph update --skip-flows --repo \"$CLAUDE_PROJECT_DIR\" || true",
             "timeout": 30
           }
         ]
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "git rev-parse --git-dir >/dev/null 2>&1 && code-review-graph status --repo \"/mnt/d/Tools/Narra\" || echo 'Not a git repo, skipping'",
+            "command": "git rev-parse --git-dir >/dev/null 2>&1 && code-review-graph status --repo \"$CLAUDE_PROJECT_DIR\" || echo 'Not a git repo, skipping'",
             "timeout": 10
           }
         ]

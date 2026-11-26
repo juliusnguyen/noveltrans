@@ -31,7 +31,8 @@ from noveltrans.youtube_upload import (
     _CONFIRM_DIALOG_SEL,
     _DIALOG_SEL,
     _DONE_SEL,
-    _STILL_CHECKING_PUBLISH_ANYWAY_SEL,
+    _PUBLISH_ANYWAY_SEL,
+    _STILL_CHECKING_GATE_SEL,
     _TITLE_SEL,
     _format_date,
     _format_time,
@@ -589,15 +590,32 @@ class _FakeStudioPage:
 
     def __init__(
         self, *, step="SELECT_FILES", attached=True, visible=(), confirm=False,
-        still_checking=False,
+        still_checking=False, anyway_present=True, gate_reappears=False,
+        heading_shown=True, linger_polls=0,
     ):
         self.step = step
         self.attached = attached
         self.visible = set(visible)
         self.confirm = confirm
-        self.still_checking = still_checking  # "We're still checking your content" gate
+        # "We're still checking your content" gate is up
+        self.still_checking = still_checking
+        # its English heading is shown (Vietnamese Studio shows only the button)
+        self.heading_shown = heading_shown
+        # its "Publish anyway" button exists; a click on it dismisses the gate, unless
+        # `gate_reappears` models Studio putting the gate back up after that click
+        self.anyway_present = anyway_present
+        self.gate_reappears = gate_reappears
+        # after a click the gate lingers for this many visibility checks (publish in flight)
+        self.linger_polls = linger_polls
+        self.linger = 0
         self.clicked: list = []
         self.waits: list = []
+
+    def gate_visible_now(self):
+        if self.linger > 0:
+            self.linger -= 1
+            return True
+        return self.still_checking
 
     def wait_for_timeout(self, ms):
         pass
@@ -638,14 +656,21 @@ class _FakeStudioPage:
                     raise PlaywrightTimeoutError(f"{selector} not {state}")
 
             def is_visible(self, timeout=None):
-                if selector == _STILL_CHECKING_PUBLISH_ANYWAY_SEL:
-                    return page.still_checking
+                if selector == _STILL_CHECKING_GATE_SEL:
+                    return page.gate_visible_now() and page.heading_shown
+                if selector == _PUBLISH_ANYWAY_SEL:
+                    return page.gate_visible_now() and page.anyway_present
                 return selector in page.visible
 
             def click(self):
                 page.clicked.append(selector)
-                if selector == _STILL_CHECKING_PUBLISH_ANYWAY_SEL:
-                    page.still_checking = False  # "Publish anyway" dismisses the gate
+                if selector == _PUBLISH_ANYWAY_SEL:
+                    if not page.anyway_present:
+                        raise RuntimeError("no Publish anyway button")
+                    # "Publish anyway" dismisses the gate, unless Studio re-shows it;
+                    # a lingering gate stays up for `linger_polls` checks first
+                    page.linger = page.linger_polls
+                    page.still_checking = page.gate_reappears
 
             def is_enabled(self, timeout=None):
                 return selector in page.visible
@@ -853,15 +878,98 @@ class TestFinishConfirmation:
         with pytest.raises(YouTubeUploadError, match="CHECKS"):
             _finish(page, video_id="")
 
-    def test_still_checking_content_dialog_is_dismissed_then_confirms(self):
-        """YouTube's "We're still checking your content" gate (Publish anyway / Go back)
-        must be clicked through, not left to stall the run until the timeout fires."""
+    @staticmethod
+    def _clicks_after_done(page):
+        """Everything clicked after the publish button itself (the gate's own clicks)."""
+        from noveltrans.youtube_upload import _DONE_SEL
+
+        return [c for c in page.clicked if c != _DONE_SEL]
+
+    def test_gate_is_cleared_with_publish_anyway_then_confirms(self):
+        """The gate must be passed by clicking "Publish anyway" — never "Got it" (which only
+        dismisses the dialog and leaves the video unpublished)."""
         from noveltrans.youtube_upload import _finish
 
         page = _FakeStudioPage(attached=True, confirm=True, still_checking=True)
         page.visible = {_DONE_SEL}
         _finish(page, video_id="dQw4w9WgXcQ")  # does not raise
-        assert _STILL_CHECKING_PUBLISH_ANYWAY_SEL in page.clicked
+        assert self._clicks_after_done(page) == [_PUBLISH_ANYWAY_SEL]
+
+    def test_gate_reappearing_after_publish_anyway_waits_then_reports_without_retrying(self):
+        """One "Publish anyway" click only. If the gate stays up, keep waiting for the real
+        confirmation until the normal budget runs out, then report it with the gate noted."""
+        from noveltrans.youtube_upload import _finish
+
+        page = _FakeStudioPage(
+            attached=True, confirm=False, still_checking=True, gate_reappears=True,
+        )
+        page.visible = {_DONE_SEL}
+        with pytest.raises(YouTubeUploadError, match="không xác nhận.*Publish anyway"):
+            _finish(page, video_id="dQw4w9WgXcQ")
+        assert self._clicks_after_done(page) == [_PUBLISH_ANYWAY_SEL]
+
+    def test_gate_reappearing_but_publish_confirms_later_is_not_a_failure(self):
+        """The gate can stay up while the publish is still going through. A confirmation that
+        arrives after it must count as success, not be reported as failed."""
+        from noveltrans.youtube_upload import _finish
+
+        class _ConfirmsLate(_FakeStudioPage):
+            def __init__(self, **kw):
+                super().__init__(**kw)
+                self.polls = 0
+
+            def wait_for_timeout(self, ms):
+                self.polls += 1
+                if self.polls >= 5:
+                    self.confirm = True  # the share dialog appears after the gate lingers
+
+        page = _ConfirmsLate(
+            attached=True, confirm=False, still_checking=True, gate_reappears=True,
+        )
+        page.visible = {_DONE_SEL}
+        _finish(page, video_id="dQw4w9WgXcQ")  # does not raise
+        assert self._clicks_after_done(page) == [_PUBLISH_ANYWAY_SEL]
+
+    def test_gate_lingering_after_publish_anyway_is_not_reported_as_failure(self):
+        """The heading can stay mounted while the publish is still in flight. That must
+        wait, not be reported as an unpublished video."""
+        from noveltrans.youtube_upload import _finish
+
+        page = _FakeStudioPage(
+            attached=True, confirm=True, still_checking=True, linger_polls=4,
+        )
+        page.visible = {_DONE_SEL}
+        _finish(page, video_id="dQw4w9WgXcQ")  # does not raise
+        assert self._clicks_after_done(page) == [_PUBLISH_ANYWAY_SEL]
+
+    def test_vietnamese_gate_detected_by_publish_anyway_button_alone(self):
+        """On a Vietnamese Studio only the bilingual button is present, no English heading."""
+        from noveltrans.youtube_upload import _finish
+
+        page = _FakeStudioPage(
+            attached=True, confirm=True, still_checking=True, heading_shown=False,
+        )
+        page.visible = {_DONE_SEL}
+        _finish(page, video_id="dQw4w9WgXcQ")  # does not raise
+        assert self._clicks_after_done(page) == [_PUBLISH_ANYWAY_SEL]
+
+    def test_gate_without_publish_anyway_button_stops_after_one_attempt(self):
+        from noveltrans.youtube_upload import _finish
+
+        page = _FakeStudioPage(
+            attached=True, confirm=True, still_checking=True, anyway_present=False,
+        )
+        page.visible = {_DONE_SEL}
+        with pytest.raises(YouTubeUploadError, match="Chưa xác nhận đã xuất bản"):
+            _finish(page, video_id="dQw4w9WgXcQ")
+        assert self._clicks_after_done(page) == [_PUBLISH_ANYWAY_SEL]
+
+    def test_publish_anyway_selector_never_matches_got_it(self):
+        """"Got it" only dismisses the dialog; it must never be a publish-through target."""
+        from noveltrans.youtube_upload import _PUBLISH_ANYWAY_SEL
+
+        for label in ("Got it", "Đã hiểu"):
+            assert label not in _PUBLISH_ANYWAY_SEL
 
 
 class TestClearProfile:
