@@ -1809,19 +1809,24 @@ def _is_visible(page, selector: str, *, timeout_ms: int = 500) -> bool:
 
 
 def _click_gate_button(page) -> bool:
-    """Click the gate's way through, by exact label. False if neither button is clickable.
+    """Click the gate's way through, by exact label. False if the gate can't be passed.
 
-    "Publish anyway" first: it is the public gate's only publish-through. "Got it" is the
-    fallback the Members gate offers alone. It is never preferred, so the public gate is
-    not dismissed by it.
+    "Publish anyway" is the public gate's publish-through. "Got it" is what the Members gate
+    offers alone, so it is clicked only when "Publish anyway" is not on screen. If
+    "Publish anyway" is there but its click fails, "Got it" is NOT tried: it would dismiss
+    the public gate without publishing (the feature-110 stall).
     """
-    for selector in (_PUBLISH_ANYWAY_SEL, _GOT_IT_SEL):
+    if _is_visible(page, _PUBLISH_ANYWAY_SEL):
         try:
-            page.locator(selector).first.click()
+            page.locator(_PUBLISH_ANYWAY_SEL).first.click()
         except Exception:
-            continue
+            return False
         return True
-    return False
+    try:
+        page.locator(_GOT_IT_SEL).first.click()
+    except Exception:
+        return False
+    return True
 
 
 def _gate_showing(page) -> bool:

@@ -592,7 +592,7 @@ class _FakeStudioPage:
     def __init__(
         self, *, step="SELECT_FILES", attached=True, visible=(), confirm=False,
         still_checking=False, anyway_present=True, gate_reappears=False,
-        heading_shown=True, linger_polls=0, got_it_present=False,
+        heading_shown=True, linger_polls=0, got_it_present=False, anyway_click_fails=False,
     ):
         self.step = step
         self.attached = attached
@@ -611,6 +611,8 @@ class _FakeStudioPage:
         self.linger = 0
         # Members gate offers only "Got it", which dismisses it and lets the publish go on
         self.got_it_present = got_it_present
+        # "Publish anyway" is shown but its click fails (e.g. covered)
+        self.anyway_click_fails = anyway_click_fails
         self.clicked: list = []
         self.waits: list = []
 
@@ -669,8 +671,8 @@ class _FakeStudioPage:
 
             def click(self):
                 if selector == _PUBLISH_ANYWAY_SEL:
-                    if not page.anyway_present:
-                        raise RuntimeError("no Publish anyway button")
+                    if not page.anyway_present or page.anyway_click_fails:
+                        raise RuntimeError("Publish anyway not clickable")
                     page.clicked.append(selector)
                     # "Publish anyway" dismisses the gate, unless Studio re-shows it;
                     # a lingering gate stays up for `linger_polls` checks first
@@ -988,6 +990,21 @@ class TestFinishConfirmation:
         page.visible = {_DONE_SEL}
         _finish(page, video_id="dQw4w9WgXcQ")  # does not raise
         assert self._clicks_after_done(page) == [_GOT_IT_SEL]
+
+    def test_failed_publish_anyway_click_does_not_fall_back_to_got_it(self):
+        """"Publish anyway" is on screen but its click fails: "Got it" would dismiss the public
+        gate without publishing, so the upload must stop instead."""
+        from noveltrans.youtube_upload import _finish
+
+        page = _FakeStudioPage(
+            attached=True, confirm=True, still_checking=True,
+            got_it_present=True, anyway_click_fails=True,
+        )
+        page.visible = {_DONE_SEL}
+        with pytest.raises(YouTubeUploadError, match="không tìm thấy nút"):
+            _finish(page, video_id="dQw4w9WgXcQ")
+        assert _GOT_IT_SEL not in page.clicked
+        assert _PUBLISH_ANYWAY_SEL not in page.clicked
 
     def test_public_gate_never_dismissed_by_got_it_when_publish_anyway_exists(self):
         """Both buttons present (public gate): "Publish anyway" is the one clicked."""
