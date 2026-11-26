@@ -3400,6 +3400,12 @@ def _comment_after_publish(page, video: Path, *, video_id: str, text: str) -> st
             return "Trình duyệt đã đóng trước khi đăng bình luận."
         return f"Không mở được tab để đăng bình luận: {exc}"
     try:
+        # A new tab opens in the background, and Chrome does not draw a background tab, so
+        # Studio's toast never appears there. Bring it forward before posting and pinning.
+        try:
+            comment_page.bring_to_front()
+        except Exception:
+            pass
         return _post_and_pin_comment(comment_page, video, video_id=video_id, text=text)
     finally:
         try:

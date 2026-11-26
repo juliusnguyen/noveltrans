@@ -3730,6 +3730,9 @@ class _FakeCommentPage:
     def close(self):
         self.closed = True
 
+    def bring_to_front(self):
+        self.brought_front = True
+
     def press(self, key):
         pass
 
