@@ -3669,7 +3669,7 @@ class TestPickPlaylistIndex:
 
 
 class _FakeCommentPage:
-    """The watch page as far as the comment step sees it.
+    """The Studio comments page as far as the comment step sees it.
 
     A comment box, a Post button, and a comment menu whose items include "Ghim" (pin) and,
     when `menu_has_pin` is set, also "Bỏ ghim" (unpin) as a distractor. Records every
@@ -3678,7 +3678,7 @@ class _FakeCommentPage:
 
     def __init__(
         self, *, submit_ok=True, menu_has_pin=True, thread_present=True,
-        logged_out=False, goto_error=None,
+        logged_out=False, goto_error=None, confirm_present=True,
     ):
         self.submit_ok = submit_ok
         self.menu_has_pin = menu_has_pin
@@ -3691,6 +3691,8 @@ class _FakeCommentPage:
         self.clicks: list = []
         self.typed: list = []
         self.closed = False
+        self.confirm_present = confirm_present
+        self.confirm_open = False
         self.keyboard = self
 
     def goto(self, url, wait_until=None):
@@ -3719,11 +3721,15 @@ class _FakeCommentPage:
             _PIN_MENU_ITEM_SEL,
         )
 
+        from noveltrans.youtube_upload import _PIN_CONFIRM_SEL
+
         present = {_COMMENT_BOX_SEL, _COMMENT_SUBMIT_SEL}
         if self.posted and self.thread_present:
             present.add(_COMMENT_THREAD_SEL)
         if self.menu_has_pin:
             present.add(_PIN_MENU_ITEM_SEL)
+        if self.confirm_open and self.confirm_present:
+            present.add(_PIN_CONFIRM_SEL)
         return present
 
     def locator(self, selector):
@@ -3753,6 +3759,22 @@ class _CommentLoc:
     def is_visible(self, timeout=None):
         return self._selector in self._page._present()
 
+    def count(self):
+        return 1 if self._selector in self._page._present() else 0
+
+    def nth(self, index):
+        return self if index == 0 else _CommentLoc(self._page, "")
+
+    def inner_text(self, timeout=None):
+        from noveltrans.youtube_upload import _PIN_CONFIRM_SEL, _PIN_MENU_ITEM_SEL
+
+        # the menu item reads "Pin\n" as on the live page; the dialog's button reads "Pin"
+        if self._selector == _PIN_MENU_ITEM_SEL:
+            return "Pin\n"
+        if self._selector == _PIN_CONFIRM_SEL:
+            return "Pin"
+        return ""
+
     def click(self):
         from noveltrans.youtube_upload import _COMMENT_SUBMIT_SEL
 
@@ -3761,6 +3783,10 @@ class _CommentLoc:
             if not self._page.submit_ok:
                 raise RuntimeError("submit button not clickable")
             self._page.posted = True
+        from noveltrans.youtube_upload import _PIN_MENU_ITEM_SEL
+
+        if self._selector == _PIN_MENU_ITEM_SEL:
+            self._page.confirm_open = True  # Studio asks "Pin this comment?" next
 
 
 class TestPostAndPinComment:
@@ -3790,18 +3816,21 @@ class TestPostAndPinComment:
         assert note == ""
         assert page.typed == ["Hello"]
         # the box is clicked to focus it, then Post, then the thread's menu, then Pin
+        from noveltrans.youtube_upload import _PIN_CONFIRM_SEL
+
         assert page.clicks == [
             _COMMENT_BOX_SEL, _COMMENT_SUBMIT_SEL, _COMMENT_MENU_SEL, _PIN_MENU_ITEM_SEL,
+            _PIN_CONFIRM_SEL,
         ]
         state = read_upload_state(video)
         assert state["comment_status"] == "posted"
         assert state["pinned"] is True
 
     def test_pin_menu_item_never_matches_unpin(self):
-        from noveltrans.youtube_upload import _PIN_MENU_ITEM_SEL
+        from noveltrans.youtube_upload import _PIN_LABELS
 
         for label in ("Bỏ ghim", "Unpin"):
-            assert label not in _PIN_MENU_ITEM_SEL
+            assert label not in _PIN_LABELS
 
     def test_missing_pin_leaves_comment_posted_and_says_so(self, tmp_path):
         from noveltrans.youtube_upload import _post_and_pin_comment
@@ -3814,6 +3843,18 @@ class TestPostAndPinComment:
         state = read_upload_state(video)
         assert state["comment_status"] == "posted"
         assert "pinned" not in state
+
+    def test_menu_pin_without_confirmation_is_not_recorded_as_pinned(self, tmp_path):
+        """Picking Ghim opens "Pin this comment?". Without its Pin button nothing is pinned,
+        so the record must not say pinned."""
+        from noveltrans.youtube_upload import _post_and_pin_comment
+
+        video = self._video(tmp_path)
+        page = _FakeCommentPage(confirm_present=False)
+        note = _post_and_pin_comment(page, video, video_id="dQw4w9WgXcQ", text="Hello")
+
+        assert "không ghim được" in note
+        assert "pinned" not in read_upload_state(video)
 
     def test_failed_post_is_marked_failed_and_never_pins(self, tmp_path):
         from noveltrans.youtube_upload import (
