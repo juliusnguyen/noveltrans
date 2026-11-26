@@ -31,6 +31,7 @@ from noveltrans.youtube_upload import (
     _CONFIRM_DIALOG_SEL,
     _DIALOG_SEL,
     _DONE_SEL,
+    _GOT_IT_SEL,
     _PUBLISH_ANYWAY_SEL,
     _STILL_CHECKING_GATE_SEL,
     _TITLE_SEL,
@@ -591,7 +592,7 @@ class _FakeStudioPage:
     def __init__(
         self, *, step="SELECT_FILES", attached=True, visible=(), confirm=False,
         still_checking=False, anyway_present=True, gate_reappears=False,
-        heading_shown=True, linger_polls=0,
+        heading_shown=True, linger_polls=0, got_it_present=False, anyway_click_fails=False,
     ):
         self.step = step
         self.attached = attached
@@ -608,6 +609,10 @@ class _FakeStudioPage:
         # after a click the gate lingers for this many visibility checks (publish in flight)
         self.linger_polls = linger_polls
         self.linger = 0
+        # Members gate offers only "Got it", which dismisses it and lets the publish go on
+        self.got_it_present = got_it_present
+        # "Publish anyway" is shown but its click fails (e.g. covered)
+        self.anyway_click_fails = anyway_click_fails
         self.clicked: list = []
         self.waits: list = []
 
@@ -660,17 +665,26 @@ class _FakeStudioPage:
                     return page.gate_visible_now() and page.heading_shown
                 if selector == _PUBLISH_ANYWAY_SEL:
                     return page.gate_visible_now() and page.anyway_present
+                if selector == _GOT_IT_SEL:
+                    return page.gate_visible_now() and page.got_it_present
                 return selector in page.visible
 
             def click(self):
-                page.clicked.append(selector)
                 if selector == _PUBLISH_ANYWAY_SEL:
-                    if not page.anyway_present:
-                        raise RuntimeError("no Publish anyway button")
+                    if not page.anyway_present or page.anyway_click_fails:
+                        raise RuntimeError("Publish anyway not clickable")
+                    page.clicked.append(selector)
                     # "Publish anyway" dismisses the gate, unless Studio re-shows it;
                     # a lingering gate stays up for `linger_polls` checks first
                     page.linger = page.linger_polls
                     page.still_checking = page.gate_reappears
+                elif selector == _GOT_IT_SEL:
+                    if not page.got_it_present:
+                        raise RuntimeError("no Got it button")
+                    page.clicked.append(selector)
+                    page.still_checking = False  # Members gate: "Got it" lets the publish go on
+                else:
+                    page.clicked.append(selector)
 
             def is_enabled(self, timeout=None):
                 return selector in page.visible
@@ -953,7 +967,7 @@ class TestFinishConfirmation:
         _finish(page, video_id="dQw4w9WgXcQ")  # does not raise
         assert self._clicks_after_done(page) == [_PUBLISH_ANYWAY_SEL]
 
-    def test_gate_without_publish_anyway_button_stops_after_one_attempt(self):
+    def test_gate_without_any_button_stops_without_clicking(self):
         from noveltrans.youtube_upload import _finish
 
         page = _FakeStudioPage(
@@ -962,6 +976,45 @@ class TestFinishConfirmation:
         page.visible = {_DONE_SEL}
         with pytest.raises(YouTubeUploadError, match="Chưa xác nhận đã xuất bản"):
             _finish(page, video_id="dQw4w9WgXcQ")
+        assert self._clicks_after_done(page) == []
+
+    def test_members_gate_with_only_got_it_is_passed_and_publish_confirms(self):
+        """Members→public shows the gate with "Got it" alone (live, 2026-11-27). Clicking it
+        is what lets that publish go on; the upload must not fail for lacking "Publish anyway"."""
+        from noveltrans.youtube_upload import _finish
+
+        page = _FakeStudioPage(
+            attached=True, confirm=True, still_checking=True,
+            anyway_present=False, got_it_present=True,
+        )
+        page.visible = {_DONE_SEL}
+        _finish(page, video_id="dQw4w9WgXcQ")  # does not raise
+        assert self._clicks_after_done(page) == [_GOT_IT_SEL]
+
+    def test_failed_publish_anyway_click_does_not_fall_back_to_got_it(self):
+        """"Publish anyway" is on screen but its click fails: "Got it" would dismiss the public
+        gate without publishing, so the upload must stop instead."""
+        from noveltrans.youtube_upload import _finish
+
+        page = _FakeStudioPage(
+            attached=True, confirm=True, still_checking=True,
+            got_it_present=True, anyway_click_fails=True,
+        )
+        page.visible = {_DONE_SEL}
+        with pytest.raises(YouTubeUploadError, match="không tìm thấy nút"):
+            _finish(page, video_id="dQw4w9WgXcQ")
+        assert _GOT_IT_SEL not in page.clicked
+        assert _PUBLISH_ANYWAY_SEL not in page.clicked
+
+    def test_public_gate_never_dismissed_by_got_it_when_publish_anyway_exists(self):
+        """Both buttons present (public gate): "Publish anyway" is the one clicked."""
+        from noveltrans.youtube_upload import _finish
+
+        page = _FakeStudioPage(
+            attached=True, confirm=True, still_checking=True, got_it_present=True,
+        )
+        page.visible = {_DONE_SEL}
+        _finish(page, video_id="dQw4w9WgXcQ")
         assert self._clicks_after_done(page) == [_PUBLISH_ANYWAY_SEL]
 
     def test_publish_anyway_selector_never_matches_got_it(self):
@@ -3633,7 +3686,7 @@ class TestPickPlaylistIndex:
 
 
 class _FakeCommentPage:
-    """The watch page as far as the comment step sees it.
+    """The Studio comments page as far as the comment step sees it.
 
     A comment box, a Post button, and a comment menu whose items include "Ghim" (pin) and,
     when `menu_has_pin` is set, also "Bỏ ghim" (unpin) as a distractor. Records every
@@ -3642,7 +3695,7 @@ class _FakeCommentPage:
 
     def __init__(
         self, *, submit_ok=True, menu_has_pin=True, thread_present=True,
-        logged_out=False, goto_error=None,
+        logged_out=False, goto_error=None, confirm_present=True,
     ):
         self.submit_ok = submit_ok
         self.menu_has_pin = menu_has_pin
@@ -3655,6 +3708,8 @@ class _FakeCommentPage:
         self.clicks: list = []
         self.typed: list = []
         self.closed = False
+        self.confirm_present = confirm_present
+        self.confirm_open = False
         self.keyboard = self
 
     def goto(self, url, wait_until=None):
@@ -3683,11 +3738,15 @@ class _FakeCommentPage:
             _PIN_MENU_ITEM_SEL,
         )
 
+        from noveltrans.youtube_upload import _PIN_CONFIRM_SEL
+
         present = {_COMMENT_BOX_SEL, _COMMENT_SUBMIT_SEL}
         if self.posted and self.thread_present:
             present.add(_COMMENT_THREAD_SEL)
         if self.menu_has_pin:
             present.add(_PIN_MENU_ITEM_SEL)
+        if self.confirm_open and self.confirm_present:
+            present.add(_PIN_CONFIRM_SEL)
         return present
 
     def locator(self, selector):
@@ -3717,6 +3776,22 @@ class _CommentLoc:
     def is_visible(self, timeout=None):
         return self._selector in self._page._present()
 
+    def count(self):
+        return 1 if self._selector in self._page._present() else 0
+
+    def nth(self, index):
+        return self if index == 0 else _CommentLoc(self._page, "")
+
+    def inner_text(self, timeout=None):
+        from noveltrans.youtube_upload import _PIN_CONFIRM_SEL, _PIN_MENU_ITEM_SEL
+
+        # the menu item reads "Pin\n" as on the live page; the dialog's button reads "Pin"
+        if self._selector == _PIN_MENU_ITEM_SEL:
+            return "Pin\n"
+        if self._selector == _PIN_CONFIRM_SEL:
+            return "Pin"
+        return ""
+
     def click(self):
         from noveltrans.youtube_upload import _COMMENT_SUBMIT_SEL
 
@@ -3725,6 +3800,10 @@ class _CommentLoc:
             if not self._page.submit_ok:
                 raise RuntimeError("submit button not clickable")
             self._page.posted = True
+        from noveltrans.youtube_upload import _PIN_MENU_ITEM_SEL
+
+        if self._selector == _PIN_MENU_ITEM_SEL:
+            self._page.confirm_open = True  # Studio asks "Pin this comment?" next
 
 
 class TestPostAndPinComment:
@@ -3754,18 +3833,21 @@ class TestPostAndPinComment:
         assert note == ""
         assert page.typed == ["Hello"]
         # the box is clicked to focus it, then Post, then the thread's menu, then Pin
+        from noveltrans.youtube_upload import _PIN_CONFIRM_SEL
+
         assert page.clicks == [
             _COMMENT_BOX_SEL, _COMMENT_SUBMIT_SEL, _COMMENT_MENU_SEL, _PIN_MENU_ITEM_SEL,
+            _PIN_CONFIRM_SEL,
         ]
         state = read_upload_state(video)
         assert state["comment_status"] == "posted"
         assert state["pinned"] is True
 
     def test_pin_menu_item_never_matches_unpin(self):
-        from noveltrans.youtube_upload import _PIN_MENU_ITEM_SEL
+        from noveltrans.youtube_upload import _PIN_LABELS
 
         for label in ("Bỏ ghim", "Unpin"):
-            assert label not in _PIN_MENU_ITEM_SEL
+            assert label not in _PIN_LABELS
 
     def test_missing_pin_leaves_comment_posted_and_says_so(self, tmp_path):
         from noveltrans.youtube_upload import _post_and_pin_comment
@@ -3778,6 +3860,18 @@ class TestPostAndPinComment:
         state = read_upload_state(video)
         assert state["comment_status"] == "posted"
         assert "pinned" not in state
+
+    def test_menu_pin_without_confirmation_is_not_recorded_as_pinned(self, tmp_path):
+        """Picking Ghim opens "Pin this comment?". Without its Pin button nothing is pinned,
+        so the record must not say pinned."""
+        from noveltrans.youtube_upload import _post_and_pin_comment
+
+        video = self._video(tmp_path)
+        page = _FakeCommentPage(confirm_present=False)
+        note = _post_and_pin_comment(page, video, video_id="dQw4w9WgXcQ", text="Hello")
+
+        assert "không ghim được" in note
+        assert "pinned" not in read_upload_state(video)
 
     def test_failed_post_is_marked_failed_and_never_pins(self, tmp_path):
         from noveltrans.youtube_upload import (

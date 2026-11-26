@@ -177,6 +177,10 @@ _PUBLISH_ANYWAY_SEL = (
     ':text-is("Publish anyway"):visible, :text-is("Vẫn xuất bản"):visible, '
     ':text-is("Cứ xuất bản"):visible'
 )
+# The Members→public gate offers only this button, and clicking it lets that publish
+# continue (seen live 2026-11-20). Used only as the fallback when the gate has no
+# "Publish anyway", so the public gate is still never dismissed by it.
+_GOT_IT_SEL = ':text-is("Got it"):visible, :text-is("Đã hiểu"):visible'
 # After "Publish anyway", how long the gate may linger before it counts as re-shown.
 # Studio can keep the heading mounted while the publish request is still processing.
 _GATE_CLEAR_WAIT_MS = 10_000
@@ -1804,10 +1808,22 @@ def _is_visible(page, selector: str, *, timeout_ms: int = 500) -> bool:
         return False
 
 
-def _click_publish_anyway(page) -> bool:
-    """Click the gate's "Publish anyway" button by its exact label. False if not clickable."""
+def _click_gate_button(page) -> bool:
+    """Click the gate's way through, by exact label. False if the gate can't be passed.
+
+    "Publish anyway" is the public gate's publish-through. "Got it" is what the Members gate
+    offers alone, so it is clicked only when "Publish anyway" is not on screen. If
+    "Publish anyway" is there but its click fails, "Got it" is NOT tried: it would dismiss
+    the public gate without publishing (the feature-110 stall).
+    """
+    if _is_visible(page, _PUBLISH_ANYWAY_SEL):
+        try:
+            page.locator(_PUBLISH_ANYWAY_SEL).first.click()
+        except Exception:
+            return False
+        return True
     try:
-        page.locator(_PUBLISH_ANYWAY_SEL).first.click()
+        page.locator(_GOT_IT_SEL).first.click()
     except Exception:
         return False
     return True
@@ -1853,11 +1869,11 @@ def _finish(page, *, video_id: str) -> None:
         # retrying would keep pressing publish blindly.
         if _gate_showing(page):
             if gate_clicks == 0:
-                if not _click_publish_anyway(page):
+                if not _click_gate_button(page):
                     raise YouTubeUploadError(
                         "YouTube Studio hiện cảnh báo “We're still checking your content” "
-                        "nhưng không tìm thấy nút “Publish anyway”. Chưa xác nhận đã xuất "
-                        "bản — kiểm tra trên Studio.",
+                        "nhưng không tìm thấy nút “Publish anyway” hoặc “Got it”. Chưa xác "
+                        "nhận đã xuất bản — kiểm tra trên Studio.",
                         video_id=video_id,
                     )
                 gate_clicks += 1
@@ -3182,28 +3198,64 @@ DEFAULT_UPLOAD_COMMENT = (
 # warning, never a failed publish.
 COMMENT_VISIBILITIES = ("public", "unlisted", "schedule", "members_then_public")
 
-# UNVERIFIED: watch-page comment UI, not yet checked against live Studio. Confirm with the
-# live probe before relying on these; a wrong selector only produces a warning.
-_WATCH_URL = "https://www.youtube.com/watch?v={video_id}&hl=vi"
-_COMMENT_PLACEHOLDER_SEL = "#simplebox-placeholder"
-_COMMENT_BOX_SEL = "#contenteditable-root"
-_COMMENT_SUBMIT_SEL = "#submit-button"
-_COMMENT_SUBMIT_TEXTS = ("Bình luận", "Comment")
-_COMMENT_THREAD_SEL = "ytd-comment-thread-renderer"
-_COMMENT_MENU_SEL = "#action-menu button"
-# Exact labels only. A substring match would also catch "Bỏ ghim" / "Unpin", which
-# un-pin instead of pinning.
-_PIN_MENU_ITEM_SEL = (
-    'ytd-menu-service-item-renderer:text-is("Ghim"), '
-    'ytd-menu-service-item-renderer:text-is("Pin"), '
-    'ytd-menu-service-item-renderer:text-is("Ghim bình luận"), '
-    'ytd-menu-service-item-renderer:text-is("Pin comment")'
+# Studio's comments page for the video, opened straight after publish. Probe-confirmed on
+# 2nirnSM10vk: the comment row is `ytcp-comment-thread`, and the box is `ytcp-commentbox`
+# with a `ytcp-comment-button` labelled "Comment". Studio shows English without `hl`.
+# Still UNVERIFIED: the ⋮ menu button and the pin labels (no comment on that video to open a menu on). A wrong selector only produces a warning.
+_STUDIO_COMMENTS_URL = "https://studio.youtube.com/video/{video_id}/comments"
+_COMMENT_BOX_SEL = (
+    "ytcp-commentbox textarea, ytcp-commentbox #contenteditable-root, "
+    "ytcp-commentbox [contenteditable='true']"
 )
+# Scoped to the "Comment" label: the same button row also holds "Cancel", and a bare
+# `button` match could cancel the comment instead of posting it (seen live 2026-11-27).
+_COMMENT_SUBMIT_SEL = (
+    'ytcp-comment-button button:text-is("Comment"), '
+    'ytcp-comment-button button:text-is("Bình luận")'
+)
+_COMMENT_SUBMIT_TEXTS = ("Comment", "Bình luận")
+_COMMENT_THREAD_SEL = "ytcp-comment-thread"
+# Searched from inside a thread (`thread.locator`), so no thread prefix here. Probe-confirmed
+# 2026-11-27: `ytcp-icon-button#action-menu-button`, aria-label "Action menu".
+_COMMENT_MENU_SEL = (
+    "ytcp-icon-button#action-menu-button, ytcp-icon-button[aria-label*='action' i]"
+)
+# Menu items are matched by their whole text, in Python (see `_click_menu_item`). Probe
+# 2026-11-27: the item reads "Pin\n", which Playwright's `:text-is` does not match, and a
+# substring match would also catch "Unpin" / "Bỏ ghim", which un-pin the comment.
+_PIN_MENU_ITEM_SEL = "tp-yt-paper-item"
+_PIN_LABELS = ("Pin", "Pin comment", "Ghim", "Ghim bình luận")
+# Picking the menu item opens "Pin this comment? … Cancel / Pin" (probe 2026-11-27). The
+# dialog's Pin button is the one that pins; "Cancel" never matches.
+_PIN_CONFIRM_SEL = "ytcp-button, tp-yt-paper-button, button"
+_PIN_CONFIRM_LABELS = ("Pin", "Ghim")
 
 
 def _should_comment(request: UploadRequest) -> bool:
     """True if this part should get a comment: text set and visibility allows comments."""
     return bool(request.comment.strip()) and request.visibility in COMMENT_VISIBILITIES
+
+
+def _click_menu_item(page, selector: str, labels) -> bool:
+    """Click the first visible menu item whose whole text is one of `labels`. False if none.
+
+    Exact whole-text match on purpose: see `_PIN_MENU_ITEM_SEL`.
+    """
+    items = page.locator(selector)
+    try:
+        count = items.count()
+    except Exception:
+        return False
+    for index in range(count):
+        item = items.nth(index)
+        try:
+            text = (item.inner_text(timeout=1_000) or "").strip()
+            if text in labels and item.is_visible(timeout=500):
+                item.click()
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _pin_newest_comment(page) -> None:
@@ -3215,8 +3267,14 @@ def _pin_newest_comment(page) -> None:
         thread.locator(_COMMENT_MENU_SEL).first.click()
     except Exception as exc:
         raise YouTubeUploadError("không mở được menu của bình luận") from exc
-    if not _click_any(page, _PIN_MENU_ITEM_SEL):
+    if not _click_menu_item(page, _PIN_MENU_ITEM_SEL, _PIN_LABELS):
         raise YouTubeUploadError("không có mục Ghim trong menu bình luận")
+    # The menu item only opens a confirmation. Nothing is pinned until its Pin button is clicked.
+    for _ in range(10):
+        if _click_menu_item(page, _PIN_CONFIRM_SEL, _PIN_CONFIRM_LABELS):
+            return
+        page.wait_for_timeout(500)
+    raise YouTubeUploadError("đã chọn Ghim nhưng không thấy nút xác nhận “Pin”")
 
 
 def _post_and_pin_comment(page, video: Path, *, video_id: str, text: str) -> str:
@@ -3243,10 +3301,9 @@ def _post_and_pin_comment(page, video: Path, *, video_id: str, text: str) -> str
         return "Đã bình luận nhưng chưa ghim — hãy ghim thủ công trên YouTube."
 
     try:
-        page.goto(_WATCH_URL.format(video_id=video_id), wait_until="domcontentloaded")
+        page.goto(_STUDIO_COMMENTS_URL.format(video_id=video_id), wait_until="domcontentloaded")
         if _LOGGED_OUT_URL_RE.search(page.url or ""):
             return "Profile YouTube chưa đăng nhập — không đăng được bình luận."
-        _click_any(page, _COMMENT_PLACEHOLDER_SEL)  # expand the box if it is collapsed
         _fill_box(page, _COMMENT_BOX_SEL, text)
         write_upload_state(video, comment_status="posting")
         if not _click_any(page, _COMMENT_SUBMIT_SEL, _COMMENT_SUBMIT_TEXTS):
@@ -3274,7 +3331,7 @@ def _post_and_pin_comment(page, video: Path, *, video_id: str, text: str) -> str
 def _comment_after_publish(page, video: Path, *, video_id: str, text: str) -> str:
     """Post and pin the comment in its own tab, leaving the upload page where it is.
 
-    A batch reuses one page for every part, so navigating that page to the watch page
+    A batch reuses one page for every part, so navigating that page to the comments page
     here would strand the next part on the wrong screen. The comment gets a tab of its
     own, closed afterwards. Returns a note, "" on success, like `_post_and_pin_comment`.
     """
