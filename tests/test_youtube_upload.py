@@ -3695,7 +3695,7 @@ class _FakeCommentPage:
 
     def __init__(
         self, *, submit_ok=True, menu_has_pin=True, thread_present=True,
-        logged_out=False, goto_error=None, confirm_present=True,
+        logged_out=False, goto_error=None, confirm_present=True, filter_chip=True,
     ):
         self.submit_ok = submit_ok
         self.menu_has_pin = menu_has_pin
@@ -3709,6 +3709,8 @@ class _FakeCommentPage:
         self.typed: list = []
         self.closed = False
         self.confirm_present = confirm_present
+        # Studio's "Unresponded" filter chip: on by default, hides the new comment
+        self.chip_open = filter_chip
         self.confirm_open = False
         self.keyboard = self
 
@@ -3740,8 +3742,13 @@ class _FakeCommentPage:
 
         from noveltrans.youtube_upload import _PIN_CONFIRM_SEL
 
+        from noveltrans.youtube_upload import _FILTER_CHIP_X_SEL
+
         present = {_COMMENT_BOX_SEL, _COMMENT_SUBMIT_SEL}
-        if self.posted and self.thread_present:
+        if self.chip_open:
+            present.add(_FILTER_CHIP_X_SEL)
+        # the filter hides the thread until the chip is removed
+        if self.posted and self.thread_present and not self.chip_open:
             present.add(_COMMENT_THREAD_SEL)
         if self.menu_has_pin:
             present.add(_PIN_MENU_ITEM_SEL)
@@ -3792,10 +3799,14 @@ class _CommentLoc:
             return "Pin"
         return ""
 
-    def click(self):
+    def click(self, timeout=None):
         from noveltrans.youtube_upload import _COMMENT_SUBMIT_SEL
 
         self._page.clicks.append(self._selector)
+        from noveltrans.youtube_upload import _FILTER_CHIP_X_SEL
+
+        if self._selector == _FILTER_CHIP_X_SEL:
+            self._page.chip_open = False
         if self._selector == _COMMENT_SUBMIT_SEL:
             if not self._page.submit_ok:
                 raise RuntimeError("submit button not clickable")
@@ -3835,10 +3846,13 @@ class TestPostAndPinComment:
         # the box is clicked to focus it, then Post, then the thread's menu, then Pin
         from noveltrans.youtube_upload import _PIN_CONFIRM_SEL
 
+        from noveltrans.youtube_upload import _FILTER_CHIP_X_SEL
+
         assert page.clicks == [
-            _COMMENT_BOX_SEL, _COMMENT_SUBMIT_SEL, _COMMENT_MENU_SEL, _PIN_MENU_ITEM_SEL,
-            _PIN_CONFIRM_SEL,
+            _COMMENT_BOX_SEL, _COMMENT_SUBMIT_SEL, _FILTER_CHIP_X_SEL,
+            _COMMENT_MENU_SEL, _PIN_MENU_ITEM_SEL, _PIN_CONFIRM_SEL,
         ]
+        assert page.chip_open is False
         state = read_upload_state(video)
         assert state["comment_status"] == "posted"
         assert state["pinned"] is True

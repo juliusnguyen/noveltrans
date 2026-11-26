@@ -3215,6 +3215,8 @@ _COMMENT_SUBMIT_SEL = (
 )
 _COMMENT_SUBMIT_TEXTS = ("Comment", "Bình luận")
 _COMMENT_THREAD_SEL = "ytcp-comment-thread"
+# The X on the "Response status" filter chip (probe-confirmed 2026-11-27).
+_FILTER_CHIP_X_SEL = "ytcp-icon-button[aria-label*='Remove' i]"
 # Searched from inside a thread (`thread.locator`), so no thread prefix here. Probe-confirmed
 # 2026-11-27: `ytcp-icon-button#action-menu-button`, aria-label "Action menu".
 _COMMENT_MENU_SEL = (
@@ -3258,8 +3260,25 @@ def _click_menu_item(page, selector: str, labels) -> bool:
     return False
 
 
+def _clear_comment_filter(page) -> None:
+    """Remove Studio's "Response status: Unresponded" filter if it is on.
+
+    The comments list opens filtered, and that filter hides a comment the channel has just
+    posted: the pin step then finds no thread (probe 2026-11-27). Clicks only the filter
+    chip's X. Nothing to do when the filter is already off.
+    """
+    chip_x = page.locator(_FILTER_CHIP_X_SEL).first
+    try:
+        if chip_x.is_visible(timeout=2_000):
+            chip_x.click(timeout=5_000)
+            page.wait_for_timeout(_SETTLE_MS)
+    except Exception:
+        pass
+
+
 def _pin_newest_comment(page) -> None:
     """Open the menu on the first comment thread and pick Pin. Raises if any step is missing."""
+    _clear_comment_filter(page)
     thread = _first_present(page, _COMMENT_THREAD_SEL, timeout_ms=_STEP_WAIT_MS)
     if thread is None:
         raise YouTubeUploadError("không thấy bình luận vừa đăng")
