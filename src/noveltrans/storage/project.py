@@ -1379,6 +1379,19 @@ class NovelProject:
             json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
+    def save_upload_comment(self, enabled: bool, text: str) -> None:
+        """Persist this novel's comment-under-video choice into meta.json (feature 111).
+        Same per-novel reasoning as `save_upload_playlist`: one novel's comment must not
+        end up under another novel's videos."""
+        self.meta.upload_comment_enabled = bool(enabled)
+        self.meta.upload_comment = text
+        meta_path = self.path / META_FILE
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+        data.update(upload_comment_enabled=bool(enabled), upload_comment=text)
+        meta_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
     def save_upload_visibility(self, key: str) -> None:
         """Persist this novel's chosen YouTube visibility ("private"/"unlisted"/"public"/
         "schedule") into meta.json — same per-novel reasoning as `save_video_image_path`,

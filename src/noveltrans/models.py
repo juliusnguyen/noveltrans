@@ -77,6 +77,11 @@ class NovelMeta:
     # "never chosen for this novel" — VideoTab falls back to "private" (the safe default)
     # rather than to whatever some OTHER novel happened to have selected last.
     upload_visibility: str = ""
+    # Per-novel comment posted and pinned under each video after upload (feature 111).
+    # Off until enabled. `upload_comment` None means "never saved for this novel", so the
+    # UI seeds DEFAULT_UPLOAD_COMMENT; "" means the user cleared it on purpose.
+    upload_comment_enabled: bool = False
+    upload_comment: str | None = None
 
     def slug_name(self) -> str:
         """The filename stem every generated file of this novel is named after.
