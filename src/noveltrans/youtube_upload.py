@@ -177,6 +177,10 @@ _PUBLISH_ANYWAY_SEL = (
     ':text-is("Publish anyway"):visible, :text-is("Vẫn xuất bản"):visible, '
     ':text-is("Cứ xuất bản"):visible'
 )
+# The Members→public gate offers only this button, and clicking it lets that publish
+# continue (seen live 2026-11-20). Used only as the fallback when the gate has no
+# "Publish anyway", so the public gate is still never dismissed by it.
+_GOT_IT_SEL = ':text-is("Got it"):visible, :text-is("Đã hiểu"):visible'
 # After "Publish anyway", how long the gate may linger before it counts as re-shown.
 # Studio can keep the heading mounted while the publish request is still processing.
 _GATE_CLEAR_WAIT_MS = 10_000
@@ -1804,13 +1808,20 @@ def _is_visible(page, selector: str, *, timeout_ms: int = 500) -> bool:
         return False
 
 
-def _click_publish_anyway(page) -> bool:
-    """Click the gate's "Publish anyway" button by its exact label. False if not clickable."""
-    try:
-        page.locator(_PUBLISH_ANYWAY_SEL).first.click()
-    except Exception:
-        return False
-    return True
+def _click_gate_button(page) -> bool:
+    """Click the gate's way through, by exact label. False if neither button is clickable.
+
+    "Publish anyway" first: it is the public gate's only publish-through. "Got it" is the
+    fallback the Members gate offers alone. It is never preferred, so the public gate is
+    not dismissed by it.
+    """
+    for selector in (_PUBLISH_ANYWAY_SEL, _GOT_IT_SEL):
+        try:
+            page.locator(selector).first.click()
+        except Exception:
+            continue
+        return True
+    return False
 
 
 def _gate_showing(page) -> bool:
@@ -1853,11 +1864,11 @@ def _finish(page, *, video_id: str) -> None:
         # retrying would keep pressing publish blindly.
         if _gate_showing(page):
             if gate_clicks == 0:
-                if not _click_publish_anyway(page):
+                if not _click_gate_button(page):
                     raise YouTubeUploadError(
                         "YouTube Studio hiện cảnh báo “We're still checking your content” "
-                        "nhưng không tìm thấy nút “Publish anyway”. Chưa xác nhận đã xuất "
-                        "bản — kiểm tra trên Studio.",
+                        "nhưng không tìm thấy nút “Publish anyway” hoặc “Got it”. Chưa xác "
+                        "nhận đã xuất bản — kiểm tra trên Studio.",
                         video_id=video_id,
                     )
                 gate_clicks += 1

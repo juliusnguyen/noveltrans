@@ -31,6 +31,7 @@ from noveltrans.youtube_upload import (
     _CONFIRM_DIALOG_SEL,
     _DIALOG_SEL,
     _DONE_SEL,
+    _GOT_IT_SEL,
     _PUBLISH_ANYWAY_SEL,
     _STILL_CHECKING_GATE_SEL,
     _TITLE_SEL,
@@ -591,7 +592,7 @@ class _FakeStudioPage:
     def __init__(
         self, *, step="SELECT_FILES", attached=True, visible=(), confirm=False,
         still_checking=False, anyway_present=True, gate_reappears=False,
-        heading_shown=True, linger_polls=0,
+        heading_shown=True, linger_polls=0, got_it_present=False,
     ):
         self.step = step
         self.attached = attached
@@ -608,6 +609,8 @@ class _FakeStudioPage:
         # after a click the gate lingers for this many visibility checks (publish in flight)
         self.linger_polls = linger_polls
         self.linger = 0
+        # Members gate offers only "Got it", which dismisses it and lets the publish go on
+        self.got_it_present = got_it_present
         self.clicked: list = []
         self.waits: list = []
 
@@ -660,17 +663,26 @@ class _FakeStudioPage:
                     return page.gate_visible_now() and page.heading_shown
                 if selector == _PUBLISH_ANYWAY_SEL:
                     return page.gate_visible_now() and page.anyway_present
+                if selector == _GOT_IT_SEL:
+                    return page.gate_visible_now() and page.got_it_present
                 return selector in page.visible
 
             def click(self):
-                page.clicked.append(selector)
                 if selector == _PUBLISH_ANYWAY_SEL:
                     if not page.anyway_present:
                         raise RuntimeError("no Publish anyway button")
+                    page.clicked.append(selector)
                     # "Publish anyway" dismisses the gate, unless Studio re-shows it;
                     # a lingering gate stays up for `linger_polls` checks first
                     page.linger = page.linger_polls
                     page.still_checking = page.gate_reappears
+                elif selector == _GOT_IT_SEL:
+                    if not page.got_it_present:
+                        raise RuntimeError("no Got it button")
+                    page.clicked.append(selector)
+                    page.still_checking = False  # Members gate: "Got it" lets the publish go on
+                else:
+                    page.clicked.append(selector)
 
             def is_enabled(self, timeout=None):
                 return selector in page.visible
@@ -953,7 +965,7 @@ class TestFinishConfirmation:
         _finish(page, video_id="dQw4w9WgXcQ")  # does not raise
         assert self._clicks_after_done(page) == [_PUBLISH_ANYWAY_SEL]
 
-    def test_gate_without_publish_anyway_button_stops_after_one_attempt(self):
+    def test_gate_without_any_button_stops_without_clicking(self):
         from noveltrans.youtube_upload import _finish
 
         page = _FakeStudioPage(
@@ -962,6 +974,30 @@ class TestFinishConfirmation:
         page.visible = {_DONE_SEL}
         with pytest.raises(YouTubeUploadError, match="Chưa xác nhận đã xuất bản"):
             _finish(page, video_id="dQw4w9WgXcQ")
+        assert self._clicks_after_done(page) == []
+
+    def test_members_gate_with_only_got_it_is_passed_and_publish_confirms(self):
+        """Members→public shows the gate with "Got it" alone (live, 2026-11-27). Clicking it
+        is what lets that publish go on; the upload must not fail for lacking "Publish anyway"."""
+        from noveltrans.youtube_upload import _finish
+
+        page = _FakeStudioPage(
+            attached=True, confirm=True, still_checking=True,
+            anyway_present=False, got_it_present=True,
+        )
+        page.visible = {_DONE_SEL}
+        _finish(page, video_id="dQw4w9WgXcQ")  # does not raise
+        assert self._clicks_after_done(page) == [_GOT_IT_SEL]
+
+    def test_public_gate_never_dismissed_by_got_it_when_publish_anyway_exists(self):
+        """Both buttons present (public gate): "Publish anyway" is the one clicked."""
+        from noveltrans.youtube_upload import _finish
+
+        page = _FakeStudioPage(
+            attached=True, confirm=True, still_checking=True, got_it_present=True,
+        )
+        page.visible = {_DONE_SEL}
+        _finish(page, video_id="dQw4w9WgXcQ")
         assert self._clicks_after_done(page) == [_PUBLISH_ANYWAY_SEL]
 
     def test_publish_anyway_selector_never_matches_got_it(self):
