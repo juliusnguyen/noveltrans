@@ -3695,7 +3695,8 @@ class _FakeCommentPage:
 
     def __init__(
         self, *, submit_ok=True, menu_has_pin=True, thread_present=True,
-        logged_out=False, goto_error=None, confirm_present=True,
+        logged_out=False, goto_error=None, confirm_present=True, filter_chip=True,
+        toast_shows=True,
     ):
         self.submit_ok = submit_ok
         self.menu_has_pin = menu_has_pin
@@ -3709,6 +3710,11 @@ class _FakeCommentPage:
         self.typed: list = []
         self.closed = False
         self.confirm_present = confirm_present
+        # Studio's "Unresponded" filter chip: on by default, hides the new comment
+        self.chip_open = filter_chip
+        # Studio's "Comment pinned" toast after the confirmation (off to simulate a lost pin)
+        self.toast_shows = toast_shows
+        self.toast_open = False
         self.confirm_open = False
         self.keyboard = self
 
@@ -3724,6 +3730,9 @@ class _FakeCommentPage:
     def close(self):
         self.closed = True
 
+    def bring_to_front(self):
+        self.brought_front = True
+
     def press(self, key):
         pass
 
@@ -3738,15 +3747,22 @@ class _FakeCommentPage:
             _PIN_MENU_ITEM_SEL,
         )
 
-        from noveltrans.youtube_upload import _PIN_CONFIRM_SEL
+        from noveltrans.youtube_upload import _PIN_CONFIRM_SEL, _PIN_TOAST_SEL
+
+        from noveltrans.youtube_upload import _FILTER_CHIP_X_SEL
 
         present = {_COMMENT_BOX_SEL, _COMMENT_SUBMIT_SEL}
-        if self.posted and self.thread_present:
+        if self.chip_open:
+            present.add(_FILTER_CHIP_X_SEL)
+        # the filter hides the thread until the chip is removed
+        if self.posted and self.thread_present and not self.chip_open:
             present.add(_COMMENT_THREAD_SEL)
         if self.menu_has_pin:
             present.add(_PIN_MENU_ITEM_SEL)
         if self.confirm_open and self.confirm_present:
             present.add(_PIN_CONFIRM_SEL)
+        if self.toast_open:
+            present.add(_PIN_TOAST_SEL)
         return present
 
     def locator(self, selector):
@@ -3783,27 +3799,37 @@ class _CommentLoc:
         return self if index == 0 else _CommentLoc(self._page, "")
 
     def inner_text(self, timeout=None):
-        from noveltrans.youtube_upload import _PIN_CONFIRM_SEL, _PIN_MENU_ITEM_SEL
+        from noveltrans.youtube_upload import _PIN_CONFIRM_SEL, _PIN_MENU_ITEM_SEL, _PIN_TOAST_SEL
 
         # the menu item reads "Pin\n" as on the live page; the dialog's button reads "Pin"
         if self._selector == _PIN_MENU_ITEM_SEL:
             return "Pin\n"
         if self._selector == _PIN_CONFIRM_SEL:
             return "Pin"
+        if self._selector == _PIN_TOAST_SEL and self._page.toast_open:
+            return "Comment pinned"
         return ""
 
-    def click(self):
+    def click(self, timeout=None):
         from noveltrans.youtube_upload import _COMMENT_SUBMIT_SEL
 
         self._page.clicks.append(self._selector)
+        from noveltrans.youtube_upload import _FILTER_CHIP_X_SEL
+
+        if self._selector == _FILTER_CHIP_X_SEL:
+            self._page.chip_open = False
         if self._selector == _COMMENT_SUBMIT_SEL:
             if not self._page.submit_ok:
                 raise RuntimeError("submit button not clickable")
             self._page.posted = True
         from noveltrans.youtube_upload import _PIN_MENU_ITEM_SEL
 
+        from noveltrans.youtube_upload import _PIN_CONFIRM_SEL
+
         if self._selector == _PIN_MENU_ITEM_SEL:
             self._page.confirm_open = True  # Studio asks "Pin this comment?" next
+        if self._selector == _PIN_CONFIRM_SEL and self._page.toast_shows:
+            self._page.toast_open = True
 
 
 class TestPostAndPinComment:
@@ -3835,10 +3861,13 @@ class TestPostAndPinComment:
         # the box is clicked to focus it, then Post, then the thread's menu, then Pin
         from noveltrans.youtube_upload import _PIN_CONFIRM_SEL
 
+        from noveltrans.youtube_upload import _FILTER_CHIP_X_SEL
+
         assert page.clicks == [
-            _COMMENT_BOX_SEL, _COMMENT_SUBMIT_SEL, _COMMENT_MENU_SEL, _PIN_MENU_ITEM_SEL,
-            _PIN_CONFIRM_SEL,
+            _COMMENT_BOX_SEL, _COMMENT_SUBMIT_SEL, _FILTER_CHIP_X_SEL,
+            _COMMENT_MENU_SEL, _PIN_MENU_ITEM_SEL, _PIN_CONFIRM_SEL,
         ]
+        assert page.chip_open is False
         state = read_upload_state(video)
         assert state["comment_status"] == "posted"
         assert state["pinned"] is True
@@ -3871,6 +3900,17 @@ class TestPostAndPinComment:
         note = _post_and_pin_comment(page, video, video_id="dQw4w9WgXcQ", text="Hello")
 
         assert "không ghim được" in note
+        assert "pinned" not in read_upload_state(video)
+
+    def test_pin_is_recorded_only_after_studio_confirms_it(self, tmp_path):
+        """No "Comment pinned" toast means the pin is not recorded, so a later run can retry."""
+        from noveltrans.youtube_upload import _post_and_pin_comment
+
+        video = self._video(tmp_path)
+        page = _FakeCommentPage(toast_shows=False)
+        note = _post_and_pin_comment(page, video, video_id="dQw4w9WgXcQ", text="Hello")
+
+        assert "Comment pinned" in note
         assert "pinned" not in read_upload_state(video)
 
     def test_failed_post_is_marked_failed_and_never_pins(self, tmp_path):

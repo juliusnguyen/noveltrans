@@ -3215,6 +3215,8 @@ _COMMENT_SUBMIT_SEL = (
 )
 _COMMENT_SUBMIT_TEXTS = ("Comment", "Bình luận")
 _COMMENT_THREAD_SEL = "ytcp-comment-thread"
+# The X on the "Response status" filter chip (probe-confirmed 2026-11-27).
+_FILTER_CHIP_X_SEL = "ytcp-icon-button[aria-label*='Remove' i]"
 # Searched from inside a thread (`thread.locator`), so no thread prefix here. Probe-confirmed
 # 2026-11-27: `ytcp-icon-button#action-menu-button`, aria-label "Action menu".
 _COMMENT_MENU_SEL = (
@@ -3229,6 +3231,8 @@ _PIN_LABELS = ("Pin", "Pin comment", "Ghim", "Ghim bình luận")
 # dialog's Pin button is the one that pins; "Cancel" never matches.
 _PIN_CONFIRM_SEL = "ytcp-button, tp-yt-paper-button, button"
 _PIN_CONFIRM_LABELS = ("Pin", "Ghim")
+# Studio's toast after a pin lands ("Comment pinned"). Pinned is recorded only once it shows.
+_PIN_TOAST_SEL = "ytcp-toast, tp-yt-paper-toast, [role='alert']"
 
 
 def _should_comment(request: UploadRequest) -> bool:
@@ -3258,8 +3262,57 @@ def _click_menu_item(page, selector: str, labels) -> bool:
     return False
 
 
+def _clear_comment_filter(page) -> None:
+    """Remove Studio's "Response status: Unresponded" filter if it is on.
+
+    The comments list opens filtered, and that filter hides a comment the channel has just
+    posted: the pin step then finds no thread (probe 2026-11-27). Clicks only the filter
+    chip's X. Nothing to do when the filter is already off.
+    """
+    chip_x = page.locator(_FILTER_CHIP_X_SEL).first
+    try:
+        if chip_x.is_visible(timeout=2_000):
+            chip_x.click(timeout=5_000)
+            page.wait_for_timeout(_SETTLE_MS)
+    except Exception:
+        pass
+
+
+def _toast_says_pinned(page) -> bool:
+    """True if any toast on the page reads as a pin confirmation. Never raises.
+
+    Checks every match: the first one can be an empty toast container, and reading only
+    that one missed a real "Comment pinned" (seen live 2026-11-27).
+    """
+    toasts = page.locator(_PIN_TOAST_SEL)
+    try:
+        count = toasts.count()
+    except Exception:
+        return False
+    for index in range(count):
+        try:
+            text = (toasts.nth(index).inner_text(timeout=500) or "").lower()
+        except Exception:
+            continue
+        if "pinned" in text or "ghim" in text:
+            return True
+    return False
+
+
+def _wait_pin_toast(page, timeout_ms: int = 10_000) -> bool:
+    """True once Studio shows its "Comment pinned" toast. Polls, never raises."""
+    waited = 0
+    while waited < timeout_ms:
+        if _toast_says_pinned(page):
+            return True
+        page.wait_for_timeout(500)
+        waited += 500
+    return False
+
+
 def _pin_newest_comment(page) -> None:
     """Open the menu on the first comment thread and pick Pin. Raises if any step is missing."""
+    _clear_comment_filter(page)
     thread = _first_present(page, _COMMENT_THREAD_SEL, timeout_ms=_STEP_WAIT_MS)
     if thread is None:
         raise YouTubeUploadError("không thấy bình luận vừa đăng")
@@ -3272,9 +3325,14 @@ def _pin_newest_comment(page) -> None:
     # The menu item only opens a confirmation. Nothing is pinned until its Pin button is clicked.
     for _ in range(10):
         if _click_menu_item(page, _PIN_CONFIRM_SEL, _PIN_CONFIRM_LABELS):
-            return
+            break
         page.wait_for_timeout(500)
-    raise YouTubeUploadError("đã chọn Ghim nhưng không thấy nút xác nhận “Pin”")
+    else:
+        raise YouTubeUploadError("đã chọn Ghim nhưng không thấy nút xác nhận “Pin”")
+    # Pinned only once Studio confirms it. Closing the browser before the request lands
+    # leaves the comment unpinned, so wait for the toast first.
+    if not _wait_pin_toast(page):
+        raise YouTubeUploadError("đã bấm Ghim nhưng không thấy xác nhận “Comment pinned”")
 
 
 def _post_and_pin_comment(page, video: Path, *, video_id: str, text: str) -> str:
@@ -3342,6 +3400,12 @@ def _comment_after_publish(page, video: Path, *, video_id: str, text: str) -> st
             return "Trình duyệt đã đóng trước khi đăng bình luận."
         return f"Không mở được tab để đăng bình luận: {exc}"
     try:
+        # A new tab opens in the background, and Chrome does not draw a background tab, so
+        # Studio's toast never appears there. Bring it forward before posting and pinning.
+        try:
+            comment_page.bring_to_front()
+        except Exception:
+            pass
         return _post_and_pin_comment(comment_page, video, video_id=video_id, text=text)
     finally:
         try:
