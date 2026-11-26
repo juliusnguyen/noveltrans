@@ -3627,3 +3627,293 @@ class TestPickPlaylistIndex:
 
         assert pick_playlist_index(["Khác"], "Cho Cậu Học") is None
         assert pick_playlist_index(["Khác"], "   ") is None
+
+
+# -- per-video comment, posted and pinned after publish (feature 111) ---------
+
+
+class _FakeCommentPage:
+    """The watch page as far as the comment step sees it.
+
+    A comment box, a Post button, and a comment menu whose items include "Ghim" (pin) and,
+    when `menu_has_pin` is set, also "Bỏ ghim" (unpin) as a distractor. Records every
+    click, every visited URL, and the text typed into the box.
+    """
+
+    def __init__(
+        self, *, submit_ok=True, menu_has_pin=True, thread_present=True,
+        logged_out=False, goto_error=None,
+    ):
+        self.submit_ok = submit_ok
+        self.menu_has_pin = menu_has_pin
+        self.thread_present = thread_present
+        self.logged_out = logged_out
+        self.goto_error = goto_error
+        self.posted = False
+        self.url = ""
+        self.visited: list = []
+        self.clicks: list = []
+        self.typed: list = []
+        self.closed = False
+        self.keyboard = self
+
+    def goto(self, url, wait_until=None):
+        self.visited.append(url)
+        if self.goto_error is not None:
+            raise self.goto_error
+        self.url = "https://accounts.google.com/signin" if self.logged_out else url
+
+    def wait_for_timeout(self, ms):
+        pass
+
+    def close(self):
+        self.closed = True
+
+    def press(self, key):
+        pass
+
+    def insert_text(self, text):
+        self.typed.append(text)
+
+    def _present(self):
+        from noveltrans.youtube_upload import (
+            _COMMENT_BOX_SEL,
+            _COMMENT_SUBMIT_SEL,
+            _COMMENT_THREAD_SEL,
+            _PIN_MENU_ITEM_SEL,
+        )
+
+        present = {_COMMENT_BOX_SEL, _COMMENT_SUBMIT_SEL}
+        if self.posted and self.thread_present:
+            present.add(_COMMENT_THREAD_SEL)
+        if self.menu_has_pin:
+            present.add(_PIN_MENU_ITEM_SEL)
+        return present
+
+    def locator(self, selector):
+        return _CommentLoc(self, selector)
+
+
+class _CommentLoc:
+    """One locator on `_FakeCommentPage`. `.locator()` nests, as the thread's menu does."""
+
+    def __init__(self, page, selector):
+        self._page = page
+        self._selector = selector
+
+    @property
+    def first(self):
+        return self
+
+    def locator(self, sub):
+        return _CommentLoc(self._page, sub)
+
+    def wait_for(self, state=None, timeout=None):
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+        if self._selector not in self._page._present():
+            raise PlaywrightTimeoutError(f"{self._selector} not present")
+
+    def is_visible(self, timeout=None):
+        return self._selector in self._page._present()
+
+    def click(self):
+        from noveltrans.youtube_upload import _COMMENT_SUBMIT_SEL
+
+        self._page.clicks.append(self._selector)
+        if self._selector == _COMMENT_SUBMIT_SEL:
+            if not self._page.submit_ok:
+                raise RuntimeError("submit button not clickable")
+            self._page.posted = True
+
+
+class TestPostAndPinComment:
+    """Post the comment, then pin it. Warn-only: the publish is already recorded, so every
+    failure is a note, and the state file keeps each step so a re-run never double-posts."""
+
+    @staticmethod
+    def _video(tmp_path: Path) -> Path:
+        video = tmp_path / "truyen-0001-0010.mp4"
+        video.write_bytes(b"not really an mp4")
+        return video
+
+    def test_posts_then_pins_and_records_each_step(self, tmp_path):
+        from noveltrans.youtube_upload import (
+            _COMMENT_MENU_SEL,
+            _COMMENT_SUBMIT_SEL,
+            _PIN_MENU_ITEM_SEL,
+            _post_and_pin_comment,
+        )
+
+        video = self._video(tmp_path)
+        page = _FakeCommentPage()
+        note = _post_and_pin_comment(page, video, video_id="dQw4w9WgXcQ", text="Hello")
+
+        from noveltrans.youtube_upload import _COMMENT_BOX_SEL
+
+        assert note == ""
+        assert page.typed == ["Hello"]
+        # the box is clicked to focus it, then Post, then the thread's menu, then Pin
+        assert page.clicks == [
+            _COMMENT_BOX_SEL, _COMMENT_SUBMIT_SEL, _COMMENT_MENU_SEL, _PIN_MENU_ITEM_SEL,
+        ]
+        state = read_upload_state(video)
+        assert state["comment_status"] == "posted"
+        assert state["pinned"] is True
+
+    def test_pin_menu_item_never_matches_unpin(self):
+        from noveltrans.youtube_upload import _PIN_MENU_ITEM_SEL
+
+        for label in ("Bỏ ghim", "Unpin"):
+            assert label not in _PIN_MENU_ITEM_SEL
+
+    def test_missing_pin_leaves_comment_posted_and_says_so(self, tmp_path):
+        from noveltrans.youtube_upload import _post_and_pin_comment
+
+        video = self._video(tmp_path)
+        page = _FakeCommentPage(menu_has_pin=False)
+        note = _post_and_pin_comment(page, video, video_id="dQw4w9WgXcQ", text="Hello")
+
+        assert "không ghim được" in note
+        state = read_upload_state(video)
+        assert state["comment_status"] == "posted"
+        assert "pinned" not in state
+
+    def test_failed_post_is_marked_failed_and_never_pins(self, tmp_path):
+        from noveltrans.youtube_upload import (
+            _COMMENT_MENU_SEL,
+            _COMMENT_SUBMIT_SEL,
+            _post_and_pin_comment,
+        )
+
+        video = self._video(tmp_path)
+        page = _FakeCommentPage(submit_ok=False)
+        note = _post_and_pin_comment(page, video, video_id="dQw4w9WgXcQ", text="Hello")
+
+        assert "Không tìm thấy nút đăng" in note
+        assert read_upload_state(video)["comment_status"] == "failed"
+        assert _COMMENT_MENU_SEL not in page.clicks
+        assert page.clicks.count(_COMMENT_SUBMIT_SEL) == 1
+
+    def test_pinned_video_is_left_alone_on_rerun(self, tmp_path):
+        from noveltrans.youtube_upload import _post_and_pin_comment
+
+        video = self._video(tmp_path)
+        write_upload_state(video, comment_status="posted", pinned=True)
+        page = _FakeCommentPage()
+        assert _post_and_pin_comment(page, video, video_id="dQw4w9WgXcQ", text="Hello") == ""
+        assert page.visited == [] and page.clicks == []
+
+    def test_posted_but_unpinned_is_not_reposted_on_rerun(self, tmp_path):
+        from noveltrans.youtube_upload import _post_and_pin_comment
+
+        video = self._video(tmp_path)
+        write_upload_state(video, comment_status="posted")
+        page = _FakeCommentPage()
+        note = _post_and_pin_comment(page, video, video_id="dQw4w9WgXcQ", text="Hello")
+
+        assert "chưa ghim" in note
+        assert page.visited == [] and page.clicks == []
+
+    def test_interrupted_post_is_not_reposted_automatically(self, tmp_path):
+        from noveltrans.youtube_upload import _post_and_pin_comment
+
+        video = self._video(tmp_path)
+        write_upload_state(video, comment_status="posting")
+        page = _FakeCommentPage()
+        note = _post_and_pin_comment(page, video, video_id="dQw4w9WgXcQ", text="Hello")
+
+        assert "Không rõ" in note
+        assert page.visited == [] and page.clicks == []
+
+    def test_logged_out_profile_is_a_note_not_an_exception(self, tmp_path):
+        from noveltrans.youtube_upload import _post_and_pin_comment
+
+        video = self._video(tmp_path)
+        page = _FakeCommentPage(logged_out=True)
+        note = _post_and_pin_comment(page, video, video_id="dQw4w9WgXcQ", text="Hello")
+
+        assert "chưa đăng nhập" in note
+        assert page.clicks == []
+
+    def test_closed_browser_is_a_note_not_an_exception(self, tmp_path):
+        from noveltrans.youtube_upload import _post_and_pin_comment
+
+        video = self._video(tmp_path)
+        page = _FakeCommentPage(goto_error=Exception("Target page, context or browser has been closed"))
+        note = _post_and_pin_comment(page, video, video_id="dQw4w9WgXcQ", text="Hello")
+
+        assert "đóng" in note
+        # Nothing was clicked, so nothing was posted: no status is written and a re-run
+        # may try again. "posting" would have blocked that.
+        assert read_upload_state(video).get("comment_status") is None
+
+
+class TestCommentInOwnTab:
+    """Regression: a batch reuses one page for every part. The comment used to navigate that
+    page to the watch page, so the next part (e.g. a Members→public one) started in the wrong
+    place. The comment must run in its own tab and leave the upload page untouched."""
+
+    def test_upload_page_is_not_navigated_and_comment_tab_is_closed(self, tmp_path):
+        from types import SimpleNamespace
+
+        from noveltrans.youtube_upload import _comment_after_publish
+
+        video = tmp_path / "truyen-0001-0010.mp4"
+        video.write_bytes(b"x")
+        upload_page = _FakeCommentPage()
+        comment_page = _FakeCommentPage()
+        upload_page.context = SimpleNamespace(new_page=lambda: comment_page)
+
+        note = _comment_after_publish(upload_page, video, video_id="dQw4w9WgXcQ", text="Hello")
+
+        assert note == ""
+        assert upload_page.visited == []
+        assert comment_page.visited and "dQw4w9WgXcQ" in comment_page.visited[0]
+        assert comment_page.closed is True
+
+    def test_failure_to_open_a_tab_is_a_note_not_an_exception(self, tmp_path):
+        from types import SimpleNamespace
+
+        from noveltrans.youtube_upload import _comment_after_publish
+
+        def _boom():
+            raise RuntimeError("no new tab")
+
+        video = tmp_path / "truyen-0001-0010.mp4"
+        video.write_bytes(b"x")
+        upload_page = _FakeCommentPage()
+        upload_page.context = SimpleNamespace(new_page=_boom)
+
+        note = _comment_after_publish(upload_page, video, video_id="dQw4w9WgXcQ", text="Hello")
+
+        assert "Không mở được tab" in note
+        assert upload_page.visited == []
+
+
+class TestCommentGate:
+    def test_private_is_skipped_and_the_rest_are_commented(self):
+        from noveltrans.youtube_upload import UploadRequest, _should_comment
+
+        for visibility in ("private", "public", "unlisted", "schedule", "members_then_public"):
+            kwargs = {"visibility": visibility}
+            if visibility == "members_then_public":
+                from datetime import datetime
+
+                kwargs["public_at"] = datetime(2026, 12, 1, 20, 0)
+            request = UploadRequest(
+                video=Path(__file__), title="t", comment="Hello", **kwargs
+            )
+            assert _should_comment(request) is (visibility != "private"), visibility
+
+    def test_empty_comment_is_never_posted(self):
+        from noveltrans.youtube_upload import UploadRequest, _should_comment
+
+        request = UploadRequest(video=Path(__file__), title="t", visibility="public", comment="  ")
+        assert _should_comment(request) is False
+
+    def test_default_comment_carries_the_donation_lines(self):
+        from noveltrans.youtube_upload import DEFAULT_UPLOAD_COMMENT
+
+        assert DEFAULT_UPLOAD_COMMENT.splitlines()[1] == "19038324284018"
+        assert DEFAULT_UPLOAD_COMMENT.splitlines()[2] == "Techcombank"

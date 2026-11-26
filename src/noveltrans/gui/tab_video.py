@@ -552,6 +552,23 @@ class VideoTab(QWidget):
         # doesn't leave it selected the next time a DIFFERENT novel is opened.
         self.upload_playlist.currentTextChanged.connect(self._save_upload_playlist_choice)
 
+        # Per-novel comment, posted and pinned under each uploaded video (feature 111).
+        # Saved on every change like the playlist box, so there is no separate save step.
+        from noveltrans.youtube_upload import DEFAULT_UPLOAD_COMMENT
+
+        self.upload_comment_enabled = QCheckBox("Bình luận và ghim sau khi đăng")
+        self.upload_comment_enabled.setToolTip(
+            "Sau khi xuất bản, đăng nội dung bên dưới làm bình luận rồi ghim lên trên. "
+            "Áp dụng cho công khai, không công khai, hẹn giờ và hội viên → công khai; "
+            "video riêng tư được bỏ qua."
+        )
+        self.upload_comment_text = QPlainTextEdit()
+        self.upload_comment_text.setPlainText(DEFAULT_UPLOAD_COMMENT)
+        self.upload_comment_text.setFixedHeight(72)
+        self.upload_comment_text.setToolTip("Nội dung bình luận cho truyện này.")
+        self.upload_comment_enabled.toggled.connect(self._save_upload_comment_choice)
+        self.upload_comment_text.textChanged.connect(self._save_upload_comment_choice)
+
         self.upload_button = QPushButton("⬆️ Tải lên YouTube")
         self.upload_button.setToolTip(
             "Tải mọi phần đã tạo mà chưa tải lên, tuần tự trong một cửa sổ trình duyệt."
@@ -641,6 +658,10 @@ class VideoTab(QWidget):
         inner.addLayout(sched_row)
         inner.addWidget(self.schedule_preview)
         inner.addLayout(action_row)
+        comment_row = QHBoxLayout()
+        comment_row.addWidget(self.upload_comment_enabled, alignment=Qt.AlignmentFlag.AlignTop)
+        comment_row.addWidget(self.upload_comment_text, stretch=1)
+        inner.addLayout(comment_row)
         inner.addWidget(hint)
         box.setLayout(inner)
         self._on_visibility_changed()
@@ -2963,6 +2984,41 @@ class VideoTab(QWidget):
             self._save_video_setting("video_image_path", path)
             self._maybe_refresh_preview()
 
+    def _save_upload_comment_choice(self, *_args) -> None:
+        """Persist the comment toggle and text onto the open novel, if any (feature 111)."""
+        if self.project is not None:
+            self.project.save_upload_comment(
+                self.upload_comment_enabled.isChecked(),
+                self.upload_comment_text.toPlainText(),
+            )
+
+    def _load_upload_comment_for_project(self) -> None:
+        """Show the open novel's comment setting. Never saved just by showing it."""
+        from noveltrans.youtube_upload import DEFAULT_UPLOAD_COMMENT
+
+        meta = self.project.meta if self.project is not None else None
+        enabled = bool(meta.upload_comment_enabled) if meta is not None else False
+        # None = this novel never saved one, so show the default; "" = cleared on purpose.
+        text = (
+            DEFAULT_UPLOAD_COMMENT
+            if meta is None or meta.upload_comment is None
+            else meta.upload_comment
+        )
+        self.upload_comment_enabled.blockSignals(True)
+        self.upload_comment_text.blockSignals(True)
+        try:
+            self.upload_comment_enabled.setChecked(enabled)
+            self.upload_comment_text.setPlainText(text)
+        finally:
+            self.upload_comment_enabled.blockSignals(False)
+            self.upload_comment_text.blockSignals(False)
+
+    def _upload_comment_for_request(self) -> str:
+        """The comment text to post on this upload, or "" when the novel has it off."""
+        if not self.upload_comment_enabled.isChecked():
+            return ""
+        return self.upload_comment_text.toPlainText()
+
     def _save_upload_playlist_choice(self, text: str) -> None:
         """Persist the playlist box's current text onto the open novel, if any.
 
@@ -3111,6 +3167,7 @@ class VideoTab(QWidget):
                 self.project.meta.upload_visibility
             )
             self.upload_visibility.setCurrentIndex(max(visibility_index, 0))
+            self._load_upload_comment_for_project()
             self._sync_display_title()
             self._update_status_line()
         else:
@@ -3121,6 +3178,7 @@ class VideoTab(QWidget):
             self._load_video_settings_for_project()
             self.upload_playlist.setCurrentText("")
             self.upload_visibility.setCurrentIndex(0)  # back to Riêng tư, no novel open
+            self._load_upload_comment_for_project()  # no novel: shows off, never saves
             self.display_title_edit.clear()
             self.display_title_edit.setPlaceholderText("")
             self.status_label.setText("")
@@ -4229,6 +4287,7 @@ class VideoTab(QWidget):
             publish_at=publish_at,
             public_at=public_at,
             label=label,
+            comment=self._upload_comment_for_request(),
         )
 
     def _start_upload(self) -> None:

@@ -499,6 +499,9 @@ class UploadRequest:
     # required when visibility == "members_then_public": when the video goes public
     public_at: datetime | None = None
     label: str = ""  # human name for progress lines, e.g. "Phần 3"
+    # Posted as a comment and pinned after publish, only for COMMENT_VISIBILITIES.
+    # "" means off (feature 111).
+    comment: str = ""
 
     def __post_init__(self) -> None:
         """Clamp the description to YouTube's 5000 characters — the single choke point.
@@ -548,6 +551,9 @@ class UploadResult:
     publish_at: datetime | None = None
     public_at: datetime | None = None
     skipped: bool = False  # already published; nothing was sent this run
+    # Why the comment or pin did not happen, "" when it did or none was asked for.
+    # Never fails the publish: the video is already live by then.
+    comment_note: str = ""
 
 
 @dataclass
@@ -3162,6 +3168,131 @@ def _parse_iso(value: str) -> datetime | None:
 # -- public entry points ------------------------------------------------------
 
 
+# -- per-video comment, posted and pinned after publish (feature 111) ----------
+
+# Used until a novel saves its own text. The bank number in it is posted publicly under
+# every video that gets the comment, so it is public by design.
+DEFAULT_UPLOAD_COMMENT = (
+    "Các bác bơm tí lúa mình có động lực làm video sớm nhé!\n"
+    "19038324284018\n"
+    "Techcombank"
+)
+# Visibilities where a viewer can comment. `private` is skipped. The scheduled and
+# members-first ones may not be public yet, so the comment can fail there; that is a
+# warning, never a failed publish.
+COMMENT_VISIBILITIES = ("public", "unlisted", "schedule", "members_then_public")
+
+# UNVERIFIED: watch-page comment UI, not yet checked against live Studio. Confirm with the
+# live probe before relying on these; a wrong selector only produces a warning.
+_WATCH_URL = "https://www.youtube.com/watch?v={video_id}&hl=vi"
+_COMMENT_PLACEHOLDER_SEL = "#simplebox-placeholder"
+_COMMENT_BOX_SEL = "#contenteditable-root"
+_COMMENT_SUBMIT_SEL = "#submit-button"
+_COMMENT_SUBMIT_TEXTS = ("Bình luận", "Comment")
+_COMMENT_THREAD_SEL = "ytd-comment-thread-renderer"
+_COMMENT_MENU_SEL = "#action-menu button"
+# Exact labels only. A substring match would also catch "Bỏ ghim" / "Unpin", which
+# un-pin instead of pinning.
+_PIN_MENU_ITEM_SEL = (
+    'ytd-menu-service-item-renderer:text-is("Ghim"), '
+    'ytd-menu-service-item-renderer:text-is("Pin"), '
+    'ytd-menu-service-item-renderer:text-is("Ghim bình luận"), '
+    'ytd-menu-service-item-renderer:text-is("Pin comment")'
+)
+
+
+def _should_comment(request: UploadRequest) -> bool:
+    """True if this part should get a comment: text set and visibility allows comments."""
+    return bool(request.comment.strip()) and request.visibility in COMMENT_VISIBILITIES
+
+
+def _pin_newest_comment(page) -> None:
+    """Open the menu on the first comment thread and pick Pin. Raises if any step is missing."""
+    thread = _first_present(page, _COMMENT_THREAD_SEL, timeout_ms=_STEP_WAIT_MS)
+    if thread is None:
+        raise YouTubeUploadError("không thấy bình luận vừa đăng")
+    try:
+        thread.locator(_COMMENT_MENU_SEL).first.click()
+    except Exception as exc:
+        raise YouTubeUploadError("không mở được menu của bình luận") from exc
+    if not _click_any(page, _PIN_MENU_ITEM_SEL):
+        raise YouTubeUploadError("không có mục Ghim trong menu bình luận")
+
+
+def _post_and_pin_comment(page, video: Path, *, video_id: str, text: str) -> str:
+    """Post `text` on the published video, then pin it. Returns a note, "" on success.
+
+    Warn-only: the video is already published and recorded, so every failure comes back as
+    a note instead of an exception. The `.upload.json` record keeps the steps, so a re-run
+    never posts twice:
+
+      comment_status: "posting" just before the Post click, then "posted", or "failed"
+                      if the click never happened.
+      pinned:         True once the pin click succeeded.
+
+    "posting" with no "posted" means the click may or may not have landed, so nothing is
+    re-posted automatically.
+    """
+    state = read_upload_state(video)
+    if state.get("pinned"):
+        return ""
+    status = state.get("comment_status", "")
+    if status == "posting":
+        return "Không rõ bình luận đã đăng chưa (gián đoạn khi đang đăng) — kiểm tra kênh, không đăng lại tự động."
+    if status == "posted":
+        return "Đã bình luận nhưng chưa ghim — hãy ghim thủ công trên YouTube."
+
+    try:
+        page.goto(_WATCH_URL.format(video_id=video_id), wait_until="domcontentloaded")
+        if _LOGGED_OUT_URL_RE.search(page.url or ""):
+            return "Profile YouTube chưa đăng nhập — không đăng được bình luận."
+        _click_any(page, _COMMENT_PLACEHOLDER_SEL)  # expand the box if it is collapsed
+        _fill_box(page, _COMMENT_BOX_SEL, text)
+        write_upload_state(video, comment_status="posting")
+        if not _click_any(page, _COMMENT_SUBMIT_SEL, _COMMENT_SUBMIT_TEXTS):
+            write_upload_state(video, comment_status="failed")
+            return "Không tìm thấy nút đăng bình luận."
+        write_upload_state(video, comment_status="posted")
+    except Exception as exc:
+        if _browser_gone(exc):
+            return "Trình duyệt đã đóng trước khi đăng bình luận."
+        # Failed before the Post click: nothing was posted, so a re-run may try again.
+        if read_upload_state(video).get("comment_status") != "posting":
+            write_upload_state(video, comment_status="failed")
+        return f"Không đăng được bình luận: {exc}"
+
+    try:
+        _pin_newest_comment(page)
+    except Exception as exc:
+        if _browser_gone(exc):
+            return "Đã bình luận, nhưng trình duyệt đóng trước khi ghim."
+        return f"Đã bình luận nhưng không ghim được ({exc}) — hãy ghim thủ công."
+    write_upload_state(video, pinned=True)
+    return ""
+
+
+def _comment_after_publish(page, video: Path, *, video_id: str, text: str) -> str:
+    """Post and pin the comment in its own tab, leaving the upload page where it is.
+
+    A batch reuses one page for every part, so navigating that page to the watch page
+    here would strand the next part on the wrong screen. The comment gets a tab of its
+    own, closed afterwards. Returns a note, "" on success, like `_post_and_pin_comment`.
+    """
+    try:
+        comment_page = page.context.new_page()
+    except Exception as exc:
+        if _browser_gone(exc):
+            return "Trình duyệt đã đóng trước khi đăng bình luận."
+        return f"Không mở được tab để đăng bình luận: {exc}"
+    try:
+        return _post_and_pin_comment(comment_page, video, video_id=video_id, text=text)
+    finally:
+        try:
+            comment_page.close()
+        except Exception:
+            pass
+
+
 def upload_one(
     page,
     request: UploadRequest,
@@ -3261,12 +3392,27 @@ def upload_one(
         publish_at=request.publish_at.isoformat() if request.publish_at else "",
         public_at=request.public_at.isoformat() if request.public_at else "",
     )
+
+    # Past the publish fence: the video is live and recorded, so this step can only warn.
+    # No cancel checks here either, for the same reason.
+    comment_note = ""
+    if _should_comment(request):
+        if not video_id:
+            comment_note = "Không có ID video để bình luận."
+        else:
+            _report(on_progress, "Đăng và ghim bình luận…")
+            comment_note = _comment_after_publish(
+                page, video, video_id=video_id, text=request.comment
+            )
+        if comment_note:
+            _report(on_progress, f"⚠ {comment_note}")
     return UploadResult(
         video_id=video_id,
         url=url,
         visibility=request.visibility,
         publish_at=request.publish_at,
         public_at=request.public_at,
+        comment_note=comment_note,
     )
 
 
