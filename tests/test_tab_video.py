@@ -389,7 +389,7 @@ class TestVideoPartsList:
     def _make_button(self, tab, row):
         from PySide6.QtWidgets import QPushButton
 
-        return tab.video_list.cellWidget(row, 6).findChildren(QPushButton)[0]
+        return tab.video_list.cellWidget(row, 7).findChildren(QPushButton)[0]
 
     def test_lists_one_row_per_part_all_pending(
         self, qapp, tmp_path, library_dir, sample_meta, sample_refs
@@ -447,6 +447,37 @@ class TestVideoPartsList:
         assert tab.video_list.item(0, 4).text() == "✅ Đã tạo"
         assert self._make_button(tab, 0).text() == "Tạo lại"
         assert tab.video_list.item(1, 4).text() == "⬜ Chưa tạo"  # the others still pending
+        tab.shutdown()
+
+    def test_schedule_column_is_blank_until_booked_then_shows_members_switch(
+        self, qapp, tmp_path, library_dir, sample_meta, sample_refs
+    ):
+        from noveltrans.youtube_upload import write_upload_state
+
+        path = self._project_with_audio(library_dir, sample_meta, sample_refs)
+        tab = self._tab_on_project(tmp_path, path)
+        windows = tab._windows_for_current_selection()
+        out = tab._part_output_path(windows[0], whole_novel=False)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"fake mp4")
+        tab._refresh_video_list()
+        headers = [
+            tab.video_list.horizontalHeaderItem(c).text()
+            for c in range(tab.video_list.columnCount())
+        ]
+        assert headers[6] == "Lịch đăng"
+        assert headers[7] == "Thao tác"
+        assert tab.video_list.item(0, 6).text() == ""  # nothing booked yet
+
+        write_upload_state(
+            out,
+            status="committed",
+            visibility="members_then_public",
+            public_at="2026-12-03T19:00:00",
+        )
+        tab._refresh_video_list()
+        assert tab.video_list.item(0, 6).text() == "03/12 19:00"
+        assert "Hội viên" in tab.video_list.item(0, 6).toolTip()
         tab.shutdown()
 
     def test_each_part_renders_into_its_own_subfolder(
@@ -528,7 +559,7 @@ class TestVideoPartsList:
 
         path = self._project_with_audio(library_dir, sample_meta, sample_refs)
         tab = self._tab_on_project(tmp_path, path)
-        thumb_btn = tab.video_list.cellWidget(0, 6).findChildren(QPushButton)[2]
+        thumb_btn = tab.video_list.cellWidget(0, 7).findChildren(QPushButton)[2]
         assert thumb_btn.text() == "Ảnh bìa"
         assert not thumb_btn.isEnabled()  # no thumbnail yet
         windows = tab._windows_for_current_selection()
@@ -536,7 +567,7 @@ class TestVideoPartsList:
         jpg.parent.mkdir(parents=True, exist_ok=True)
         jpg.write_bytes(b"fake jpg")
         tab._refresh_video_list()
-        thumb_btn = tab.video_list.cellWidget(0, 6).findChildren(QPushButton)[2]
+        thumb_btn = tab.video_list.cellWidget(0, 7).findChildren(QPushButton)[2]
         assert thumb_btn.isEnabled()
         tab.shutdown()
 
@@ -1727,7 +1758,7 @@ class TestYouTubeUploadUi:
                                               sample_meta, sample_refs):
         tab = self._tab_on_project(tmp_path, self._project_with_audio(
             library_dir, sample_meta, sample_refs))
-        assert tab.video_list.columnCount() == 7
+        assert tab.video_list.columnCount() == 8
         assert tab.video_list.horizontalHeaderItem(5).text() == "Đã tải lên"
         tab.shutdown()
 
@@ -2062,11 +2093,12 @@ class TestYouTubeUploadUi:
         requests = tab._upload_worker.requests
         assert all(r.visibility == "members_then_public" for r in requests)
         assert all(r.publish_at is None for r in requests)
-        # Part k goes public on the day 3k days after the click, at 19:00 local time.
-        for k, r in enumerate(requests, start=1):
-            assert r.public_at.hour == 19 and r.public_at.minute == 0
-            assert r.public_at.date() == (before + timedelta(days=3 * k)).date() or \
-                r.public_at.date() == (after + timedelta(days=3 * k)).date()
+        # Feature 112: no members switch booked yet in this library, so part 1 lands at the
+        # latest 19:00 within the next 3 days, and each later part 3 days after the last.
+        publics = [r.public_at for r in requests]
+        assert all(p.hour == 19 and p.minute == 0 for p in publics)
+        assert before < publics[0] <= after + timedelta(days=3)
+        assert all(b - a == timedelta(days=3) for a, b in zip(publics, publics[1:]))
         tab._upload_worker = None
         tab.shutdown()
 
@@ -2157,11 +2189,11 @@ class TestYouTubeUploadUi:
             library_dir, sample_meta, sample_refs))
         _, out = self._render_part(tab, 0)
         tab._refresh_video_list()
-        assert tab.video_list.cellWidget(0, 6).findChildren(QPushButton)[3].text() == "Tải lên"
+        assert tab.video_list.cellWidget(0, 7).findChildren(QPushButton)[3].text() == "Tải lên"
 
         write_upload_state(out, status=STATE_STARTED)
         tab._refresh_video_list()
-        btn = tab.video_list.cellWidget(0, 6).findChildren(QPushButton)[3]
+        btn = tab.video_list.cellWidget(0, 7).findChildren(QPushButton)[3]
         assert btn.text() == "Đặt lại"
         assert btn.isEnabled()
         tab.shutdown()
@@ -2621,14 +2653,14 @@ class TestYouTubeUploadUi:
             library_dir, sample_meta, sample_refs))
         _, out = self._render_part(tab, 0)
         tab._refresh_video_list()
-        btn = tab.video_list.cellWidget(0, 6).findChildren(QPushButton)[3]
+        btn = tab.video_list.cellWidget(0, 7).findChildren(QPushButton)[3]
         assert btn.text() == "Tải lên" and btn.isEnabled()
 
         write_upload_state(out, status=STATE_PUBLISHED)
         tab._refresh_video_list()
         # No direct re-upload path for a published part — un-marking is the tick in the
         # "Đã tải lên" column, so this button just goes dead.
-        assert not tab.video_list.cellWidget(0, 6).findChildren(QPushButton)[3].isEnabled()
+        assert not tab.video_list.cellWidget(0, 7).findChildren(QPushButton)[3].isEnabled()
         tab.shutdown()
 
     def test_shutdown_and_running_check_account_for_the_upload_worker(self, qapp, tmp_path):
@@ -2700,7 +2732,7 @@ class TestThumbnailUpdateUi:
         """The row's "Cập nhật bìa" — appended last, after Tạo/Chi tiết/Ảnh bìa/Tải lên."""
         from PySide6.QtWidgets import QPushButton
 
-        return tab.video_list.cellWidget(row, 6).findChildren(QPushButton)[4]
+        return tab.video_list.cellWidget(row, 7).findChildren(QPushButton)[4]
 
     def test_row_button_is_last_so_existing_positions_do_not_shift(
         self, qapp, tmp_path, library_dir, sample_meta, sample_refs

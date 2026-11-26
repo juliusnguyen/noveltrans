@@ -670,6 +670,96 @@ def public_switch_times(
     ]
 
 
+# -- members schedule chain (feature 112) -------------------------------------
+
+
+def _as_naive_local(value: datetime) -> datetime:
+    """Naive local time. State files mix naive and aware timestamps; comparing them raises."""
+    if value.tzinfo is not None:
+        return value.astimezone().replace(tzinfo=None)
+    return value
+
+
+def members_schedule_anchor(now: datetime, last: datetime | None) -> datetime:
+    """When the first Members→public part of a new batch goes public.
+
+    `last` is the latest members switch already recorded on the channel. Three days after
+    it, so the chain continues. If there is none, or it is more than PUBLIC_SWITCH_DAYS in
+    the past, the chain has lapsed: start at the latest PUBLIC_SWITCH_HOUR:00 that is still
+    within the next PUBLIC_SWITCH_DAYS from now. A `last` that is recent or in the future
+    is never reset.
+    """
+    now = _as_naive_local(now)
+    window = timedelta(days=PUBLIC_SWITCH_DAYS)
+    if last is None or _as_naive_local(last) < now - window:
+        ceiling = now + window
+        anchor = ceiling.replace(hour=PUBLIC_SWITCH_HOUR, minute=0, second=0, microsecond=0)
+        if anchor > ceiling:
+            anchor -= timedelta(days=1)
+        return anchor
+    return _as_naive_local(last) + window
+
+
+def members_chain_times(now: datetime, last: datetime | None, count: int) -> list[datetime]:
+    """Switch times for `count` Members parts uploaded in one batch, each PUBLIC_SWITCH_DAYS
+    after the previous one, starting from `members_schedule_anchor`."""
+    if count < 0:
+        raise ValueError("count must be >= 0")
+    first = members_schedule_anchor(now, last)
+    return [first + timedelta(days=PUBLIC_SWITCH_DAYS * i) for i in range(count)]
+
+
+def last_members_public_at(states) -> datetime | None:
+    """The latest members→public switch recorded in these upload states, or None.
+
+    Counts only Members parts that have passed the publish click (committed or published),
+    so a slot that is already booked is never handed out twice. Unreadable or half-written
+    records are skipped, not fatal.
+    """
+    latest: datetime | None = None
+    for state in states:
+        if not isinstance(state, dict):
+            continue
+        if state.get("visibility") != "members_then_public":
+            continue
+        if state.get("status") not in (STATE_COMMITTED, STATE_PUBLISHED):
+            continue
+        raw = state.get("public_at") or ""
+        try:
+            when = _as_naive_local(datetime.fromisoformat(raw))
+        except (TypeError, ValueError):
+            continue
+        if latest is None or when > latest:
+            latest = when
+    return latest
+
+
+def library_members_last(library_root: Path) -> datetime | None:
+    """Latest members switch recorded in any project under `library_root`. Channel-wide:
+    the members cadence is one release rhythm, so two novels must not book the same slot.
+
+    Walks each project's video folder, which holds both the per-part folders and the older
+    flat layout. Unreadable records are skipped.
+    """
+    from noveltrans.storage.library import Library
+    from noveltrans.storage.project import EXPORTS_DIR, VIDEO_DIR
+
+    root = Path(library_root)
+    if not root.is_dir():
+        return None
+    states = []
+    for project in Library(root).list_projects():
+        video_dir = project / EXPORTS_DIR / VIDEO_DIR
+        if not video_dir.is_dir():
+            continue
+        for record in video_dir.rglob("*.upload.json"):
+            try:
+                states.append(json.loads(record.read_text(encoding="utf-8")))
+            except (OSError, ValueError):
+                continue
+    return last_members_public_at(states)
+
+
 def validate_schedule_start(start: datetime, *, now: datetime | None = None) -> None:
     """Reject a first publish time YouTube would refuse. Raises, or returns silently.
 
@@ -3563,6 +3653,9 @@ def upload_batch(
     starts = [r.publish_at for r in requests if r.publish_at is not None]
     if starts:
         validate_schedule_start(min(starts))
+    switches = [r.public_at for r in requests if r.public_at is not None]
+    if switches:  # the members→public switch is a schedule too: same 15-minute lead rule
+        validate_schedule_start(min(switches))
 
     sync_playwright = _require_playwright()
     playwright, context = _launch_context(sync_playwright, headless=headless)
