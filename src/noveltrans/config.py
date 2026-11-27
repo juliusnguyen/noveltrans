@@ -686,6 +686,16 @@ class AppConfig:
     def address_ai_model(self, value: str) -> None:
         self._s.setValue("address_ai_model", value.strip())
 
+    @property
+    def auto_detect_address(self) -> bool:
+        """Auto-detect missing xưng hô pairs from the source text per chapter during
+        translation and merge them into `address.json` (feature 113)."""
+        return self._s.value("auto_detect_address", True, type=bool)
+
+    @auto_detect_address.setter
+    def auto_detect_address(self, value: bool) -> None:
+        self._s.setValue("auto_detect_address", bool(value))
+
     # ---- translation quality control (feature 084) ------------------------
 
     @property

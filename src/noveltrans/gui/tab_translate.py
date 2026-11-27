@@ -227,8 +227,8 @@ class TranslateTab(QWidget):
         self.names_button.clicked.connect(self._open_names)
         self.address_button = QPushButton("🗣 Xưng hô")
         self.address_button.setToolTip(
-            "Bảng xưng hô giữa các nhân vật (tôi/cậu, tao/mày…). Gửi kèm khi dịch bằng AI, "
-            "nên cùng một cặp nhân vật xưng hô giống nhau ở mọi chương."
+            "Bảng xưng hô giữa các nhân vật (tôi/cậu, tao/mày…). Khi dịch bằng AI, hệ thống "
+            "tự động dò cặp nhân vật mới từ bản gốc để cập nhật bảng và gửi kèm khi dịch."
         )
         self.address_button.clicked.connect(self._open_address)
         self.rewrite_button = QPushButton("✍️ Viết lại văn phong")
@@ -586,6 +586,7 @@ class TranslateTab(QWidget):
             approved_names=approved_names or frozenset(),
             name_profile=name_profile,
             translate_workers=self.config.translate_workers,
+            auto_address=self.config.auto_detect_address,
         )
         self._worker.chapter_started.connect(self._on_chapter_started)
         self._worker.progress.connect(self._on_progress)

@@ -360,6 +360,7 @@ class TranslateWorker(PausableWorker):
         approved_names: frozenset | set = frozenset(),
         name_profile=None,
         translate_workers: int = 1,  # >1 translates that many chapters concurrently
+        auto_address: bool = True,
         parent=None,
     ):
         super().__init__(parent)
@@ -387,9 +388,13 @@ class TranslateWorker(PausableWorker):
         # None = the path this worker has always taken: one engine, one attempt per chunk,
         # no checking, no extra calls. Everything QC does is behind this being set.
         self.qc = qc
-        # The novel's address table (feature 113), read once in `run()`. Empty = no table,
-        # and then every chapter is translated with exactly the prompt it always had.
+        # The novel's address table (feature 113), read once in `run()` and updated as new
+        # character pairs are auto-detected from source chapters (when `auto_address` is on).
+        self.auto_address = auto_address
         self._address = None
+        self._address_lock = threading.Lock()
+        self._known_names: list[str] = []
+        self._source_lang: str = "zh"
 
     def _address_context(self, chapter, source_content: str) -> str:
         """The xưng hô rules for one chapter, "" when the novel has none that apply.
@@ -398,11 +403,55 @@ class TranslateWorker(PausableWorker):
         are in this chapter and on its number (`from_chapter`), while engines are shared
         across chapters by a thread's `_TranslateCtx`.
         """
-        if self._address is None:
+        with self._address_lock:
+            address = self._address
+        if address is None:
             return ""
         from noveltrans.address_table import prompt_for_chapter
 
-        return prompt_for_chapter(self._address, chapter.index + 1, source_content)
+        return prompt_for_chapter(address, chapter.index + 1, source_content)
+
+    def _maybe_auto_detect_address(
+        self, translator, chapter_number: int, source_content: str
+    ) -> None:
+        """Extract missing xưng hô pairs from `source_content` and merge into `address.json`.
+
+        Non-fatal: extraction failures never abort chapter translation. Existing user-saved
+        or previously detected pairs are never overwritten (`merge_extracted`).
+        """
+        if (
+            not self.auto_address
+            or self.target_lang != "vi"
+            or not getattr(translator, "supports_completion", False)
+            or not getattr(translator, "supports_context", False)
+        ):
+            return
+        from noveltrans.address_table import AddressTable, merge_extracted, read_address, write_address
+        from noveltrans.translators.address import extract_chapter_address
+
+        with self._address_lock:
+            existing = self._address.entries if self._address is not None else ()
+        try:
+            proposed = extract_chapter_address(
+                translator.complete,
+                source_content,
+                self._known_names,
+                from_source=True,
+                source_lang=self._source_lang,
+                chapter_number=chapter_number,
+                existing=existing,
+            )
+        except Exception:  # noqa: BLE001 — never fail translation if auto-detect errors
+            return
+        if not proposed:
+            return
+        with self._address_lock:
+            current = read_address(self.project_path)
+            merged = merge_extracted(current.entries, proposed)
+            if len(merged) > len(current.entries):
+                updated = AddressTable(general_note=current.general_note, entries=tuple(merged))
+                write_address(self.project_path, updated)
+                self._address = None if updated.empty else updated
 
     def engine_label(self) -> str:
         """Human-readable record of what translated a chapter, e.g. 'CLI (agy)'."""
@@ -609,6 +658,9 @@ class TranslateWorker(PausableWorker):
         try:
             source_title = apply_glossary(chapter.title, glossary)
             source_content = apply_glossary(chapter.content, glossary)
+            self._maybe_auto_detect_address(ctx.translator, chapter.index + 1, source_content)
+            if self._cancelled:
+                return _TranslateResult(chapter.index, "cancelled", chapter.title)
             context = self._address_context(chapter, source_content)
             # Only when non-empty, so a novel without an address table makes the same call
             # it always has.
@@ -957,6 +1009,7 @@ class TranslateWorker(PausableWorker):
                     if entries:
                         write_names(project.path, entries, chapters_scanned=total)
                 glossary = applied_glossary(entries)
+                self._known_names = sorted(set(glossary.values()))
                 # The address table (feature 113) is Vietnamese-only too: its terms are
                 # Vietnamese pronouns. Engines without a prompt (Google) simply never
                 # receive it — see `Translator.supports_context`.
@@ -964,6 +1017,7 @@ class TranslateWorker(PausableWorker):
 
                 address = read_address(project.path)
                 self._address = None if address.empty else address
+            self._source_lang = project.meta.source_lang
             if self._cancelled:
                 return
 
@@ -1478,7 +1532,7 @@ class AddressScanWorker(PausableWorker):
     def __init__(
         self, project_path, engine_name: str, *, api_key: str = "", model: str = "",
         cli_command: str = "", base_url: str = "", sample_size: int = 20, parent=None,
-        existing: list | tuple = (),
+        existing: list | tuple = (), prefer_source: bool = False,
     ):
         super().__init__(parent)
         self.project_path = Path(project_path)
@@ -1488,6 +1542,7 @@ class AddressScanWorker(PausableWorker):
         self.cli_command = cli_command
         self.base_url = base_url
         self.sample_size = sample_size
+        self.prefer_source = prefer_source
         # The rows the table has now (unsaved edits included): pairs it already covers are
         # measured against it, not against the scan's own majority — see `aggregate`.
         self.existing = tuple(existing)
@@ -1520,8 +1575,10 @@ class AddressScanWorker(PausableWorker):
             glossary = applied_glossary(read_names(project.path))
             names = sorted(set(glossary.values()))
             chapters = [c for c in project.chapters() if c.enabled and (c.translated or c.content)]
+            source_lang = project.meta.source_lang
             translated = [c for c in chapters if c.translated]
-            sample = sample_chapters(translated or chapters, self.sample_size)
+            pool = [c for c in chapters if c.content] if self.prefer_source else (translated or chapters)
+            sample = sample_chapters(pool, self.sample_size)
         finally:
             project.close()
 
@@ -1533,11 +1590,18 @@ class AddressScanWorker(PausableWorker):
                 self.stopped.emit(proposed, conflicts, done, len(sample))
                 return
             self.progress.emit(done, len(sample), chapter.translated_title or chapter.title)
-            from_source = not chapter.translated
-            text = chapter.translated or apply_glossary(chapter.content, glossary)
+            from_source = self.prefer_source or not chapter.translated
+            text = (
+                apply_glossary(chapter.content, glossary)
+                if from_source
+                else chapter.translated
+            )
             try:
                 reply = translator.complete(
-                    build_extract_prompt(dialogue_excerpt(text), names, from_source=from_source)
+                    build_extract_prompt(
+                        dialogue_excerpt(text), names,
+                        from_source=from_source, source_lang=source_lang,
+                    )
                 )
             except Exception as exc:  # noqa: BLE001 — one bad chapter must not end the scan
                 errors.append(str(exc))

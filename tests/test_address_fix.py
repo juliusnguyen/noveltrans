@@ -445,6 +445,29 @@ class TestScanWorker:
         worker.run()
         assert failed
 
+    def test_prefer_source_scans_original_text_even_when_translated(
+        self, qapp, library_dir, monkeypatch
+    ):
+        from noveltrans.name_glossary import NameEntry, write_names
+
+        path = _project(library_dir, [DRIFTED])
+        project = NovelProject.open(path)
+        try:
+            project.save_content(0, "林风看着苏雪说道：“你好。”")
+            write_names(path, [NameEntry(source="林风", reading=A), NameEntry(source="苏雪", reading=B)])
+        finally:
+            project.close()
+        engine = _Llm("Lâm Phong | Tô Tuyết | tớ | cậu | 1")
+        _use(monkeypatch, engine)
+        got = []
+        worker = AddressScanWorker(path, "fake", sample_size=5, prefer_source=True)
+        worker.scanned.connect(lambda p, c: got.append((p, c)))
+        worker.run()
+        assert len(engine.prompts) == 1
+        assert "Đoạn truyện tiếng Trung" in engine.prompts[0]
+        assert "林风" not in engine.prompts[0] and A in engine.prompts[0]
+        assert (got[0][0][0].self_term, got[0][0][0].other_term) == ("tớ", "cậu")
+
 
 # --------------------------------------------------------------------------- dialog
 

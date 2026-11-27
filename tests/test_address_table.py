@@ -276,6 +276,116 @@ def test_worker_without_a_table_passes_no_context(qapp, library_dir, monkeypatch
     assert engine.contexts and all(c == "" for _t, c in engine.contexts)
 
 
+def test_auto_detect_extracts_from_source_updates_address_json_and_injects_context(
+    qapp, library_dir, monkeypatch
+):
+    path = _project(library_dir)
+    extract_prompts: list[str] = []
+
+    class _AutoEngine(_Recorder):
+        def complete(self, prompt):
+            extract_prompts.append(prompt)
+            return (
+                "Lâm Phong | Tô Tuyết | tớ | cậu | 2\n"
+                "Tô Tuyết | Lâm Phong | tớ | cậu | 1\n"
+                "(người kể) | Lâm Phong | - | hắn | 1"
+            )
+
+    engine = _AutoEngine()
+    monkeypatch.setattr("noveltrans.translators.get_translator", lambda *a, **k: engine)
+    TranslateWorker(path, "fake", "vi", auto_address=True).run()
+
+    # Only ch0 (has names/dialogue) triggered extraction; ch1 (scenery only) did not.
+    assert len(extract_prompts) == 1
+    assert "Đoạn truyện tiếng Trung" in extract_prompts[0]
+    assert A in extract_prompts[0] and B in extract_prompts[0]
+
+    saved = read_address(path)
+    pairs = {(e.speaker, e.listener): (e.self_term, e.other_term, e.origin) for e in saved.entries}
+    assert pairs[(A, B)] == ("tớ", "cậu", "auto")
+    assert pairs[(B, A)] == ("tớ", "cậu", "auto")
+    assert pairs[("(người kể)", A)] == ("", "hắn", "auto")
+
+    ch0_context = next(c for t, c in engine.contexts if t.startswith(A))
+    assert "Lâm Phong nói với Tô Tuyết: xưng 'tớ', gọi 'cậu'" in ch0_context
+
+
+def test_auto_detect_never_overwrites_existing_rows_and_skips_when_covered(
+    qapp, library_dir, monkeypatch
+):
+    from noveltrans.translators.address import should_extract_chapter
+
+    path = _project(library_dir)
+    # A already has a row with C, while B has no row anywhere in the table yet.
+    existing_ac = _row(A, C, self_term="anh", other_term="em")
+    write_address(path, AddressTable(entries=(existing_ac,)))
+    extract_prompts: list[str] = []
+
+    class _AutoEngine(_Recorder):
+        def complete(self, prompt):
+            extract_prompts.append(prompt)
+            return (
+                f"{A} | {C} | tao | mày | 3\n"
+                f"{A} | {B} | tớ | cậu | 2\n"
+                f"{B} | {A} | tớ | cậu | 2"
+            )
+
+    engine = _AutoEngine()
+    monkeypatch.setattr("noveltrans.translators.get_translator", lambda *a, **k: engine)
+    TranslateWorker(path, "fake", "vi", auto_address=True).run()
+
+    assert len(extract_prompts) == 1
+    saved = read_address(path)
+    pairs = {(e.speaker, e.listener): (e.self_term, e.other_term, e.origin) for e in saved.entries}
+    assert pairs[(A, C)] == ("anh", "em", "manual")  # existing row preserved
+    assert pairs[(A, B)] == ("tớ", "cậu", "auto")    # new character B's pairs added
+    assert pairs[(B, A)] == ("tớ", "cậu", "auto")
+
+    # Once every present character has at least one row in the table, extraction is skipped
+    # even if not all cross-pairs or narration rows exist yet.
+    assert not should_extract_chapter(f"{A} nói với {B}: “Đi.”", [A, B, C], saved.entries)
+    # A brand-new character C appearing in a chapter re-enables extraction.
+    assert should_extract_chapter(f"{B} nói với {C}: “Chào.”", [A, B, C], (AddressEntry(A, B, "tớ", "cậu"),))
+    # Chapter with no known characters from a non-empty glossary is skipped; empty glossary
+    # still extracts on dialogue.
+    assert not should_extract_chapter("Người lạ nói: “Chào.”", [A, B], ())
+    assert should_extract_chapter("Người lạ nói: “Chào.”", [], ())
+
+
+def test_auto_detect_failure_never_fails_translation(qapp, library_dir, monkeypatch):
+    path = _project(library_dir)
+
+    class _FailingExtract(_Recorder):
+        def complete(self, prompt):
+            raise RuntimeError("extract failed")
+
+    engine = _FailingExtract()
+    monkeypatch.setattr("noveltrans.translators.get_translator", lambda *a, **k: engine)
+    TranslateWorker(path, "fake", "vi", auto_address=True).run()
+
+    project = NovelProject.open(path)
+    try:
+        assert project.chapter(0).translated
+        assert read_address(path).empty
+    finally:
+        project.close()
+
+
+def test_auto_detect_can_be_disabled(qapp, library_dir, monkeypatch):
+    path = _project(library_dir)
+    called = []
+
+    class _Spy(_Recorder):
+        def complete(self, prompt):
+            called.append(prompt)
+            return "Lâm Phong | Tô Tuyết | tớ | cậu | 1"
+
+    monkeypatch.setattr("noveltrans.translators.get_translator", lambda *a, **k: _Spy())
+    TranslateWorker(path, "fake", "vi", auto_address=False).run()
+    assert called == []
+    assert read_address(path).empty
+
+
 # --------------------------------------------------------------------------- dialog
 
 
