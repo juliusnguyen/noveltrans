@@ -731,15 +731,14 @@ class VideoTab(QWidget):
         """
         from datetime import datetime
 
-        from noveltrans.youtube_upload import library_members_last, members_chain_times
+        from noveltrans.youtube_upload import members_chain_times, project_release_last
 
         pending = self._pending_upload_rows()
         if not pending:
             self.schedule_preview.setText("Không có phần nào cần tải lên.")
             return
-        times = members_chain_times(
-            datetime.now(), library_members_last(self.config.library_dir), len(pending)
-        )
+        last = project_release_last(self.project.path) if self.project is not None else None
+        times = members_chain_times(datetime.now(), last, len(pending))
         shown = [
             f"{label}: {when:%d/%m %H:%M}"
             for (_, label, _, _), when in zip(pending[:4], times)
@@ -4519,8 +4518,8 @@ class VideoTab(QWidget):
 
         from noveltrans.youtube_upload import (
             YouTubeUploadError,
-            library_members_last,
             members_chain_times,
+            project_release_last,
             schedule_times,
         )
 
@@ -4533,12 +4532,11 @@ class VideoTab(QWidget):
             if scheduling
             else [None] * len(rows)
         )
-        # Chained across the whole channel, not anchored to the click: 3 days after the
-        # latest members switch already booked, or the next 3 days if that has lapsed.
+        # Chained per novel, not anchored to the click: 3 days after this novel's latest
+        # part went (or goes) public, or the next 3 days if that has lapsed.
+        last = project_release_last(self.project.path) if self.project is not None else None
         public_times = (
-            members_chain_times(
-                datetime.now(), library_members_last(self.config.library_dir), len(rows)
-            )
+            members_chain_times(datetime.now(), last, len(rows))
             if members
             else [None] * len(rows)
         )
