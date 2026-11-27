@@ -288,6 +288,9 @@ class Chapter:
     # blanks these, which is what makes the chapter eligible for a fresh rewrite.
     translated_raw: str = ""
     translated_title_raw: str = ""
+    # The body before a pronoun fix (feature 113); "" = never fixed. Kept apart from
+    # `translated_raw` so a fix neither counts as a style rewrite nor undoes with one.
+    translated_fix_raw: str = ""
     status: str = STATUS_PENDING
     error: str = ""
     updated_at: str = ""
@@ -320,6 +323,8 @@ class Chapter:
     # the DB through seven different write paths.
     qc_text_hash: str = ""
     qc_attempts: int = 0  # engine calls this chapter's last QC run cost
+    # What the AI pronoun check last judged (`address_check_hash`); "" = never.
+    qc_address_hash: str = ""
     # False once the user disables this chapter: skipped everywhere (download, translate,
     # audio, video) until re-enabled. A TOC re-scan never resets this — see `replace_toc`.
     enabled: bool = True
@@ -343,6 +348,10 @@ class Chapter:
     @property
     def is_rewritten(self) -> bool:
         return bool(self.translated_raw)
+
+    @property
+    def is_address_fixed(self) -> bool:
+        return bool(self.translated_fix_raw)
 
     @property
     def qc_checked(self) -> bool:

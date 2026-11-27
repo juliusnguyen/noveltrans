@@ -211,6 +211,9 @@ class QcSettings:
 
     chain: list[QcEngineSpec]
     judge: QcEngineSpec | None = None
+    # Feature 113: who checks dialogue against the novel's address table during a SCAN.
+    # None = not checked. Independent of `judge`: the style check can be off and this on.
+    address_judge: QcEngineSpec | None = None
 
 
 def qc_settings_from_config(config, fallback: QcEngineSpec) -> QcSettings:
@@ -233,17 +236,19 @@ def qc_settings_from_config(config, fallback: QcEngineSpec) -> QcSettings:
         )
     if not chain:
         chain = [fallback]
-    judge = None
-    if config.qc_use_llm_judge:
-        judge_engine = config.qc_ai_engine
-        judge = QcEngineSpec(
-            engine_name=judge_engine,
-            model=config.qc_ai_model,
-            api_key=config.claude_api_key,
-            cli_command=config.cli_command_for(judge_engine),
-            base_url=config.lmstudio_url if judge_engine == "lmstudio" else "",
-        )
-    return QcSettings(chain=chain, judge=judge)
+    judge_engine = config.qc_ai_engine
+    judge_spec = QcEngineSpec(
+        engine_name=judge_engine,
+        model=config.qc_ai_model,
+        api_key=config.claude_api_key,
+        cli_command=config.cli_command_for(judge_engine),
+        base_url=config.lmstudio_url if judge_engine == "lmstudio" else "",
+    )
+    return QcSettings(
+        chain=chain,
+        judge=judge_spec if config.qc_use_llm_judge else None,
+        address_judge=judge_spec if config.qc_check_address else None,
+    )
 
 
 def build_qc_judge(spec: QcEngineSpec | None):
@@ -266,6 +271,22 @@ def build_qc_judge(spec: QcEngineSpec | None):
     # `complete` is called with ONE positional argument and no system prompt — the only
     # signature all three LLM engines share.
     return lambda body: judge_translation(translator.complete, body)
+
+
+def build_address_judge(spec: QcEngineSpec | None):
+    """A `judge(body, block) -> QcVerdict` callable, or None — same rules as
+    `build_qc_judge`: an engine that will not build means no check, never a failure."""
+    if spec is None:
+        return None
+    from noveltrans.translators.qc import judge_address
+
+    try:
+        translator = spec.build()
+    except NovelTransError:
+        return None
+    if not translator.supports_completion:
+        return None
+    return lambda body, block: judge_address(translator.complete, body, block)
 
 
 @dataclass
@@ -366,6 +387,22 @@ class TranslateWorker(PausableWorker):
         # None = the path this worker has always taken: one engine, one attempt per chunk,
         # no checking, no extra calls. Everything QC does is behind this being set.
         self.qc = qc
+        # The novel's address table (feature 113), read once in `run()`. Empty = no table,
+        # and then every chapter is translated with exactly the prompt it always had.
+        self._address = None
+
+    def _address_context(self, chapter, source_content: str) -> str:
+        """The xưng hô rules for one chapter, "" when the novel has none that apply.
+
+        Computed per chapter, not per engine: which rows apply depends on which characters
+        are in this chapter and on its number (`from_chapter`), while engines are shared
+        across chapters by a thread's `_TranslateCtx`.
+        """
+        if self._address is None:
+            return ""
+        from noveltrans.address_table import prompt_for_chapter
+
+        return prompt_for_chapter(self._address, chapter.index + 1, source_content)
 
     def engine_label(self) -> str:
         """Human-readable record of what translated a chapter, e.g. 'CLI (agy)'."""
@@ -388,9 +425,11 @@ class TranslateWorker(PausableWorker):
             plans.append(
                 QcAttemptPlan(
                     label=spec.label,
-                    translate=lambda title, content, hint, t=translator: t.translate_chapter(
-                        title, content, source=source_lang, target=self.target_lang,
-                        retry_hint=hint,
+                    translate=lambda title, content, hint, context="", t=translator: (
+                        t.translate_chapter(
+                            title, content, source=source_lang, target=self.target_lang,
+                            retry_hint=hint, context=context,
+                        )
                     ),
                     attempts=spec.attempts,
                     translate_title=lambda title, t=translator: t.translate_title(
@@ -570,18 +609,34 @@ class TranslateWorker(PausableWorker):
         try:
             source_title = apply_glossary(chapter.title, glossary)
             source_content = apply_glossary(chapter.content, glossary)
+            context = self._address_context(chapter, source_content)
+            # Only when non-empty, so a novel without an address table makes the same call
+            # it always has.
+            context_kwarg = {"context": context} if context else {}
             started = time.monotonic()
             if ctx.qc_plans is None:
                 title, text = ctx.translator.translate_chapter(
                     source_title, source_content, source=source_lang, target=self.target_lang,
+                    **context_kwarg,
                 )
                 return _TranslateResult(
                     chapter.index, "ok", chapter.title,
                     translated_title=title, translated_body=text,
                     engine_label=self.engine_label(), seconds=time.monotonic() - started,
                 )
+            plans = ctx.qc_plans
+            if context:
+                # Bind this chapter's rules into each plan's call; `translate_with_qc`
+                # itself stays unaware of them and keeps its (title, content, hint) shape.
+                plans = [
+                    replace(
+                        plan,
+                        translate=lambda t, c, h, f=plan.translate: f(t, c, h, context=context),
+                    )
+                    for plan in plans
+                ]
             outcome = translate_with_qc(
-                ctx.qc_plans, source_title, source_content,
+                plans, source_title, source_content,
                 judge=ctx.qc_judge, policy=Policy.KEEP_BEST, target=self.target_lang,
                 # Only reviewed names (see `confirmed_glossary`): the substitution above
                 # may use every auto-detected entry, but a verdict that triggers a
@@ -902,6 +957,13 @@ class TranslateWorker(PausableWorker):
                     if entries:
                         write_names(project.path, entries, chapters_scanned=total)
                 glossary = applied_glossary(entries)
+                # The address table (feature 113) is Vietnamese-only too: its terms are
+                # Vietnamese pronouns. Engines without a prompt (Google) simply never
+                # receive it — see `Translator.supports_context`.
+                from noveltrans.address_table import read_address
+
+                address = read_address(project.path)
+                self._address = None if address.empty else address
             if self._cancelled:
                 return
 
@@ -1062,10 +1124,14 @@ class RewriteWorker(PausableWorker):
         self.dry_run = dry_run  # preview: emit the result, write nothing
 
     def run(self) -> None:
+        from noveltrans.address_table import prompt_for_chapter, read_address
         from noveltrans.translators import get_translator
         from noveltrans.translators.rewrite import rewrite_chapter
 
         project = NovelProject.open(self.project_path)
+        # The address table (feature 113): with one, the rewrite follows it instead of
+        # freezing whatever pronouns the translation happened to use.
+        address = read_address(self.project_path)
         try:
             try:
                 translator = get_translator(
@@ -1112,6 +1178,10 @@ class RewriteWorker(PausableWorker):
                         chapter.translated_title,
                         chapter.translated,
                         max_chunk_chars=translator.max_chunk_chars,
+                        address_block=prompt_for_chapter(
+                            address, chapter.index + 1, chapter.translated,
+                            for_translation=False,
+                        ),
                     )
                     if self.dry_run:
                         self.preview_ready.emit(chapter.index, title, text)
@@ -1149,6 +1219,7 @@ def chapters_to_qc(
     start_idx: int = 0,
     end_idx: int | None = None,
     force: bool = False,
+    address=None,
 ) -> list:
     """Chapters a quality check would look at, in reading order.
 
@@ -1158,11 +1229,35 @@ def chapters_to_qc(
 
     Shared with `QcDialog` on purpose, exactly as `chapters_to_rewrite` is: the count the
     dialog shows before the user spends quota has to be the set the worker then processes.
+
+    With `address` (the novel's table, when the AI pronoun check is on), chapters that
+    already passed are added back when the pronoun check has not judged them against the
+    rules that cover them now — a table written after the scan, or a row since changed.
+    Only the pronoun check runs on those (`needs_address_check_only`).
     """
     if indices is not None:
         chapters = (project.chapter(i) for i in indices)
         return [c for c in chapters if c is not None and c.translated and c.enabled]
-    return project.pending_qc(target_lang, start_idx, end_idx, force=force)
+    pending = project.pending_qc(target_lang, start_idx, end_idx, force=force)
+    if force or address is None or address.empty:
+        return pending
+    from noveltrans.address_table import chapter_check_block, check_stamp
+
+    have = {c.index for c in pending}
+    extra = []
+    for chapter in project.pending_qc(target_lang, start_idx, end_idx, force=True):
+        if chapter.index in have or not chapter.qc_ok or chapter.qc_is_stale:
+            continue
+        block = chapter_check_block(address, chapter)
+        if block and chapter.qc_address_hash != check_stamp(block, chapter.qc_fingerprint()):
+            extra.append(chapter)
+    return sorted(pending + extra, key=lambda c: c.index)
+
+
+def needs_address_check_only(chapter) -> bool:
+    """A chapter `chapters_to_qc` added back only for the pronoun check: it passed every
+    other check as it stands, so only that check is paid for again."""
+    return chapter.qc_ok and not chapter.qc_is_stale
 
 
 class RetranslationPlan(NamedTuple):
@@ -1171,6 +1266,7 @@ class RetranslationPlan(NamedTuple):
     title_only: list[int]  # title re-translated, body kept (feature 094)
     name_fix: list[int]  # names corrected in place, no engine call (feature 095)
     full: list[int]  # cleared and translated again
+    address_fix: list[int]  # pronouns swapped in place by AI (feature 113)
 
 
 def split_retranslation(chapters: list) -> RetranslationPlan:
@@ -1181,6 +1277,8 @@ def split_retranslation(chapters: list) -> RetranslationPlan:
     * `name_variant` → a string edit: the check already knows the wrong spelling and the
       novel's usual one. NOT `name_drift`: that check only knows a glossary name is
       MISSING, never what the engine wrote instead, so there is nothing to replace.
+    * `address_drift` → the in-place pronoun fix (`AddressFixWorker`): the prose passed
+      every other check, and a re-translation would throw away edits and rewrites.
     * everything else → a full re-translation, as before.
 
     Both cheap paths need a translated body to keep; without one there is nothing to
@@ -1188,14 +1286,20 @@ def split_retranslation(chapters: list) -> RetranslationPlan:
     reason as `chapters_to_qc`: what the dialog says the click will do has to be what the
     worker then does.
     """
-    from noveltrans.translators.qc import QC_NAME_VARIANT, QC_TITLE_UNTRANSLATED
+    from noveltrans.translators.qc import (
+        QC_ADDRESS_DRIFT,
+        QC_NAME_VARIANT,
+        QC_TITLE_UNTRANSLATED,
+    )
 
-    plan = RetranslationPlan([], [], [])
+    plan = RetranslationPlan([], [], [], [])
     for chapter in chapters:
         if chapter.translated and chapter.qc_code == QC_TITLE_UNTRANSLATED:
             plan.title_only.append(chapter.index)
         elif chapter.translated and chapter.qc_code == QC_NAME_VARIANT:
             plan.name_fix.append(chapter.index)
+        elif chapter.translated and chapter.qc_code == QC_ADDRESS_DRIFT:
+            plan.address_fix.append(chapter.index)
         else:
             plan.full.append(chapter.index)
     return plan
@@ -1262,6 +1366,11 @@ class QcScanWorker(PausableWorker):
                 (c.translated for c in project.chapters() if c.translated),
                 applied_glossary(entries).values(),
             )
+            address = None
+            if self.settings.address_judge is not None:
+                from noveltrans.address_table import read_address
+
+                address = read_address(project.path)
             pending = chapters_to_qc(
                 project,
                 self.target_lang,
@@ -1269,10 +1378,16 @@ class QcScanWorker(PausableWorker):
                 start_idx=self.start_idx,
                 end_idx=self.end_idx,
                 force=self.force,
+                address=address,
             )
             if self.limit > 0:
                 pending = pending[: self.limit]
             judge = build_qc_judge(self.settings.judge)
+            # Feature 113. Only when switched on AND the novel has a table; a chapter with
+            # none of the table's characters in it costs nothing (`prompt_for_chapter` is "").
+            address_judge = None
+            if address is not None and not address.empty:
+                address_judge = build_address_judge(self.settings.address_judge)
             total = len(pending)
             done = 0
             failed = 0
@@ -1281,18 +1396,41 @@ class QcScanWorker(PausableWorker):
                     break
                 title = chapter.translated_title or chapter.title
                 self.progress.emit(done, total, title)
-                result = check_translation(
-                    chapter.content, chapter.translated_title, chapter.translated,
-                    target=self.target_lang, glossary=glossary, profile=profile,
+                fingerprint = chapter.qc_fingerprint()
+                address_only = (
+                    address_judge is not None and self.indices is None and not self.force
+                    and needs_address_check_only(chapter)
                 )
-                # The judge is asked only about a chapter the cheap checks cleared: there is
-                # nothing to ask about one they already failed, and the call costs quota.
-                if result.ok and judge is not None:
-                    result = judge(chapter.translated)
+                if address_only:
+                    from noveltrans.translators.qc import QcVerdict
+
+                    # Passed everything else as it stands — only the pronoun check is new.
+                    result = QcVerdict(chapter.qc_code, chapter.qc_reason)
+                else:
+                    result = check_translation(
+                        chapter.content, chapter.translated_title, chapter.translated,
+                        target=self.target_lang, glossary=glossary, profile=profile,
+                    )
+                    # The judge is asked only about a chapter the cheap checks cleared:
+                    # nothing to ask about one they already failed, and the call costs quota.
+                    if result.ok and judge is not None:
+                        result = judge(chapter.translated)
+                address_hash = None  # leave it: the pronoun check is off
+                if address_judge is not None:
+                    from noveltrans.address_table import chapter_check_block, check_stamp
+
+                    # Only chapters a row actually covers: a general note alone gives the
+                    # judge nothing to check, and the fixer could never act on its verdict.
+                    block = chapter_check_block(address, chapter)
+                    address_hash = ""  # not judged (an earlier check already failed it)
+                    if result.ok and block:
+                        result = address_judge(chapter.translated, block)
+                        address_hash = check_stamp(block, fingerprint)
                 status = QC_STATUS_OK if result.ok else QC_STATUS_FAIL
                 project.save_qc_verdict(
-                    chapter.index, status, result.code, result.reason,
-                    chapter.qc_fingerprint(),
+                    chapter.index, status, result.code, result.reason, fingerprint,
+                    chapter.qc_attempts if address_only else 0,
+                    address_hash=address_hash,
                 )
                 self.verdict.emit(chapter.index, result.code, result.reason)
                 self.chapter_done.emit(chapter.index)
@@ -1301,6 +1439,215 @@ class QcScanWorker(PausableWorker):
                 done += 1
             self.progress.emit(done, total, "")
             self.finished_ok.emit(done, failed)
+        finally:
+            project.close()
+
+
+def sample_chapters(chapters: list, size: int) -> list:
+    """Up to `size` chapters: the first half of the budget in order, the rest spread evenly.
+
+    The opening chapters are where the main cast first speak to each other; the spread
+    catches relationships that change later. Reading order is kept.
+    """
+    if size <= 0 or len(chapters) <= size:
+        return list(chapters)
+    head = size // 2
+    rest = chapters[head:]
+    spread = size - head
+    step = len(rest) / spread
+    picked = [rest[int(i * step)] for i in range(spread)]
+    return list(chapters[:head]) + picked
+
+
+class AddressScanWorker(PausableWorker):
+    """Draft an address table from a sample of chapters (feature 113), off the GUI thread.
+
+    Reads only: the dialog merges the proposal and the user decides what to save. One LLM
+    call per sampled chapter. Uses the Vietnamese translation when a chapter has one — it
+    shows what the novel actually says — else the name-substituted Chinese source, asking
+    the model to propose terms instead.
+    """
+
+    progress = Signal(int, int, str)  # done, total, chapter title
+    scanned = Signal(list, list)  # list[AddressEntry] proposed, list[Conflict]
+    # Dừng: what the chapters scanned so far found (already paid for), and how many
+    # chapters that was out of the sample.
+    stopped = Signal(list, list, int, int)
+    failed = Signal(str)
+
+    def __init__(
+        self, project_path, engine_name: str, *, api_key: str = "", model: str = "",
+        cli_command: str = "", base_url: str = "", sample_size: int = 20, parent=None,
+        existing: list | tuple = (),
+    ):
+        super().__init__(parent)
+        self.project_path = Path(project_path)
+        self.engine_name = engine_name
+        self.api_key = api_key
+        self.model = model
+        self.cli_command = cli_command
+        self.base_url = base_url
+        self.sample_size = sample_size
+        # The rows the table has now (unsaved edits included): pairs it already covers are
+        # measured against it, not against the scan's own majority — see `aggregate`.
+        self.existing = tuple(existing)
+
+    def run(self) -> None:
+        from noveltrans.name_glossary import applied_glossary, read_names
+        from noveltrans.translators import get_translator
+        from noveltrans.translators.address import (
+            aggregate,
+            build_extract_prompt,
+            dialogue_excerpt,
+            parse_extract_reply,
+        )
+        from noveltrans.translators.names import apply_glossary
+
+        try:
+            translator = get_translator(
+                self.engine_name, api_key=self.api_key, model=self.model,
+                cli_command=self.cli_command, base_url=self.base_url,
+            )
+        except NovelTransError as exc:
+            self.failed.emit(str(exc))
+            return
+        if not translator.supports_completion:
+            self.failed.emit("Engine này không dò được — hãy chọn CLI Agent, Claude hoặc LM Studio.")
+            return
+
+        project = NovelProject.open(self.project_path)
+        try:
+            glossary = applied_glossary(read_names(project.path))
+            names = sorted(set(glossary.values()))
+            chapters = [c for c in project.chapters() if c.enabled and (c.translated or c.content)]
+            translated = [c for c in chapters if c.translated]
+            sample = sample_chapters(translated or chapters, self.sample_size)
+        finally:
+            project.close()
+
+        findings: dict[int, list] = {}
+        errors: list[str] = []
+        for done, chapter in enumerate(sample):
+            if self._checkpoint():
+                proposed, conflicts = aggregate(findings, self.existing)
+                self.stopped.emit(proposed, conflicts, done, len(sample))
+                return
+            self.progress.emit(done, len(sample), chapter.translated_title or chapter.title)
+            from_source = not chapter.translated
+            text = chapter.translated or apply_glossary(chapter.content, glossary)
+            try:
+                reply = translator.complete(
+                    build_extract_prompt(dialogue_excerpt(text), names, from_source=from_source)
+                )
+            except Exception as exc:  # noqa: BLE001 — one bad chapter must not end the scan
+                errors.append(str(exc))
+                continue
+            findings[chapter.index + 1] = parse_extract_reply(reply)
+        self.progress.emit(len(sample), len(sample), "")
+        if not findings and errors:
+            self.failed.emit(errors[0])
+            return
+        proposed, conflicts = aggregate(findings, self.existing)
+        self.scanned.emit(proposed, conflicts)
+
+
+class AddressFixWorker(PausableWorker):
+    """Fix the xưng hô of already-translated chapters to match the table (feature 113).
+
+    Signals mirror `RewriteWorker` so the tab can reuse its progress handling. Writes
+    through `save_address_fix` — its own undo copy, so "↩︎ Hoàn tác sửa xưng hô" undoes it
+    alone, and a fixed chapter is not mistaken for a style-rewritten one.
+
+    **A chapter that fails keeps its text byte for byte** and is NOT marked as errored:
+    `mark_error` sets the status to error, which would queue a perfectly good translation
+    for re-translation on the next "Dịch tất cả". The failure is reported instead.
+    A chapter that comes back unchanged is not written at all, so it does not get the ✍️
+    marker for nothing.
+    """
+
+    progress = Signal(int, int, str)
+    chapter_done = Signal(int)
+    chapter_error = Signal(int, str)
+    failed = Signal(str)
+    finished_ok = Signal(int, int, int)  # changed, unchanged, failed
+
+    def __init__(
+        self, project_path, engine_name: str, indices: list[int], *, api_key: str = "",
+        model: str = "", cli_command: str = "", base_url: str = "", parent=None,
+    ):
+        super().__init__(parent)
+        self.project_path = Path(project_path)
+        self.engine_name = engine_name
+        self.indices = list(indices)
+        self.api_key = api_key
+        self.model = model
+        self.cli_command = cli_command
+        self.base_url = base_url
+
+    def run(self) -> None:
+        from noveltrans.address_table import read_address, rows_for_chapter
+        from noveltrans.translators import get_translator
+        from noveltrans.translators.address import fix_chapter
+        from noveltrans.translators.qc import QC_ADDRESS_DRIFT
+        from noveltrans.translators.rewrite import paragraphs
+
+        try:
+            translator = get_translator(
+                self.engine_name, api_key=self.api_key, model=self.model,
+                cli_command=self.cli_command, base_url=self.base_url,
+            )
+        except NovelTransError as exc:
+            self.failed.emit(str(exc))
+            return
+        if not translator.supports_completion:
+            self.failed.emit("Engine này không sửa được — hãy chọn CLI Agent, Claude hoặc LM Studio.")
+            return
+
+        project = NovelProject.open(self.project_path)
+        try:
+            table = read_address(project.path)
+            chapters = [project.chapter(i) for i in self.indices]
+            pending = [c for c in chapters if c is not None and c.translated and c.enabled]
+            total = len(pending)
+            changed = unchanged = errors = 0
+            for done, chapter in enumerate(pending):
+                if self._checkpoint():
+                    break
+                self.progress.emit(done, total, chapter.translated_title or chapter.title)
+                rows = rows_for_chapter(table, chapter.index + 1, chapter.translated)
+                try:
+                    body = fix_chapter(
+                        translator.complete, chapter.translated, rows, table.general_note,
+                        max_chunk_chars=translator.max_chunk_chars,
+                    ) if rows else chapter.translated
+                except Exception as exc:  # noqa: BLE001 — keep the batch going
+                    errors += 1
+                    message = str(exc) if isinstance(exc, NovelTransError) else repr(exc)
+                    self.chapter_error.emit(chapter.index, message)
+                    continue
+                # Stripped: a reply that only lost trailing spaces is not a fix, and saving
+                # it would mark the chapter as fixed for nothing.
+                if [q.strip() for q in paragraphs(body)] == [
+                    q.strip() for q in paragraphs(chapter.translated)
+                ]:
+                    unchanged += 1
+                    if chapter.qc_code == QC_ADDRESS_DRIFT:
+                        # Nothing left to fix here (no row covers it any more, or the model
+                        # found nothing): drop the verdict too, or the chapter would stay on
+                        # the failure list and every click would repeat this no-op.
+                        project.save_qc_verdict(chapter.index, "", "", "", "")
+                        self.chapter_done.emit(chapter.index)
+                    continue
+                project.save_address_fix(chapter.index, body)
+                if chapter.qc_code == QC_ADDRESS_DRIFT:
+                    # The verdict was about the text just replaced. Back to "unchecked" —
+                    # not "OK", since nothing re-judged it — so the next scan looks again
+                    # and the result view stops listing a chapter that was dealt with.
+                    project.save_qc_verdict(chapter.index, "", "", "", "")
+                changed += 1
+                self.chapter_done.emit(chapter.index)
+            self.progress.emit(total, total, "")
+            self.finished_ok.emit(changed, unchanged, errors)
         finally:
             project.close()
 

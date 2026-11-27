@@ -82,6 +82,10 @@ class TranslateTab(QWidget):
         # _cancel, _reset_buttons, has_running_workers, shutdown — has to account for it,
         # or quitting mid-rewrite abandons a running QThread.
         self._rewrite_worker: RewriteWorker | None = None
+        # Feature 113: QC `address_drift` chapters waiting for the translate run started
+        # alongside them to finish — the two batches write the same rows, so never overlap.
+        self._pending_address_fix: list[int] = []
+        self._address_fix_errors: dict[int, str] = {}  # chapter index -> why it failed
         self._qc_worker: QcScanWorker | None = None
         self._rewrite_dialog: RewriteDialog | None = None
         self._names_dialog = None  # NameGlossaryDialog; imported lazily where used
@@ -221,6 +225,12 @@ class TranslateTab(QWidget):
             "khi gửi cho AI, nên mọi chương đều viết giống nhau."
         )
         self.names_button.clicked.connect(self._open_names)
+        self.address_button = QPushButton("🗣 Xưng hô")
+        self.address_button.setToolTip(
+            "Bảng xưng hô giữa các nhân vật (tôi/cậu, tao/mày…). Gửi kèm khi dịch bằng AI, "
+            "nên cùng một cặp nhân vật xưng hô giống nhau ở mọi chương."
+        )
+        self.address_button.clicked.connect(self._open_address)
         self.rewrite_button = QPushButton("✍️ Viết lại văn phong")
         self.rewrite_button.setToolTip(
             "Dùng AI viết lại bản dịch cho đúng văn phong tiếng Việt (truyện convert dịch "
@@ -245,6 +255,7 @@ class TranslateTab(QWidget):
         bottom_row.addWidget(self.retranslate_button)
         bottom_row.addWidget(self.find_replace_button)
         bottom_row.addWidget(self.names_button)
+        bottom_row.addWidget(self.address_button)
         bottom_row.addWidget(self.rewrite_button)
         bottom_row.addWidget(self.qc_button)
         bottom_row.addWidget(self.cancel_button)
@@ -509,6 +520,9 @@ class TranslateTab(QWidget):
         approved_names: set | None = None,
         name_profile=None,
     ) -> None:
+        # A pronoun fix queued by the QC plan belongs to THIS run only. Taken here, before
+        # any early return, so it can never be left behind for an unrelated later run.
+        address_fix, self._pending_address_fix = self._pending_address_fix, []
         self._save_preview_edits()
         if self.project is None:
             QMessageBox.information(self, "Chưa chọn truyện", "Hãy tải một truyện ở Tab 1 trước.")
@@ -579,6 +593,13 @@ class TranslateTab(QWidget):
         self._worker.chapter_error.connect(lambda idx, _msg: self._on_chapter_updated(idx))
         self._worker.failed.connect(self._on_failed)
         self._worker.finished_ok.connect(self._on_finished)
+        if address_fix:
+            # Started from the THREAD's finished signal, not finished_ok: finished_ok is
+            # emitted while run() is still closing the project, so the worker still counts
+            # as busy then and the fix would be refused.
+            self._worker.address_fix_after = address_fix
+            self._worker.address_fix_ok = False
+            self._worker.finished.connect(self._on_translate_thread_done)
         track_worker(self._worker)  # keep the Mac awake while translating
         self._job = job_registry.register(
             self._worker, kind="Dịch", novel=self._job_novel()
@@ -817,6 +838,104 @@ class TranslateTab(QWidget):
         finally:
             self._names_dialog = None
 
+    def _open_address(self) -> None:
+        """Edit the novel's address table — see `address_table.py` (feature 113)."""
+        from noveltrans.gui.address_table_dialog import AddressTableDialog
+
+        if self.project is None:
+            QMessageBox.information(self, "Chưa chọn truyện", "Hãy tải một truyện ở Tab 1 trước.")
+            return
+        if self._busy():
+            self.status_label.setText(self._busy_message())
+            return
+        self._save_preview_edits()  # the fix pass reads `translated` — flush edits first
+        self._save_original_edits()
+        dialog = AddressTableDialog(
+            self.project, self, engine=self.engine_combo.currentData() or "",
+            config=self.config,
+        )
+        dialog.retranslate_requested.connect(self._retranslate_indices)
+        dialog.fix_requested.connect(self._start_address_fix)
+        dialog.exec()
+
+    def _start_qc_address_fix(self, indices: list) -> None:
+        """The pronoun fix for chapters picked in the QC result view: run by the engine the
+        user set up for QC (its AI check is what flagged them), not by the 🗣 Xưng hô
+        dialog's, which they may never have opened."""
+        self._start_address_fix(
+            indices, engine=self.config.qc_ai_engine, model=self.config.qc_ai_model
+        )
+
+    def _start_address_fix(
+        self, indices: list, engine: str | None = None, model: str | None = None
+    ) -> None:
+        """Fix the xưng hô of `indices` in place, by AI (feature 113, `AddressFixWorker`).
+
+        Held in the rewrite slot: it is the same kind of job — it rewrites `translated` —
+        so busy checks, Dừng, pause and shutdown all already cover it. `engine`/`model`
+        default to the 🗣 Xưng hô dialog's choice.
+        """
+        from noveltrans.gui.workers import AddressFixWorker
+
+        if self.project is None or not indices:
+            return
+        if self._busy():
+            self.status_label.setText(self._busy_message())
+            return
+        if engine is None:
+            engine, model = self.config.address_ai_engine, self.config.address_ai_model
+        worker = AddressFixWorker(
+            self.project.path, engine, list(indices),
+            api_key=self.config.claude_api_key,
+            model=model or "",
+            cli_command=self.config.cli_command_for(engine),
+            base_url=self.config.lmstudio_url if engine == "lmstudio" else "",
+        )
+        self._rewrite_worker = worker
+        self._progress_verb = f"Đang sửa xưng hô ({engine})"
+        self._close_find_replace()
+        for button in (self.translate_button, self.retranslate_button,
+                       self.find_replace_button, self.rewrite_button, self.qc_button):
+            button.setEnabled(False)
+        self.cancel_button.setEnabled(True)
+        self.picker.setEnabled(False)
+        self.progress.setMaximum(max(len(indices), 1))
+        self.progress.setValue(0)
+        worker.failed.connect(self._on_address_fix_failed)
+        worker.progress.connect(self._on_progress)
+        worker.chapter_done.connect(self._on_chapter_updated)
+        self._address_fix_errors = {}
+        worker.chapter_error.connect(self._on_address_fix_error)
+        worker.finished_ok.connect(self._on_address_fix_finished)
+        track_worker(worker)
+        self._job = job_registry.register(worker, kind="Sửa xưng hô", novel=self._job_novel())
+        self.pause_button.set_job(self._job.id if self._job else None)
+        worker.start()
+
+    def _on_address_fix_failed(self, message: str) -> None:
+        self._reset_buttons()
+        QMessageBox.warning(self, "Không sửa được xưng hô", message)
+
+    def _on_address_fix_error(self, idx: int, message: str) -> None:
+        self._address_fix_errors[idx] = message
+
+    def _on_address_fix_finished(self, changed: int, unchanged: int, errors: int) -> None:
+        self._reset_buttons()
+        message = f"Sửa xưng hô xong: {changed} chương đã sửa"
+        if unchanged:
+            message += f", {unchanged} chương không cần sửa"
+        if errors:
+            # The reason varies (the AI changed other words, a timeout, a network error),
+            # so name the chapters and the first reason rather than guess one for all.
+            failed = sorted(self._address_fix_errors)
+            numbers = ", ".join(str(i + 1) for i in failed[:10]) + ("…" if len(failed) > 10 else "")
+            message += f", {errors} chương lỗi nên giữ nguyên bản cũ"
+            if failed:
+                message += f" (chương {numbers} — {self._address_fix_errors[failed[0]]})"
+        self.status_label.setText(
+            message + ". Hoàn tác được: chuột phải chương → “↩︎ Hoàn tác sửa xưng hô”."
+        )
+
     def _retranslate_indices(self, indices: list) -> None:
         """Drop the translations of `indices` and queue exactly those for another pass.
 
@@ -980,10 +1099,17 @@ class TranslateTab(QWidget):
                 name_fix = set(plan.name_fix)
 
         skipped = set(plan.name_fix) - name_fix  # unapproved: left as they are, still marked
-        run = [i for i in indices if i not in skipped]
-        if not run:
+        # Pronoun drift is fixed in place by its own worker (feature 113), after any
+        # translate run below — never at the same time.
+        address_fix = list(plan.address_fix)
+        run = [i for i in indices if i not in skipped and i not in set(address_fix)]
+        if not run and not address_fix:
             self.status_label.setText("Không sửa cặp tên nào — các chương giữ nguyên.")
             return
+        if not run:
+            self._start_qc_address_fix(address_fix)
+            return
+        self._pending_address_fix = address_fix
         if plan.full:
             self.project.clear_translations(plan.full)
             self._on_replacements_applied(set(plan.full))
@@ -1184,6 +1310,18 @@ class TranslateTab(QWidget):
         for index in indices:
             self._undo_rewrite(index)
 
+    def _undo_address_fix_rows(self, indices: list[int]) -> None:
+        """Put back the body from before the pronoun fix (feature 113) — the fix alone."""
+        if self.project is None:
+            return
+        restored = sum(self.project.restore_address_fix(i) for i in indices)
+        if not restored:
+            return
+        self.model.set_chapters(self.project.chapters())
+        if self._preview_idx is not None:
+            self._load_preview(self.project.chapter(self._preview_idx))
+        self.status_label.setText(f"Đã hoàn tác sửa xưng hô {restored} chương.")
+
     def _menu_rows(self, index) -> list[int]:
         """The rows a right-click at `index` should act on.
 
@@ -1250,7 +1388,8 @@ class TranslateTab(QWidget):
         chapters = [c for c in (self.model.chapter_at(row) for row in rows) if c is not None]
         rewritable = [c.index for c in chapters if c.translated]
         undoable = [c.index for c in chapters if c.is_rewritten]
-        if not rewritable and not undoable:
+        fixed = [c.index for c in chapters if c.is_address_fixed]
+        if not rewritable and not undoable and not fixed:
             return  # nothing translated here — offering it would only mislead
 
         menu.addSeparator()
@@ -1274,6 +1413,17 @@ class TranslateTab(QWidget):
             action.setEnabled(not busy)
             action.triggered.connect(
                 lambda _=False, idxs=undoable: self._undo_rewrite_rows(idxs)
+            )
+        if fixed:
+            label = (
+                "↩︎ Hoàn tác sửa xưng hô"
+                if len(fixed) == 1
+                else f"↩︎ Hoàn tác sửa xưng hô {len(fixed)} chương"
+            )
+            action = menu.addAction(label)
+            action.setEnabled(not busy)
+            action.triggered.connect(
+                lambda _=False, idxs=fixed: self._undo_address_fix_rows(idxs)
             )
         if busy:
             menu.setToolTipsVisible(True)  # QMenu hides action tooltips unless asked
@@ -1300,7 +1450,7 @@ class TranslateTab(QWidget):
         """Which run is in the way. Naming it beats a generic "something is running":
         the two batches take very different amounts of time to finish."""
         if self._rewrite_worker is not None and self._rewrite_worker.isRunning():
-            return "Đang có phiên viết lại chạy — chờ xong rồi thử lại."
+            return "Đang có phiên viết lại / sửa xưng hô chạy — chờ xong rồi thử lại."
         if self._qc_worker is not None and self._qc_worker.isRunning():
             return "Đang kiểm tra chất lượng — chờ xong rồi thử lại."
         return "Đang có phiên dịch chạy — chờ xong rồi thử lại."
@@ -1353,6 +1503,24 @@ class TranslateTab(QWidget):
         if errors:
             message += f", {errors} lỗi (bấm 'Dịch tất cả' để thử lại)"
         self.status_label.setText(message + ".")
+        worker = self.sender()
+        if worker is not None and getattr(worker, "address_fix_after", None):
+            worker.address_fix_ok = True
+
+    def _on_translate_thread_done(self) -> None:
+        """Run the pronoun fix queued with this translate run, once its thread has ended.
+
+        Only after a run that reported finished_ok: a failure, or a run that returned with
+        no signal at all, drops it. A Dừng stops the whole request, not just its first half.
+        """
+        worker = self.sender()
+        pending = list(getattr(worker, "address_fix_after", None) or [])
+        if (
+            pending
+            and getattr(worker, "address_fix_ok", False)
+            and not getattr(worker, "_cancelled", False)
+        ):
+            self._start_qc_address_fix(pending)
 
     def _reset_buttons(self) -> None:
         self.translate_button.setEnabled(True)

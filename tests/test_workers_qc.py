@@ -477,8 +477,11 @@ class TestSplitRetranslation:
             replace(title_chapter, index=3, qc_code="name_drift"),
             replace(title_chapter, index=4, qc_code="name_variant", translated=""),
             replace(title_chapter, index=5, translated=""),
+            # feature 113: pronouns only → fixed in place; nothing to keep → full
+            replace(title_chapter, index=6, qc_code="address_drift"),
+            replace(title_chapter, index=7, qc_code="address_drift", translated=""),
         ]
-        assert split_retranslation(chapters) == ([0], [1], [2, 3, 4, 5])
+        assert split_retranslation(chapters) == ([0], [1], [2, 3, 4, 5, 7], [6])
 
 
 READING = "Doãn Chí Bình"
