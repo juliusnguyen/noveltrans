@@ -664,6 +664,28 @@ class AppConfig:
     def rewrite_ai_model(self, value: str) -> None:
         self._s.setValue("rewrite_ai_model", value.strip())
 
+    @property
+    def address_ai_engine(self) -> str:
+        """LLM engine the Xưng hô dialog uses to draft a table and fix chapters (113).
+
+        Separate from the translator for the same reason as `rewrite_ai_engine`: the
+        translate combo may hold Google, which can do neither.
+        """
+        return str(self._s.value("address_ai_engine", self._llm_engine_default))
+
+    @address_ai_engine.setter
+    def address_ai_engine(self, value: str) -> None:
+        self._s.setValue("address_ai_engine", value)
+
+    @property
+    def address_ai_model(self) -> str:
+        """Optional model override for the Xưng hô passes ("" = engine default)."""
+        return str(self._s.value("address_ai_model", ""))
+
+    @address_ai_model.setter
+    def address_ai_model(self, value: str) -> None:
+        self._s.setValue("address_ai_model", value.strip())
+
     # ---- translation quality control (feature 084) ------------------------
 
     @property
@@ -695,6 +717,17 @@ class AppConfig:
     @qc_use_llm_judge.setter
     def qc_use_llm_judge(self, value: bool) -> None:
         self._s.setValue("qc_use_llm_judge", bool(value))
+
+    @property
+    def qc_check_address(self) -> bool:
+        """Also ask the QC judge engine whether dialogue follows the novel's address table
+        (feature 113). Off by default: one extra engine call per chapter that has table
+        characters in it, and only meaningful once the user has written a table."""
+        return self._s.value("qc_check_address", False, type=bool)
+
+    @qc_check_address.setter
+    def qc_check_address(self, value: bool) -> None:
+        self._s.setValue("qc_check_address", bool(value))
 
     @property
     def qc_ai_engine(self) -> str:

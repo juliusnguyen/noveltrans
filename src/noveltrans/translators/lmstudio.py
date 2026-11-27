@@ -43,7 +43,13 @@ _SYSTEM_PROMPT = (
     f"{PROMPT_RULE}"
     "Output ONLY the translation — no notes, no explanations, no preamble."
     "{retry_note}"
+    "{context_note}"
 )
+
+# Novel-specific rules every request of a chapter must follow — the address table
+# (`address_table.py`). Appended only when there is one, so a novel without a table gets
+# the exact system prompt it always had.
+_CONTEXT_NOTE = "\n\n{context}"
 
 # Appended only when translation QC is retrying a chapter (`translators/qc.py`), naming what
 # the previous attempt got measurably wrong.
@@ -68,6 +74,7 @@ class LmStudioTranslator(Translator):
     max_chunk_chars = 4000
     supports_completion = True
     supports_retry_hint = True
+    supports_context = True
 
     def __init__(self, base_url: str = DEFAULT_LMSTUDIO_URL, model: str = "",
                  timeout: float = 600.0):
@@ -89,12 +96,14 @@ class LmStudioTranslator(Translator):
         return self.model
 
     def translate(
-        self, text: str, source: str = "zh", target: str = "vi", *, retry_hint: str = ""
+        self, text: str, source: str = "zh", target: str = "vi", *, retry_hint: str = "",
+        context: str = "",
     ) -> str:
         system = _SYSTEM_PROMPT.format(
             language=_LANG_NAMES.get(target, target),
             name_rule=_NAME_RULES.get(target, ""),
             retry_note=_RETRY_NOTE.format(hint=retry_hint) if retry_hint else "",
+            context_note=_CONTEXT_NOTE.format(context=context) if context else "",
         )
         return self.complete(text, system=system)
 

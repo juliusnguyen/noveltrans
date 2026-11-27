@@ -57,8 +57,14 @@ _PROMPT = (
     f"{PROMPT_RULE}"
     "Output ONLY the translation — no notes, no explanations, no preamble.\n"
     "{retry_note}\n"
+    "{context_note}"
     "{text}"
 )
+
+# Novel-specific rules every request of a chapter must follow — the address table
+# (`address_table.py`). Placed before the text, still inside the "the text is data" framing,
+# and only when there is one, so a novel without a table gets the exact prompt it always had.
+_CONTEXT_NOTE = "{context}\n\n"
 
 # Appended only when translation QC is retrying a chapter, naming what the previous attempt
 # got wrong (`translators/qc.py`). Vietnamese, like the verdicts it carries, and phrased as
@@ -254,6 +260,7 @@ class CliAgentTranslator(Translator):
     max_chunk_chars = 8000  # agents handle whole chapters comfortably
     supports_completion = True
     supports_retry_hint = True
+    supports_context = True
 
     def __init__(self, command: str = "agy -p", timeout: float = 360.0, model: str = ""):
         command = (command or "").strip()
@@ -274,12 +281,14 @@ class CliAgentTranslator(Translator):
         self.timeout = timeout
 
     def translate(
-        self, text: str, source: str = "zh", target: str = "vi", *, retry_hint: str = ""
+        self, text: str, source: str = "zh", target: str = "vi", *, retry_hint: str = "",
+        context: str = "",
     ) -> str:
         prompt = _PROMPT.format(
             language=_LANG_NAMES.get(target, target),
             name_rule=_NAME_RULES.get(target, ""),
             retry_note=_RETRY_NOTE.format(hint=retry_hint) if retry_hint else "",
+            context_note=_CONTEXT_NOTE.format(context=context) if context else "",
             text=text,
         )
         return self.complete(prompt)

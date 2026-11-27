@@ -44,7 +44,11 @@ from noveltrans.config import (
     AppConfig,
     translator_labels,
 )
-from noveltrans.gui.workers import chapters_to_qc, split_retranslation
+from noveltrans.gui.workers import (
+    chapters_to_qc,
+    needs_address_check_only,
+    split_retranslation,
+)
 from noveltrans.storage import NovelProject
 from noveltrans.translators.qc import QC_LABELS
 
@@ -143,6 +147,26 @@ class QcDialog(QDialog):
         )
         self.judge_check.toggled.connect(self._on_judge_toggled)
         judge_layout.addWidget(self.judge_check)
+
+        # Feature 113 — only offered when the novel has an address table to check against.
+        from noveltrans.address_table import read_address
+
+        self._address_table = read_address(project.path)
+        self._has_address_table = not self._address_table.empty
+        self.address_check = QCheckBox(
+            "Dùng AI kiểm tra xưng hô theo bảng 🗣 Xưng hô (tốn thêm 1 lượt/chương có nhân "
+            "vật trong bảng)"
+        )
+        self.address_check.setChecked(config.qc_check_address and self._has_address_table)
+        self.address_check.setEnabled(self._has_address_table)
+        self.address_check.setToolTip(
+            "Chỉ khi quét kiểm tra: AI đọc lời thoại và báo chương nào có cặp nhân vật xưng "
+            "hô khác bảng. Chương lỗi này được sửa tại chỗ (chỉ đổi đại từ), không dịch lại."
+            if self._has_address_table
+            else "Truyện này chưa có bảng xưng hô — tạo ở nút 🗣 Xưng hô trong tab Dịch."
+        )
+        self.address_check.toggled.connect(self._on_judge_toggled)
+        judge_layout.addWidget(self.address_check)
         layout.addWidget(judge_box)
 
         # --- the re-translate chain
@@ -254,6 +278,7 @@ class QcDialog(QDialog):
             self.estimate_label.setText(self._blocked)
             for widget in (
                 self.auto_check, self.engine_combo, self.model_edit, self.judge_check,
+                self.address_check,
                 self.chain_table, self.start_spin, self.end_spin, self.scope_pending,
                 self.scope_all, self.start_button, self.dry_run_button, self.results_button,
                 self.save_button,  # nothing above can be edited, so there is nothing to save
@@ -339,15 +364,20 @@ class QcDialog(QDialog):
     # ------------------------------------------------------------------ state
 
     def _eligible(self) -> list:
+        # The same table the worker will read, so the count is what the scan then does —
+        # including passed chapters the pronoun check has not judged against it yet.
         return chapters_to_qc(
             self.project,
             self._target_lang,
             start_idx=self.start_spin.value() - 1,
             end_idx=self.end_spin.value() - 1,
             force=self.scope_all.isChecked(),
+            address=self._address_table if self.address_check.isChecked() else None,
         )
 
-    def _on_judge_toggled(self, on: bool) -> None:
+    def _on_judge_toggled(self, _on: bool = False) -> None:
+        # The engine box serves both AI checks, so it stays usable while either is on.
+        on = self.judge_check.isChecked() or self.address_check.isChecked()
         self.engine_combo.setEnabled(on)
         self.model_edit.setEnabled(on)
         self._refresh_estimate()
@@ -357,6 +387,7 @@ class QcDialog(QDialog):
         return (
             self.auto_check.isChecked(),
             self.judge_check.isChecked(),
+            self.address_check.isChecked(),
             self.engine_combo.currentData(),
             self.model_edit.text().strip(),
             tuple(self._chain()),
@@ -421,6 +452,8 @@ class QcDialog(QDialog):
     def _remember_choices(self) -> None:
         self.config.qc_enabled = self.auto_check.isChecked()
         self.config.qc_use_llm_judge = self.judge_check.isChecked()
+        if self._has_address_table:  # a disabled box says nothing about the user's choice
+            self.config.qc_check_address = self.address_check.isChecked()
         self.config.qc_ai_engine = self.engine_combo.currentData()
         self.config.qc_ai_model = self.model_edit.text()
         self.config.qc_engine_chain = self._chain()
@@ -441,15 +474,24 @@ class QcDialog(QDialog):
             f"{counts['qc_failed']} lỗi, {counts['qc_unchecked']} chưa kiểm tra. "
             f"Lượt này: <b>{len(eligible)} chương</b>."
         ]
-        if eligible and self.judge_check.isChecked():
-            minutes = len(eligible) * 0.4  # one short agent call per chapter
+        # Chapters back only for the pronoun check skip the style judge (see the worker).
+        judged = eligible
+        if self.address_check.isChecked() and not self.scope_all.isChecked():
+            judged = [c for c in eligible if not needs_address_check_only(c)]
+        if judged and self.judge_check.isChecked():
+            minutes = len(judged) * 0.4  # one short agent call per chapter
             duration = f"{minutes / 60:.1f} giờ" if minutes >= 60 else f"{minutes:.0f} phút"
             parts.append(
                 f"Mỗi chương tốn <b>một lượt gọi AI</b> để chấm văn phong — khoảng "
                 f"{duration}. Tắt mục \"AI chấm văn phong\" thì miễn phí và gần như tức thì."
             )
-        elif eligible:
+        elif eligible and not self.address_check.isChecked():
             parts.append("Chỉ kiểm tra nhanh — không gọi AI, không tốn quota.")
+        if eligible and self.address_check.isChecked():
+            parts.append(
+                "Kiểm tra xưng hô: thêm <b>một lượt gọi AI</b> cho mỗi chương có nhân vật "
+                "trong bảng xưng hô."
+            )
         self.estimate_label.setText("<br>".join(parts))
         self.start_button.setEnabled(bool(eligible))
         self.dry_run_button.setEnabled(bool(eligible))
@@ -601,6 +643,11 @@ class QcResultDialog(QDialog):
             parts.append(
                 f"<b>{len(plan.name_fix)} chương chỉ sửa tên riêng</b> — thay tại chỗ, "
                 "không dịch lại"
+            )
+        if plan.address_fix:
+            parts.append(
+                f"<b>{len(plan.address_fix)} chương chỉ sửa xưng hô</b> — AI đổi đại từ tại "
+                "chỗ theo bảng, giữ nguyên bản dịch"
             )
         if plan.full:
             parts.append(

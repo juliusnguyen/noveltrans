@@ -66,6 +66,9 @@ CREATE TABLE IF NOT EXISTS chapters (
   -- the translation as it stood before a style rewrite; non-empty == already rewritten
   translated_raw       TEXT NOT NULL DEFAULT '',
   translated_title_raw TEXT NOT NULL DEFAULT '',
+  -- the body as it stood before a pronoun fix (feature 113); '' = never fixed. Separate
+  -- from translated_raw so a fix is not mistaken for a style rewrite, and undoes alone.
+  translated_fix_raw   TEXT NOT NULL DEFAULT '',
   status           TEXT NOT NULL DEFAULT 'pending',
   error            TEXT NOT NULL DEFAULT '',
   updated_at       TEXT NOT NULL DEFAULT '',
@@ -88,6 +91,8 @@ CREATE TABLE IF NOT EXISTS chapters (
   -- fingerprint of the (title, text) that was judged; a later edit makes the verdict stale
   qc_text_hash     TEXT NOT NULL DEFAULT '',
   qc_attempts      INTEGER NOT NULL DEFAULT 0,
+  -- which address table (and text) the AI pronoun check last judged; '' = never
+  qc_address_hash  TEXT NOT NULL DEFAULT '',
   -- 0 once the user disables this chapter; a disabled chapter is skipped everywhere
   -- (download/translate/audio/video) until re-enabled. Default 1 so every row already
   -- in the table, and every row inserted before this existed, reads as enabled.
@@ -129,6 +134,7 @@ def _row_to_chapter(row: sqlite3.Row) -> Chapter:
         translate_seconds=row["translate_seconds"],
         translated_raw=row["translated_raw"],
         translated_title_raw=row["translated_title_raw"],
+        translated_fix_raw=row["translated_fix_raw"],
         status=row["status"],
         error=row["error"],
         updated_at=row["updated_at"],
@@ -145,6 +151,7 @@ def _row_to_chapter(row: sqlite3.Row) -> Chapter:
         qc_reason=row["qc_reason"],
         qc_text_hash=row["qc_text_hash"],
         qc_attempts=row["qc_attempts"],
+        qc_address_hash=row["qc_address_hash"],
         enabled=bool(row["enabled"]),
         toc_index=row["toc_index"],
     )
@@ -184,6 +191,8 @@ class NovelProject:
             # pre-rewrite copy — empty is exactly right
             "translated_raw": "TEXT NOT NULL DEFAULT ''",
             "translated_title_raw": "TEXT NOT NULL DEFAULT ''",
+            # no pronoun fix predates feature 113
+            "translated_fix_raw": "TEXT NOT NULL DEFAULT ''",
             "audio_path": "TEXT NOT NULL DEFAULT ''",
             "audio_voice": "TEXT NOT NULL DEFAULT ''",
             # existing audio predates the original/translation choice → it's translated
@@ -204,6 +213,8 @@ class NovelProject:
             "qc_reason": "TEXT NOT NULL DEFAULT ''",
             "qc_text_hash": "TEXT NOT NULL DEFAULT ''",
             "qc_attempts": "INTEGER NOT NULL DEFAULT 0",
+            # no verdict predates the AI pronoun check, so none was checked against a table
+            "qc_address_hash": "TEXT NOT NULL DEFAULT ''",
             # every existing chapter predates this feature, so none of them was ever
             # deliberately disabled — default 1 (enabled) keeps an upgrade silent
             "enabled": "INTEGER NOT NULL DEFAULT 1",
@@ -818,7 +829,9 @@ class NovelProject:
         with self._db:
             self._db.execute(
                 "UPDATE chapters SET translated = ?, translated_title = ?, target_lang = ?,"
-                " translator = ?, translate_seconds = ?, status = ?, error = '', updated_at = ?"
+                " translator = ?, translate_seconds = ?, status = ?, error = '', updated_at = ?,"
+                # the pronoun-fix backup belongs to the translation being replaced
+                " translated_fix_raw = ''"
                 " WHERE idx = ?",
                 (text, title, lang, translator, seconds, STATUS_TRANSLATED, _now(), idx),
             )
@@ -861,7 +874,7 @@ class NovelProject:
 
     def save_qc_verdict(
         self, idx: int, status: str, code: str, reason: str, text_hash: str,
-        attempts: int = 0,
+        attempts: int = 0, *, address_hash: str | None = None,
     ) -> None:
         """Record a quality verdict. Touches ONLY the four `qc_*` columns.
 
@@ -869,13 +882,20 @@ class NovelProject:
         and forms an opinion about it, and an opinion must not be able to damage the text it
         is about. `mark_qc_failed` is the separate, deliberate call for the one path that
         does want a failure to reach the chapter's error column.
+
+        `address_hash` records what the AI pronoun check judged against (feature 113):
+        None leaves it, "" clears it.
         """
+        sql = (
+            "UPDATE chapters SET qc_status = ?, qc_code = ?, qc_reason = ?,"
+            " qc_text_hash = ?, qc_attempts = ?"
+        )
+        params: list = [status, code, reason, text_hash, int(attempts)]
+        if address_hash is not None:
+            sql += ", qc_address_hash = ?"
+            params.append(address_hash)
         with self._db:
-            self._db.execute(
-                "UPDATE chapters SET qc_status = ?, qc_code = ?, qc_reason = ?,"
-                " qc_text_hash = ?, qc_attempts = ? WHERE idx = ?",
-                (status, code, reason, text_hash, int(attempts), idx),
-            )
+            self._db.execute(sql + " WHERE idx = ?", (*params, idx))
 
     def mark_qc_failed(
         self, idx: int, code: str, reason: str, text_hash: str, attempts: int = 0
@@ -970,8 +990,50 @@ class NovelProject:
             "  translated_title = CASE WHEN translated_title_raw != ''"
             "                          THEN translated_title_raw"
             "                          ELSE translated_title END,"
-            "  translated_raw = '', translated_title_raw = '', updated_at = ?"
+            "  translated_raw = '', translated_title_raw = '',"
+            # a pronoun-fix backup taken after the rewrite would bring the rewrite back
+            "  translated_fix_raw = '', updated_at = ?"
             " WHERE translated_raw != ''"
+        )
+        params: list = [_now()]
+        if idx is not None:
+            sql += " AND idx = ?"
+            params.append(idx)
+        with self._db:
+            cursor = self._db.execute(sql, params)
+        return cursor.rowcount
+
+    def save_address_fix(self, idx: int, text: str) -> None:
+        """Replace a chapter's body with its pronoun-fixed version (feature 113).
+
+        Its own backup, captured once like `save_rewrite`'s, and NOT `translated_raw`: that
+        column is the "style-rewritten" flag, so reusing it made a fixed chapter look
+        restyled — skipped by every later rewrite run, and undone together with an
+        earlier rewrite. The title is never touched: a fix only changes the body.
+        """
+        with self._db:
+            self._db.execute(
+                """
+                UPDATE chapters SET
+                    translated_fix_raw = CASE WHEN translated_fix_raw = '' THEN translated
+                                              ELSE translated_fix_raw END,
+                    translated = ?, status = ?, error = '', updated_at = ?
+                WHERE idx = ?
+                """,
+                (text, STATUS_TRANSLATED, _now(), idx),
+            )
+
+    def restore_address_fix(self, idx: int | None = None) -> int:
+        """Undo pronoun fixes, putting the body from before the first fix back.
+
+        `idx=None` restores the whole novel. Returns how many chapters were restored. Like
+        `restore_translation`, edits made after the fix are lost; a style rewrite made
+        before it is kept.
+        """
+        sql = (
+            "UPDATE chapters SET translated = translated_fix_raw,"
+            "  translated_fix_raw = '', updated_at = ?"
+            " WHERE translated_fix_raw != ''"
         )
         params: list = [_now()]
         if idx is not None:
@@ -1419,12 +1481,12 @@ class NovelProject:
             # the backup belongs to the translation being dropped; keeping it would
             # leave every chapter flagged as rewritten, with an undo that restores
             # text from a translation that no longer exists
-            "  translated_raw = '', translated_title_raw = '',"
+            "  translated_raw = '', translated_title_raw = '', translated_fix_raw = '',"
             # a verdict about a translation that no longer exists is worse than no verdict:
             # it would keep the chapter red, and the result view would offer to re-translate
             # a chapter that is already back in the queue
             "  qc_status = '', qc_code = '', qc_reason = '', qc_text_hash = '',"
-            "  qc_attempts = 0,"
+            "  qc_attempts = 0, qc_address_hash = '',"
             "  status = CASE WHEN content = '' THEN ? ELSE ? END, updated_at = ?"
         )
         params: tuple = (STATUS_PENDING, STATUS_DOWNLOADED, _now())

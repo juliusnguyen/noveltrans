@@ -63,6 +63,12 @@ class Translator(ABC):
     # never passed when empty, so an engine that does not set this — Google, or any
     # subclass written before QC existed — is called exactly as it always was.
     supports_retry_hint: bool = False
+    # LLM engines also accept a `context` on `translate`: novel-specific rules that must
+    # hold in EVERY request of a chapter — today the address table (`address_table.py`),
+    # so a pair of characters keeps the same xưng hô across chunks and chapters. Same
+    # opt-in contract as `retry_hint`: never passed when empty, never passed to an engine
+    # that does not set this (Google has no prompt to put it in).
+    supports_context: bool = False
 
     @abstractmethod
     def translate(self, text: str, source: str = "zh", target: str = "vi") -> str:
@@ -76,7 +82,7 @@ class Translator(ABC):
         )
 
     def _translate_with_retry(
-        self, text: str, source: str, target: str, retry_hint: str = ""
+        self, text: str, source: str, target: str, retry_hint: str = "", context: str = ""
     ) -> str:
         last_error: Exception | None = None
         best: str | None = None  # cleanest dirty attempt (fewest leftover CJK chars)
@@ -86,6 +92,8 @@ class Translator(ABC):
         hint_kwarg = (
             {"retry_hint": retry_hint} if retry_hint and self.supports_retry_hint else {}
         )
+        if context and self.supports_context:
+            hint_kwarg["context"] = context
         for attempt in range(self.max_retries):
             try:
                 result = self.translate(text, source=source, target=target, **hint_kwarg)
@@ -173,18 +181,20 @@ class Translator(ABC):
 
     def translate_chapter(
         self, title: str, content: str, source: str = "zh", target: str = "vi",
-        *, retry_hint: str = "",
+        *, retry_hint: str = "", context: str = "",
     ) -> tuple[str, str]:
         """Translate a chapter title + content. Returns (title, content).
 
         `retry_hint` names what a previous attempt got wrong (see `supports_retry_hint`).
         It reaches the BODY only: `_safe_title` already has its own repair path, and a hint
-        about the body's language would be noise on a heading like `第127章`.
+        about the body's language would be noise on a heading like `第127章`. `context`
+        (see `supports_context`) follows the same route, into every body chunk: a title
+        has no dialogue for an address table to govern.
         """
         translated_title = self.translate_title(title, source, target)
         chunks = split_paragraph_chunks(content, self.max_chunk_chars)
         translated_chunks = [
-            self._translate_with_retry(c, source, target, retry_hint) for c in chunks
+            self._translate_with_retry(c, source, target, retry_hint, context) for c in chunks
         ]
         # Source-site watermarks are stripped HERE, not inside `_translate_with_retry`:
         # that loop scores each attempt by `cjk_count(result)` to pick the cleanest one,

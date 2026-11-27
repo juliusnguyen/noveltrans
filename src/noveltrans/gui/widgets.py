@@ -913,6 +913,8 @@ class ChapterTableModel(QAbstractTableModel):
                 marks = ""
                 if chapter.is_rewritten:
                     marks += " ✍️"
+                if chapter.is_address_fixed:
+                    marks += " 🗣"
                 if chapter.qc_failed:
                     marks += " ⚠️"
                 elif chapter.qc_ok:
@@ -928,6 +930,8 @@ class ChapterTableModel(QAbstractTableModel):
             hints = []
             if chapter.is_rewritten:
                 hints.append("Đã viết lại văn phong — chuột phải để hoàn tác")
+            if chapter.is_address_fixed:
+                hints.append("Đã sửa xưng hô theo bảng — chuột phải để hoàn tác")
             if chapter.qc_failed:
                 hints.append(f"Kiểm tra chất lượng: {chapter.qc_reason}")
             elif chapter.qc_ok:
