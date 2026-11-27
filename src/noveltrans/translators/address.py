@@ -176,7 +176,9 @@ def dialogue_excerpt(text: str, limit: int = EXTRACT_CHARS_PER_CHAPTER) -> str:
     return "\n\n".join(out)
 
 
-def build_extract_prompt(text: str, names: list[str], *, from_source: bool = False) -> str:
+def build_extract_prompt(
+    text: str, names: list[str], *, from_source: bool = False, source_lang: str = "zh"
+) -> str:
     """Ask for every (speaker → listener) usage in one chapter, one line each."""
     # Only the names in this excerpt, most frequent first: a cut of the whole glossary
     # (sorted alphabetically) could leave out the very characters who are talking.
@@ -185,14 +187,22 @@ def build_extract_prompt(text: str, names: list[str], *, from_source: bool = Fal
         key=lambda n: -text.count(n),
     )
     known = ", ".join(present[:80])
-    what = (
-        "Đoạn truyện tiếng Trung dưới đây (tên nhân vật đã được viết sẵn bằng Hán-Việt). "
-        "Với mỗi cặp nhân vật nói chuyện với nhau, hãy ĐỀ XUẤT cách xưng hô tiếng Việt phù "
-        "hợp với quan hệ của họ (tuổi tác, thân sơ, địa vị, bối cảnh truyện)."
-        if from_source
-        else "Đoạn truyện tiếng Việt dưới đây là bản dịch từ tiếng Trung. Hãy liệt kê cách "
-        "các nhân vật XƯNG HÔ với nhau đúng như trong đoạn này."
-    )
+    if from_source:
+        source_desc = (
+            "Đoạn truyện tiếng Trung dưới đây (tên nhân vật đã được viết sẵn bằng Hán-Việt). "
+            if source_lang == "zh"
+            else "Đoạn truyện bản gốc dưới đây (tên nhân vật đã được giữ sẵn). "
+        )
+        what = (
+            f"{source_desc}"
+            "Hãy đọc kỹ ngữ cảnh bản gốc (tuổi tác, vai vế, thân sơ, địa vị, sắc thái câu thoại) "
+            "rồi ĐỀ XUẤT cách xưng hô tiếng Việt phù hợp nhất cho từng cặp nhân vật."
+        )
+    else:
+        what = (
+            "Đoạn truyện tiếng Việt dưới đây là bản dịch từ tiếng Trung. Hãy liệt kê cách "
+            "các nhân vật XƯNG HÔ với nhau đúng như trong đoạn này."
+        )
     return (
         f"{what}\n\n"
         "Trả lời mỗi dòng một cặp, đúng định dạng (5 cột, ngăn bằng dấu |):\n"
@@ -338,6 +348,57 @@ def aggregate(
     proposed.sort(key=lambda e: -weight[(e.speaker, e.listener)])
     conflicts.sort(key=lambda c: -weight[(c.speaker, c.listener)])
     return proposed, conflicts
+
+
+def should_extract_chapter(
+    text: str,
+    known_names: list[str] | tuple[str, ...],
+    existing: list[AddressEntry] | tuple[AddressEntry, ...],
+) -> bool:
+    """Whether `text` could introduce a character not yet present anywhere in `existing`.
+
+    Skips pure scenery chapters and chapters where every known character appearing in
+    `text` already has at least one row (as speaker or listener) in `existing`, so later
+    chapters with the same recurring cast cost zero extra extraction calls.
+    """
+    if not (text or "").strip():
+        return False
+    norm_text = nfc(text)
+    present = [n for n in dict.fromkeys(known_names) if n and nfc(n) in norm_text]
+    has_dialogue = any(is_dialogue(p) for p in paragraphs(text))
+    if not has_dialogue and not present:
+        return False
+    if not present:
+        return not known_names and has_dialogue
+    covered = {nfc(e.speaker) for e in existing} | {nfc(e.listener) for e in existing}
+    return any(nfc(name) not in covered for name in present)
+
+
+def extract_chapter_address(
+    send: Callable[[str], str],
+    text: str,
+    names: list[str] | tuple[str, ...],
+    *,
+    from_source: bool = True,
+    source_lang: str = "zh",
+    chapter_number: int = 1,
+    existing: list[AddressEntry] | tuple[AddressEntry, ...] = (),
+) -> list[AddressEntry]:
+    """Extract missing address pairs from one chapter using `send`, returning new entries."""
+    if not should_extract_chapter(text, names, existing):
+        return []
+    excerpt = dialogue_excerpt(text)
+    if not excerpt.strip():
+        return []
+    prompt = build_extract_prompt(
+        excerpt, list(names), from_source=from_source, source_lang=source_lang
+    )
+    findings = parse_extract_reply(send(prompt))
+    if not findings:
+        return []
+    proposed, _ = aggregate({chapter_number: findings}, existing=existing)
+    have = {(nfc(e.speaker), nfc(e.listener)) for e in existing}
+    return [e for e in proposed if (nfc(e.speaker), nfc(e.listener)) not in have]
 
 
 # --------------------------------------------------------------------------- fix

@@ -25,6 +25,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QCompleter,
     QDialog,
@@ -122,12 +123,13 @@ class AddressTableDialog(QDialog):
 
         intro = QLabel(
             "Mỗi dòng là cách <b>một nhân vật nói với một nhân vật khác</b>. Khi dịch bằng AI, "
-            "các dòng có nhân vật xuất hiện trong chương sẽ được gửi kèm, nên cùng một cặp "
-            "nhân vật xưng hô giống nhau ở mọi chương. A nói với B và B nói với A là hai dòng "
+            "hệ thống có thể tự động dò các cặp mới từ bản gốc để cập nhật vào bảng (không ghi "
+            "đè dòng bạn đã lưu), rồi gửi kèm các dòng có nhân vật xuất hiện trong chương nên "
+            "cùng một cặp xưng hô giống nhau ở mọi chương. A nói với B và B nói với A là hai dòng "
             "riêng. Quan hệ đổi giữa truyện (người lạ → bạn bè) thì thêm dòng mới với "
             "“Từ chương” lớn hơn. Người nói là “(người kể)” = cách lời kể gọi nhân vật đó "
             "(hắn, anh ta, nàng…), chỉ cần cột “Gọi”. Tên phải viết đúng như trong "
-            "👤 Tên nhân vật. Chỉ áp dụng cho các chương dịch sau khi lưu."
+            "👤 Tên nhân vật."
         )
         intro.setWordWrap(True)
         self.engine_warning = QLabel(
@@ -160,7 +162,8 @@ class AddressTableDialog(QDialog):
 
         # --- AI used for the draft scan and the in-place fix (not for translation)
         self.ai_box = QGroupBox("AI dùng để dò bảng và sửa xưng hô")
-        ai_row = QHBoxLayout(self.ai_box)
+        ai_layout = QVBoxLayout(self.ai_box)
+        ai_row = QHBoxLayout()
         self.ai_engine = QComboBox()
         self.ai_model = QLineEdit()
         self.ai_model.setPlaceholderText("model mặc định của engine")
@@ -183,6 +186,25 @@ class AddressTableDialog(QDialog):
         ai_row.addWidget(QLabel("Số chương:"))
         ai_row.addWidget(self.sample_spin)
         ai_row.addWidget(self.scan_button)
+        ai_layout.addLayout(ai_row)
+
+        options_row = QHBoxLayout()
+        self.auto_detect_check = QCheckBox("Tự động dò từ bản gốc khi dịch từng chương")
+        self.auto_detect_check.setToolTip(
+            "Khi dịch bằng AI, chỉ tự dò thêm khi chương xuất hiện nhân vật hoàn toàn chưa "
+            "có dòng nào trong bảng, rồi cập nhật vào bảng (không ghi đè dòng đã có)."
+        )
+        self.prefer_source_check = QCheckBox("Dò từ bản gốc (kể cả chương đã dịch)")
+        self.prefer_source_check.setToolTip(
+            "Khi bấm Dò, luôn đọc bản gốc để nắm rõ ngữ nghĩa quan hệ nhân vật rồi đề xuất "
+            "xưng hô tiếng Việt, thay vì đọc bản đã dịch."
+        )
+        self.prefer_source_check.toggled.connect(self._update_scan_button_label)
+        options_row.addWidget(self.auto_detect_check)
+        options_row.addWidget(self.prefer_source_check)
+        options_row.addStretch(1)
+        ai_layout.addLayout(options_row)
+
         self.scan_status = QLabel("")
         self.scan_status.setWordWrap(True)
         if config is not None:
@@ -194,6 +216,10 @@ class AddressTableDialog(QDialog):
             index = self.ai_engine.findData(config.address_ai_engine)
             self.ai_engine.setCurrentIndex(index if index >= 0 else 0)
             self.ai_model.setText(config.address_ai_model)
+            self.auto_detect_check.setChecked(config.auto_detect_address)
+            self.auto_detect_check.toggled.connect(
+                lambda checked: setattr(config, "auto_detect_address", checked)
+            )
             # One model string shared across engines — reset it on switch, exactly like
             # the rewrite dialog, so a Claude model never reaches Codex.
             self.ai_engine.currentIndexChanged.connect(
@@ -478,11 +504,20 @@ class AddressTableDialog(QDialog):
         """(engine, model) picked for the scan and the fix."""
         return self.ai_engine.currentData() or "", self.ai_model.text().strip()
 
+    def _update_scan_button_label(self) -> None:
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            return
+        self.scan_button.setText(
+            "🔎 Dò từ bản gốc" if self.prefer_source_check.isChecked() else "🔎 Dò từ bản dịch"
+        )
+
     def _remember_ai_choice(self) -> None:
-        if self.config is not None and self.ai_engine.count():
-            engine, model = self.ai_choice()
-            self.config.address_ai_engine = engine
-            self.config.address_ai_model = model
+        if self.config is not None:
+            if self.ai_engine.count():
+                engine, model = self.ai_choice()
+                self.config.address_ai_engine = engine
+                self.config.address_ai_model = model
+            self.config.auto_detect_address = self.auto_detect_check.isChecked()
 
     # ------------------------------------------------------------------ scan
 
@@ -502,6 +537,7 @@ class AddressTableDialog(QDialog):
             cli_command=self.config.cli_command_for(engine),
             base_url=self.config.lmstudio_url if engine == "lmstudio" else "",
             sample_size=self.sample_spin.value(), parent=self, existing=self._rows(),
+            prefer_source=self.prefer_source_check.isChecked(),
         )
         worker.progress.connect(
             lambda done, total, title: self.scan_status.setText(
@@ -511,7 +547,7 @@ class AddressTableDialog(QDialog):
         worker.scanned.connect(self.apply_scan)
         worker.stopped.connect(self._on_scan_stopped)
         worker.failed.connect(self._on_scan_failed)
-        worker.finished.connect(lambda: self.scan_button.setText("🔎 Dò từ bản dịch"))
+        worker.finished.connect(self._update_scan_button_label)
         self._scan_worker = worker
         self.scan_button.setText("■ Dừng dò")
         worker.start()
