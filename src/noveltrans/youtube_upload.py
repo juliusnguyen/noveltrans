@@ -683,21 +683,26 @@ def _as_naive_local(value: datetime) -> datetime:
 def members_schedule_anchor(now: datetime, last: datetime | None) -> datetime:
     """When the first Members→public part of a new batch goes public.
 
-    `last` is the latest members switch already recorded on the channel. Three days after
-    it, so the chain continues. If there is none, or it is more than PUBLIC_SWITCH_DAYS in
-    the past, the chain has lapsed: start at the latest PUBLIC_SWITCH_HOUR:00 that is still
-    within the next PUBLIC_SWITCH_DAYS from now. A `last` that is recent or in the future
-    is never reset.
+    `last` is when this novel's previous part went (or goes) public — see
+    `last_release_at`. The next part follows PUBLIC_SWITCH_DAYS later, on that day at
+    PUBLIC_SWITCH_HOUR:00, so the chain continues. If there is none, or that slot is
+    already too close or past (the chain has lapsed), start at the latest
+    PUBLIC_SWITCH_HOUR:00 that is still within the next PUBLIC_SWITCH_DAYS from now. A
+    `last` that is recent or in the future is never reset.
     """
     now = _as_naive_local(now)
     window = timedelta(days=PUBLIC_SWITCH_DAYS)
-    if last is None or _as_naive_local(last) < now - window:
-        ceiling = now + window
-        anchor = ceiling.replace(hour=PUBLIC_SWITCH_HOUR, minute=0, second=0, microsecond=0)
-        if anchor > ceiling:
-            anchor -= timedelta(days=1)
-        return anchor
-    return _as_naive_local(last) + window
+    if last is not None:
+        chained = (_as_naive_local(last) + window).replace(
+            hour=PUBLIC_SWITCH_HOUR, minute=0, second=0, microsecond=0
+        )
+        if chained - now >= _MIN_SCHEDULE_LEAD:
+            return chained
+    ceiling = now + window
+    anchor = ceiling.replace(hour=PUBLIC_SWITCH_HOUR, minute=0, second=0, microsecond=0)
+    if anchor > ceiling:
+        anchor -= timedelta(days=1)
+    return anchor
 
 
 def members_chain_times(now: datetime, last: datetime | None, count: int) -> list[datetime]:
@@ -709,24 +714,31 @@ def members_chain_times(now: datetime, last: datetime | None, count: int) -> lis
     return [first + timedelta(days=PUBLIC_SWITCH_DAYS * i) for i in range(count)]
 
 
-def last_members_public_at(states) -> datetime | None:
-    """The latest members→public switch recorded in these upload states, or None.
+def last_release_at(states) -> datetime | None:
+    """When the latest of these parts went (or goes) public, or None.
 
-    Counts only Members parts that have passed the publish click (committed or published),
-    so a slot that is already booked is never handed out twice. Unreadable or half-written
-    records are skipped, not fatal.
+    A Members part counts from its switch to public (`public_at`), a scheduled one from
+    its publish time (`publish_at`) — both only once past the publish click (committed or
+    published), so a booked slot is never handed out twice — and a part published as
+    Public from when it was published (`published_at`). Private and unlisted parts never
+    went public, so they do not count. Unreadable records are skipped, not fatal.
     """
     latest: datetime | None = None
+    booked = (STATE_COMMITTED, STATE_PUBLISHED)
     for state in states:
         if not isinstance(state, dict):
             continue
-        if state.get("visibility") != "members_then_public":
+        visibility, status = state.get("visibility"), state.get("status")
+        if visibility == "members_then_public" and status in booked:
+            raw = state.get("public_at")
+        elif visibility == "schedule" and status in booked:
+            raw = state.get("publish_at")
+        elif visibility == "public" and status == STATE_PUBLISHED:
+            raw = state.get("published_at")
+        else:
             continue
-        if state.get("status") not in (STATE_COMMITTED, STATE_PUBLISHED):
-            continue
-        raw = state.get("public_at") or ""
         try:
-            when = _as_naive_local(datetime.fromisoformat(raw))
+            when = _as_naive_local(datetime.fromisoformat(raw or ""))
         except (TypeError, ValueError):
             continue
         if latest is None or when > latest:
@@ -734,30 +746,25 @@ def last_members_public_at(states) -> datetime | None:
     return latest
 
 
-def library_members_last(library_root: Path) -> datetime | None:
-    """Latest members switch recorded in any project under `library_root`. Channel-wide:
-    the members cadence is one release rhythm, so two novels must not book the same slot.
+def project_release_last(project_path: Path) -> datetime | None:
+    """`last_release_at` of one novel's parts: the members chain is per novel, so each
+    novel keeps its own 3-day rhythm whatever the others have booked.
 
-    Walks each project's video folder, which holds both the per-part folders and the older
+    Walks the project's video folder, which holds both the per-part folders and the older
     flat layout. Unreadable records are skipped.
     """
-    from noveltrans.storage.library import Library
     from noveltrans.storage.project import EXPORTS_DIR, VIDEO_DIR
 
-    root = Path(library_root)
-    if not root.is_dir():
+    video_dir = Path(project_path) / EXPORTS_DIR / VIDEO_DIR
+    if not video_dir.is_dir():
         return None
     states = []
-    for project in Library(root).list_projects():
-        video_dir = project / EXPORTS_DIR / VIDEO_DIR
-        if not video_dir.is_dir():
+    for record in video_dir.rglob("*.upload.json"):
+        try:
+            states.append(json.loads(record.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
             continue
-        for record in video_dir.rglob("*.upload.json"):
-            try:
-                states.append(json.loads(record.read_text(encoding="utf-8")))
-            except (OSError, ValueError):
-                continue
-    return last_members_public_at(states)
+    return last_release_at(states)
 
 
 def validate_schedule_start(start: datetime, *, now: datetime | None = None) -> None:

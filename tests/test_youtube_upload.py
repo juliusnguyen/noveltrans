@@ -4092,11 +4092,25 @@ class TestMembersScheduleChain:
         last = datetime(2026, 12, 20, 19, 0)
         assert members_schedule_anchor(self.NOW, last) == datetime(2026, 12, 23, 19, 0)
 
-    def test_exactly_three_days_ago_chains_rather_than_resets(self):
+    def test_a_slot_still_ahead_today_chains_rather_than_resets(self):
         from noveltrans.youtube_upload import members_schedule_anchor
 
-        last = self.NOW - timedelta(days=3)  # boundary: not "more than 3 days" ago
-        assert members_schedule_anchor(self.NOW, last) == last + timedelta(days=3)
+        last = self.NOW - timedelta(days=3)  # 28/11 10:00 → 01/12 19:00, still ahead
+        assert members_schedule_anchor(self.NOW, last) == datetime(2026, 12, 1, 19, 0)
+
+    def test_the_chained_slot_is_snapped_to_nineteen_hundred(self):
+        from noveltrans.youtube_upload import members_schedule_anchor
+
+        # a Public part published at 19:44 — the next one goes public 3 days later at 19:00
+        last = datetime(2026, 11, 29, 19, 44)
+        assert members_schedule_anchor(self.NOW, last) == datetime(2026, 12, 2, 19, 0)
+
+    def test_a_chained_slot_already_past_resets_to_the_window(self):
+        from noveltrans.youtube_upload import members_schedule_anchor
+
+        late = datetime(2026, 12, 1, 20, 0)
+        last = datetime(2026, 11, 28, 19, 0)  # → 01/12 19:00, an hour ago
+        assert members_schedule_anchor(late, last) == datetime(2026, 12, 4, 19, 0)
 
     def test_batch_is_three_days_apart_all_at_nineteen_hundred(self):
         from noveltrans.youtube_upload import members_chain_times
@@ -4113,30 +4127,37 @@ class TestMembersScheduleChain:
 
         assert members_chain_times(self.NOW, None, 0) == []
 
-    def test_last_takes_only_committed_or_published_members_parts(self):
-        from noveltrans.youtube_upload import last_members_public_at
+    def test_last_release_counts_booked_members_scheduled_and_public_parts(self):
+        from noveltrans.youtube_upload import last_release_at
 
         states = [
             {"visibility": "members_then_public", "status": "published",
              "public_at": "2026-11-20T19:00:00"},
-            {"visibility": "members_then_public", "status": "committed",
-             "public_at": "2026-11-23T19:00:00"},
-            # not booked yet: a draft or a part that never reached the publish click
+            {"visibility": "schedule", "status": "committed",
+             "publish_at": "2026-11-22T20:00:00"},
+            {"visibility": "public", "status": "published",
+             "published_at": "2026-11-23T19:44:00+07:00"},
+            # not booked yet: a draft never reached the publish click
             {"visibility": "members_then_public", "status": "draft",
              "public_at": "2026-11-30T19:00:00"},
-            # wrong visibility
-            {"visibility": "public", "status": "published", "public_at": "2026-11-29T19:00:00"},
+            # never went public
+            {"visibility": "private", "status": "published",
+             "published_at": "2026-11-29T19:00:00"},
+            {"visibility": "unlisted", "status": "published",
+             "published_at": "2026-11-29T19:00:00"},
         ]
-        assert last_members_public_at(states) == datetime(2026, 11, 23, 19, 0)
+        last = last_release_at(states)
+        assert last is not None and last.tzinfo is None
+        assert last.date() == datetime(2026, 11, 23).date()
 
-    def test_last_is_none_when_nothing_is_booked(self):
-        from noveltrans.youtube_upload import last_members_public_at
+    def test_last_release_is_none_when_nothing_went_public(self):
+        from noveltrans.youtube_upload import last_release_at
 
-        assert last_members_public_at([]) is None
-        assert last_members_public_at([{"visibility": "private", "status": "published"}]) is None
+        assert last_release_at([]) is None
+        assert last_release_at([{"visibility": "private", "status": "published"}]) is None
 
     def test_mixed_naive_and_aware_timestamps_compare_without_error(self):
-        from noveltrans.youtube_upload import last_members_public_at, members_schedule_anchor
+        from noveltrans.youtube_upload import last_release_at, members_schedule_anchor
 
         states = [
             {"visibility": "members_then_public", "status": "published",
@@ -4144,19 +4165,19 @@ class TestMembersScheduleChain:
             {"visibility": "members_then_public", "status": "published",
              "public_at": "2026-11-27T19:00:00"},
         ]
-        last = last_members_public_at(states)
+        last = last_release_at(states)
         assert last is not None and last.tzinfo is None
         assert members_schedule_anchor(self.NOW, last) is not None
 
-    def test_unreadable_public_at_is_skipped(self):
-        from noveltrans.youtube_upload import last_members_public_at
+    def test_unreadable_times_are_skipped(self):
+        from noveltrans.youtube_upload import last_release_at
 
         states = [
             {"visibility": "members_then_public", "status": "published", "public_at": "not a date"},
-            {"visibility": "members_then_public", "status": "published", "public_at": ""},
+            {"visibility": "public", "status": "published", "published_at": ""},
             "not even a dict",
         ]
-        assert last_members_public_at(states) is None
+        assert last_release_at(states) is None
 
     def test_upload_batch_rejects_a_members_switch_inside_the_lead(self, part):
         from noveltrans.youtube_upload import upload_batch
@@ -4171,48 +4192,38 @@ class TestMembersScheduleChain:
             upload_batch([request])
 
 
-class TestLibraryMembersLast:
-    """The chain is channel-wide: the latest members switch in ANY project counts."""
+class TestProjectReleaseLast:
+    """The chain is per novel: only this project's own parts count."""
 
-    def _project_with_part(self, library: Path, name: str, state: dict) -> None:
+    def _part(self, project: Path, name: str, state: dict) -> None:
         from noveltrans.storage.project import EXPORTS_DIR, VIDEO_DIR
 
-        folder = library / name
-        (folder / EXPORTS_DIR / VIDEO_DIR / "part").mkdir(parents=True)
-        (folder / "meta.json").write_text("{}", encoding="utf-8")
-        record = folder / EXPORTS_DIR / VIDEO_DIR / "part" / "part.upload.json"
-        record.write_text(json.dumps(state), encoding="utf-8")
+        folder = project / EXPORTS_DIR / VIDEO_DIR / name
+        folder.mkdir(parents=True)
+        (folder / f"{name}.upload.json").write_text(json.dumps(state), encoding="utf-8")
 
-    def test_latest_members_switch_across_two_novels(self, tmp_path, monkeypatch):
-        from noveltrans.storage import library as lib
-        from noveltrans.youtube_upload import library_members_last
+    def test_latest_release_of_this_novel_only(self, tmp_path):
+        from noveltrans.youtube_upload import project_release_last
 
-        monkeypatch.setattr(
-            lib.NovelProject, "is_project_dir", staticmethod(lambda p: (p / "meta.json").is_file())
-        )
-        self._project_with_part(tmp_path, "a-0001", {
-            "visibility": "members_then_public", "status": "published",
-            "public_at": "2026-11-20T19:00:00"})
-        self._project_with_part(tmp_path, "b-0002", {
-            "visibility": "members_then_public", "status": "committed",
-            "public_at": "2026-11-23T19:00:00"})
-        assert library_members_last(tmp_path) == datetime(2026, 11, 23, 19, 0)
+        mine, other = tmp_path / "mine", tmp_path / "other"
+        self._part(mine, "p4", {"visibility": "public", "status": "published",
+                                "published_at": "2026-11-27T19:44:37+07:00"})
+        self._part(other, "x", {"visibility": "members_then_public", "status": "published",
+                                "public_at": "2026-12-11T19:00:00"})
+        last = project_release_last(mine)
+        assert last is not None and last.date() == datetime(2026, 11, 27).date()
 
-    def test_missing_library_is_none(self, tmp_path):
-        from noveltrans.youtube_upload import library_members_last
+    def test_a_novel_without_videos_is_none(self, tmp_path):
+        from noveltrans.youtube_upload import project_release_last
 
-        assert library_members_last(tmp_path / "nope") is None
+        assert project_release_last(tmp_path / "nope") is None
 
-    def test_corrupt_record_is_skipped(self, tmp_path, monkeypatch):
-        from noveltrans.storage import library as lib
+    def test_corrupt_record_is_skipped(self, tmp_path):
         from noveltrans.storage.project import EXPORTS_DIR, VIDEO_DIR
-        from noveltrans.youtube_upload import library_members_last
+        from noveltrans.youtube_upload import project_release_last
 
-        monkeypatch.setattr(
-            lib.NovelProject, "is_project_dir", staticmethod(lambda p: (p / "meta.json").is_file())
-        )
-        folder = tmp_path / "c-0003"
-        (folder / EXPORTS_DIR / VIDEO_DIR).mkdir(parents=True)
-        (folder / "meta.json").write_text("{}", encoding="utf-8")
-        (folder / EXPORTS_DIR / VIDEO_DIR / "x.upload.json").write_text("{not json", encoding="utf-8")
-        assert library_members_last(tmp_path) is None
+        video = tmp_path / EXPORTS_DIR / VIDEO_DIR
+        video.mkdir(parents=True)
+        (video / "x.upload.json").write_text("{not json", encoding="utf-8")
+        assert project_release_last(tmp_path) is None
+
