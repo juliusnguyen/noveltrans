@@ -44,6 +44,8 @@ from noveltrans.tts.description import (  # noqa: F401 (re-exported for video ca
     fit_description,
 )
 from noveltrans.tts.player_skin import (
+    DEFAULT_PHOTO_FOCUS,
+    DEFAULT_PHOTO_ZOOM,
     PlayerLayout,
     build_knob,
     build_player_skin,
@@ -1144,6 +1146,8 @@ def render_video(
     show_bars: bool = True,
     title_scale: float = DEFAULT_TITLE_SCALE,
     encoder: str = DEFAULT_VIDEO_ENCODER,
+    photo_focus: tuple[float, float] = DEFAULT_PHOTO_FOCUS,
+    photo_zoom: float = DEFAULT_PHOTO_ZOOM,
     cancelled: Callable[[], bool] | None = None,
 ) -> Path:
     """Render `segments` into an MP4 at `out_path`; also write the YouTube description.
@@ -1158,7 +1162,9 @@ def render_video(
     if a non-default encoder fails partway through, the render is retried once with
     `libx264` before raising. `show_bars=False` leaves the spectrum out — a little faster
     and a noticeably smaller file, and the chapter title then gets the bars' strip to wrap
-    into. Raises TtsError on ffmpeg failure, MergeCancelled if cancelled.
+    into. `photo_focus` / `photo_zoom` frame the image inside the small photo box (see
+    `player_skin.cover_crop`); the defaults are the centre crop. Raises TtsError on ffmpeg
+    failure, MergeCancelled if cancelled.
     """
     if not segments:
         raise TtsError("Không có chương nào có audio để tạo video.")
@@ -1198,7 +1204,8 @@ def render_video(
         # Bake the three artwork layers once; ffmpeg loops each and animates them: the
         # static skin (backdrop), the vinyl disc (spun), and the playhead knob (slid).
         lay = PlayerLayout.of(width, height, title_scale=title_scale)
-        build_player_skin(image_path, skin_file, width=width, height=height, bg_color=bg_color)
+        build_player_skin(image_path, skin_file, width=width, height=height, bg_color=bg_color,
+                          photo_focus=photo_focus, photo_zoom=photo_zoom)
         build_vinyl(font_dir / VINYL_LABEL, vinyl_file, size=lay.vinyl_size)
         build_knob(knob_file, radius=lay.knob_r)
 
@@ -1289,6 +1296,8 @@ def render_preview_frame(
     title_scale: float = DEFAULT_TITLE_SCALE,
     font_name: str = FONT_NAME,
     bg_color: tuple[int, int, int] | None = None,
+    photo_focus: tuple[float, float] = DEFAULT_PHOTO_FOCUS,
+    photo_zoom: float = DEFAULT_PHOTO_ZOOM,
     cancelled: Callable[[], bool] | None = None,
 ) -> Path:
     """Render ONE still PNG of the music-player video — a fast preview, no encode/audio.
@@ -1297,7 +1306,8 @@ def render_preview_frame(
     the preview is WYSIWYG (layout, photo, titles, font). Needs no chapter audio: a short
     pink-noise `lavfi` source drives `showfreqs` so the bars look alive (silence would render
     empty), and a single frame is grabbed at `_PREVIEW_GRAB_T` with a synthetic total so the
-    playhead sits partway along the track. Raises TtsError on ffmpeg failure.
+    playhead sits partway along the track. `photo_focus` / `photo_zoom` frame the small
+    photo exactly as `render_video` does. Raises TtsError on ffmpeg failure.
     """
     out_png = Path(out_png)
     out_png.parent.mkdir(parents=True, exist_ok=True)
@@ -1320,7 +1330,8 @@ def render_preview_frame(
                                 show_bars=show_bars, title_scale=title_scale),
             encoding="utf-8",
         )
-        build_player_skin(image_path, skin_file, width=width, height=height, bg_color=bg_color)
+        build_player_skin(image_path, skin_file, width=width, height=height, bg_color=bg_color,
+                          photo_focus=photo_focus, photo_zoom=photo_zoom)
         build_vinyl(font_dir / VINYL_LABEL, vinyl_file, size=lay.vinyl_size)
         build_knob(knob_file, radius=lay.knob_r)
 

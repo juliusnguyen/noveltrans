@@ -24,7 +24,7 @@ import re
 from types import SimpleNamespace
 
 from PySide6.QtCore import QDateTime, Qt, QTimer, QUrl
-from PySide6.QtGui import QColor, QDesktopServices, QPixmap
+from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -60,6 +60,7 @@ from noveltrans.config import LLM_ENGINES, AppConfig, translator_labels
 from noveltrans.gui.job_popup import BROWSER_PAUSE_HINT
 from noveltrans.gui.jobs import job_registry
 from noveltrans.gui.keep_awake import track_worker
+from noveltrans.gui.preview_photo_pan import PhotoPanLabel
 from noveltrans.gui.rename_novel import rename_novel
 from noveltrans.gui.widgets import (
     SORT_ROLE,
@@ -86,6 +87,7 @@ from noveltrans.gui.workers import (
     YouTubeUploadWorker,
 )
 from noveltrans.storage import NovelProject
+from noveltrans.tts.player_skin import DEFAULT_PHOTO_FOCUS, DEFAULT_PHOTO_ZOOM
 from noveltrans.tts.description import (
     YOUTUBE_DESCRIPTION_CHAR_LIMIT,
     description_length,
@@ -154,11 +156,14 @@ class VideoTab(QWidget):
         self._stale_descriptions: set[str] = set()
         # a persistent, non-modal preview window so the color can be tuned live
         self._preview_dialog: QDialog | None = None
-        self._preview_label: QLabel | None = None
+        self._preview_label: PhotoPanLabel | None = None
         self._preview_status: QLabel | None = None
         self._preview_color_button: QPushButton | None = None
         self._preview_title_scale_spin: QSpinBox | None = None
         self._preview_font_combo: QComboBox | None = None
+        self._preview_zoom_spin: QSpinBox | None = None
+        # the background image the last preview was started with; the photo drag needs it
+        self._preview_image_path = ""
         self._preview_controls: list = []
         # The open novel's effective video settings (see noveltrans.video_settings).
         # Every render/preview reads from here rather than from `config`, so one novel's
@@ -2955,6 +2960,7 @@ class VideoTab(QWidget):
             self._preview_font_combo.blockSignals(True)
             self._set_combo(self._preview_font_combo, values["video_font"])
             self._preview_font_combo.blockSignals(False)
+        self._sync_preview_photo_framing()
         self._on_video_mode_changed()
 
     @staticmethod
@@ -3017,7 +3023,11 @@ class VideoTab(QWidget):
             self.video_image_edit.setText(path)
             # Per-novel only — deliberately NOT mirrored into the global config, which is
             # what used to carry this image onto the next novel's video.
+            changed = path != self._video_settings.get("video_image_path")
             self._save_video_setting("video_image_path", path)
+            if changed:
+                # The saved framing was chosen for the previous picture.
+                self._save_photo_framing(DEFAULT_PHOTO_FOCUS, DEFAULT_PHOTO_ZOOM)
             self._maybe_refresh_preview()
 
     def _save_upload_comment_choice(self, *_args) -> None:
@@ -3744,6 +3754,7 @@ class VideoTab(QWidget):
         if self.project is not None:
             novel_title = self.project.meta.display_name()
 
+        self._preview_image_path = image
         self.video_preview_button.setEnabled(False)
         self.status_label.setText("🖼️ Đang tạo ảnh xem trước…")
         if self._preview_dialog is not None and self._preview_dialog.isVisible():
@@ -3755,20 +3766,26 @@ class VideoTab(QWidget):
             spin_vinyl=preset["spin_vinyl"], show_bars=self.show_bars_check.isChecked(),
             title_scale=self._video_settings["video_title_scale"],
             font=family, bg_color=self.bg_color,
+            photo_focus=self._video_settings["video_photo_focus"],
+            photo_zoom=self._video_settings["video_photo_zoom"],
         )
         self._preview_worker.done.connect(self._on_preview_ready)
         self._preview_worker.failed.connect(self._on_preview_failed)
         self._preview_worker.start()
 
     def _build_preview_dialog(self) -> None:
-        """Create the persistent, non-modal preview window with live font/color/title-size controls."""
+        """Create the persistent, non-modal preview window with live controls: font, colour,
+        title size, and the framing of the small photo (drag on it, zoom, re-centre)."""
+        from noveltrans.tts.player_skin import MAX_PHOTO_ZOOM, MIN_PHOTO_ZOOM
         from noveltrans.tts.video import MAX_TITLE_SCALE, MIN_TITLE_SCALE, VIDEO_FONTS
 
         dialog = QDialog(self)
-        dialog.setWindowTitle("Xem trước video — chỉnh màu nền trực tiếp")
+        dialog.setWindowTitle("Xem trước video — chỉnh trực tiếp")
         dialog.setModal(False)
 
-        self._preview_label = QLabel()
+        self._preview_label = PhotoPanLabel()
+        self._preview_label.pan_finished.connect(self._on_preview_photo_pan_finished)
+        self._preview_label.zoom_step.connect(self._on_preview_zoom_step)
         self._preview_status = QLabel("")
 
         # Phông chữ: lives here too — the preview is the only place a font choice can
@@ -3807,6 +3824,28 @@ class VideoTab(QWidget):
         )
         self._preview_title_scale_spin.valueChanged.connect(self._on_preview_title_scale_changed)
 
+        # Khung ảnh nhỏ: which part of the background shows in the small photo. Dragging
+        # on the photo pans it; zoom is what makes a wide image movable up/down at all.
+        framing_tip = (
+            "Chọn phần nào của ảnh nền hiện trong khung ảnh nhỏ bên trái video: kéo trên ảnh "
+            "nhỏ để dời, lăn chuột hoặc chỉnh % để phóng to. Ảnh ngang chỉ kéo lên/xuống được "
+            "khi đã phóng to. Chỉ áp dụng cho video tạo mới — phần đã tạo cần “Tạo lại”."
+        )
+        self._preview_zoom_spin = QSpinBox()
+        self._preview_zoom_spin.setKeyboardTracking(False)
+        self._preview_zoom_spin.setRange(round(MIN_PHOTO_ZOOM * 100), round(MAX_PHOTO_ZOOM * 100))
+        self._preview_zoom_spin.setSingleStep(10)
+        self._preview_zoom_spin.setSuffix("%")
+        self._preview_zoom_spin.setValue(round(self._video_settings["video_photo_zoom"] * 100))
+        self._preview_zoom_spin.setToolTip(framing_tip)
+        self._preview_zoom_spin.valueChanged.connect(self._on_preview_zoom_changed)
+        center_button = QPushButton("Căn giữa")
+        center_button.setToolTip("Đưa khung ảnh nhỏ về giữa ảnh, 100%.")
+        center_button.clicked.connect(self._reset_preview_photo_framing)
+        framing_hint = QLabel("Kéo trên ảnh nhỏ để chỉnh vị trí · lăn chuột để phóng to")
+        framing_hint.setProperty("muted", True)
+        framing_hint.setToolTip(framing_tip)
+
         refresh_button = QPushButton("Cập nhật")
         refresh_button.setToolTip("Render lại ảnh xem trước.")
         refresh_button.clicked.connect(self._start_preview)
@@ -3815,6 +3854,7 @@ class VideoTab(QWidget):
         self._preview_controls = [
             self._preview_font_combo, self._preview_color_button, reset_button,
             self._preview_title_scale_spin, refresh_button,
+            self._preview_zoom_spin, center_button,
         ]
 
         controls = QHBoxLayout()
@@ -3830,9 +3870,18 @@ class VideoTab(QWidget):
         controls.addStretch()
         controls.addWidget(close_button)
 
+        framing = QHBoxLayout()
+        framing.addWidget(QLabel("Khung ảnh nhỏ:"))
+        framing.addWidget(QLabel("Phóng to:"))
+        framing.addWidget(self._preview_zoom_spin)
+        framing.addWidget(center_button)
+        framing.addWidget(framing_hint)
+        framing.addStretch()
+
         layout = QVBoxLayout(dialog)
         layout.addWidget(self._preview_label)
         layout.addLayout(controls)
+        layout.addLayout(framing)
 
         dialog.finished.connect(self._on_preview_dialog_closed)
         self._preview_dialog = dialog
@@ -3844,6 +3893,46 @@ class VideoTab(QWidget):
     def _set_preview_controls_enabled(self, enabled: bool) -> None:
         for w in self._preview_controls:
             w.setEnabled(enabled)
+        # Not setEnabled: a disabled QLabel greys out the whole preview image.
+        if self._preview_label is not None:
+            self._preview_label.set_interactive(enabled)
+
+    # ---------------------------------------------- small-photo framing (116)
+
+    def _save_photo_framing(self, focus, zoom) -> None:
+        """Save the small photo's framing for the open novel and show it in the dialog."""
+        self._save_video_setting("video_photo_focus", tuple(focus))
+        self._save_video_setting("video_photo_zoom", float(zoom))
+        self._sync_preview_photo_framing()
+
+    def _sync_preview_photo_framing(self) -> None:
+        """Push the novel's framing into the open dialog's zoom box and drag overlay."""
+        focus = self._video_settings.get("video_photo_focus", DEFAULT_PHOTO_FOCUS)
+        zoom = self._video_settings.get("video_photo_zoom", DEFAULT_PHOTO_ZOOM)
+        if self._preview_zoom_spin is not None:
+            self._preview_zoom_spin.blockSignals(True)
+            self._preview_zoom_spin.setValue(round(zoom * 100))
+            self._preview_zoom_spin.blockSignals(False)
+        if self._preview_label is not None:
+            self._preview_label.set_focus_zoom(focus, zoom)
+
+    def _on_preview_photo_pan_finished(self, fx: float, fy: float) -> None:
+        self._save_video_setting("video_photo_focus", (fx, fy))
+        self._maybe_refresh_preview()
+
+    def _on_preview_zoom_changed(self, value: int) -> None:
+        self._save_video_setting("video_photo_zoom", value / 100.0)
+        if self._preview_label is not None:
+            self._preview_label.set_focus_zoom(self._video_settings["video_photo_focus"], value / 100.0)
+        self._maybe_refresh_preview()
+
+    def _on_preview_zoom_step(self, step: int) -> None:
+        if self._preview_zoom_spin is not None and self._preview_zoom_spin.isEnabled():
+            self._preview_zoom_spin.stepBy(step)
+
+    def _reset_preview_photo_framing(self) -> None:
+        self._save_photo_framing(DEFAULT_PHOTO_FOCUS, DEFAULT_PHOTO_ZOOM)
+        self._maybe_refresh_preview()
 
     def _on_preview_dialog_closed(self, *_args) -> None:
         self._preview_dialog = None
@@ -3852,17 +3941,18 @@ class VideoTab(QWidget):
         self._preview_color_button = None
         self._preview_title_scale_spin = None
         self._preview_font_combo = None
+        self._preview_zoom_spin = None
         self._preview_controls = []
 
     def _on_preview_ready(self, png_path: str) -> None:
         self.video_preview_button.setEnabled(True)
         self.status_label.setText("")
-        pix = QPixmap(png_path).scaled(
-            900, 520, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
-        )
         if self._preview_dialog is None:
             self._build_preview_dialog()
-        self._preview_label.setPixmap(pix)
+        self._preview_label.set_frame(
+            png_path, self._preview_image_path,
+            self._video_settings["video_photo_focus"], self._video_settings["video_photo_zoom"],
+        )
         self._preview_status.setText("")
         self._set_preview_controls_enabled(True)
         self._update_bg_swatch()  # paints the in-dialog swatch too
@@ -4171,6 +4261,8 @@ class VideoTab(QWidget):
             show_bars=self.show_bars_check.isChecked(),
             title_scale=self._video_settings["video_title_scale"],
             bg_color=self.bg_color, skip_existing=skip_existing, part_num=part_num,
+            photo_focus=self._video_settings["video_photo_focus"],
+            photo_zoom=self._video_settings["video_photo_zoom"],
             explicit_windows=explicit_windows, explicit_part_numbers=explicit_part_numbers,
             credit=self.credit_edit.text().strip() or "Fox Novel",
             tagline=self.tagline_edit.text().strip(),

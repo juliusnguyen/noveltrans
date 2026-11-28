@@ -8,8 +8,9 @@ the box was already filled in when the tab opened.
 The fix is not "make everything per-novel" — that would make you re-pick your usual
 quality and AI engine for every new novel. The settings split in two:
 
-* **Identity** — what this novel *looks like*: its background image and colour, cover
-  image, credit line, tagline, fonts, and the cover's text layout. These are never
+* **Identity** — what this novel *looks like*: its background image and colour, how
+  that image is framed in the small photo, cover image, credit line, tagline, fonts,
+  and the cover's text layout. These are never
   inherited from another novel. An unset one reads as the app default (a blank image,
   the pastel gradient), because inheriting here is precisely the reported bug.
 
@@ -47,6 +48,8 @@ IDENTITY_KEYS: tuple[str, ...] = (
     "video_title_scale",
     "video_thumbnail_title_text",
     "video_title_order",
+    "video_photo_focus",
+    "video_photo_zoom",
 )
 
 # Per-novel override, seeded from the user's last-used value when the novel has none.
@@ -67,6 +70,10 @@ VIDEO_SETTING_KEYS: tuple[str, ...] = IDENTITY_KEYS + WORKFLOW_KEYS
 # meta.json as lists and are normalised on read — the renderer unpacks them positionally
 # and a list would work by luck, but equality checks against the defaults would not.
 _PAIR_KEYS = frozenset({"video_thumbnail_title_pos", "video_thumbnail_part_pos"})
+# Framing keys go straight from meta.json to the renderer (identity keys skip AppConfig's
+# clamping), so a hand-edited or corrupt value is clamped here instead.
+_PHOTO_FOCUS_KEY = "video_photo_focus"
+_PHOTO_ZOOM_KEY = "video_photo_zoom"
 
 
 def identity_defaults() -> dict[str, Any]:
@@ -81,6 +88,7 @@ def identity_defaults() -> dict[str, Any]:
         DEFAULT_TITLE_ALIGN,
         DEFAULT_TITLE_POS,
     )
+    from noveltrans.tts.player_skin import DEFAULT_PHOTO_FOCUS, DEFAULT_PHOTO_ZOOM
     from noveltrans.tts.video import DEFAULT_TITLE_SCALE, DEFAULT_VIDEO_FONT
 
     return {
@@ -100,6 +108,8 @@ def identity_defaults() -> dict[str, Any]:
         "video_title_scale": DEFAULT_TITLE_SCALE,
         "video_thumbnail_title_text": "",  # "" = auto-wrap the display name
         "video_title_order": "name_first",  # "{tên} - Phần N"; see tts.video.TITLE_ORDERS
+        "video_photo_focus": DEFAULT_PHOTO_FOCUS,  # centre crop of the small photo
+        "video_photo_zoom": DEFAULT_PHOTO_ZOOM,  # 1.0 = image just covers the small photo
     }
 
 
@@ -134,6 +144,14 @@ def snapshot(config) -> dict[str, Any]:
 
 def _normalise(key: str, value: Any) -> Any:
     """Coerce a stored value back to the type the renderer expects (see _PAIR_KEYS)."""
+    if key == _PHOTO_FOCUS_KEY:
+        from noveltrans.tts.player_skin import clamp_photo_focus
+
+        return clamp_photo_focus(value)
+    if key == _PHOTO_ZOOM_KEY:
+        from noveltrans.tts.player_skin import clamp_photo_zoom
+
+        return clamp_photo_zoom(value)
     if key in _PAIR_KEYS and isinstance(value, (list, tuple)) and len(value) == 2:
         return (float(value[0]), float(value[1]))
     return value

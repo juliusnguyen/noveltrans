@@ -1040,6 +1040,41 @@ class AppConfig:
         self._s.setValue("video_title_scale", _clamp(float(value), MIN_TITLE_SCALE, MAX_TITLE_SCALE))
 
     @property
+    def video_photo_focus(self) -> tuple[float, float]:
+        """Which part of the background image the small photo frame shows — (fx, fy) in
+        [0, 1], where the crop sits within the spare image (0.5, 0.5 = centred). Set by
+        dragging on the photo in the preview window. A per-novel identity setting (see
+        `video_settings`); this global value only seeds `snapshot()`."""
+        from noveltrans.tts.player_skin import DEFAULT_PHOTO_FOCUS, clamp_photo_focus
+
+        return clamp_photo_focus((
+            self._s.value("video_photo_focus_x", DEFAULT_PHOTO_FOCUS[0]),
+            self._s.value("video_photo_focus_y", DEFAULT_PHOTO_FOCUS[1]),
+        ))
+
+    @video_photo_focus.setter
+    def video_photo_focus(self, value: tuple[float, float]) -> None:
+        from noveltrans.tts.player_skin import clamp_photo_focus
+
+        fx, fy = clamp_photo_focus(value)
+        self._s.setValue("video_photo_focus_x", fx)
+        self._s.setValue("video_photo_focus_y", fy)
+
+    @property
+    def video_photo_zoom(self) -> float:
+        """Zoom of the background image inside the small photo frame — 1.0 just covers the
+        frame, up to 3.0. Per-novel identity setting, like `video_photo_focus`."""
+        from noveltrans.tts.player_skin import DEFAULT_PHOTO_ZOOM, clamp_photo_zoom
+
+        return clamp_photo_zoom(self._s.value("video_photo_zoom", DEFAULT_PHOTO_ZOOM))
+
+    @video_photo_zoom.setter
+    def video_photo_zoom(self, value: float) -> None:
+        from noveltrans.tts.player_skin import clamp_photo_zoom
+
+        self._s.setValue("video_photo_zoom", clamp_photo_zoom(value))
+
+    @property
     def video_burn_subtitles(self) -> bool:
         """Burn the narration subtitles into the video as well as writing the .srt.
 
