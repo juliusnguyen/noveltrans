@@ -2821,6 +2821,8 @@ class VideoWorker(PausableWorker):
         title_scale: float | None = None,  # in-video novel-title size multiplier; None → 1.0
         encoder: str = "libx264",  # video codec: "libx264" (CPU) | "h264_nvenc" (NVIDIA GPU)
         bg_color: str = "",  # background hex "#rrggbb"; "" → the default pastel gradient
+        photo_focus: tuple[float, float] | None = None,  # small-photo framing; None → centre
+        photo_zoom: float | None = None,  # small-photo zoom; None → 1.0 (just covers the box)
         skip_existing: bool = False,  # skip parts whose .mp4 already exists (batch "continue")
         part_num: int | None = None,  # explicit part # for a single range-mode re-render;
                                        # None → computed per-window (batch/whole-novel runs)
@@ -2866,6 +2868,8 @@ class VideoWorker(PausableWorker):
         self.title_scale = title_scale
         self.encoder = encoder
         self.bg_color = bg_color
+        self.photo_focus = photo_focus
+        self.photo_zoom = photo_zoom
         self.skip_existing = skip_existing
         self.part_num = part_num
         self.explicit_windows = explicit_windows
@@ -2892,7 +2896,7 @@ class VideoWorker(PausableWorker):
             plan_merge_windows,
             plan_source_windows,
         )
-        from noveltrans.tts.player_skin import hex_to_rgb
+        from noveltrans.tts.player_skin import clamp_photo_focus, clamp_photo_zoom, hex_to_rgb
         from noveltrans.tts.thumbnail import render_thumbnail
         from noveltrans.tts.video import (
             DEFAULT_TITLE_SCALE,
@@ -3085,6 +3089,8 @@ class VideoWorker(PausableWorker):
                             show_bars=self.show_bars,
                             title_scale=self.title_scale or DEFAULT_TITLE_SCALE,
                             encoder=self.encoder,
+                            photo_focus=clamp_photo_focus(self.photo_focus),
+                            photo_zoom=clamp_photo_zoom(self.photo_zoom),
                             # Cancel only — do NOT gate pause here. This callback is polled inside a
                             # deadline-bounded ffmpeg/TTS wait; holding it would trip the timeout, and
                             # synthesize_chapter buffers the whole chapter in RAM until it writes.
@@ -3448,6 +3454,8 @@ class VideoPreviewWorker(QThread):
         title_scale: float | None = None,  # in-video novel-title size multiplier; None → 1.0
         font: str = "",
         bg_color: str = "",  # background hex "#rrggbb"; "" → the default pastel gradient
+        photo_focus: tuple[float, float] | None = None,  # small-photo framing; None → centre
+        photo_zoom: float | None = None,  # small-photo zoom; None → 1.0
         parent=None,
     ):
         super().__init__(parent)
@@ -3461,12 +3469,14 @@ class VideoPreviewWorker(QThread):
         self.title_scale = title_scale
         self.font = font
         self.bg_color = bg_color
+        self.photo_focus = photo_focus
+        self.photo_zoom = photo_zoom
 
     def run(self) -> None:
         import tempfile
 
         from noveltrans.errors import TtsError
-        from noveltrans.tts.player_skin import hex_to_rgb
+        from noveltrans.tts.player_skin import clamp_photo_focus, clamp_photo_zoom, hex_to_rgb
         from noveltrans.tts.video import (
             DEFAULT_TITLE_SCALE,
             FONT_NAME,
@@ -3484,6 +3494,8 @@ class VideoPreviewWorker(QThread):
                     title_scale=self.title_scale or DEFAULT_TITLE_SCALE,
                     font_name=self.font or FONT_NAME,
                     bg_color=hex_to_rgb(self.bg_color),
+                    photo_focus=clamp_photo_focus(self.photo_focus),
+                    photo_zoom=clamp_photo_zoom(self.photo_zoom),
                 )
             self.done.emit(str(out))
         except TtsError as exc:

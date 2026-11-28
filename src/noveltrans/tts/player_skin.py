@@ -20,8 +20,10 @@ width/height, so those callers stay unit-testable without rendering anything.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 from PIL import Image, ImageDraw, ImageFilter
 
@@ -208,13 +210,109 @@ def _drop_shadow(base: Image.Image, box: tuple[int, int, int, int], radius: int,
     base.alpha_composite(sh, (x - pad, y - pad + round(blur * 0.4)))
 
 
-def _cover_fit(photo: Image.Image, w: int, h: int) -> Image.Image:
-    """Scale+centre-crop `photo` to exactly w×h (CSS object-fit: cover)."""
-    scale = max(w / photo.width, h / photo.height)
-    photo = photo.resize((max(1, round(photo.width * scale)), max(1, round(photo.height * scale))))
-    left = (photo.width - w) // 2
-    top = (photo.height - h) // 2
-    return photo.crop((left, top, left + w, top + h))
+# -- framing of the small photo -------------------------------------------------
+# The user picks which part of the background image shows in the small photo frame:
+# `focus` (fx, fy) in [0, 1] says where the crop sits within the spare image on each axis
+# (0 = left/top edge, 1 = right/bottom), and `zoom` >= 1 enlarges the image past "just
+# covers the frame". The defaults reproduce the old centre crop exactly. Zoom matters as
+# much as focus: a 16:9 image covering the ~1.3:1 frame has no spare height at 100%, so
+# it can only move sideways until it is zoomed in.
+DEFAULT_PHOTO_FOCUS: tuple[float, float] = (0.5, 0.5)
+DEFAULT_PHOTO_ZOOM = 1.0
+MIN_PHOTO_ZOOM = 1.0
+MAX_PHOTO_ZOOM = 3.0
+
+
+def _finite_float(value) -> float | None:
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def clamp_photo_focus(value) -> tuple[float, float]:
+    """`value` as an (fx, fy) pair in [0, 1]; anything that is not a pair of numbers → centre."""
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return DEFAULT_PHOTO_FOCUS
+    fx, fy = _finite_float(value[0]), _finite_float(value[1])
+    if fx is None or fy is None:
+        return DEFAULT_PHOTO_FOCUS
+    return (min(max(fx, 0.0), 1.0), min(max(fy, 0.0), 1.0))
+
+
+def clamp_photo_zoom(value) -> float:
+    """`value` as a zoom in [MIN_PHOTO_ZOOM, MAX_PHOTO_ZOOM]; not a number → 1.0."""
+    z = _finite_float(value)
+    if z is None:
+        return DEFAULT_PHOTO_ZOOM
+    return min(max(z, MIN_PHOTO_ZOOM), MAX_PHOTO_ZOOM)
+
+
+class CoverCrop(NamedTuple):
+    """Where `_cover_fit` resizes the source to, and the top-left of the w×h window it keeps."""
+
+    scaled_w: int
+    scaled_h: int
+    left: int
+    top: int
+
+
+def cover_crop(src_w: int, src_h: int, w: int, h: int, *,
+               focus=DEFAULT_PHOTO_FOCUS, zoom=DEFAULT_PHOTO_ZOOM) -> CoverCrop:
+    """The cover-fit crop of a src_w×src_h image into w×h, placed by `focus`, scaled by `zoom`.
+
+    `int()` (floor), not `round()`: at focus 0.5 it equals the old `slack // 2` for odd
+    slack too, so novels that never set a framing render pixel-for-pixel as before.
+    """
+    scale = max(w / src_w, h / src_h) * clamp_photo_zoom(zoom)
+    sw, sh = max(1, round(src_w * scale)), max(1, round(src_h * scale))
+    fx, fy = clamp_photo_focus(focus)
+    slack_x, slack_y = max(sw - w, 0), max(sh - h, 0)
+    left = min(max(int(fx * slack_x), 0), slack_x)
+    top = min(max(int(fy * slack_y), 0), slack_y)
+    return CoverCrop(sw, sh, left, top)
+
+
+def _cover_fit(photo: Image.Image, w: int, h: int, *,
+               focus=DEFAULT_PHOTO_FOCUS, zoom=DEFAULT_PHOTO_ZOOM) -> Image.Image:
+    """Scale `photo` to cover exactly w×h (CSS object-fit: cover) and crop at `focus`.
+
+    The defaults are the plain centre crop; the thumbnail always uses them.
+    """
+    c = cover_crop(photo.width, photo.height, w, h, focus=focus, zoom=zoom)
+    photo = photo.resize((c.scaled_w, c.scaled_h))
+    return photo.crop((c.left, c.top, c.left + w, c.top + h))
+
+
+def pan_photo_focus(src_size: tuple[int, int], slot_size: tuple[float, float],
+                    focus, zoom, dx: float, dy: float) -> tuple[float, float]:
+    """The focus after dragging the picture by (dx, dy) slot-space pixels.
+
+    The picture follows the hand: dragging right reveals more of its left side, so fx
+    drops. Works at any display scale, since slack and the drag are in the same units.
+    An axis with no spare image (slack 0) cannot move and keeps its value.
+    """
+    src_w, src_h = src_size
+    w, h = slot_size
+    fx, fy = clamp_photo_focus(focus)
+    if src_w <= 0 or src_h <= 0 or w <= 0 or h <= 0:
+        return (fx, fy)
+    scale = max(w / src_w, h / src_h) * clamp_photo_zoom(zoom)
+    slack_x, slack_y = src_w * scale - w, src_h * scale - h
+    if slack_x > 1e-9:
+        fx = fx - dx / slack_x
+    if slack_y > 1e-9:
+        fy = fy - dy / slack_y
+    return clamp_photo_focus((fx, fy))
+
+
+def load_photo(image_path: Path) -> Image.Image:
+    """Open the background image the way the renderer does (RGB, no EXIF rotation).
+
+    One loader for the renderer and the preview's drag overlay, so both see the same size.
+    """
+    return Image.open(image_path).convert("RGB")
 
 
 # -- the three baked layers ---------------------------------------------------
@@ -222,6 +320,7 @@ def _cover_fit(photo: Image.Image, w: int, h: int) -> Image.Image:
 def build_player_skin(
     image_path: Path, out_path: Path, *, width: int, height: int,
     bg_color: tuple[int, int, int] | None = None,
+    photo_focus=DEFAULT_PHOTO_FOCUS, photo_zoom: float = DEFAULT_PHOTO_ZOOM,
 ) -> Path:
     """Render the static backdrop (gradient + framed photo + empty progress track).
 
@@ -231,6 +330,9 @@ def build_player_skin(
     `bg_color` (r, g, b) replaces the default pastel gradient with one derived from that hue
     (a light-to-slightly-darker vertical gradient plus soft tinted glows); `None` keeps the
     original pastel look.
+
+    `photo_focus` / `photo_zoom` frame the background image inside the small photo box
+    (see `cover_crop`); the defaults are the centre crop every render used before.
     """
     lay = PlayerLayout.of(width, height)
     W, H = width, height
@@ -265,8 +367,8 @@ def build_player_skin(
     box = (lay.photo_x, lay.photo_y, lay.photo_w, lay.photo_h)
     _drop_shadow(bg, box, radius=lay.photo_radius, blur=round(H * 0.035), alpha=90)
     try:
-        photo = Image.open(image_path).convert("RGB")
-        photo = _cover_fit(photo, lay.photo_w, lay.photo_h)
+        photo = load_photo(image_path)
+        photo = _cover_fit(photo, lay.photo_w, lay.photo_h, focus=photo_focus, zoom=photo_zoom)
         bg.paste(photo, (lay.photo_x, lay.photo_y), _rounded_mask((lay.photo_w, lay.photo_h), lay.photo_radius))
     except OSError:
         draw.rounded_rectangle(
