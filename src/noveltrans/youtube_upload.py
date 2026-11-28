@@ -3330,6 +3330,16 @@ _PIN_CONFIRM_SEL = "ytcp-button, tp-yt-paper-button, button"
 _PIN_CONFIRM_LABELS = ("Pin", "Ghim")
 # Studio's toast after a pin lands ("Comment pinned"). Pinned is recorded only once it shows.
 _PIN_TOAST_SEL = "ytcp-toast, tp-yt-paper-toast, [role='alert']"
+# "Pin this comment?" shows its buttons before it is ready: a click right away was lost
+# (seen live 2026-11-27). Wait this long after the dialog appears before clicking Pin.
+_PIN_DIALOG_LOAD_MS = 2_000
+# After Studio confirms the pin, keep the tab open this long so the pin request lands
+# before the caller closes it.
+_PIN_LAND_MS = 3_000
+# A Pin click that left the dialog open did not register: click it again, up to this many times.
+_PIN_CLICK_ATTEMPTS = 3
+# How long the comment menu and the confirmation dialog get to appear.
+_PIN_APPEAR_MS = 10_000
 
 
 def _should_comment(request: UploadRequest) -> bool:
@@ -3337,8 +3347,8 @@ def _should_comment(request: UploadRequest) -> bool:
     return bool(request.comment.strip()) and request.visibility in COMMENT_VISIBILITIES
 
 
-def _click_menu_item(page, selector: str, labels) -> bool:
-    """Click the first visible menu item whose whole text is one of `labels`. False if none.
+def _find_menu_item(page, selector: str, labels):
+    """The first visible item whose whole text is one of `labels`, or None. Never raises.
 
     Exact whole-text match on purpose: see `_PIN_MENU_ITEM_SEL`.
     """
@@ -3346,17 +3356,39 @@ def _click_menu_item(page, selector: str, labels) -> bool:
     try:
         count = items.count()
     except Exception:
-        return False
+        return None
     for index in range(count):
         item = items.nth(index)
         try:
             text = (item.inner_text(timeout=1_000) or "").strip()
             if text in labels and item.is_visible(timeout=500):
-                item.click()
-                return True
+                return item
         except Exception:
             continue
-    return False
+    return None
+
+
+def _click_menu_item(page, selector: str, labels) -> bool:
+    """Click the first visible menu item whose whole text is one of `labels`. False if none."""
+    item = _find_menu_item(page, selector, labels)
+    if item is None:
+        return False
+    try:
+        item.click()
+    except Exception:
+        return False
+    return True
+
+
+def _wait_menu_item(page, selector: str, labels, timeout_ms: int = _PIN_APPEAR_MS) -> bool:
+    """True once an item `_find_menu_item` accepts is on screen. Polls, never raises."""
+    waited = 0
+    while _find_menu_item(page, selector, labels) is None:
+        if waited >= timeout_ms:
+            return False
+        page.wait_for_timeout(500)
+        waited += 500
+    return True
 
 
 def _clear_comment_filter(page) -> None:
@@ -3408,7 +3440,12 @@ def _wait_pin_toast(page, timeout_ms: int = 10_000) -> bool:
 
 
 def _pin_newest_comment(page) -> None:
-    """Open the menu on the first comment thread and pick Pin. Raises if any step is missing."""
+    """Open the menu on the first comment thread and pick Pin. Raises if any step is missing.
+
+    Every step waits for Studio: the menu and the "Pin this comment?" dialog get time to
+    appear, the dialog gets `_PIN_DIALOG_LOAD_MS` to finish loading before Pin is clicked,
+    and once "Comment pinned" shows the tab stays open another `_PIN_LAND_MS`.
+    """
     _clear_comment_filter(page)
     thread = _first_present(page, _COMMENT_THREAD_SEL, timeout_ms=_STEP_WAIT_MS)
     if thread is None:
@@ -3417,19 +3454,29 @@ def _pin_newest_comment(page) -> None:
         thread.locator(_COMMENT_MENU_SEL).first.click()
     except Exception as exc:
         raise YouTubeUploadError("không mở được menu của bình luận") from exc
+    if not _wait_menu_item(page, _PIN_MENU_ITEM_SEL, _PIN_LABELS):
+        raise YouTubeUploadError("không có mục Ghim trong menu bình luận")
+    page.wait_for_timeout(_SETTLE_MS)
     if not _click_menu_item(page, _PIN_MENU_ITEM_SEL, _PIN_LABELS):
         raise YouTubeUploadError("không có mục Ghim trong menu bình luận")
     # The menu item only opens a confirmation. Nothing is pinned until its Pin button is clicked.
-    for _ in range(10):
-        if _click_menu_item(page, _PIN_CONFIRM_SEL, _PIN_CONFIRM_LABELS):
-            break
-        page.wait_for_timeout(500)
-    else:
+    if not _wait_menu_item(page, _PIN_CONFIRM_SEL, _PIN_CONFIRM_LABELS):
         raise YouTubeUploadError("đã chọn Ghim nhưng không thấy nút xác nhận “Pin”")
-    # Pinned only once Studio confirms it. Closing the browser before the request lands
-    # leaves the comment unpinned, so wait for the toast first.
-    if not _wait_pin_toast(page):
-        raise YouTubeUploadError("đã bấm Ghim nhưng không thấy xác nhận “Comment pinned”")
+    for _ in range(_PIN_CLICK_ATTEMPTS):
+        page.wait_for_timeout(_PIN_DIALOG_LOAD_MS)  # the dialog is drawn before it is ready
+        if not _click_menu_item(page, _PIN_CONFIRM_SEL, _PIN_CONFIRM_LABELS):
+            break  # the dialog closed on its own: an earlier click went through
+        # Pinned only once Studio confirms it. Closing the browser before the request lands
+        # leaves the comment unpinned, so wait for the toast, then a little longer.
+        if _wait_pin_toast(page):
+            page.wait_for_timeout(_PIN_LAND_MS)
+            return
+        if _find_menu_item(page, _PIN_CONFIRM_SEL, _PIN_CONFIRM_LABELS) is None:
+            break  # the dialog closed but the toast was missed: don't click blindly again
+    page.wait_for_timeout(_PIN_LAND_MS)
+    if _toast_says_pinned(page):
+        return
+    raise YouTubeUploadError("đã bấm Ghim nhưng không thấy xác nhận “Comment pinned”")
 
 
 def _post_and_pin_comment(page, video: Path, *, video_id: str, text: str) -> str:

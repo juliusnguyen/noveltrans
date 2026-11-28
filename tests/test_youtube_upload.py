@@ -3696,9 +3696,13 @@ class _FakeCommentPage:
     def __init__(
         self, *, submit_ok=True, menu_has_pin=True, thread_present=True,
         logged_out=False, goto_error=None, confirm_present=True, filter_chip=True,
-        toast_shows=True,
+        toast_shows=True, confirm_ignores=0,
     ):
         self.submit_ok = submit_ok
+        # Pin clicks the dialog swallows before it has finished loading
+        self.confirm_ignores = confirm_ignores
+        # clicks and waits in order, as ("click", selector) / ("wait", ms)
+        self.events: list = []
         self.menu_has_pin = menu_has_pin
         self.thread_present = thread_present
         self.logged_out = logged_out
@@ -3725,7 +3729,7 @@ class _FakeCommentPage:
         self.url = "https://accounts.google.com/signin" if self.logged_out else url
 
     def wait_for_timeout(self, ms):
-        pass
+        self.events.append(("wait", ms))
 
     def close(self):
         self.closed = True
@@ -3814,6 +3818,7 @@ class _CommentLoc:
         from noveltrans.youtube_upload import _COMMENT_SUBMIT_SEL
 
         self._page.clicks.append(self._selector)
+        self._page.events.append(("click", self._selector))
         from noveltrans.youtube_upload import _FILTER_CHIP_X_SEL
 
         if self._selector == _FILTER_CHIP_X_SEL:
@@ -3828,8 +3833,12 @@ class _CommentLoc:
 
         if self._selector == _PIN_MENU_ITEM_SEL:
             self._page.confirm_open = True  # Studio asks "Pin this comment?" next
-        if self._selector == _PIN_CONFIRM_SEL and self._page.toast_shows:
-            self._page.toast_open = True
+        if self._selector == _PIN_CONFIRM_SEL:
+            if self._page.confirm_ignores:
+                self._page.confirm_ignores -= 1  # not loaded yet: the click is lost
+            elif self._page.toast_shows:
+                self._page.confirm_open = False
+                self._page.toast_open = True
 
 
 class TestPostAndPinComment:
@@ -3911,6 +3920,48 @@ class TestPostAndPinComment:
         note = _post_and_pin_comment(page, video, video_id="dQw4w9WgXcQ", text="Hello")
 
         assert "Comment pinned" in note
+        assert "pinned" not in read_upload_state(video)
+
+    def test_waits_for_the_dialog_before_pin_and_after_it(self, tmp_path):
+        """The dialog gets time to load before Pin is clicked, and the tab stays open a
+        while after "Comment pinned" so the pin lands before the tab closes."""
+        from noveltrans.youtube_upload import (
+            _PIN_CONFIRM_SEL,
+            _PIN_DIALOG_LOAD_MS,
+            _PIN_LAND_MS,
+            _post_and_pin_comment,
+        )
+
+        video = self._video(tmp_path)
+        page = _FakeCommentPage()
+        assert _post_and_pin_comment(page, video, video_id="dQw4w9WgXcQ", text="Hello") == ""
+
+        at = page.events.index(("click", _PIN_CONFIRM_SEL))
+        assert page.events[at - 1] == ("wait", _PIN_DIALOG_LOAD_MS)
+        assert page.events[-1] == ("wait", _PIN_LAND_MS)
+
+    def test_a_pin_click_the_dialog_swallowed_is_clicked_again(self, tmp_path):
+        """A click before the dialog is ready leaves it open: click Pin again."""
+        from noveltrans.youtube_upload import _PIN_CONFIRM_SEL, _post_and_pin_comment
+
+        video = self._video(tmp_path)
+        page = _FakeCommentPage(confirm_ignores=1)
+        assert _post_and_pin_comment(page, video, video_id="dQw4w9WgXcQ", text="Hello") == ""
+        assert page.clicks.count(_PIN_CONFIRM_SEL) == 2
+        assert read_upload_state(video)["pinned"] is True
+
+    def test_pin_clicks_stop_after_the_attempt_limit(self, tmp_path):
+        from noveltrans.youtube_upload import (
+            _PIN_CLICK_ATTEMPTS,
+            _PIN_CONFIRM_SEL,
+            _post_and_pin_comment,
+        )
+
+        video = self._video(tmp_path)
+        page = _FakeCommentPage(confirm_ignores=99)
+        note = _post_and_pin_comment(page, video, video_id="dQw4w9WgXcQ", text="Hello")
+        assert "không ghim được" in note
+        assert page.clicks.count(_PIN_CONFIRM_SEL) == _PIN_CLICK_ATTEMPTS
         assert "pinned" not in read_upload_state(video)
 
     def test_failed_post_is_marked_failed_and_never_pins(self, tmp_path):
